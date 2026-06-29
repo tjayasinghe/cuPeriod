@@ -99,6 +99,116 @@ def _theta_batch(
     return theta
 
 
+#: CUDA threads per block (one block per trial period).
+CUDA_BLOCK: Final = 128
+
+#: One-block-per-period PDM kernel: a block bins its folded points in shared memory
+#: (sum, sum of squares, count per cover) and reduces them to Theta on one thread.
+_PDM_CUDA_SRC: Final = r"""
+extern "C" __global__ void pdm_block(
+    const double* __restrict__ tau, const double* __restrict__ y,
+    const double* __restrict__ periods,
+    const int n_points, const int n_periods, const int n_bins, const int n_covers,
+    const double sigma2, double* o_theta)
+{
+    const int pidx = blockIdx.x;
+    if (pidx >= n_periods) return;
+    const int tid = threadIdx.x;
+    const int nth = blockDim.x;
+    const double period = periods[pidx];
+    const int M = n_bins * n_covers;
+
+    extern __shared__ double sh[];
+    double* s_sum = sh;          // (M) sum of y per bin
+    double* s_sq = sh + M;       // (M) sum of y^2 per bin
+    double* s_cnt = sh + 2 * M;  // (M) point count per bin
+    for (int i = tid; i < M; i += nth) {
+        s_sum[i] = 0.0; s_sq[i] = 0.0; s_cnt[i] = 0.0;
+    }
+    __syncthreads();
+
+    const double cover_step = 1.0 / ((double)n_bins * (double)n_covers);
+    for (int j = tid; j < n_points; j += nth) {
+        double x = tau[j];
+        double ph = (x - period * floor(x / period)) / period;  // mod(tau/period, 1)
+        double yj = y[j];
+        for (int c = 0; c < n_covers; ++c) {
+            double pc = ph + (double)c * cover_step;
+            pc -= floor(pc);
+            int b = (int)(pc * n_bins);
+            if (b >= n_bins) b = n_bins - 1;
+            if (b < 0) b = 0;
+            int gid = c * n_bins + b;
+            atomicAdd(&s_sum[gid], yj);
+            atomicAdd(&s_sq[gid], yj * yj);
+            atomicAdd(&s_cnt[gid], 1.0);
+        }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        double ssd = 0.0;
+        int nonempty = 0;
+        for (int i = 0; i < M; ++i) {
+            double cnt = s_cnt[i];
+            if (cnt > 0.0) {
+                ssd += s_sq[i] - s_sum[i] * s_sum[i] / cnt;
+                nonempty += 1;
+            }
+        }
+        double den = (double)(n_points * n_covers - nonempty);
+        o_theta[pidx] = (den > 0.0) ? (ssd / den) / sigma2 : 1e30;
+    }
+}
+"""
+
+_pdm_kernel_cache: dict[int, Any] = {}
+
+
+def _pdm_kernel(block: int) -> Any:
+    """Compile (once) and cache the PDM RawKernel for a given block size."""
+    kernel = _pdm_kernel_cache.get(block)
+    if kernel is None:
+        import cupy
+
+        kernel = cupy.RawKernel(_PDM_CUDA_SRC, "pdm_block")
+        _pdm_kernel_cache[block] = kernel
+    return kernel
+
+
+def _pdm_cuda(
+    tau: FloatArray,
+    y: FloatArray,
+    periods: FloatArray,
+    *,
+    n_bins: int,
+    n_covers: int,
+    sigma2: float,
+    block: int = CUDA_BLOCK,
+) -> FloatArray:
+    """One-block-per-period CUDA PDM Theta; returns a host float64 array."""
+    import cupy as cp
+
+    tau_d = cp.asarray(np.ascontiguousarray(tau, dtype=np.float64))
+    y_d = cp.asarray(np.ascontiguousarray(y, dtype=np.float64))
+    per_d = cp.asarray(np.ascontiguousarray(periods, dtype=np.float64))
+    n_periods = int(per_d.size)
+    if n_periods == 0:
+        return np.zeros(0, dtype=np.float64)
+    out = cp.empty(n_periods, dtype=cp.float64)
+    _pdm_kernel(block)(
+        (n_periods,),
+        (block,),
+        (
+            tau_d, y_d, per_d,
+            np.int32(tau_d.size), np.int32(n_periods),
+            np.int32(n_bins), np.int32(n_covers), np.float64(sigma2), out,
+        ),
+        shared_mem=3 * n_bins * n_covers * 8,
+    )
+    return np.asarray(cp.asnumpy(out), dtype=np.float64)
+
+
 def pdm_theta(
     t: FloatArray,
     y: FloatArray,
@@ -146,20 +256,9 @@ def pdm_theta(
 
     if backend == "cupy":
         ensure_cuda_dll_path()
-        import cupy as cp
-
-        theta = _theta_batch(
-            cp,
-            cp.asarray(tau),
-            cp.asarray(y),
-            cp.asarray(y * y),
-            cp.asarray(periods_host),
-            n_bins=n_bins,
-            n_covers=n_covers,
-            sigma2=sigma2,
-            batch=batch,
+        return _pdm_cuda(
+            tau, y, periods_host, n_bins=n_bins, n_covers=n_covers, sigma2=sigma2
         )
-        return np.asarray(cp.asnumpy(theta), dtype=np.float64)
     if backend != "numpy":
         raise ValueError(f"unknown backend {backend!r}")
     theta = _theta_batch(
