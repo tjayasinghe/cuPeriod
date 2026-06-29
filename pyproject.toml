@@ -55,6 +55,10 @@ gpu = [
     "nvidia-cusolver-cu12",
 ]
 pandas = ["pandas>=2.0"]
+# Multicore CPU acceleration for the box search: a numba-parallel BLS that beats
+# astropy's compiled BoxLeastSquares by ~20x and is auto-selected on the CPU when
+# present (otherwise BLS falls back to astropy).
+fast = ["numba>=0.59"]
 dev = [
     "pytest>=8",
     "pytest-cov>=5",
@@ -62,6 +66,7 @@ dev = [
     "mypy>=1.11",
     "pandas>=2.0",
     "hypothesis>=6",
+    "numba>=0.59",
 ]
 
 [project.scripts]

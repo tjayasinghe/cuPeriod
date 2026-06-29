@@ -31,11 +31,15 @@ All seven methods have CPU and GPU backends, plus the full single/batch/CLI mach
 ```bash
 pip install cuperiod            # CPU (numpy, scipy, astropy, finufft)
 pip install "cuperiod[gpu]"     # + CUDA 12 GPU backends (cupy, cufinufft)
+pip install "cuperiod[fast]"    # + numba (multicore box search, ~20x astropy BLS on CPU)
 pip install "cuperiod[pandas]"  # + pandas DataFrame ingestion
 ```
 
 GPU acceleration needs an NVIDIA GPU with the CUDA 12 runtime; the `[gpu]` extra pulls in
-`cupy-cuda12x`, `cufinufft`, and the CUDA runtime wheels.
+`cupy-cuda12x`, `cufinufft`, and the CUDA runtime wheels. The `[fast]` extra adds a
+multicore `numba` box search that becomes BLS's default CPU backend — an order of
+magnitude faster than astropy's compiled `BoxLeastSquares`, and matching it to
+floating-point.
 
 ## Quick start (Python)
 

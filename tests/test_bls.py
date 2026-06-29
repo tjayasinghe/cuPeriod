@@ -31,6 +31,23 @@ def test_bls_numpy_matches_astropy() -> None:
     assert np.max(np.abs(mine.extras["duration"] - astro.extras["duration"])) < 1e-9
 
 
+def test_bls_numba_matches_astropy() -> None:
+    pytest.importorskip("numba")
+    grid, lc, settings = _grid_and_lc()
+    method = BLSMethod()
+    mine = method.power(grid, lc, settings, "numba")
+    astro = method.power(grid, lc, settings, "astropy")
+    finite = np.isfinite(mine.power) & np.isfinite(astro.power)
+    assert float(np.max(np.abs(mine.power[finite] - astro.power[finite]))) < 1e-7
+    assert int(np.argmax(mine.power)) == int(np.argmax(astro.power))
+    assert np.max(np.abs(mine.extras["duration"] - astro.extras["duration"])) < 1e-9
+
+
+def test_bls_cpu_prefers_numba_when_available() -> None:
+    pytest.importorskip("numba")
+    assert BLSMethod().resolve_backend("cpu") == "numba"
+
+
 def test_bls_power_function_matches_astropy() -> None:
     from astropy.timeseries import BoxLeastSquares
 

@@ -26,7 +26,7 @@ import numpy as np
 
 from cuperiod.core._typing import FloatArray
 
-BLSBackend = Literal["numpy", "cupy"]
+BLSBackend = Literal["numpy", "cupy", "numba"]
 
 #: Inverse-variance floor: an empty in/out side (ivar sum 0) is skipped, not divided by.
 _IVAR_EPS: Final = float(np.finfo(np.float64).eps)
@@ -220,6 +220,141 @@ def _bls_search(
         out["transit_time"][sl] = xp.where(finite, transit_time, zero)
         out["log_likelihood"][sl] = xp.where(finite, log_like, zero)
     return out
+
+
+# --- CPU fast path: numba-parallel, one loop-iteration per trial period -------
+# The same per-period binned box search as the CUDA kernel below, JIT-compiled
+# and run across all CPU cores with numba ``prange`` — each trial period is
+# independent, so the search parallelizes perfectly. numba is imported lazily and
+# the kernel cached, so this is pure opt-in: nothing imports numba unless the
+# ``numba`` backend actually runs. Matches astropy ``run_bls`` to round-off, like
+# the numpy and cupy backends, but is the fast CPU product path.
+
+_NUMBA_BLS_KERNEL: Any = None
+
+
+def _numba_bls_kernel() -> Any:
+    """Lazily compile (once) and cache the numba BLS kernel."""
+    global _NUMBA_BLS_KERNEL
+    if _NUMBA_BLS_KERNEL is not None:
+        return _NUMBA_BLS_KERNEL
+    from numba import njit, prange
+
+    eps = _IVAR_EPS
+
+    @njit(parallel=True, cache=True, fastmath=False)  # pragma: no cover - njit
+    def _kernel(tau, yw, wv, periods, dur_bins, bin_duration, oversample, width,  # type: ignore[no-untyped-def]
+                sum_y, sum_ivar, t_min, obj_flag):
+        n_periods = periods.shape[0]
+        n_points = tau.shape[0]
+        n_dur = dur_bins.shape[0]
+        neg = -np.inf
+        o_power = np.full(n_periods, neg)
+        o_depth = np.zeros(n_periods)
+        o_depth_err = np.zeros(n_periods)
+        o_depth_snr = np.zeros(n_periods)
+        o_duration = np.zeros(n_periods)
+        o_tt = np.zeros(n_periods)
+        o_ll = np.zeros(n_periods)
+        for pidx in prange(n_periods):
+            period = periods[pidx]
+            n_bins = int(np.ceil(period / bin_duration)) + oversample
+            if n_bins > width - 1:
+                n_bins = width - 1
+            my = np.zeros(width)
+            mi = np.zeros(width)
+            for j in range(n_points):
+                x = tau[j]
+                w = x - period * np.floor(x / period)
+                ind = int(w / bin_duration) + 1
+                if ind < 0:
+                    ind = 0
+                elif ind > width - 1:
+                    ind = width - 1
+                my[ind] += yw[j]
+                mi[ind] += wv[j]
+            for k in range(oversample):
+                dst = n_bins - oversample + k
+                if 0 <= dst < width:
+                    my[dst] = my[1 + k]
+                    mi[dst] = mi[1 + k]
+            ay = 0.0
+            ai = 0.0
+            for i in range(n_bins + 1):
+                ay += my[i]
+                my[i] = ay
+                ai += mi[i]
+                mi[i] = ai
+            loc = neg
+            ln = 0
+            ld = 0
+            for di in range(n_dur):
+                d = dur_bins[di]
+                if d < 1 or d >= n_bins:
+                    continue
+                for n in range(n_bins - d + 1):
+                    y_in = my[n + d] - my[n]
+                    iv_in = mi[n + d] - mi[n]
+                    iv_out = sum_ivar - iv_in
+                    if iv_in < eps or iv_out < eps:
+                        continue
+                    yin = y_in / iv_in
+                    yout = (sum_y - y_in) / iv_out
+                    if yout < yin:
+                        continue
+                    depth = yout - yin
+                    if obj_flag == 0:
+                        obj = depth / np.sqrt(1.0 / iv_in + 1.0 / iv_out)
+                    else:
+                        obj = 0.5 * iv_in * depth * depth
+                    if obj > loc:
+                        loc = obj
+                        ln = n
+                        ld = d
+            if loc <= neg:
+                continue
+            y_in = my[ln + ld] - my[ln]
+            iv_in = mi[ln + ld] - mi[ln]
+            iv_out = sum_ivar - iv_in
+            yin = y_in / iv_in
+            yout = (sum_y - y_in) / iv_out
+            depth = yout - yin
+            derr = np.sqrt(1.0 / iv_in + 1.0 / iv_out)
+            dsnr = depth / derr
+            ll = 0.5 * iv_in * depth * depth
+            dur = ld * bin_duration
+            o_power[pidx] = dsnr if obj_flag == 0 else ll
+            o_depth[pidx] = depth
+            o_depth_err[pidx] = derr
+            o_depth_snr[pidx] = dsnr
+            o_duration[pidx] = dur
+            o_tt[pidx] = (ln * bin_duration + 0.5 * dur) % period + t_min
+            o_ll[pidx] = ll
+        return o_power, o_depth, o_depth_err, o_depth_snr, o_duration, o_tt, o_ll
+
+    _NUMBA_BLS_KERNEL = _kernel
+    return _kernel
+
+
+def _bls_search_numba(
+    t: Any, y: Any, ivar: Any, periods: Any, *,
+    bin_duration: float, dur_bins: list[int], oversample: int, width: int,
+    obj_flag: int,
+) -> dict[str, Any]:
+    """Numba CPU box search; same output dict as :func:`_bls_search`."""
+    kernel = _numba_bls_kernel()
+    yw = np.ascontiguousarray(y * ivar, dtype=np.float64)
+    t_min = float(t.min())
+    tau = np.ascontiguousarray(t - t_min, dtype=np.float64)
+    db = np.ascontiguousarray(dur_bins, dtype=np.int64)
+    pw, dep, de, ds, du, tt, ll = kernel(
+        tau, yw, np.ascontiguousarray(ivar, dtype=np.float64),
+        np.ascontiguousarray(periods, dtype=np.float64), db,
+        float(bin_duration), int(oversample), int(width),
+        float(yw.sum()), float(ivar.sum()), t_min, int(obj_flag),
+    )
+    return {"power": pw, "depth": dep, "depth_err": de, "depth_snr": ds,
+            "duration": du, "transit_time": tt, "log_likelihood": ll}
 
 
 # --- GPU fast path: one CUDA block per trial period --------------------------
@@ -500,7 +635,7 @@ def bls_power(
     if objective not in ("snr", "likelihood"):
         raise ValueError("objective must be 'snr' or 'likelihood'")
     obj_flag = 0 if objective == "snr" else 1
-    if backend not in ("numpy", "cupy"):
+    if backend not in ("numpy", "cupy", "numba"):
         raise ValueError(f"unknown backend {backend!r}")
 
     periods_host = np.ascontiguousarray(periods, dtype=np.float64)
@@ -533,6 +668,21 @@ def bls_power(
 
         def host(a: Any) -> FloatArray:
             return np.asarray(cupy.asnumpy(a), dtype=np.float64)
+    elif backend == "numba":
+        out = _bls_search_numba(
+            np.ascontiguousarray(t, dtype=np.float64),
+            np.ascontiguousarray(y, dtype=np.float64),
+            ivar_host,
+            periods_host,
+            bin_duration=bin_duration,
+            dur_bins=dur_bins,
+            oversample=oversample,
+            width=width,
+            obj_flag=obj_flag,
+        )
+
+        def host(a: Any) -> FloatArray:
+            return np.asarray(a, dtype=np.float64)
     else:
         out = _bls_search(
             np,
