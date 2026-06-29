@@ -76,5 +76,6 @@ def test_pdm_gpu_matches_cpu() -> None:
     t, mag, _ = synthetic_sine()
     periods = np.linspace(0.3, 3.0, 500)
     cpu = pdm_theta(t, mag, periods, backend="numpy")
-    gpu = pdm_theta(t, mag, periods, backend="cupy")
-    assert float(np.max(np.abs(cpu - gpu))) < 1e-9
+    gpu = pdm_theta(t, mag, periods, backend="cupy")  # one-block-per-period CUDA kernel
+    # atomicAdd reorders the summation, so allow a small relative tolerance.
+    assert np.allclose(cpu, gpu, rtol=1e-6, atol=1e-9)

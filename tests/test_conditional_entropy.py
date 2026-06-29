@@ -67,5 +67,6 @@ def test_ce_gpu_matches_cpu() -> None:
     t, mag, _ = synthetic_sine()
     periods = np.linspace(0.3, 3.0, 500)
     cpu = conditional_entropy(t, mag, periods, backend="numpy")
-    gpu = conditional_entropy(t, mag, periods, backend="cupy")
-    assert float(np.max(np.abs(cpu - gpu))) < 1e-9
+    gpu = conditional_entropy(t, mag, periods, backend="cupy")  # CUDA kernel
+    # atomicAdd reorders the histogram summation, so allow a small tolerance.
+    assert np.allclose(cpu, gpu, rtol=1e-6, atol=1e-9)

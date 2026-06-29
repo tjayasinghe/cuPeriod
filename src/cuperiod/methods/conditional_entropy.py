@@ -17,7 +17,7 @@ from typing import Any, ClassVar, Final, Literal
 
 import numpy as np
 
-from cuperiod.core._typing import FloatArray
+from cuperiod.core._typing import FloatArray, IntArray
 from cuperiod.core.backend import ensure_cuda_dll_path
 from cuperiod.core.config import CESettings
 from cuperiod.core.errors import InsufficientDataError
@@ -76,6 +76,104 @@ def _entropy_batch(
     return entropy
 
 
+#: CUDA threads per block (one block per trial period).
+CUDA_BLOCK: Final = 128
+
+#: One-block-per-period CE kernel: a block folds its points into a shared-memory 2-D
+#: phase-magnitude histogram (magnitude bins precomputed on the host), then one thread
+#: reduces it to the Shannon conditional entropy H(m | phase).
+_CE_CUDA_SRC: Final = r"""
+extern "C" __global__ void ce_block(
+    const double* __restrict__ tau, const int* __restrict__ mag_bin,
+    const double* __restrict__ periods,
+    const int n_points, const int n_periods, const int n_phase, const int n_mag,
+    double* o_entropy)
+{
+    const int pidx = blockIdx.x;
+    if (pidx >= n_periods) return;
+    const int tid = threadIdx.x;
+    const int nth = blockDim.x;
+    const double period = periods[pidx];
+    const int M = n_phase * n_mag;
+
+    extern __shared__ double cnt[];  // (M) point count per (phase, mag) cell
+    for (int i = tid; i < M; i += nth) cnt[i] = 0.0;
+    __syncthreads();
+
+    for (int j = tid; j < n_points; j += nth) {
+        double x = tau[j];
+        double ph = (x - period * floor(x / period)) / period;  // mod(tau/period, 1)
+        int pb = (int)(ph * n_phase);
+        if (pb >= n_phase) pb = n_phase - 1;
+        if (pb < 0) pb = 0;
+        atomicAdd(&cnt[pb * n_mag + mag_bin[j]], 1.0);
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        double h = 0.0;
+        for (int p = 0; p < n_phase; ++p) {
+            double ci = 0.0;
+            for (int m = 0; m < n_mag; ++m) ci += cnt[p * n_mag + m];
+            if (ci > 0.0) {
+                double lci = log(ci);
+                for (int m = 0; m < n_mag; ++m) {
+                    double c = cnt[p * n_mag + m];
+                    if (c > 0.0) h += c * (lci - log(c));
+                }
+            }
+        }
+        o_entropy[pidx] = h / (double)n_points;
+    }
+}
+"""
+
+_ce_kernel_cache: dict[int, Any] = {}
+
+
+def _ce_kernel(block: int) -> Any:
+    """Compile (once) and cache the CE RawKernel for a given block size."""
+    kernel = _ce_kernel_cache.get(block)
+    if kernel is None:
+        import cupy
+
+        kernel = cupy.RawKernel(_CE_CUDA_SRC, "ce_block")
+        _ce_kernel_cache[block] = kernel
+    return kernel
+
+
+def _ce_cuda(
+    tau: FloatArray,
+    mag_bin: IntArray,
+    periods: FloatArray,
+    *,
+    n_phase: int,
+    n_mag: int,
+    block: int = CUDA_BLOCK,
+) -> FloatArray:
+    """One-block-per-period CUDA conditional entropy; returns a host float64 array."""
+    import cupy as cp
+
+    tau_d = cp.asarray(np.ascontiguousarray(tau, dtype=np.float64))
+    mag_d = cp.asarray(np.ascontiguousarray(mag_bin, dtype=np.int32))
+    per_d = cp.asarray(np.ascontiguousarray(periods, dtype=np.float64))
+    n_periods = int(per_d.size)
+    if n_periods == 0:
+        return np.zeros(0, dtype=np.float64)
+    out = cp.empty(n_periods, dtype=cp.float64)
+    _ce_kernel(block)(
+        (n_periods,),
+        (block,),
+        (
+            tau_d, mag_d, per_d,
+            np.int32(tau_d.size), np.int32(n_periods),
+            np.int32(n_phase), np.int32(n_mag), out,
+        ),
+        shared_mem=n_phase * n_mag * 8,
+    )
+    return np.asarray(cp.asnumpy(out), dtype=np.float64)
+
+
 def conditional_entropy(
     t: FloatArray,
     y: FloatArray,
@@ -121,13 +219,9 @@ def conditional_entropy(
 
     if backend == "cupy":
         ensure_cuda_dll_path()
-        import cupy as cp
-
-        entropy = _entropy_batch(
-            cp, cp.asarray(tau), cp.asarray(mag_bin), cp.asarray(periods_host),
-            n_phase=n_phase_bins, n_mag=n_mag_bins, batch=batch,
+        return _ce_cuda(
+            tau, mag_bin, periods_host, n_phase=n_phase_bins, n_mag=n_mag_bins
         )
-        return np.asarray(cp.asnumpy(entropy), dtype=np.float64)
     if backend != "numpy":
         raise ValueError(f"unknown backend {backend!r}")
     return np.asarray(
