@@ -6,8 +6,9 @@ import numpy as np
 import pytest
 
 import cuperiod as cup
+from conftest import requires_gpu
 from cuperiod.core.errors import BackendUnavailableError
-from cuperiod.methods.tls import limb_darkened_template
+from cuperiod.methods.tls import limb_darkened_template, tls_power
 
 
 def _inject_transit(
@@ -85,5 +86,23 @@ def test_tls_converts_magnitude() -> None:
 
 
 def test_tls_gpu_backend_unavailable() -> None:
+    from cuperiod.core.backend import cuda_available
+
+    if cuda_available():
+        pytest.skip("a GPU is present")
     with pytest.raises(BackendUnavailableError):
         cup.get_method("TLS").resolve_backend("gpu")
+
+
+@requires_gpu
+def test_tls_gpu_matches_cpu() -> None:
+    t, flux, err = _inject_transit(period=3.0, depth=0.02)
+    settings = cup.TLSSettings(min_period_days=2.0)
+    grid = cup.get_method("TLS").default_grid(
+        cup.LightCurve.from_arrays(t, flux, err, domain=cup.Domain.FLUX), settings
+    )
+    periods = grid.period
+    cpu = tls_power(t, flux, err, periods, settings=settings, backend="numpy")
+    gpu = tls_power(t, flux, err, periods, settings=settings, backend="cupy")
+    assert np.allclose(cpu["sr"], gpu["sr"], rtol=1e-6, atol=1e-6)
+    assert np.allclose(cpu["sde"], gpu["sde"], rtol=1e-6, atol=1e-6)

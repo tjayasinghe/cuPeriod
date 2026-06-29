@@ -19,11 +19,13 @@ the Ofir (2014) optimal-frequency grid are planned refinements.
 
 from __future__ import annotations
 
-from typing import ClassVar, Final, Literal
+from types import ModuleType
+from typing import Any, ClassVar, Final, Literal
 
 import numpy as np
 
 from cuperiod.core._typing import FloatArray
+from cuperiod.core.backend import ensure_cuda_dll_path
 from cuperiod.core.columns import Domain
 from cuperiod.core.config import TLSSettings
 from cuperiod.core.errors import InsufficientDataError
@@ -31,6 +33,8 @@ from cuperiod.core.grid import GridSpec
 from cuperiod.core.lightcurve import LightCurve
 from cuperiod.core.result import Periodogram
 from cuperiod.methods.base import PeriodogramMethod, register
+
+TLSBackend = Literal["numpy", "cupy"]
 
 #: Smallest admissible per-bin weight (an empty side is skipped, not divided by).
 _W_EPS: Final = 1e-300
@@ -90,75 +94,80 @@ def _period_grid(baseline: float, settings: TLSSettings) -> FloatArray:
 
 
 def _matched_filter(
-    tau: FloatArray,
-    yw: FloatArray,
-    w: FloatArray,
-    periods: FloatArray,
+    xp: ModuleType,
+    tau: Any,
+    yw: Any,
+    w: Any,
+    periods: Any,
     *,
     n_bins: int,
     dur_bins: list[int],
     templates: dict[int, FloatArray],
     period_batch: int,
-) -> dict[str, FloatArray]:
-    """Per-period best matched-filter signal residue and transit parameters."""
-    n_periods = int(periods.size)
+) -> dict[str, Any]:
+    """Per-period best matched-filter signal residue and transit parameters.
+
+    Device-agnostic: ``xp`` is numpy (CPU) or cupy (GPU). The phase correlation is a
+    short width-loop of shifted slices (the template width is small), which runs on
+    either backend without ``sliding_window_view`` (absent in cupy). Templates stay on
+    the host; their per-bin scalars broadcast against device arrays.
+    """
+    n_periods = int(periods.shape[0])
     out = {
-        "sr": np.zeros(n_periods),
-        "depth": np.zeros(n_periods),
-        "duration": np.zeros(n_periods),
-        "t0": np.zeros(n_periods),
+        "sr": xp.zeros(n_periods),
+        "depth": xp.zeros(n_periods),
+        "duration": xp.zeros(n_periods),
+        "t0": xp.zeros(n_periods),
     }
-    n_points = int(tau.size)
+    n_points = int(tau.shape[0])
     for start in range(0, n_periods, period_batch):
         stop = min(start + period_batch, n_periods)
         pb = periods[start:stop]
-        n_p = int(pb.size)
-        phase = np.mod(tau[None, :] / pb[:, None], 1.0)
-        bin_idx = np.minimum((phase * n_bins).astype(np.int64), n_bins - 1)
-        rows = np.repeat(np.arange(n_p), n_points)
-        flat = (rows * n_bins + bin_idx.ravel()).astype(np.int64)
-        a_flat = np.zeros(n_p * n_bins)  # sum w*y' per bin
-        b_flat = np.zeros(n_p * n_bins)  # sum w per bin
-        np.add.at(a_flat, flat, np.broadcast_to(yw, (n_p, n_points)).ravel())
-        np.add.at(b_flat, flat, np.broadcast_to(w, (n_p, n_points)).ravel())
+        n_p = int(pb.shape[0])
+        rows_p = xp.arange(n_p)
+        phase = xp.mod(tau[None, :] / pb[:, None], 1.0)
+        bin_idx = xp.minimum((phase * n_bins).astype(xp.int64), n_bins - 1)
+        flat = (rows_p[:, None] * n_bins + bin_idx).ravel()
+        a_flat = xp.zeros(n_p * n_bins)  # sum w*y' per bin
+        b_flat = xp.zeros(n_p * n_bins)  # sum w per bin
+        xp.add.at(a_flat, flat, xp.broadcast_to(yw, (n_p, n_points)).ravel())
+        xp.add.at(b_flat, flat, xp.broadcast_to(w, (n_p, n_points)).ravel())
         a = a_flat.reshape(n_p, n_bins)
         b = b_flat.reshape(n_p, n_bins)
 
-        best_sr = np.zeros(n_p)
-        best_depth = np.zeros(n_p)
-        best_start = np.zeros(n_p, dtype=np.int64)
-        best_width = np.zeros(n_p, dtype=np.int64)
+        best_sr = xp.zeros(n_p)
+        best_depth = xp.zeros(n_p)
+        best_start = xp.zeros(n_p, dtype=xp.int64)
+        best_width = xp.zeros(n_p, dtype=xp.int64)
         for width in dur_bins:
             g = templates[width]
-            g2 = g * g
-            a_ext = np.concatenate([a, a[:, : width - 1]], axis=1)
-            b_ext = np.concatenate([b, b[:, : width - 1]], axis=1)
-            win_a = np.lib.stride_tricks.sliding_window_view(a_ext, width, axis=1)
-            win_b = np.lib.stride_tricks.sliding_window_view(b_ext, width, axis=1)
-            num = np.einsum("psk,k->ps", win_a, g)
-            den = np.einsum("psk,k->ps", win_b, g2)
-            safe_den = np.where(den > _W_EPS, den, 1.0)
-            sr = np.where(den > _W_EPS, num * num / safe_den, 0.0)
+            a_ext = xp.concatenate([a, a[:, : width - 1]], axis=1)
+            b_ext = xp.concatenate([b, b[:, : width - 1]], axis=1)
+            num = xp.zeros((n_p, n_bins))
+            den = xp.zeros((n_p, n_bins))
+            for k in range(width):  # correlate the folded data with the template
+                gk = float(g[k])
+                num += gk * a_ext[:, k : k + n_bins]
+                den += (gk * gk) * b_ext[:, k : k + n_bins]
+            safe_den = xp.where(den > _W_EPS, den, 1.0)
             # a dip means the in-transit weighted residual is negative -> num < 0
-            sr = np.where(num < 0.0, sr, 0.0)
-            s_best = np.argmax(sr, axis=1)
-            rows_p = np.arange(n_p)
+            sr = xp.where((den > _W_EPS) & (num < 0.0), num * num / safe_den, 0.0)
+            s_best = xp.argmax(sr, axis=1)
             sr_best = sr[rows_p, s_best]
             improve = sr_best > best_sr
-            best_sr = np.where(improve, sr_best, best_sr)
-            depth = -num[rows_p, s_best] / np.where(
-                den[rows_p, s_best] > _W_EPS, den[rows_p, s_best], 1.0
-            )
-            best_depth = np.where(improve, depth, best_depth)
-            best_start = np.where(improve, s_best, best_start)
-            best_width = np.where(improve, width, best_width)
+            best_sr = xp.where(improve, sr_best, best_sr)
+            den_best = den[rows_p, s_best]
+            depth = -num[rows_p, s_best] / xp.where(den_best > _W_EPS, den_best, 1.0)
+            best_depth = xp.where(improve, depth, best_depth)
+            best_start = xp.where(improve, s_best, best_start)
+            best_width = xp.where(improve, xp.int64(width), best_width)
 
         sl = slice(start, stop)
         out["sr"][sl] = best_sr
         out["depth"][sl] = best_depth
-        out["duration"][sl] = best_width.astype(np.float64) / n_bins * pb
-        centre = (best_start.astype(np.float64) + best_width / 2.0) / n_bins
-        out["t0"][sl] = np.mod(centre, 1.0) * pb
+        out["duration"][sl] = best_width.astype(xp.float64) / n_bins * pb
+        centre = (best_start.astype(xp.float64) + best_width / 2.0) / n_bins
+        out["t0"][sl] = xp.mod(centre, 1.0) * pb
     return out
 
 
@@ -169,6 +178,7 @@ def tls_power(
     periods: FloatArray,
     *,
     settings: TLSSettings,
+    backend: TLSBackend = "numpy",
 ) -> dict[str, FloatArray]:
     """TLS matched-filter search over ``periods`` (flux input; a transit is a dip).
 
@@ -182,6 +192,8 @@ def tls_power(
         Trial periods (days).
     settings : TLSSettings
         Search configuration.
+    backend : {"numpy", "cupy"}, default "numpy"
+        CPU or GPU; both run the identical vectorized matched filter.
 
     Returns
     -------
@@ -213,20 +225,38 @@ def tls_power(
         z = np.zeros(n_periods)
         return {"sde": z, "sr": z, "depth": z, "duration": z, "t0": z}
 
-    res = _matched_filter(
-        tau, yw, w, periods_host,
-        n_bins=settings.n_phase_bins, dur_bins=dur_bins, templates=templates,
-        period_batch=settings.period_batch,
-    )
+    n_bins = settings.n_phase_bins
+    period_batch = settings.period_batch
+    if backend == "cupy":
+        ensure_cuda_dll_path()
+        import cupy as cp
+
+        device = _matched_filter(
+            cp, cp.asarray(tau), cp.asarray(yw), cp.asarray(w),
+            cp.asarray(periods_host),
+            n_bins=n_bins, dur_bins=dur_bins, templates=templates,
+            period_batch=period_batch,
+        )
+        res = {
+            k: np.asarray(cp.asnumpy(v), dtype=np.float64) for k, v in device.items()
+        }
+    elif backend == "numpy":
+        res = _matched_filter(
+            np, tau, yw, w, periods_host,
+            n_bins=n_bins, dur_bins=dur_bins, templates=templates,
+            period_batch=period_batch,
+        )
+    else:
+        raise ValueError(f"unknown backend {backend!r}")
+
     sr = res["sr"]
     mean, std = float(sr.mean()), float(sr.std())
-    sde = (sr - mean) / std if std > 0.0 else np.zeros_like(sr)
-    res["sde"] = sde
+    res["sde"] = (sr - mean) / std if std > 0.0 else np.zeros_like(sr)
     return res
 
 
 class TLSMethod(PeriodogramMethod):
-    """Transit Least Squares — limb-darkened matched filter (numpy CPU)."""
+    """Transit Least Squares — limb-darkened matched filter (numpy CPU, cupy GPU)."""
 
     name: ClassVar[str] = "TLS"
     objective_sense: ClassVar[Literal["max", "min"]] = "max"
@@ -234,8 +264,8 @@ class TLSMethod(PeriodogramMethod):
     natural_domain: ClassVar[Domain] = Domain.FLUX
     settings_cls: ClassVar[type] = TLSSettings
     cpu_backend: ClassVar[str] = "numpy"
-    gpu_backend: ClassVar[str | None] = None
-    all_backends: ClassVar[tuple[str, ...]] = ("numpy",)
+    gpu_backend: ClassVar[str | None] = "cupy"
+    all_backends: ClassVar[tuple[str, ...]] = ("numpy", "cupy")
 
     def default_grid(self, lc: LightCurve, settings: TLSSettings) -> GridSpec:  # type: ignore[override]
         finite = lc.finite()
@@ -264,7 +294,8 @@ class TLSMethod(PeriodogramMethod):
             raise InsufficientDataError("TLS: no usable time baseline")
         periods = grid.period
         res = tls_power(
-            finite.time, finite.value, finite.error, periods, settings=settings
+            finite.time, finite.value, finite.error, periods,
+            settings=settings, backend=backend,  # type: ignore[arg-type]
         )
         extras = {
             "sr": res["sr"],
@@ -284,7 +315,10 @@ class TLSMethod(PeriodogramMethod):
             meta=finite.meta,
         )
 
+    def estimate_device_bytes(self, n_points: int) -> int:
+        return 128 * 1024**2 + n_points * 8 * 4
+
 
 register(TLSMethod())
 
-__all__ = ["TLSMethod", "limb_darkened_template", "tls_power"]
+__all__ = ["TLSBackend", "TLSMethod", "limb_darkened_template", "tls_power"]
