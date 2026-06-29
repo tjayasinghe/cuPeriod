@@ -10,6 +10,7 @@ from __future__ import annotations
 # Importing each method module registers it under its uppercase name.
 from cuperiod.methods import bls as bls  # noqa: F401
 from cuperiod.methods import gls as gls  # noqa: F401
+from cuperiod.methods import pdm as pdm  # noqa: F401
 from cuperiod.methods.base import (
     MethodInfo,
     PeriodogramMethod,

@@ -124,6 +124,47 @@ class BLSSettings(BaseSettings):
     )
 
 
+class PDMSettings(BaseSettings):
+    """Settings for phase dispersion minimization (PDM)."""
+
+    model_config = SettingsConfigDict(env_prefix="CUPERIOD_PDM_", extra="forbid")
+
+    minimum_frequency: float | None = Field(
+        default=None,
+        description="Lowest trial frequency (cycles/day); None -> 1/baseline.",
+    )
+    maximum_frequency: float | None = Field(
+        default=None,
+        description="Highest trial frequency (cycles/day); None -> pseudo-Nyquist.",
+    )
+    nyquist_factor: int = Field(
+        default=5, ge=1, description="Pseudo-Nyquist multiple when max is None."
+    )
+    samples_per_peak: int = Field(
+        default=5, ge=1, description="Frequency oversampling factor."
+    )
+    n_bins: int = Field(default=10, ge=2, description="Number of phase bins.")
+    n_covers: int = Field(
+        default=3, ge=1, description="Overlapping bin sets (Stellingwerf covers)."
+    )
+    n_peaks: int = Field(default=10, ge=1, description="Default stored peak count.")
+    peak_separation_rayleigh: float = Field(
+        default=3.0, gt=0.0, description="Min peak separation in Rayleigh widths."
+    )
+    min_detections: int = Field(
+        default=20, ge=3, description="Skip if fewer finite points."
+    )
+    backend: Literal["auto", "cpu", "gpu", "numpy", "cupy"] = Field(
+        default="auto", description="Compute backend."
+    )
+    batch_periods: int = Field(
+        default=2048, ge=1, description="Trial periods per vectorized batch."
+    )
+    downsample_points: int = Field(
+        default=2000, ge=2, description="Stored downsampled-spectrum size."
+    )
+
+
 class BatchSettings(BaseSettings):
     """Settings for batch processing of many light curves."""
 
@@ -145,4 +186,10 @@ class BatchSettings(BaseSettings):
     )
 
 
-__all__ = ["BackendName", "BLSSettings", "BatchSettings", "GLSSettings"]
+__all__ = [
+    "BackendName",
+    "BLSSettings",
+    "BatchSettings",
+    "GLSSettings",
+    "PDMSettings",
+]

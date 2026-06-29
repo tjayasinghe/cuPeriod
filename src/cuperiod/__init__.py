@@ -19,7 +19,12 @@ from cuperiod import methods as methods
 from cuperiod.api import best_periods, periodogram, to_input
 from cuperiod.batch import BatchSummary, batch_periodograms
 from cuperiod.core.columns import ColumnMap, Domain
-from cuperiod.core.config import BatchSettings, BLSSettings, GLSSettings
+from cuperiod.core.config import (
+    BatchSettings,
+    BLSSettings,
+    GLSSettings,
+    PDMSettings,
+)
 from cuperiod.core.device import GpuInfo, free_gpu_memory, gpu_info, suggest_gpu_workers
 from cuperiod.core.errors import (
     BackendUnavailableError,
@@ -52,6 +57,7 @@ __all__ = [
     "MethodInfo",
     "MultiBandLightCurve",
     "MultiResult",
+    "PDMSettings",
     "Peak",
     "Periodogram",
     "UnknownMethodError",

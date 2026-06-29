@@ -163,7 +163,7 @@ def gpu_info_cmd() -> None:
     typer.echo(str(info))
     typer.echo("  suggested workers:")
     for m in list_methods():
-        if m.name in {"GLS", "BLS"}:
+        if any(b in {"cupy", "cufinufft"} for b in m.all_backends):
             typer.echo(f"    {m.name}: {suggest_gpu_workers(m.name)}")
 
 
