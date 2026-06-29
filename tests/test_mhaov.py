@@ -62,6 +62,28 @@ def test_mhaov_peaks_at_true_frequency() -> None:
     assert at_true > 5.0 * off
 
 
+def test_mhaov_multiband_recovers_period() -> None:
+    period = 0.6234
+    tg, mg, eg = synthetic_sine(n=300, period=period, seed=2)
+    tr, mr, er = synthetic_sine(n=300, period=period, amp=0.3, seed=3)
+    mb = cup.MultiBandLightCurve.from_light_curves(
+        {
+            "g": cup.LightCurve.from_arrays(tg, mg, eg),
+            "r": cup.LightCurve.from_arrays(tr, mr + 1.0, er),
+        }
+    )
+    # bounded above the first subharmonic, as for the single-band sine
+    pg = cup.periodogram(
+        mb, "MHAOV", settings=cup.MHAOVSettings(minimum_frequency=1.0)
+    )
+    assert "bands" in pg.meta
+    assert pg.best_period() == pytest.approx(period, rel=2e-3)
+
+
+def test_mhaov_supports_multiband() -> None:
+    assert cup.get_method("MHAOV").supports_multiband
+
+
 def test_mhaov_too_few_points() -> None:
     t = np.linspace(0.0, 10.0, 5)
     out = aov_power(t, np.arange(5.0), np.array([0.5, 1.0]), n_harmonics=3)

@@ -34,7 +34,7 @@ from cuperiod.core.grid import (
     pseudo_nyquist_frequency,
     uniform_frequency_grid,
 )
-from cuperiod.core.lightcurve import LightCurve
+from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
 from cuperiod.core.result import Periodogram
 from cuperiod.methods.base import PeriodogramMethod, register
 
@@ -59,7 +59,7 @@ def _design(xp: ModuleType, angle: Any, n_harmonics: int) -> Any:
     return design
 
 
-def _aov_batch(
+def _model_ss_batch(
     xp: ModuleType,
     tau: Any,
     y: Any,
@@ -71,10 +71,12 @@ def _aov_batch(
     n_points: int,
     batch: int,
 ) -> Any:
-    """AOV F-statistic for each trial frequency, vectorized over frequencies."""
+    """Regression sum of squares (about the mean) per trial frequency.
+
+    This is the projection norm of the data onto the ``2H+1`` harmonic basis; the AOV
+    F-statistic (single- or multi-band) is formed from it by the callers.
+    """
     d = 2 * n_harmonics + 1
-    dof_model = float(2 * n_harmonics)
-    dof_resid = float(n_points - d)
     n_freq = int(frequencies.shape[0])
     eye = xp.eye(d, dtype=np.float64) * _RIDGE
     out = xp.empty(n_freq, dtype=np.float64)
@@ -91,10 +93,54 @@ def _aov_batch(
         # singleton to keep it a per-frequency vector solve.
         beta = xp.linalg.solve(gram, proj[..., None])[..., 0]
         model_ss = (beta * proj).sum(axis=1) - n_points * y_mean * y_mean
-        model_ss = xp.clip(model_ss, 0.0, total_ss)
-        resid_ss = xp.clip(total_ss - model_ss, 1e-300, None)
-        out[start:stop] = (model_ss / dof_model) / (resid_ss / dof_resid)
+        out[start:stop] = xp.clip(model_ss, 0.0, total_ss)
     return out
+
+
+def _compute_model_ss(
+    t: FloatArray,
+    y: FloatArray,
+    frequencies: FloatArray,
+    *,
+    n_harmonics: int,
+    backend: MHAOVBackend,
+    batch: int,
+) -> tuple[FloatArray, float, int]:
+    """Host-side regression SS per frequency, plus ``(total_ss, n)`` for one band.
+
+    Returns all-zero model SS (and ``total_ss=0``) when the band has too few points or
+    no variance, so a caller can skip it.
+    """
+    t = np.ascontiguousarray(t, dtype=np.float64)
+    y = np.ascontiguousarray(y, dtype=np.float64)
+    freqs = np.ascontiguousarray(frequencies, dtype=np.float64)
+    n = t.size
+    if freqs.size == 0 or n <= 2 * n_harmonics + 1:
+        return np.zeros(freqs.size, dtype=np.float64), 0.0, n
+    tau = t - t.min()
+    y_mean = float(y.mean())
+    total_ss = float(((y - y_mean) ** 2).sum())
+    if total_ss <= 0.0:
+        return np.zeros(freqs.size, dtype=np.float64), 0.0, n
+
+    if backend == "cupy":
+        ensure_cuda_dll_path()
+        import cupy as cp
+
+        out = _model_ss_batch(
+            cp, cp.asarray(tau), cp.asarray(y), cp.asarray(freqs),
+            n_harmonics=n_harmonics, total_ss=total_ss, y_mean=y_mean,
+            n_points=n, batch=batch,
+        )
+        return np.asarray(cp.asnumpy(out), dtype=np.float64), total_ss, n
+    if backend != "numpy":
+        raise ValueError(f"unknown backend {backend!r}")
+    out = _model_ss_batch(
+        np, tau, y, freqs,
+        n_harmonics=n_harmonics, total_ss=total_ss, y_mean=y_mean,
+        n_points=n, batch=batch,
+    )
+    return np.asarray(out, dtype=np.float64), total_ss, n
 
 
 def aov_power(
@@ -127,38 +173,70 @@ def aov_power(
         AOV F-statistic per frequency (maximized at the true frequency). All-zero for a
         constant signal or when there are too few points.
     """
-    t = np.ascontiguousarray(t, dtype=np.float64)
-    y = np.ascontiguousarray(y, dtype=np.float64)
+    model_ss, total_ss, n = _compute_model_ss(
+        t, y, frequencies, n_harmonics=n_harmonics, backend=backend, batch=batch
+    )
+    if total_ss <= 0.0:
+        return model_ss
+    dof_model = float(2 * n_harmonics)
+    dof_resid = float(n - (2 * n_harmonics + 1))
+    resid_ss = np.clip(total_ss - model_ss, 1e-300, None)
+    return (model_ss / dof_model) / (resid_ss / dof_resid)
+
+
+def aov_multiband_power(
+    frequencies: FloatArray,
+    bands: list[tuple[FloatArray, FloatArray]],
+    *,
+    n_harmonics: int = 3,
+    backend: MHAOVBackend = "numpy",
+    batch: int = DEFAULT_BATCH,
+) -> FloatArray:
+    """Pooled multiband AOV F-statistic at a shared frequency, per-band amplitudes.
+
+    Each band is fit with its own ``2H+1`` trig-polynomial (independent amplitudes and
+    phases) at the *same* trial frequency; the regression and residual sums of squares
+    are pooled across bands into one F-statistic with ``B*2H`` model and
+    ``N_total - B*(2H+1)`` residual degrees of freedom.
+
+    Parameters
+    ----------
+    frequencies : numpy.ndarray
+        Shared trial frequencies (cycles/day).
+    bands : list of (time, value)
+        Per-band finite ``(t, y)`` arrays.
+    n_harmonics, backend, batch
+        As for :func:`aov_power`.
+
+    Returns
+    -------
+    numpy.ndarray
+        Pooled AOV F-statistic per frequency.
+    """
     freqs = np.ascontiguousarray(frequencies, dtype=np.float64)
     if freqs.size == 0:
         return np.zeros(0, dtype=np.float64)
-    n = t.size
-    if n <= 2 * n_harmonics + 1:
-        return np.zeros(freqs.size, dtype=np.float64)
-    tau = t - t.min()
-    y_mean = float(y.mean())
-    total_ss = float(((y - y_mean) ** 2).sum())
-    if total_ss <= 0.0:
-        return np.zeros(freqs.size, dtype=np.float64)
-
-    if backend == "cupy":
-        ensure_cuda_dll_path()
-        import cupy as cp
-
-        out = _aov_batch(
-            cp, cp.asarray(tau), cp.asarray(y), cp.asarray(freqs),
-            n_harmonics=n_harmonics, total_ss=total_ss, y_mean=y_mean,
-            n_points=n, batch=batch,
+    model_sum = np.zeros(freqs.size, dtype=np.float64)
+    resid_sum = np.zeros(freqs.size, dtype=np.float64)
+    n_total = 0
+    n_used_bands = 0
+    for t, y in bands:
+        model_ss, total_ss, n = _compute_model_ss(
+            t, y, freqs, n_harmonics=n_harmonics, backend=backend, batch=batch
         )
-        return np.asarray(cp.asnumpy(out), dtype=np.float64)
-    if backend != "numpy":
-        raise ValueError(f"unknown backend {backend!r}")
-    out = _aov_batch(
-        np, tau, y, freqs,
-        n_harmonics=n_harmonics, total_ss=total_ss, y_mean=y_mean,
-        n_points=n, batch=batch,
-    )
-    return np.asarray(out, dtype=np.float64)
+        if total_ss <= 0.0:
+            continue
+        model_sum += model_ss
+        resid_sum += total_ss - model_ss
+        n_total += n
+        n_used_bands += 1
+    d = 2 * n_harmonics + 1
+    dof_resid = n_total - n_used_bands * d
+    if n_used_bands == 0 or dof_resid <= 0:
+        return np.zeros(freqs.size, dtype=np.float64)
+    dof_model = float(n_used_bands * 2 * n_harmonics)
+    resid = np.clip(resid_sum, 1e-300, None)
+    return (model_sum / dof_model) / (resid / dof_resid)
 
 
 class MHAOVMethod(PeriodogramMethod):
@@ -166,7 +244,7 @@ class MHAOVMethod(PeriodogramMethod):
 
     name: ClassVar[str] = "MHAOV"
     objective_sense: ClassVar[Literal["max", "min"]] = "max"
-    supports_multiband: ClassVar[bool] = False
+    supports_multiband: ClassVar[bool] = True
     settings_cls: ClassVar[type] = MHAOVSettings
     cpu_backend: ClassVar[str] = "numpy"
     gpu_backend: ClassVar[str | None] = "cupy"
@@ -221,10 +299,27 @@ class MHAOVMethod(PeriodogramMethod):
             meta=finite.meta,
         )
 
+    def multiband_power(  # type: ignore[override]
+        self,
+        grid: GridSpec,
+        mblc: MultiBandLightCurve,
+        settings: MHAOVSettings,
+        backend: str,
+    ) -> Periodogram:
+        from cuperiod.multiband.mhaov_mb import mhaov_multiband_power
+
+        return mhaov_multiband_power(grid, mblc, settings, backend)
+
     def estimate_device_bytes(self, n_points: int) -> int:
         return 128 * 1024**2 + n_points * 8 * 12
 
 
 register(MHAOVMethod())
 
-__all__ = ["DEFAULT_BATCH", "MHAOVBackend", "MHAOVMethod", "aov_power"]
+__all__ = [
+    "DEFAULT_BATCH",
+    "MHAOVBackend",
+    "MHAOVMethod",
+    "aov_multiband_power",
+    "aov_power",
+]

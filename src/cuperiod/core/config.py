@@ -330,8 +330,8 @@ class TLSSettings(BaseSettings):
     min_detections: int = Field(
         default=20, ge=3, description="Skip if fewer finite points."
     )
-    backend: Literal["auto", "cpu", "numpy"] = Field(
-        default="auto", description="Compute backend (GPU TLS is planned)."
+    backend: Literal["auto", "cpu", "gpu", "numpy", "cupy"] = Field(
+        default="auto", description="Compute backend."
     )
     period_batch: int = Field(
         default=256, ge=1, description="Trial periods per vectorized batch."

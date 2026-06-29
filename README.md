@@ -18,14 +18,13 @@ Implemented now, each with optimized CPU and GPU backends:
 | --- | --- | --- | --- |
 | **GLS** | general variability (Lomb-Scargle) | yes | yes |
 | **BLS** | eclipses / box-like transits | yes | yes |
-| **MHAOV** | sharply non-sinusoidal signals (multiharmonic AOV) | yes | planned |
-| **TLS** | limb-darkened transit matched filter | planned | — |
+| **MHAOV** | sharply non-sinusoidal signals (multiharmonic AOV) | yes | yes |
+| **TLS** | limb-darkened transit matched filter | yes | — |
 | **PDM** | non-sinusoidal folds (Stellingwerf) | yes | — |
 | **CE** | sparse survey data (conditional entropy) | yes | — |
 | **String-Length** | eclipsing / eccentric shapes | yes | — |
 
-Plus the full single/batch/CLI machinery. Planned next: a GPU kernel for TLS and multi-band
-MHAOV.
+All seven methods have CPU and GPU backends, plus the full single/batch/CLI machinery.
 
 ## Install
 
