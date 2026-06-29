@@ -1,0 +1,123 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cuperiod"
+version = "0.1.0"
+description = "Optimized, GPU-accelerated periodograms for astronomy"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "GPL-3.0-or-later"
+authors = [{ name = "Tharindu Jayasinghe" }]
+keywords = [
+    "astronomy",
+    "periodogram",
+    "lomb-scargle",
+    "box-least-squares",
+    "variable-stars",
+    "time-series",
+    "gpu",
+    "cuda",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Astronomy",
+    "Typing :: Typed",
+]
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "astropy>=6.0",
+    "finufft>=2.2",
+    "pydantic>=2.5",
+    "pydantic-settings>=2.1",
+    "typer>=0.12",
+    "pyarrow>=14",
+]
+
+[project.optional-dependencies]
+# GPU acceleration. The cufinufft Windows wheel needs the CUDA-12 runtime DLLs on
+# the search path; importing cupy (and cuperiod's DLL shim) completes the setup.
+gpu = [
+    "cupy-cuda12x>=13.3",
+    "cufinufft>=2.3",
+    "nvidia-cuda-runtime-cu12",
+    "nvidia-cufft-cu12",
+    "nvidia-cuda-nvrtc-cu12",
+]
+pandas = ["pandas>=2.0"]
+dev = [
+    "pytest>=8",
+    "pytest-cov>=5",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "pandas>=2.0",
+    "hypothesis>=6",
+]
+
+[project.scripts]
+cuperiod = "cuperiod.cli.app:main"
+
+[project.urls]
+Homepage = "https://github.com/tjayasinghe/cuPeriod"
+Repository = "https://github.com/tjayasinghe/cuPeriod"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cuperiod"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "NPY"]
+
+[tool.ruff.lint.per-file-ignores]
+# typer's API requires function calls (Option/Argument) in parameter defaults.
+"src/cuperiod/cli/app.py" = ["B008"]
+
+# Type-checked against 3.12 (matches numpy>=2.3 stubs, which use 3.12 syntax);
+# 3.11 source compatibility is enforced by requires-python and ruff target-version.
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_ignores = false
+files = ["src/cuperiod"]
+plugins = ["pydantic.mypy"]
+
+# Third-party packages without (complete) type stubs.
+[[tool.mypy.overrides]]
+module = [
+    "finufft",
+    "cufinufft",
+    "cupy",
+    "cupy.*",
+    "numba",
+    "numba.*",
+    "pandas",
+    "astropy",
+    "astropy.*",
+    "scipy",
+    "scipy.*",
+]
+ignore_missing_imports = true
+
+# pyarrow ships py.typed but leaves read_table/write_table untyped; skip it.
+[[tool.mypy.overrides]]
+module = ["pyarrow", "pyarrow.*"]
+follow_imports = "skip"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: requires a CUDA GPU with the [gpu] extra installed (deselect with -m 'not gpu')",
+]
+filterwarnings = ["ignore::DeprecationWarning"]
