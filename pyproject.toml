@@ -66,8 +66,8 @@ dev = [
 cuperiod = "cuperiod.cli.app:main"
 
 [project.urls]
-Homepage = "https://github.com/tharindu/cuPeriod"
-Repository = "https://github.com/tharindu/cuPeriod"
+Homepage = "https://github.com/tjayasinghe/cuPeriod"
+Repository = "https://github.com/tjayasinghe/cuPeriod"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/cuperiod"]
