@@ -24,8 +24,13 @@ def test_registry_contains_phase1_methods() -> None:
 
 
 def test_resolve_cpu_backend() -> None:
+    from cuperiod.core.backend import available_backends
+
     assert get_method("GLS").resolve_backend("cpu") == "finufft"
-    assert get_method("BLS").resolve_backend("cpu") == "astropy"
+    # BLS prefers the multicore numba box search on the CPU when installed,
+    # falling back to astropy's compiled BoxLeastSquares otherwise.
+    expected = "numba" if "numba" in available_backends() else "astropy"
+    assert get_method("BLS").resolve_backend("cpu") == expected
 
 
 def test_resolve_gpu_without_device_raises() -> None:

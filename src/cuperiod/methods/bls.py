@@ -136,7 +136,14 @@ def _assemble(
 
 
 class BLSMethod(PeriodogramMethod):
-    """Box Least Squares method (numpy / astropy CPU, cupy GPU)."""
+    """Box Least Squares method (numba / astropy CPU, cupy GPU).
+
+    The CPU product path prefers the multicore ``numba`` box search when numba is
+    installed (the ``[fast]`` extra) — a faithful, parallel port of the CUDA kernel
+    that beats astropy's compiled ``BoxLeastSquares`` by an order of magnitude — and
+    falls back to astropy otherwise. ``numpy`` is the array-module-generic reference
+    that shares its source with the ``cupy`` kernel (for floating-point parity tests).
+    """
 
     name: ClassVar[str] = "BLS"
     objective_sense: ClassVar[Literal["max", "min"]] = "max"
@@ -145,7 +152,17 @@ class BLSMethod(PeriodogramMethod):
     settings_cls: ClassVar[type] = BLSSettings
     cpu_backend: ClassVar[str] = "astropy"
     gpu_backend: ClassVar[str | None] = "cupy"
-    all_backends: ClassVar[tuple[str, ...]] = ("numpy", "astropy", "cupy")
+    all_backends: ClassVar[tuple[str, ...]] = ("numba", "numpy", "astropy", "cupy")
+
+    def resolve_backend(self, requested: str) -> str:
+        """Prefer the multicore numba box search on the CPU when it is installed."""
+        from cuperiod.core.backend import available_backends, cuda_available
+
+        if requested == "auto" and self.gpu_backend is not None and cuda_available():
+            return self.gpu_backend
+        if requested in ("cpu", "auto"):
+            return "numba" if "numba" in available_backends() else "astropy"
+        return super().resolve_backend(requested)
 
     def default_grid(self, lc: LightCurve, settings: BLSSettings) -> GridSpec:  # type: ignore[override]
         finite = lc.finite()
