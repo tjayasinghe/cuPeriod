@@ -1,0 +1,17 @@
+# Large/derived artefacts — regenerate with the scripts. Keep figures, REPORT.md,
+# the small summary tables, and the code in version control.
+data/
+results/spectra/
+*.npz
+__pycache__/
+
+# keep the small summary tables that back the report
+!results/validation_metrics.parquet
+!results/bench_single.parquet
+!results/bench_npoints.parquet
+!results/bench_grid.parquet
+!results/bench_batch.parquet
+!results/tls_results.parquet
+
+# run logs
+results/*.log
