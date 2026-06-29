@@ -281,6 +281,66 @@ class StringLengthSettings(BaseSettings):
     )
 
 
+class TLSSettings(BaseSettings):
+    """Settings for the transit least squares (TLS) search."""
+
+    model_config = SettingsConfigDict(env_prefix="CUPERIOD_TLS_", extra="forbid")
+
+    min_period_days: float = Field(default=0.5, gt=0.0, description="Minimum period.")
+    max_period_days: float = Field(default=100.0, gt=0.0, description="Maximum period.")
+    min_transits: int = Field(
+        default=2, ge=1, description="Cap max period at baseline/min_transits."
+    )
+    oversample: int = Field(
+        default=2, ge=1, description="Period-grid frequency oversampling."
+    )
+    grid_duration_frac: float = Field(
+        default=0.05,
+        gt=0.0,
+        description="Period-grid spacing as a transit-width fraction (peak sampling).",
+    )
+    n_phase_bins: int = Field(
+        default=256, ge=16, description="Phase bins for the folded matched filter."
+    )
+    duration_min_frac: float = Field(
+        default=0.01, gt=0.0, description="Shortest transit as a fraction of period."
+    )
+    duration_max_frac: float = Field(
+        default=0.10, gt=0.0, description="Longest transit as a fraction of period."
+    )
+    n_durations: int = Field(
+        default=5, ge=1, description="Trial transit durations."
+    )
+    limb_dark_u1: float = Field(
+        default=0.4, description="Quadratic limb-darkening coefficient u1."
+    )
+    limb_dark_u2: float = Field(
+        default=0.3, description="Quadratic limb-darkening coefficient u2."
+    )
+    n_peaks: int = Field(default=10, ge=1, description="Default stored peak count.")
+    peak_separation_rayleigh: float = Field(
+        default=3.0, gt=0.0, description="Min peak separation in Rayleigh widths."
+    )
+    alias_freq_tolerance: float = Field(
+        default=0.0035, ge=0.0, description="Alias-diversity frequency tolerance."
+    )
+    harmonic_max: int = Field(
+        default=8, ge=1, description="Harmonic order for alias diversity."
+    )
+    min_detections: int = Field(
+        default=20, ge=3, description="Skip if fewer finite points."
+    )
+    backend: Literal["auto", "cpu", "numpy"] = Field(
+        default="auto", description="Compute backend (GPU TLS is planned)."
+    )
+    period_batch: int = Field(
+        default=256, ge=1, description="Trial periods per vectorized batch."
+    )
+    downsample_points: int = Field(
+        default=2000, ge=2, description="Stored downsampled-spectrum size."
+    )
+
+
 class BatchSettings(BaseSettings):
     """Settings for batch processing of many light curves."""
 
@@ -311,4 +371,5 @@ __all__ = [
     "MHAOVSettings",
     "PDMSettings",
     "StringLengthSettings",
+    "TLSSettings",
 ]

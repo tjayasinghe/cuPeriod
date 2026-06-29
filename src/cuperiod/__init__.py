@@ -27,6 +27,7 @@ from cuperiod.core.config import (
     MHAOVSettings,
     PDMSettings,
     StringLengthSettings,
+    TLSSettings,
 )
 from cuperiod.core.device import GpuInfo, free_gpu_memory, gpu_info, suggest_gpu_workers
 from cuperiod.core.errors import (
@@ -66,6 +67,7 @@ __all__ = [
     "Peak",
     "Periodogram",
     "StringLengthSettings",
+    "TLSSettings",
     "UnknownMethodError",
     "__version__",
     "batch_periodograms",

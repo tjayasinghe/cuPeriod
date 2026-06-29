@@ -14,17 +14,18 @@ Every implementation is validated against the standard reference (astropy
 
 Implemented now, each with optimized CPU and GPU backends:
 
-| Method | What it's for | Multi-band |
-| --- | --- | --- |
-| **GLS** | general variability (Lomb-Scargle) | yes |
-| **BLS** | eclipses / box-like transits | yes |
-| **MHAOV** | sharply non-sinusoidal signals (multiharmonic AOV) | planned |
-| **PDM** | non-sinusoidal folds (Stellingwerf) | — |
-| **CE** | sparse survey data (conditional entropy) | — |
-| **String-Length** | eclipsing / eccentric shapes | — |
+| Method | What it's for | GPU | Multi-band |
+| --- | --- | --- | --- |
+| **GLS** | general variability (Lomb-Scargle) | yes | yes |
+| **BLS** | eclipses / box-like transits | yes | yes |
+| **MHAOV** | sharply non-sinusoidal signals (multiharmonic AOV) | yes | planned |
+| **TLS** | limb-darkened transit matched filter | planned | — |
+| **PDM** | non-sinusoidal folds (Stellingwerf) | yes | — |
+| **CE** | sparse survey data (conditional entropy) | yes | — |
+| **String-Length** | eclipsing / eccentric shapes | yes | — |
 
-Plus the full single/batch/CLI machinery. Planned next: **TLS** (transit least squares) and
-multi-band MHAOV.
+Plus the full single/batch/CLI machinery. Planned next: a GPU kernel for TLS and multi-band
+MHAOV.
 
 ## Install
 
