@@ -124,6 +124,32 @@ def uniform_frequency_grid(
     return GridSpec(kind="frequency", values=freq, uniform=True)
 
 
+def pseudo_nyquist_frequency(time: FloatArray, nyquist_factor: int = 5) -> float:
+    """A pseudo-Nyquist maximum frequency from the median sampling interval.
+
+    Irregular sampling has no true Nyquist limit; this returns
+    ``nyquist_factor * 0.5 / median(diff(sort(time)))`` as a practical upper bound for
+    the trial-frequency grid of fold-based methods (PDM, CE, string-length).
+
+    Parameters
+    ----------
+    time : numpy.ndarray
+        Observation times (days).
+    nyquist_factor : int, default 5
+        Multiple of the median-sampling Nyquist frequency to allow.
+
+    Returns
+    -------
+    float
+        A maximum trial frequency in cycles/day.
+    """
+    dt = np.diff(np.sort(time))
+    dt = dt[dt > 0.0]
+    if dt.size == 0:
+        return float(nyquist_factor)
+    return float(nyquist_factor) * 0.5 / float(np.median(dt))
+
+
 def log_period_grid(
     *,
     minimum_period: float,
@@ -152,4 +178,10 @@ def log_period_grid(
     return GridSpec(kind="period", values=periods, uniform=False)
 
 
-__all__ = ["GridSpec", "GridKind", "log_period_grid", "uniform_frequency_grid"]
+__all__ = [
+    "GridSpec",
+    "GridKind",
+    "log_period_grid",
+    "pseudo_nyquist_frequency",
+    "uniform_frequency_grid",
+]

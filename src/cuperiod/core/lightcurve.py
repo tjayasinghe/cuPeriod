@@ -83,6 +83,9 @@ class LightCurve:
         object.__setattr__(self, "time", time)
         object.__setattr__(self, "value", value)
         object.__setattr__(self, "error", error)
+        # Coerce a string/aliased domain to the enum so identity checks in the
+        # flux/magnitude conversions are reliable.
+        object.__setattr__(self, "domain", Domain(self.domain))
 
     # -- properties --------------------------------------------------------------
     @property

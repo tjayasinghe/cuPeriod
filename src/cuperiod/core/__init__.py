@@ -3,7 +3,16 @@
 from __future__ import annotations
 
 from cuperiod.core.columns import ColumnMap, Domain
-from cuperiod.core.config import BatchSettings, BLSSettings, GLSSettings
+from cuperiod.core.config import (
+    BatchSettings,
+    BLSSettings,
+    CESettings,
+    GLSSettings,
+    MHAOVSettings,
+    PDMSettings,
+    StringLengthSettings,
+    TLSSettings,
+)
 from cuperiod.core.device import GpuInfo, free_gpu_memory, gpu_info, suggest_gpu_workers
 from cuperiod.core.errors import (
     BackendUnavailableError,
@@ -20,6 +29,7 @@ __all__ = [
     "BLSSettings",
     "BackendUnavailableError",
     "BatchSettings",
+    "CESettings",
     "ColumnMap",
     "ColumnResolutionError",
     "CuPeriodError",
@@ -29,10 +39,14 @@ __all__ = [
     "GridSpec",
     "InsufficientDataError",
     "LightCurve",
+    "MHAOVSettings",
     "MultiBandLightCurve",
     "MultiResult",
+    "PDMSettings",
     "Peak",
     "Periodogram",
+    "StringLengthSettings",
+    "TLSSettings",
     "UnknownMethodError",
     "free_gpu_memory",
     "gpu_info",
