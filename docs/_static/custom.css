@@ -1,0 +1,26 @@
+/* Small cosmetic tweaks on top of the Furo theme. */
+
+/* Brand accent (a periodogram-blue) for links and the sidebar highlight. */
+:root {
+  --color-brand-primary: #1c6cb3;
+  --color-brand-content: #1c6cb3;
+}
+:root[data-theme="dark"] {
+  --color-brand-primary: #6fb3e0;
+  --color-brand-content: #6fb3e0;
+}
+
+/* Give wide API/benchmark tables a horizontal scrollbar instead of overflowing. */
+.table-wrapper {
+  overflow-x: auto;
+}
+
+/* Tighten the sphinx-design cards on the landing page a touch. */
+.sd-card-title {
+  font-weight: 600;
+}
+
+/* Make inline literals (method names, backends) a hair more prominent. */
+code.literal {
+  font-size: 0.92em;
+}

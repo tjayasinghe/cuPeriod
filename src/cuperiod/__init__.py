@@ -42,7 +42,7 @@ from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
 from cuperiod.core.result import MultiResult, Peak, Periodogram
 from cuperiod.methods.base import MethodInfo, get_method, list_methods, method_names
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"
 
 __all__ = [
     "BLSSettings",

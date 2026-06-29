@@ -314,7 +314,7 @@ def main():
     L.append("# cuPeriod — Validation & Benchmark Report\n")
     L.append("GPU: **NVIDIA RTX 5070 Ti** (compute capability 12.0, sm_120) · "
              "CPU backends: finufft / numpy / astropy · "
-             "cuPeriod 0.1.0, CUDA 12, Python 3.12.\n")
+             "cuPeriod 1.0.0, CUDA 12, Python 3.12.\n")
     L.append("**Validation data** — "
              f"{len(meta)} real ASAS-SN g-band light curves across "
              f"{meta.broad_class.nunique()} variability classes (eclipsing binaries, RR Lyrae, "

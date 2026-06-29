@@ -70,6 +70,8 @@ instance/
 
 # Sphinx documentation
 docs/_build/
+# autosummary stub pages are regenerated on every build (autosummary_generate=True)
+docs/api/generated/
 
 # PyBuilder
 .pybuilder/

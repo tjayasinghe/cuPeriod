@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cuperiod"
-version = "0.1.0"
+version = "1.0.0"
 description = "Optimized, GPU-accelerated periodograms for astronomy"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -21,7 +21,7 @@ keywords = [
     "cuda",
 ]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
     "Programming Language :: Python :: 3 :: Only",
@@ -59,6 +59,16 @@ pandas = ["pandas>=2.0"]
 # astropy's compiled BoxLeastSquares by ~20x and is auto-selected on the CPU when
 # present (otherwise BLS falls back to astropy).
 fast = ["numba>=0.59"]
+# Documentation toolchain (Sphinx + Furo theme). pandas is included so the
+# DataFrame-ingestion examples and the autodoc of from_dataframe build cleanly.
+docs = [
+    "sphinx>=8",
+    "furo>=2024.8",
+    "myst-parser>=4",
+    "sphinx-copybutton>=0.5",
+    "sphinx-design>=0.6",
+    "pandas>=2.0",
+]
 dev = [
     "pytest>=8",
     "pytest-cov>=5",
@@ -74,10 +84,26 @@ cuperiod = "cuperiod.cli.app:main"
 
 [project.urls]
 Homepage = "https://github.com/tjayasinghe/cuPeriod"
+Documentation = "https://cuperiod.readthedocs.io"
 Repository = "https://github.com/tjayasinghe/cuPeriod"
+Issues = "https://github.com/tjayasinghe/cuPeriod/issues"
+Changelog = "https://github.com/tjayasinghe/cuPeriod/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/cuperiod"]
+
+# Without an explicit allowlist the sdist sweeps in the whole working tree (.venv,
+# benchmark data, build output). Ship only the source, tests, and project metadata.
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests",
+    "/README.md",
+    "/LICENSE",
+    "/CHANGELOG.md",
+    "/CITATION.cff",
+    "/pyproject.toml",
+]
 
 [tool.ruff]
 line-length = 88

@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+message: "If you use cuPeriod in your research, please cite it as below."
+title: cuPeriod
+abstract: >-
+  Optimized, GPU-accelerated periodograms for astronomy: seven period-search methods
+  (GLS, BLS, PDM, CE, String-Length, MHAOV, TLS) with fast CPU and CUDA backends, scaling
+  from a single light curve to millions.
+type: software
+authors:
+  - given-names: Tharindu
+    family-names: Jayasinghe
+    # Add your ORCID here to make the citation unambiguous, e.g.:
+    # orcid: "https://orcid.org/0000-0000-0000-0000"
+version: 1.0.0
+date-released: "2026-06-29"
+license: GPL-3.0-or-later
+repository-code: "https://github.com/tjayasinghe/cuPeriod"
+url: "https://cuperiod.readthedocs.io"
+keywords:
+  - astronomy
+  - periodogram
+  - lomb-scargle
+  - box-least-squares
+  - variable-stars
+  - time-series
+  - gpu
+  - cuda
