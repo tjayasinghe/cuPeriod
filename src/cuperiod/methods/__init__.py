@@ -11,6 +11,7 @@ from __future__ import annotations
 from cuperiod.methods import bls as bls  # noqa: F401
 from cuperiod.methods import conditional_entropy as conditional_entropy  # noqa: F401
 from cuperiod.methods import gls as gls  # noqa: F401
+from cuperiod.methods import mhaov as mhaov  # noqa: F401
 from cuperiod.methods import pdm as pdm  # noqa: F401
 from cuperiod.methods import string_length as string_length  # noqa: F401
 from cuperiod.methods.base import (

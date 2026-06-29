@@ -8,6 +8,7 @@ from cuperiod.core.config import (
     BLSSettings,
     CESettings,
     GLSSettings,
+    MHAOVSettings,
     PDMSettings,
     StringLengthSettings,
 )
@@ -37,6 +38,7 @@ __all__ = [
     "GridSpec",
     "InsufficientDataError",
     "LightCurve",
+    "MHAOVSettings",
     "MultiBandLightCurve",
     "MultiResult",
     "PDMSettings",

@@ -18,12 +18,13 @@ Implemented now, each with optimized CPU and GPU backends:
 | --- | --- | --- |
 | **GLS** | general variability (Lomb-Scargle) | yes |
 | **BLS** | eclipses / box-like transits | yes |
+| **MHAOV** | sharply non-sinusoidal signals (multiharmonic AOV) | planned |
 | **PDM** | non-sinusoidal folds (Stellingwerf) | — |
 | **CE** | sparse survey data (conditional entropy) | — |
 | **String-Length** | eclipsing / eccentric shapes | — |
 
-Plus the full single/batch/CLI machinery. Planned next: **MHAOV** (multiharmonic AOV) and
-**TLS** (transit least squares).
+Plus the full single/batch/CLI machinery. Planned next: **TLS** (transit least squares) and
+multi-band MHAOV.
 
 ## Install
 
