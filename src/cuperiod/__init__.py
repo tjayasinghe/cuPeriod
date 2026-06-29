@@ -22,8 +22,10 @@ from cuperiod.core.columns import ColumnMap, Domain
 from cuperiod.core.config import (
     BatchSettings,
     BLSSettings,
+    CESettings,
     GLSSettings,
     PDMSettings,
+    StringLengthSettings,
 )
 from cuperiod.core.device import GpuInfo, free_gpu_memory, gpu_info, suggest_gpu_workers
 from cuperiod.core.errors import (
@@ -45,6 +47,7 @@ __all__ = [
     "BackendUnavailableError",
     "BatchSettings",
     "BatchSummary",
+    "CESettings",
     "ColumnMap",
     "ColumnResolutionError",
     "CuPeriodError",
@@ -60,6 +63,7 @@ __all__ = [
     "PDMSettings",
     "Peak",
     "Periodogram",
+    "StringLengthSettings",
     "UnknownMethodError",
     "__version__",
     "batch_periodograms",

@@ -12,10 +12,18 @@ Every implementation is validated against the standard reference (astropy
 
 ## Status
 
-Implemented now: **GLS** (generalized Lomb-Scargle) and **BLS** (box least squares), each
-with optimized CPU and GPU backends and multi-band variants, plus the full single/batch/CLI
-machinery. Planned next: **PDM**, **MHAOV** (multiharmonic AOV), **TLS** (transit least
-squares), **Conditional Entropy**, and **String-Length**.
+Implemented now, each with optimized CPU and GPU backends:
+
+| Method | What it's for | Multi-band |
+| --- | --- | --- |
+| **GLS** | general variability (Lomb-Scargle) | yes |
+| **BLS** | eclipses / box-like transits | yes |
+| **PDM** | non-sinusoidal folds (Stellingwerf) | — |
+| **CE** | sparse survey data (conditional entropy) | — |
+| **String-Length** | eclipsing / eccentric shapes | — |
+
+Plus the full single/batch/CLI machinery. Planned next: **MHAOV** (multiharmonic AOV) and
+**TLS** (transit least squares).
 
 ## Install
 

@@ -165,6 +165,82 @@ class PDMSettings(BaseSettings):
     )
 
 
+class CESettings(BaseSettings):
+    """Settings for the conditional-entropy (CE) period search."""
+
+    model_config = SettingsConfigDict(env_prefix="CUPERIOD_CE_", extra="forbid")
+
+    minimum_frequency: float | None = Field(
+        default=None,
+        description="Lowest trial frequency (cycles/day); None -> 1/baseline.",
+    )
+    maximum_frequency: float | None = Field(
+        default=None,
+        description="Highest trial frequency (cycles/day); None -> pseudo-Nyquist.",
+    )
+    nyquist_factor: int = Field(
+        default=5, ge=1, description="Pseudo-Nyquist multiple when max is None."
+    )
+    samples_per_peak: int = Field(
+        default=5, ge=1, description="Frequency oversampling factor."
+    )
+    n_phase_bins: int = Field(default=10, ge=2, description="Phase histogram bins.")
+    n_mag_bins: int = Field(default=10, ge=2, description="Magnitude histogram bins.")
+    n_peaks: int = Field(default=10, ge=1, description="Default stored peak count.")
+    peak_separation_rayleigh: float = Field(
+        default=3.0, gt=0.0, description="Min peak separation in Rayleigh widths."
+    )
+    min_detections: int = Field(
+        default=20, ge=3, description="Skip if fewer finite points."
+    )
+    backend: Literal["auto", "cpu", "gpu", "numpy", "cupy"] = Field(
+        default="auto", description="Compute backend."
+    )
+    batch_periods: int = Field(
+        default=1024, ge=1, description="Trial periods per vectorized batch."
+    )
+    downsample_points: int = Field(
+        default=2000, ge=2, description="Stored downsampled-spectrum size."
+    )
+
+
+class StringLengthSettings(BaseSettings):
+    """Settings for the string-length (Lafler-Kinman / Dworetsky) period search."""
+
+    model_config = SettingsConfigDict(env_prefix="CUPERIOD_SL_", extra="forbid")
+
+    minimum_frequency: float | None = Field(
+        default=None,
+        description="Lowest trial frequency (cycles/day); None -> 1/baseline.",
+    )
+    maximum_frequency: float | None = Field(
+        default=None,
+        description="Highest trial frequency (cycles/day); None -> pseudo-Nyquist.",
+    )
+    nyquist_factor: int = Field(
+        default=5, ge=1, description="Pseudo-Nyquist multiple when max is None."
+    )
+    samples_per_peak: int = Field(
+        default=5, ge=1, description="Frequency oversampling factor."
+    )
+    n_peaks: int = Field(default=10, ge=1, description="Default stored peak count.")
+    peak_separation_rayleigh: float = Field(
+        default=3.0, gt=0.0, description="Min peak separation in Rayleigh widths."
+    )
+    min_detections: int = Field(
+        default=20, ge=3, description="Skip if fewer finite points."
+    )
+    backend: Literal["auto", "cpu", "gpu", "numpy", "cupy"] = Field(
+        default="auto", description="Compute backend."
+    )
+    batch_periods: int = Field(
+        default=1024, ge=1, description="Trial periods per vectorized batch."
+    )
+    downsample_points: int = Field(
+        default=2000, ge=2, description="Stored downsampled-spectrum size."
+    )
+
+
 class BatchSettings(BaseSettings):
     """Settings for batch processing of many light curves."""
 
@@ -190,6 +266,8 @@ __all__ = [
     "BackendName",
     "BLSSettings",
     "BatchSettings",
+    "CESettings",
     "GLSSettings",
     "PDMSettings",
+    "StringLengthSettings",
 ]

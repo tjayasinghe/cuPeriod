@@ -26,7 +26,11 @@ from cuperiod.core._typing import FloatArray
 from cuperiod.core.backend import ensure_cuda_dll_path
 from cuperiod.core.config import PDMSettings
 from cuperiod.core.errors import InsufficientDataError
-from cuperiod.core.grid import GridSpec, uniform_frequency_grid
+from cuperiod.core.grid import (
+    GridSpec,
+    pseudo_nyquist_frequency,
+    uniform_frequency_grid,
+)
 from cuperiod.core.lightcurve import LightCurve
 from cuperiod.core.result import Periodogram
 from cuperiod.methods.base import PeriodogramMethod, register
@@ -165,15 +169,6 @@ def pdm_theta(
     return np.asarray(theta, dtype=np.float64)
 
 
-def _pseudo_nyquist(t: FloatArray, nyquist_factor: int) -> float:
-    """A pseudo-Nyquist maximum frequency from the median sampling interval."""
-    dt = np.diff(np.sort(t))
-    dt = dt[dt > 0.0]
-    if dt.size == 0:
-        return float(nyquist_factor)
-    return float(nyquist_factor) * 0.5 / float(np.median(dt))
-
-
 class PDMMethod(PeriodogramMethod):
     """Phase Dispersion Minimization (numpy CPU, cupy GPU)."""
 
@@ -190,7 +185,7 @@ class PDMMethod(PeriodogramMethod):
         if finite.baseline <= 0.0:
             raise InsufficientDataError("PDM: no usable time baseline")
         minimum = settings.minimum_frequency or 1.0 / finite.baseline
-        maximum = settings.maximum_frequency or _pseudo_nyquist(
+        maximum = settings.maximum_frequency or pseudo_nyquist_frequency(
             finite.time, settings.nyquist_factor
         )
         return uniform_frequency_grid(
