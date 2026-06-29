@@ -1,6 +1,6 @@
 # cuPeriod — Validation & Benchmark Report
 
-GPU: **NVIDIA RTX 5070 Ti** (compute capability 12.0, sm_120) · CPU backends: finufft / numpy / astropy · cuPeriod 0.1.0, CUDA 12, Python 3.12.
+GPU: **NVIDIA RTX 5070 Ti** (compute capability 12.0, sm_120) · CPU backends: finufft / numpy / astropy · cuPeriod 1.0.0, CUDA 12, Python 3.12.
 
 **Validation data** — 72 real ASAS-SN g-band light curves across 6 variability classes (eclipsing binaries, RR Lyrae, Cepheids, δ Scuti, long-period and rotational variables), each with a well-established VSX (AAVSO Variable Star Index) literature period. The curves and their literature periods ship with the suite in `dataset/light_curves.parquet` — the validation is fully reproducible with no external catalogue or network access. TLS is validated on confirmed Kepler KOIs (Mendeley *Dataset_Machine_Learning_Exoplanets_2024*; raw flux via MAST/lightkurve).
 

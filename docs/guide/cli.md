@@ -1,0 +1,118 @@
+# Command line
+
+Installing cuPeriod adds a `cuperiod` command. Every subcommand is a thin wrapper over the
+Python API, so the CLI and library share one code path and give identical results. Run
+`cuperiod --help` (or `cuperiod <command> --help`) for the full option list.
+
+```text
+cuperiod run         one light curve, one or more methods → prints the best periods
+cuperiod batch       many light curves with CPU or GPU workers → Parquet/CSV
+cuperiod methods     list registered methods and their backends
+cuperiod gpu-info    show the GPU and suggested worker counts
+cuperiod grid-info   show a method's trial grid for a light curve (no compute)
+```
+
+## `run` — a single light curve
+
+```bash
+cuperiod run star.csv --method GLS,BLS --n-best 10
+```
+
+Reads a CSV/ECSV/FITS/Parquet file, computes the method(s), and prints the ranked best
+periods for each.
+
+```{list-table}
+:header-rows: 1
+:widths: 28 72
+
+* - Option
+  - Meaning
+* - `--method`, `-m`
+  - Comma-separated method names (default `GLS`).
+* - `--backend`
+  - `auto` | `cpu` | `gpu` | a concrete backend name.
+* - `--time` / `--value` / `--error` / `--band`
+  - Override column names (otherwise auto-detected).
+* - `--domain`
+  - `magnitude` | `flux`.
+* - `--n-best`
+  - Number of peaks to report (default 10).
+* - `--out`
+  - Write the results as JSON to this path.
+* - `--save-periodogram`
+  - Write the raw spectra to this `.npz`.
+```
+
+Example with explicit columns and JSON output:
+
+```bash
+cuperiod run star.fits -m BLS --time BJD --value flux --error flux_err \
+    --domain flux --out result.json --save-periodogram spectra.npz
+```
+
+## `batch` — many light curves
+
+```bash
+cuperiod batch "lcs/*.csv" --method GLS --device gpu --out results/
+```
+
+Runs over a glob, directory, or file of light curves with CPU or GPU workers and writes one
+row per light curve. Key options:
+
+```{list-table}
+:header-rows: 1
+:widths: 28 72
+
+* - Option
+  - Meaning
+* - `--method`, `-m`
+  - Comma-separated method names.
+* - `--device`
+  - `cpu` | `gpu`.
+* - `--backend`
+  - `auto` | `cpu` | `gpu` | concrete.
+* - `--workers`
+  - Worker count (omit for auto: all-but-one core on CPU, memory-sized on GPU).
+* - `--out`
+  - Output `.parquet` / `.csv` file, **or a directory** (resumable, one part per chunk).
+* - `--n-best`
+  - Peaks stored per light curve (default 10).
+* - `--store-raw`
+  - Also store the downsampled raw spectrum.
+* - `--resume / --no-resume`
+  - Skip chunks already written to a directory sink (default on).
+```
+
+A directory sink is resumable — re-running skips finished chunks. See {doc}`batch`.
+
+## `methods` — what's available
+
+```bash
+cuperiod methods
+```
+
+Lists each registered method with its objective sense, multi-band support, and backends.
+
+## `gpu-info` — device & worker sizing
+
+```bash
+cuperiod gpu-info
+```
+
+Shows the CUDA device (name, free/total memory, MPS status) and the suggested batch worker
+count per GPU-capable method. If no GPU is present, it says so and exits cleanly.
+
+## `grid-info` — inspect a grid
+
+```bash
+cuperiod grid-info star.csv --method GLS
+```
+
+Prints the default trial grid a method would use for a light curve — sample count and the
+period/frequency range — **without** computing the spectrum. The fastest way to check your
+period window before a long run.
+
+---
+
+That's the tour. For exact signatures and every option, see the {doc}`../api/index`, or
+`cuperiod <command> --help`.

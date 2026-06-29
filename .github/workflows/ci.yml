@@ -42,3 +42,17 @@ jobs:
         run: uv run ruff check src tests
       - name: Mypy
         run: uv run mypy
+
+  docs:
+    name: docs build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Create environment
+        run: uv venv --python 3.12
+      - name: Install
+        run: uv pip install -e ".[docs]"
+      # -W turns broken cross-references / malformed docstrings into build failures.
+      - name: Build (warnings are errors)
+        run: uv run sphinx-build -b html -W --keep-going docs docs/_build/html

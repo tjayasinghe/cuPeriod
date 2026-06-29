@@ -2,10 +2,16 @@
 
 **Optimized, GPU-accelerated periodograms for astronomy.**
 
+[![Documentation Status](https://readthedocs.org/projects/cuperiod/badge/?version=latest)](https://cuperiod.readthedocs.io/en/latest/)
+
 cuPeriod computes period-search statistics for variable stars and transiting systems with
 fast CPU backends and CUDA-accelerated paths that scale from a single light curve to
 millions. One API and CLI cover every method, with frictionless column handling, multi-band
 support, raw-spectrum output, and an N-best-periods utility.
+
+📖 **Documentation:** <https://cuperiod.readthedocs.io> — a [5-minute
+quickstart](https://cuperiod.readthedocs.io/en/latest/quickstart.html), a full user guide,
+and the complete API reference.
 
 Every implementation is validated against the standard reference (astropy
 `LombScargle` / `BoxLeastSquares`) to floating-point round-off.
