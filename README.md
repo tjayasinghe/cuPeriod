@@ -1,0 +1,2 @@
+# cuPeriod
+GPU accelerated periodograms
