@@ -10,13 +10,14 @@ floating-point round-off regardless of which one runs.
 pg = cup.periodogram(lc, "GLS", backend="auto")    # default
 ```
 
-The four selectors:
+The selectors:
 
 | `backend=` | Meaning |
 | --- | --- |
-| `"auto"` *(default)* | Use the GPU when a CUDA device and the `[gpu]` extra are present; otherwise the best CPU backend. The same code runs on any machine. |
+| `"auto"` *(default)* | The NVIDIA CUDA fast path when a CUDA device and the `[gpu]` extra are present; then the portable **torch** backend on another GPU (AMD/Intel/Mac) when the `[torch]` extra sees one; otherwise the best CPU backend. The same code runs on any machine. |
 | `"cpu"` | Force the best CPU backend for this method. |
-| `"gpu"` | Force the GPU backend. Raises {exc}`~cuperiod.BackendUnavailableError` if no GPU is usable. |
+| `"gpu"` | Force a GPU backend — the CUDA fast path, or torch on a non-NVIDIA GPU. Raises {exc}`~cuperiod.BackendUnavailableError` if no GPU is usable. |
+| `"torch"` / `"torch:<device>"` | Force the portable PyTorch backend; `<device>` is `cpu`, `cuda`, `mps`, or `xpu` (bare `"torch"` picks the best present). Needs the `[torch]` extra. |
 | a concrete name | Force a specific implementation, e.g. `"finufft"`, `"astropy"`, `"numpy"`, `"cupy"`, `"cufinufft"`, `"numba"`. |
 
 ## What each method can run
@@ -63,6 +64,41 @@ The four selectors:
 array-module-generic source with the CUDA kernel so the two validate to floating point,
 but it is slow (it trades memory traffic for the parallelism that makes the GPU fast).
 For CPU BLS use `numba` (the default with `[fast]`) or `astropy`, **not** `numpy`.
+
+In addition, **every method has a portable `torch` backend** (the `[torch]` extra) that
+runs the same array-API code on any torch device — see below.
+
+## The portable PyTorch backend
+
+`backend="torch"` runs a method through the [array API](https://data-apis.org/array-api/)
+on whichever torch device you have — CUDA, AMD **ROCm**, Apple **MPS**, Intel **XPU**, or
+**CPU** — so the accelerated code is no longer NVIDIA-only and works even with no GPU at
+all. The NVIDIA fast paths (cufinufft for GLS, the cupy kernels for BLS/PDM/CE/TLS) are
+untouched and remain what `"auto"`/`"gpu"` pick on CUDA; torch is the cross-vendor path
+for everything else.
+
+```python
+pg = cup.periodogram(lc, "GLS", backend="torch")        # best torch device
+pg = cup.periodogram(lc, "BLS", backend="torch:xpu")    # pin the Intel GPU
+pg = cup.periodogram(lc, "PDM", backend="torch:cpu", settings=cup.PDMSettings(device="cpu"))
+```
+
+Two orthogonal settings tune it (both environment-overridable, e.g. `CUPERIOD_GLS_DEVICE`):
+
+- **`device`** — `"auto"` (default; the best present), `"cpu"`, `"cuda"`, `"mps"`, `"xpu"`.
+  A `"torch:<device>"` backend string overrides it.
+- **`precision`** — `"auto"` (default) is float64 everywhere it is supported and float32
+  only where the device forces it (Apple MPS; some Intel GPUs). `"float64"` and `"float32"`
+  force it; `precision="float64"` on MPS raises rather than silently downgrading. Results
+  are always returned as float64 numpy arrays regardless of the device precision.
+
+:::{note}
+The portable path is correct everywhere (it matches the CPU reference to round-off — float
+methods bit-for-bit, MHAOV to ~1e-10 from its linear solve) but it is **not** the speed
+champion on CPU, where finufft (GLS) and the numba box search (BLS) are faster. Its value
+is reaching GPUs the CUDA fast paths can't — AMD, Intel, and Apple. On those devices its
+massively-parallel evaluation is the win. Run `cuperiod doctor` to see what you have.
+:::
 
 Inspect the live picture for your install:
 

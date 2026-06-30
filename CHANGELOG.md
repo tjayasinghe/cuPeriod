@@ -4,6 +4,43 @@ All notable changes to cuPeriod are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Multi-vendor GPU support via PyTorch and the Python array API.** All seven
+  period-search methods (GLS, BLS, PDM, CE, String-Length, MHAOV, TLS) gain a portable
+  `torch` backend that runs on AMD (ROCm), Intel (XPU), and Apple (MPS) GPUs as well as a
+  real CPU path — so the accelerated code is no longer NVIDIA-only, and works even with no
+  GPU at all. Select it with `backend="torch"` (or `"torch:cpu"`, `"torch:cuda"`,
+  `"torch:mps"`, `"torch:xpu"`); `backend="auto"` now reaches a torch GPU on non-NVIDIA
+  machines after the cufinufft/cupy fast paths.
+  - GLS adds a NUFFT-free direct trig-sum path (the portable formulation; cufinufft
+    remains the NVIDIA fast path).
+  - BLS, PDM, CE, String-Length, MHAOV, and TLS run their vectorized kernels through the
+    array-API namespace; the cupy `RawKernel`s (BLS/PDM/CE/TLS), numba (BLS), and finufft
+    (GLS) remain the fast paths where present.
+  - New `device` and `precision` settings: `precision="auto"` is float64 everywhere it is
+    supported and float32 only where the device forces it (Apple MPS cannot do float64);
+    an explicit `precision="float64"` on MPS raises rather than silently downgrading.
+- `array-api-compat` is now a dependency; install the portable accelerator with the
+  `[torch]` extra (`pip install 'cuperiod[torch]'`).
+
+### Known limitations
+
+- **Non-NVIDIA GPU numerics are written-to-spec and CPU-validated, not yet hardware-
+  verified.** The torch CUDA/ROCm/MPS/XPU paths share the array-API body that is parity-
+  tested on the CPU torch device; on-device parity self-skips (`requires_torch_gpu`) until
+  such hardware is available.
+- **No fp64 capability probe on Intel XPU.** `precision="auto"` resolves to float64 on an
+  XPU; a device without native float64 will error at compute time rather than falling back
+  to float32. Pass `precision="float32"` explicitly on such a device.
+- **The torch GPU path does not auto-shrink to small VRAM.** A large period×bin grid on a
+  small consumer GPU can raise an out-of-memory error; reduce `batch_periods`.
+- **Tie-broken best-fit *extras* may differ across devices.** Where an `argmax` lands on an
+  exact tie (e.g. BLS `transit_time`, TLS `t0`/`duration` at non-transit periods), the
+  chosen index is device-dependent; the periodogram power and best period are unaffected.
+
 ## [1.0.0] — 2026-06-30
 
 First public release.

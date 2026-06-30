@@ -24,6 +24,14 @@ from typing import Any, ClassVar, Final, Literal
 
 import numpy as np
 
+from cuperiod.core._arrayapi import (
+    array_namespace,
+    resolve_precision,
+    resolve_torch_device,
+    scatter_add,
+    to_device_array,
+    to_host,
+)
 from cuperiod.core._typing import FloatArray
 from cuperiod.core.backend import ensure_cuda_dll_path
 from cuperiod.core.columns import Domain
@@ -95,7 +103,7 @@ def _period_grid(baseline: float, settings: TLSSettings) -> FloatArray:
     freq = np.arange(1.0 / max_period, 1.0 / settings.min_period_days, df)
     if freq.size == 0:
         return np.zeros(0, dtype=np.float64)
-    return (1.0 / freq[::-1]).copy()
+    return np.ascontiguousarray(1.0 / freq[::-1], dtype=np.float64)
 
 
 def _matched_filter(
@@ -112,48 +120,53 @@ def _matched_filter(
 ) -> dict[str, Any]:
     """Per-period best matched-filter signal residue and transit parameters.
 
-    Device-agnostic: ``xp`` is numpy (CPU) or cupy (GPU). The phase correlation is a
-    short width-loop of shifted slices (the template width is small), which runs on
-    either backend without ``sliding_window_view`` (absent in cupy). Templates stay on
-    the host; their per-bin scalars broadcast against device arrays.
+    Array-API generic: ``xp`` is an array_api_compat namespace (numpy on CPU, torch on
+    any device). The phase correlation is a short width-loop of shifted slices (the
+    template width is small), which needs no ``sliding_window_view``. Templates stay on
+    the host; their per-bin scalars broadcast against the device arrays. The cupy
+    ``RawKernel`` fast path (NVIDIA) is separate. Float dtype follows ``periods``.
     """
+    fdtype = periods.dtype
+    idtype = xp.int64
     n_periods = int(periods.shape[0])
     out = {
-        "sr": xp.zeros(n_periods),
-        "depth": xp.zeros(n_periods),
-        "duration": xp.zeros(n_periods),
-        "t0": xp.zeros(n_periods),
+        "sr": xp.zeros(n_periods, dtype=fdtype),
+        "depth": xp.zeros(n_periods, dtype=fdtype),
+        "duration": xp.zeros(n_periods, dtype=fdtype),
+        "t0": xp.zeros(n_periods, dtype=fdtype),
     }
     n_points = int(tau.shape[0])
     for start in range(0, n_periods, period_batch):
         stop = min(start + period_batch, n_periods)
         pb = periods[start:stop]
         n_p = int(pb.shape[0])
-        rows_p = xp.arange(n_p)
-        phase = xp.mod(tau[None, :] / pb[:, None], 1.0)
-        bin_idx = xp.minimum((phase * n_bins).astype(xp.int64), n_bins - 1)
-        flat = (rows_p[:, None] * n_bins + bin_idx).ravel()
-        a_flat = xp.zeros(n_p * n_bins)  # sum w*y' per bin
-        b_flat = xp.zeros(n_p * n_bins)  # sum w per bin
-        xp.add.at(a_flat, flat, xp.broadcast_to(yw, (n_p, n_points)).ravel())
-        xp.add.at(b_flat, flat, xp.broadcast_to(w, (n_p, n_points)).ravel())
-        a = a_flat.reshape(n_p, n_bins)
-        b = b_flat.reshape(n_p, n_bins)
+        rows_p = xp.arange(n_p, dtype=idtype)
+        phase = xp.remainder(tau[None, :] / pb[:, None], 1.0)
+        bin_idx = xp.clip(xp.astype(phase * n_bins, idtype), 0, n_bins - 1)
+        flat = xp.reshape(rows_p[:, None] * n_bins + bin_idx, (-1,))
+        a_flat = xp.zeros(n_p * n_bins, dtype=fdtype)  # sum w*y' per bin
+        b_flat = xp.zeros(n_p * n_bins, dtype=fdtype)  # sum w per bin
+        yw_b = xp.reshape(xp.broadcast_to(yw, (n_p, n_points)), (-1,))
+        w_b = xp.reshape(xp.broadcast_to(w, (n_p, n_points)), (-1,))
+        scatter_add(a_flat, flat, yw_b)
+        scatter_add(b_flat, flat, w_b)
+        a = xp.reshape(a_flat, (n_p, n_bins))
+        b = xp.reshape(b_flat, (n_p, n_bins))
 
-        best_sr = xp.zeros(n_p)
-        best_depth = xp.zeros(n_p)
-        best_start = xp.zeros(n_p, dtype=xp.int64)
-        best_width = xp.zeros(n_p, dtype=xp.int64)
+        best_sr = xp.zeros(n_p, dtype=fdtype)
+        best_depth = xp.zeros(n_p, dtype=fdtype)
+        best_start = xp.zeros(n_p, dtype=idtype)
+        best_width = xp.zeros(n_p, dtype=idtype)
         for width in dur_bins:
             g = templates[width]
-            a_ext = xp.concatenate([a, a[:, : width - 1]], axis=1)
-            b_ext = xp.concatenate([b, b[:, : width - 1]], axis=1)
-            num = xp.zeros((n_p, n_bins))
-            den = xp.zeros((n_p, n_bins))
+            a_ext = xp.concat([a, a[:, : width - 1]], axis=1)
+            b_ext = xp.concat([b, b[:, : width - 1]], axis=1)
+            num = xp.zeros((n_p, n_bins), dtype=fdtype)
+            den = xp.zeros((n_p, n_bins), dtype=fdtype)
             for k in range(width):  # correlate the folded data with the template
                 gk = float(g[k])
-                num += gk * a_ext[:, k : k + n_bins]
-                den += (gk * gk) * b_ext[:, k : k + n_bins]
+                num = num + gk * a_ext[:, k : k + n_bins]
+                den = den + (gk * gk) * b_ext[:, k : k + n_bins]
             safe_den = xp.where(den > _W_EPS, den, 1.0)
             # a dip means the in-transit weighted residual is negative -> num < 0
             sr = xp.where((den > _W_EPS) & (num < 0.0), num * num / safe_den, 0.0)
@@ -165,14 +178,16 @@ def _matched_filter(
             depth = -num[rows_p, s_best] / xp.where(den_best > _W_EPS, den_best, 1.0)
             best_depth = xp.where(improve, depth, best_depth)
             best_start = xp.where(improve, s_best, best_start)
-            best_width = xp.where(improve, xp.int64(width), best_width)
+            best_width = xp.where(improve, width, best_width)
 
         sl = slice(start, stop)
         out["sr"][sl] = best_sr
         out["depth"][sl] = best_depth
-        out["duration"][sl] = best_width.astype(xp.float64) / n_bins * pb
-        centre = (best_start.astype(xp.float64) + best_width / 2.0) / n_bins
-        out["t0"][sl] = xp.mod(centre, 1.0) * pb
+        out["duration"][sl] = xp.astype(best_width, fdtype) / n_bins * pb
+        centre = (
+            xp.astype(best_start, fdtype) + xp.astype(best_width, fdtype) / 2.0
+        ) / n_bins
+        out["t0"][sl] = xp.remainder(centre, 1.0) * pb
     return out
 
 
@@ -337,7 +352,7 @@ def tls_power(
     periods: FloatArray,
     *,
     settings: TLSSettings,
-    backend: TLSBackend = "numpy",
+    backend: str = "numpy",
 ) -> dict[str, FloatArray]:
     """TLS matched-filter search over ``periods`` (flux input; a transit is a dip).
 
@@ -391,9 +406,27 @@ def tls_power(
             tau, yw, w, periods_host,
             n_bins=n_bins, dur_bins=dur_bins, templates=templates,
         )
+    elif backend == "torch" or backend.startswith("torch:"):
+        import torch
+
+        device = backend.split(":", 1)[1] if ":" in backend else "cpu"
+        fdt = (torch.float32
+               if resolve_precision(settings.precision, device) == "float32"
+               else torch.float64)
+        per_d = to_device_array(periods_host, device=device, dtype=fdt)
+        dev_res = _matched_filter(
+            array_namespace(per_d),
+            to_device_array(tau, device=device, dtype=fdt),
+            to_device_array(yw, device=device, dtype=fdt),
+            to_device_array(w, device=device, dtype=fdt),
+            per_d,
+            n_bins=n_bins, dur_bins=dur_bins, templates=templates,
+            period_batch=settings.period_batch,
+        )
+        res = {k: to_host(v) for k, v in dev_res.items()}
     elif backend == "numpy":
         res = _matched_filter(
-            np, tau, yw, w, periods_host,
+            array_namespace(periods_host), tau, yw, w, periods_host,
             n_bins=n_bins, dur_bins=dur_bins, templates=templates,
             period_batch=settings.period_batch,
         )
@@ -416,7 +449,8 @@ class TLSMethod(PeriodogramMethod):
     settings_cls: ClassVar[type] = TLSSettings
     cpu_backend: ClassVar[str] = "numpy"
     gpu_backend: ClassVar[str | None] = "cupy"
-    all_backends: ClassVar[tuple[str, ...]] = ("numpy", "cupy")
+    portable_gpu_backend: ClassVar[str | None] = "torch"
+    all_backends: ClassVar[tuple[str, ...]] = ("numpy", "cupy", "torch")
 
     def default_grid(self, lc: LightCurve, settings: TLSSettings) -> GridSpec:  # type: ignore[override]
         finite = lc.finite()
@@ -444,9 +478,11 @@ class TLSMethod(PeriodogramMethod):
         if finite.baseline <= 0.0:
             raise InsufficientDataError("TLS: no usable time baseline")
         periods = grid.period
+        if backend == "torch" or backend.startswith("torch:"):
+            backend = f"torch:{resolve_torch_device(backend, settings.device)}"
         res = tls_power(
             finite.time, finite.value, finite.error, periods,
-            settings=settings, backend=backend,  # type: ignore[arg-type]
+            settings=settings, backend=backend,
         )
         extras = {
             "sr": res["sr"],

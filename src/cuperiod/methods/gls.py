@@ -32,6 +32,13 @@ from typing import Any, ClassVar, Final, Literal
 
 import numpy as np
 
+from cuperiod.core._arrayapi import (
+    array_namespace,
+    resolve_precision,
+    resolve_torch_device,
+    to_device_array,
+    to_host,
+)
 from cuperiod.core._typing import FloatArray
 from cuperiod.core.backend import array_module, ensure_cuda_dll_path
 from cuperiod.core.config import GLSSettings
@@ -84,19 +91,19 @@ def _trig_sums(
     raise ValueError(f"unknown NUFFT backend {backend!r}")
 
 
-def _assemble_power(
-    sw: Any, swy: Any, sw2: Any, y_mean: float, yy: float, fit_mean: bool
+def _assemble_power_parts(
+    xp: Any,
+    c: Any, s: Any, yc: Any, ys: Any, c2: Any, s2: Any,
+    y_mean: float, yy: float, fit_mean: bool,
 ) -> Any:
-    """Zechmeister-Kürster generalized-LS power (standard norm) from three trig sums.
+    """Zechmeister-Kürster generalized-LS power from the real trig-sum components.
 
-    Works on numpy or cupy arrays (the GPU path keeps everything on device);
-    ``y_mean``/``yy`` are host scalars. Degenerate frequencies map to 0.
+    ``c``/``s`` are the cos/sin sums of the weights, ``yc``/``ys`` of the weighted data,
+    and ``c2``/``s2`` the doubled-frequency cos/sin sums of the weights. Uses only
+    array-API-standard ops, so it runs unchanged on numpy, cupy, and torch (any device)
+    — no complex dtype is needed, so the Apple-MPS path (no complex128) works.
+    Degenerate frequencies map to 0.
     """
-    xp = array_module(sw)
-    c, s = sw.real, sw.imag
-    yc, ys = swy.real, swy.imag
-    c2, s2 = sw2.real, sw2.imag
-
     cc = 0.5 * (1.0 + c2)
     ss = 0.5 * (1.0 - c2)
     cs = 0.5 * s2
@@ -108,12 +115,25 @@ def _assemble_power(
         cs = cs - c * s
 
     denom = cc * ss - cs * cs
+    power = (ss * yc * yc + cc * ys * ys - 2.0 * cs * yc * ys) / (yy * denom)
+    return xp.where(xp.isfinite(power), power, xp.zeros_like(power))
+
+
+def _assemble_power(
+    sw: Any, swy: Any, sw2: Any, y_mean: float, yy: float, fit_mean: bool
+) -> Any:
+    """GLS power from three *complex* trig sums (the NUFFT path).
+
+    Splits each complex sum into its real/imaginary parts and delegates the Zechmeister-
+    Kürster math to :func:`_assemble_power_parts`. Works on numpy or cupy arrays (GPU
+    path keeps everything on device); ``y_mean``/``yy`` are host scalars.
+    """
+    xp = array_module(sw)
+    parts = (sw.real, sw.imag, swy.real, swy.imag, sw2.real, sw2.imag)
     if xp is np:
         with np.errstate(divide="ignore", invalid="ignore"):
-            power = (ss * yc * yc + cc * ys * ys - 2.0 * cs * yc * ys) / (yy * denom)
-    else:
-        power = (ss * yc * yc + cc * ys * ys - 2.0 * cs * yc * ys) / (yy * denom)
-    return xp.nan_to_num(power, nan=0.0, posinf=0.0, neginf=0.0)
+            return _assemble_power_parts(xp, *parts, y_mean, yy, fit_mean)
+    return _assemble_power_parts(xp, *parts, y_mean, yy, fit_mean)
 
 
 def _prep(
@@ -186,6 +206,72 @@ def lombscargle_power(
     return np.asarray(
         _assemble_power(sw, swy, sw2, y_mean, yy, fit_mean), dtype=np.float64
     )
+
+
+def _trig_sums_direct(
+    xp: Any, tau: Any, strengths: Any, f0: float, df: float, nf: int, *, freq_batch: int
+) -> tuple[Any, Any]:
+    """Direct (NUFFT-free) trig sums on the uniform grid ``f_k = f0 + k*df``.
+
+    Returns ``(cos_sum, sin_sum)`` real arrays of length ``nf`` with
+    ``cos_sum[k] = sum_j strengths_j cos(2*pi*f_k*tau_j)`` and ``sin_sum`` the matching
+    ``+sin`` sum (the ``isign=+1`` convention of the NUFFT path). This is ``O(N*nf)``
+    rather than the NUFFT's ``O(nf log nf)``, but is pure array-API and so runs on any
+    backend/device — the portable GLS path for AMD/Intel/Mac. Batched over frequency to
+    bound the transient ``(chunk, N)`` angle matrix.
+    """
+    two_pi = 2.0 * float(np.pi)
+    fdtype = tau.dtype
+    freqs = f0 + df * xp.arange(nf, dtype=fdtype)
+    cos_sum = xp.empty(nf, dtype=fdtype)
+    sin_sum = xp.empty(nf, dtype=fdtype)
+    strength_row = strengths[None, :]
+    for start in range(0, nf, freq_batch):
+        stop = min(start + freq_batch, nf)
+        ang = (two_pi * freqs[start:stop])[:, None] * tau[None, :]
+        cos_sum[start:stop] = xp.sum(strength_row * xp.cos(ang), axis=1)
+        sin_sum[start:stop] = xp.sum(strength_row * xp.sin(ang), axis=1)
+    return cos_sum, sin_sum
+
+
+def lombscargle_power_torch(
+    t: FloatArray,
+    y: FloatArray,
+    dy: FloatArray | None,
+    f0: float,
+    df: float,
+    nf: int,
+    *,
+    fit_mean: bool = True,
+    device: str = "cpu",
+    precision: str = "auto",
+    freq_batch: int = 4096,
+) -> FloatArray:
+    """GLS power on ``f0 + df*arange(nf)`` via the portable torch direct trig-sum path.
+
+    Numerically matches :func:`lombscargle_power` (to the working precision): same
+    Zechmeister-Kürster assembly, just NUFFT-free trig sums so it runs on any torch
+    device (CUDA/ROCm/MPS/XPU/CPU). ``precision="auto"`` is float64 except on MPS, where
+    float64 is impossible and float32 is used. Returns numpy float64.
+    """
+    if nf <= 0:
+        return np.zeros(0, dtype=np.float64)
+    import torch
+
+    tau, w, y, y_mean, yy = _prep(t, y, dy)
+    prec = resolve_precision(precision, device)
+    tdtype = torch.float32 if prec == "float32" else torch.float64
+    tau_d = to_device_array(tau, device=device, dtype=tdtype)
+    w_d = to_device_array(w, device=device, dtype=tdtype)
+    wy_d = to_device_array(w * y, device=device, dtype=tdtype)
+    xp = array_namespace(tau_d)
+    c, s = _trig_sums_direct(xp, tau_d, w_d, f0, df, nf, freq_batch=freq_batch)
+    yc, ys = _trig_sums_direct(xp, tau_d, wy_d, f0, df, nf, freq_batch=freq_batch)
+    c2, s2 = _trig_sums_direct(
+        xp, tau_d, w_d, 2.0 * f0, 2.0 * df, nf, freq_batch=freq_batch
+    )
+    power = _assemble_power_parts(xp, c, s, yc, ys, c2, s2, y_mean, yy, fit_mean)
+    return to_host(power)
 
 
 class CufinufftGLS:
@@ -321,7 +407,10 @@ class GLSMethod(PeriodogramMethod):
     settings_cls: ClassVar[type] = GLSSettings
     cpu_backend: ClassVar[str] = "finufft"
     gpu_backend: ClassVar[str | None] = "cufinufft"
-    all_backends: ClassVar[tuple[str, ...]] = ("finufft", "cufinufft", "astropy")
+    portable_gpu_backend: ClassVar[str | None] = "torch"
+    all_backends: ClassVar[tuple[str, ...]] = (
+        "finufft", "cufinufft", "torch", "astropy",
+    )
 
     def default_grid(self, lc: LightCurve, settings: GLSSettings) -> GridSpec:  # type: ignore[override]
         finite = lc.finite()
@@ -371,15 +460,26 @@ class GLSMethod(PeriodogramMethod):
                 ls.power(frequency, normalization="standard"), dtype=np.float64
             )
         else:
-            actual_backend = backend
             f0, df, nf = grid.uniform_frequency_params()
             frequency = f0 + df * np.arange(nf, dtype=np.float64)
-            if backend == "cufinufft" and engine is not None:
+            if backend == "torch" or backend.startswith("torch:"):
+                device = resolve_torch_device(backend, settings.device)
+                actual_backend = f"torch:{device}"
+                power = lombscargle_power_torch(
+                    finite.time, finite.value, finite.error, f0, df, nf,
+                    fit_mean=settings.fit_mean,
+                    device=device,
+                    precision=settings.precision,
+                    freq_batch=settings.direct_freq_batch,
+                )
+            elif backend == "cufinufft" and engine is not None:
+                actual_backend = backend
                 power = engine.power(  # type: ignore[attr-defined]
                     finite.time, finite.value, finite.error, f0, df, nf,
                     fit_mean=settings.fit_mean,
                 )
             else:
+                actual_backend = backend
                 power = lombscargle_power(
                     finite.time, finite.value, finite.error, f0, df, nf,
                     fit_mean=settings.fit_mean,
@@ -435,4 +535,5 @@ __all__ = [
     "GLSMethod",
     "NufftBackend",
     "lombscargle_power",
+    "lombscargle_power_torch",
 ]

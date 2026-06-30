@@ -8,7 +8,8 @@ Python API, so the CLI and library share one code path and give identical result
 cuperiod run         one light curve, one or more methods → prints the best periods
 cuperiod batch       many light curves with CPU or GPU workers → Parquet/CSV
 cuperiod methods     list registered methods and their backends
-cuperiod gpu-info    show the GPU and suggested worker counts
+cuperiod gpu-info    show the CUDA GPU and suggested worker counts
+cuperiod doctor      diagnose backends, torch devices, and the precision each uses
 cuperiod grid-info   show a method's trial grid for a light curve (no compute)
 ```
 
@@ -101,6 +102,18 @@ cuperiod gpu-info
 
 Shows the CUDA device (name, free/total memory, MPS status) and the suggested batch worker
 count per GPU-capable method. If no GPU is present, it says so and exits cleanly.
+
+## `doctor` — full environment diagnosis
+
+```bash
+cuperiod doctor
+```
+
+A one-stop "will the accelerated paths run here, and on what?" report: which backends are
+installed, the NVIDIA CUDA fast paths, the portable **torch** backend and each device it
+sees (CUDA/ROCm/MPS/XPU/CPU) with the precision it would use, and what `backend="auto"`
+resolves to for every method. Reach for it first when a GPU isn't being picked up or you're
+unsure which build of PyTorch you have.
 
 ## `grid-info` — inspect a grid
 

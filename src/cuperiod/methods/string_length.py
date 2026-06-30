@@ -17,6 +17,13 @@ from typing import Any, ClassVar, Final, Literal
 
 import numpy as np
 
+from cuperiod.core._arrayapi import (
+    array_namespace,
+    resolve_precision,
+    resolve_torch_device,
+    to_device_array,
+    to_host,
+)
 from cuperiod.core._typing import FloatArray
 from cuperiod.core.backend import ensure_cuda_dll_path
 from cuperiod.core.config import StringLengthSettings
@@ -39,21 +46,33 @@ DEFAULT_BATCH: Final = 1024
 def _length_batch(
     xp: ModuleType, tau: Any, m_scaled: Any, periods: Any, *, batch: int
 ) -> Any:
-    """Total folded string length for each trial period, vectorized over periods."""
-    n_points = int(tau.shape[0])
+    """Total folded string length for each trial period, vectorized over periods.
+
+    Array-API generic (numpy/cupy/torch). Uses only fancy indexing and slicing for the
+    per-row sort/gather and the consecutive differences, avoiding ``take_along_axis`` /
+    ``diff`` (not in every namespace); float dtype follows ``periods``.
+
+    The phase sort must be **stable** so equal phases keep a backend-independent
+    order: the string length depends on neighbour pairing, and an unstable sort breaks
+    ties differently across numpy/torch (even across platforms), drifting the result.
+    All backends therefore run through the array-API namespace, whose ``argsort``
+    defaults to ``stable=True`` — never raw ``numpy``/``cupy`` (quicksort, unstable).
+    """
+    idtype = xp.int64
     n_periods = int(periods.shape[0])
-    length = xp.empty(n_periods, dtype=np.float64)
+    length = xp.empty(n_periods, dtype=periods.dtype)
     for start in range(0, n_periods, batch):
         stop = min(start + batch, n_periods)
         pb = periods[start:stop]
         n_p = int(pb.shape[0])
-        phase = xp.mod(tau[None, :] / pb[:, None], 1.0)  # (P, N)
+        phase = xp.remainder(tau[None, :] / pb[:, None], 1.0)  # (P, N)
         order = xp.argsort(phase, axis=1)
-        ph = xp.take_along_axis(phase, order, axis=1)
-        mm = xp.take_along_axis(xp.broadcast_to(m_scaled, (n_p, n_points)), order, 1)
-        dphi = xp.diff(ph, axis=1)
-        dmag = xp.diff(mm, axis=1)
-        total = xp.sqrt(dphi * dphi + dmag * dmag).sum(axis=1)
+        rows = xp.arange(n_p, dtype=idtype)[:, None]
+        ph = phase[rows, order]            # phase sorted per row
+        mm = m_scaled[order]               # magnitudes gathered in the same order
+        dphi = ph[:, 1:] - ph[:, :-1]
+        dmag = mm[:, 1:] - mm[:, :-1]
+        total = xp.sum(xp.sqrt(dphi * dphi + dmag * dmag), axis=1)
         wrap_phi = (ph[:, 0] + 1.0) - ph[:, -1]
         wrap_mag = mm[:, 0] - mm[:, -1]
         total = total + xp.sqrt(wrap_phi * wrap_phi + wrap_mag * wrap_mag)
@@ -66,8 +85,9 @@ def string_length(
     y: FloatArray,
     periods: FloatArray,
     *,
-    backend: SLBackend = "numpy",
+    backend: str = "numpy",
     batch: int = DEFAULT_BATCH,
+    precision: str = "auto",
 ) -> FloatArray:
     """String length for each trial period (minimized at the true period).
 
@@ -100,15 +120,31 @@ def string_length(
         ensure_cuda_dll_path()
         import cupy as cp
 
+        per_cp = cp.asarray(periods_host)
         length = _length_batch(
-            cp, cp.asarray(tau), cp.asarray(m_scaled), cp.asarray(periods_host),
+            array_namespace(per_cp), cp.asarray(tau), cp.asarray(m_scaled), per_cp,
             batch=batch,
         )
         return np.asarray(cp.asnumpy(length), dtype=np.float64)
+    if backend == "torch" or backend.startswith("torch:"):
+        import torch
+
+        device = backend.split(":", 1)[1] if ":" in backend else "cpu"
+        fdt = (torch.float32
+               if resolve_precision(precision, device) == "float32" else torch.float64)
+        tau_d = to_device_array(tau, device=device, dtype=fdt)
+        m_d = to_device_array(m_scaled, device=device, dtype=fdt)
+        per_d = to_device_array(periods_host, device=device, dtype=fdt)
+        return to_host(
+            _length_batch(array_namespace(per_d), tau_d, m_d, per_d, batch=batch)
+        )
     if backend != "numpy":
         raise ValueError(f"unknown backend {backend!r}")
     return np.asarray(
-        _length_batch(np, tau, m_scaled, periods_host, batch=batch), dtype=np.float64
+        _length_batch(
+            array_namespace(periods_host), tau, m_scaled, periods_host, batch=batch
+        ),
+        dtype=np.float64,
     )
 
 
@@ -121,7 +157,8 @@ class StringLengthMethod(PeriodogramMethod):
     settings_cls: ClassVar[type] = StringLengthSettings
     cpu_backend: ClassVar[str] = "numpy"
     gpu_backend: ClassVar[str | None] = "cupy"
-    all_backends: ClassVar[tuple[str, ...]] = ("numpy", "cupy")
+    portable_gpu_backend: ClassVar[str | None] = "torch"
+    all_backends: ClassVar[tuple[str, ...]] = ("numpy", "cupy", "torch")
 
     def default_grid(self, lc: LightCurve, settings: StringLengthSettings) -> GridSpec:  # type: ignore[override]
         finite = lc.finite()
@@ -156,9 +193,12 @@ class StringLengthMethod(PeriodogramMethod):
         if finite.baseline <= 0.0:
             raise InsufficientDataError("string-length: no usable time baseline")
         periods = grid.period
+        if backend == "torch" or backend.startswith("torch:"):
+            backend = f"torch:{resolve_torch_device(backend, settings.device)}"
         length = string_length(
             finite.time, finite.value, periods,
-            backend=backend, batch=settings.batch_periods,  # type: ignore[arg-type]
+            backend=backend, batch=settings.batch_periods,
+            precision=settings.precision,
         )
         return Periodogram.from_spectrum(
             method="STRINGLENGTH",

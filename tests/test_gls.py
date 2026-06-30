@@ -7,7 +7,7 @@ import pytest
 from astropy.timeseries import LombScargle
 
 import cuperiod as cup
-from conftest import requires_gpu
+from conftest import requires_gpu, requires_torch
 from cuperiod.methods.gls import GLSMethod, lombscargle_power
 from synth import synthetic_sine
 
@@ -87,3 +87,33 @@ def test_gls_gpu_matches_cpu() -> None:
     cpu = cup.periodogram((t, mag, err), "GLS", backend="finufft")
     gpu = cup.periodogram((t, mag, err), "GLS", backend="cufinufft")
     assert float(np.max(np.abs(cpu.power - gpu.power))) < 1e-7
+
+
+@requires_torch
+def test_gls_torch_cpu_matches_finufft() -> None:
+    # The portable direct trig-sum path must match the NUFFT path in float64.
+    t, mag, err = synthetic_sine()
+    fi = cup.periodogram((t, mag, err), "GLS", backend="finufft")
+    to = cup.periodogram((t, mag, err), "GLS", backend="torch:cpu")
+    assert to.backend == "torch:cpu"
+    assert float(np.max(np.abs(fi.power - to.power))) < 1e-6
+
+
+@requires_torch
+def test_gls_torch_recovers_period() -> None:
+    t, mag, err = synthetic_sine(period=0.6234)
+    pg = cup.periodogram((t, mag, err), "GLS", backend="torch")
+    assert pg.best_period() == pytest.approx(0.6234, rel=1e-3)
+
+
+@requires_torch
+def test_gls_torch_float32_recovers_period() -> None:
+    # float32 is the forced precision on Apple MPS; the direct trig-sum's power drifts
+    # but the peak must stay robust (the float32 path previously had no test coverage).
+    t, mag, err = synthetic_sine(period=0.6234)
+    pg = cup.periodogram(
+        (t, mag, err), "GLS", backend="torch:cpu",
+        settings=cup.GLSSettings(precision="float32"),
+    )
+    assert pg.backend == "torch:cpu"
+    assert pg.best_period() == pytest.approx(0.6234, rel=1e-3)

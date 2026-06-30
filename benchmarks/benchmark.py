@@ -26,6 +26,9 @@ warnings.filterwarnings("ignore")
 import cuperiod as cup  # noqa: E402
 
 from _common import RESULTS, load_dataset  # noqa: E402
+from cuperiod.core.backend import torch_available  # noqa: E402
+from cuperiod.core.errors import BackendUnavailableError  # noqa: E402
+from cuperiod.methods.base import get_method  # noqa: E402
 
 # bounded period window for the box methods (BLS/TLS) — independent of the star,
 # so the trial-period count can never blow up on a short-period target.
@@ -60,6 +63,23 @@ def best_time(fn, repeat=3):
     return min(_timed(fn) for _ in range(repeat))
 
 
+def safe_best_time(fn, repeat=3):
+    """:func:`best_time`, but a backend unavailable here records NaN instead of raising.
+
+    Lets the sweep run on machines missing a backend — no CUDA GPU (the ``gpu`` column),
+    or no torch / no torch GPU device (the ``torch`` column) — leaving that cell blank.
+    """
+    try:
+        return best_time(fn, repeat)
+    except BackendUnavailableError:
+        return float("nan")
+
+
+def supports_torch(method):
+    """Whether ``method`` has the portable torch backend and torch is importable."""
+    return torch_available() and "torch" in get_method(method).all_backends
+
+
 def _timed(fn):
     t0 = time.perf_counter(); fn(); return time.perf_counter() - t0
 
@@ -91,13 +111,23 @@ def bench_single(t, y, e):
     for m, st in FREQ_SETTINGS.items():
         be = cup.periodogram((t, y, e), m, backend="cpu", grid=grid, settings=st()).backend
         tc = best_time(lambda: cup.periodogram((t, y, e), m, backend="cpu", grid=grid, settings=st()))
-        tg = best_time(lambda: cup.periodogram((t, y, e), m, backend="gpu", grid=grid, settings=st()))
+        tg = safe_best_time(lambda: cup.periodogram((t, y, e), m, backend="gpu", grid=grid, settings=st()))
+        has_torch = supports_torch(m)
+        tt = (safe_best_time(lambda: cup.periodogram((t, y, e), m, backend="torch", grid=grid, settings=st()))
+              if has_torch else np.nan)
+        tbe = (cup.periodogram((t, y, e), m, backend="torch", grid=grid, settings=st()).backend
+               if has_torch and np.isfinite(tt) else "—")
         tr = best_time(reftime[m], repeat=1) if m in reftime else np.nan
         rows.append(dict(method=m, n_grid=grid.size, cpu_backend=be, cpu_s=tc, gpu_s=tg,
-                         ref_s=tr, ref=refname.get(m, "—"), gpu_speedup=tc / tg,
-                         gpu_vs_ref=(tr / tg if np.isfinite(tr) else np.nan),
+                         torch_s=tt, torch_backend=tbe,
+                         ref_s=tr, ref=refname.get(m, "—"),
+                         gpu_speedup=(tc / tg if np.isfinite(tg) else np.nan),
+                         torch_speedup=(tc / tt if np.isfinite(tt) else np.nan),
+                         gpu_vs_ref=(tr / tg if np.isfinite(tr) and np.isfinite(tg) else np.nan),
                          cpu_vs_ref=(tr / tc if np.isfinite(tr) else np.nan)))
-        print(f"  {m:12s} cpu({be})={tc:.3f}s gpu={tg:.4f}s ({tc/tg:.0f}x)", flush=True)
+        gstr = f"gpu={tg:.4f}s ({tc/tg:.0f}x)" if np.isfinite(tg) else "gpu=—"
+        tstr = f" torch({tbe})={tt:.3f}s" if np.isfinite(tt) else ""
+        print(f"  {m:12s} cpu({be})={tc:.3f}s {gstr}{tstr}", flush=True)
     # box methods on a fixed, bounded period window. cpu_s is cuPeriod's *default*
     # CPU backend: "cpu" resolves to the multicore numba box search for BLS (or
     # astropy if numba is not installed), to numpy for TLS.
@@ -107,8 +137,13 @@ def bench_single(t, y, e):
              cup.TLSSettings(min_period_days=BOX_PMIN, max_period_days=BOX_PMAX))
         be = cup.periodogram((t, y, e), m, backend="cpu", settings=S).backend
         tc = best_time(lambda: cup.periodogram((t, y, e), m, backend="cpu", settings=S), repeat=2)
-        tg = best_time(lambda: cup.periodogram((t, y, e), m, backend="gpu", settings=S), repeat=2)
-        ng = cup.periodogram((t, y, e), m, backend="gpu", settings=S).power.size
+        tg = safe_best_time(lambda: cup.periodogram((t, y, e), m, backend="gpu", settings=S), repeat=2)
+        ng = cup.periodogram((t, y, e), m, backend="cpu", settings=S).power.size  # backend-independent
+        has_torch = supports_torch(m)
+        tt = (safe_best_time(lambda: cup.periodogram((t, y, e), m, backend="torch", settings=S), repeat=2)
+              if has_torch else np.nan)
+        tbe = (cup.periodogram((t, y, e), m, backend="torch", settings=S).backend
+               if has_torch and np.isfinite(tt) else "—")
         # BLS reference = astropy's compiled BoxLeastSquares; also time the pure-numpy
         # GPU-parity reference port to document it is not the product path.
         ref_s = (best_time(lambda: cup.periodogram((t, y, e), "BLS", backend="astropy", settings=S), repeat=1)
@@ -117,13 +152,18 @@ def bench_single(t, y, e):
         port_s = (best_time(lambda: cup.periodogram((t, y, e), "BLS", backend="numpy", settings=S), repeat=1)
                   if m == "BLS" else np.nan)
         rows.append(dict(method=m, n_grid=int(ng), cpu_backend=be, cpu_s=tc, gpu_s=tg,
-                         ref_s=ref_s, ref=ref, gpu_speedup=tc / tg,
-                         gpu_vs_ref=(ref_s / tg if np.isfinite(ref_s) else np.nan),
+                         torch_s=tt, torch_backend=tbe,
+                         ref_s=ref_s, ref=ref,
+                         gpu_speedup=(tc / tg if np.isfinite(tg) else np.nan),
+                         torch_speedup=(tc / tt if np.isfinite(tt) else np.nan),
+                         gpu_vs_ref=(ref_s / tg if np.isfinite(ref_s) and np.isfinite(tg) else np.nan),
                          cpu_vs_ref=(ref_s / tc if np.isfinite(ref_s) else np.nan),
                          cpu_port_s=port_s))
+        gstr = f"gpu={tg:.4f}s (gpu {tc/tg:.0f}x)" if np.isfinite(tg) else "gpu=—"
+        tstr = f" torch({tbe})={tt:.3f}s" if np.isfinite(tt) else ""
         extra = (f"  [vs astropy {ref_s/tc:.0f}x faster; numpy-port {port_s:.1f}s]"
                  if m == "BLS" else "")
-        print(f"  {m:12s} cpu({be})={tc:.3f}s gpu={tg:.4f}s (gpu {tc/tg:.0f}x){extra}  [{ng:,} periods]",
+        print(f"  {m:12s} cpu({be})={tc:.3f}s {gstr}{tstr}{extra}  [{ng:,} periods]",
               flush=True)
     df = pd.DataFrame(rows)
     df.to_parquet(RESULTS / "bench_single.parquet", index=False)
@@ -138,8 +178,12 @@ def bench_scaling_npoints(t, y, e):
         for m in ["GLS", "PDM", "MHAOV"]:
             st = FREQ_SETTINGS[m]
             tc = best_time(lambda: cup.periodogram((tt, yy, ee), m, backend="cpu", grid=grid, settings=st()), repeat=1)
-            tg = best_time(lambda: cup.periodogram((tt, yy, ee), m, backend="gpu", grid=grid, settings=st()), repeat=1)
-            rows.append(dict(axis="npoints", method=m, n=n, cpu_s=tc, gpu_s=tg, speedup=tc / tg))
+            tg = safe_best_time(lambda: cup.periodogram((tt, yy, ee), m, backend="gpu", grid=grid, settings=st()), repeat=1)
+            ttor = (safe_best_time(lambda: cup.periodogram((tt, yy, ee), m, backend="torch", grid=grid, settings=st()), repeat=1)
+                    if supports_torch(m) else np.nan)
+            rows.append(dict(axis="npoints", method=m, n=n, cpu_s=tc, gpu_s=tg, torch_s=ttor,
+                             speedup=(tc / tg if np.isfinite(tg) else np.nan),
+                             torch_speedup=(tc / ttor if np.isfinite(ttor) else np.nan)))
         print(f"  N={n:>6}: done", flush=True)
     df = pd.DataFrame(rows)
     df.to_parquet(RESULTS / "bench_npoints.parquet", index=False)
@@ -153,8 +197,12 @@ def bench_scaling_grid(t, y, e):
         for m in ["GLS", "PDM", "MHAOV"]:
             st = FREQ_SETTINGS[m]
             tc = best_time(lambda: cup.periodogram((t, y, e), m, backend="cpu", grid=grid, settings=st()), repeat=1)
-            tg = best_time(lambda: cup.periodogram((t, y, e), m, backend="gpu", grid=grid, settings=st()), repeat=1)
-            rows.append(dict(axis="grid", method=m, n=n, cpu_s=tc, gpu_s=tg, speedup=tc / tg))
+            tg = safe_best_time(lambda: cup.periodogram((t, y, e), m, backend="gpu", grid=grid, settings=st()), repeat=1)
+            ttor = (safe_best_time(lambda: cup.periodogram((t, y, e), m, backend="torch", grid=grid, settings=st()), repeat=1)
+                    if supports_torch(m) else np.nan)
+            rows.append(dict(axis="grid", method=m, n=n, cpu_s=tc, gpu_s=tg, torch_s=ttor,
+                             speedup=(tc / tg if np.isfinite(tg) else np.nan),
+                             torch_speedup=(tc / ttor if np.isfinite(ttor) else np.nan)))
         print(f"  grid={n:>7}: done", flush=True)
     df = pd.DataFrame(rows)
     df.to_parquet(RESULTS / "bench_grid.parquet", index=False)

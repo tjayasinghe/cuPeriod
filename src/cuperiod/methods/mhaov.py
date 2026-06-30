@@ -25,6 +25,13 @@ from typing import Any, ClassVar, Final, Literal
 
 import numpy as np
 
+from cuperiod.core._arrayapi import (
+    array_namespace,
+    resolve_precision,
+    resolve_torch_device,
+    to_device_array,
+    to_host,
+)
 from cuperiod.core._typing import FloatArray
 from cuperiod.core.backend import ensure_cuda_dll_path
 from cuperiod.core.config import MHAOVSettings
@@ -43,15 +50,22 @@ MHAOVBackend = Literal["numpy", "cupy"]
 #: Trial frequencies per vectorized batch (bounds the (F, N, 2H+1) design tensor).
 DEFAULT_BATCH: Final = 512
 
-#: Diagonal ridge to keep the normal equations solvable at degenerate frequencies.
-_RIDGE: Final = 1e-10
+#: Diagonal ridge that keeps the harmonic normal equations solvable at degenerate
+#: frequencies (f→0, where the cosine columns collapse onto the constant column). It is
+#: applied as ``_RIDGE_EPS · eps(dtype) · n_points``: scaling by the working precision's
+#: machine epsilon and the Gram diagonal magnitude (≈ ``n_points``, from the all-ones
+#: constant column) makes it representable in float32. A fixed absolute 1e-10 underflows
+#: against the ~N-sized diagonal on a float32 device (1e-10 ≪ eps_f32·N), leaving the
+#: matrix singular so ``linalg.solve`` raises. In float64 this reproduces the previous
+#: ~1e-10 ridge to within rounding, so float64 results are unchanged.
+_RIDGE_EPS: Final = 1.0e3
 
 
 def _design(xp: ModuleType, angle: Any, n_harmonics: int) -> Any:
     """Trig-polynomial design tensor ``(F, N, 2H+1)`` = [1, cos kθ, sin kθ]."""
     n_freq, n_points = angle.shape
     d = 2 * n_harmonics + 1
-    design = xp.empty((n_freq, n_points, d), dtype=np.float64)
+    design = xp.empty((n_freq, n_points, d), dtype=angle.dtype)
     design[:, :, 0] = 1.0
     for k in range(1, n_harmonics + 1):
         design[:, :, 2 * k - 1] = xp.cos(k * angle)
@@ -78,9 +92,11 @@ def _model_ss_batch(
     """
     d = 2 * n_harmonics + 1
     n_freq = int(frequencies.shape[0])
-    eye = xp.eye(d, dtype=np.float64) * _RIDGE
-    out = xp.empty(n_freq, dtype=np.float64)
-    two_pi = 2.0 * np.pi
+    fdtype = frequencies.dtype
+    ridge = _RIDGE_EPS * float(xp.finfo(fdtype).eps) * float(n_points)
+    eye = xp.eye(d, dtype=fdtype) * ridge
+    out = xp.empty(n_freq, dtype=fdtype)
+    two_pi = 2.0 * float(np.pi)
 
     for start in range(0, n_freq, batch):
         stop = min(start + batch, n_freq)
@@ -92,7 +108,7 @@ def _model_ss_batch(
         # numpy 2.x batched solve treats a 2-D RHS as matrices, so add a trailing
         # singleton to keep it a per-frequency vector solve.
         beta = xp.linalg.solve(gram, proj[..., None])[..., 0]
-        model_ss = (beta * proj).sum(axis=1) - n_points * y_mean * y_mean
+        model_ss = xp.sum(beta * proj, axis=1) - n_points * y_mean * y_mean
         out[start:stop] = xp.clip(model_ss, 0.0, total_ss)
     return out
 
@@ -103,8 +119,9 @@ def _compute_model_ss(
     frequencies: FloatArray,
     *,
     n_harmonics: int,
-    backend: MHAOVBackend,
+    backend: str,
     batch: int,
+    precision: str = "auto",
 ) -> tuple[FloatArray, float, int]:
     """Host-side regression SS per frequency, plus ``(total_ss, n)`` for one band.
 
@@ -133,6 +150,21 @@ def _compute_model_ss(
             n_points=n, batch=batch,
         )
         return np.asarray(cp.asnumpy(out), dtype=np.float64), total_ss, n
+    if backend == "torch" or backend.startswith("torch:"):
+        import torch
+
+        device = backend.split(":", 1)[1] if ":" in backend else "cpu"
+        fdt = (torch.float32
+               if resolve_precision(precision, device) == "float32" else torch.float64)
+        out = _model_ss_batch(
+            array_namespace(to_device_array(freqs, device=device, dtype=fdt)),
+            to_device_array(tau, device=device, dtype=fdt),
+            to_device_array(y, device=device, dtype=fdt),
+            to_device_array(freqs, device=device, dtype=fdt),
+            n_harmonics=n_harmonics, total_ss=total_ss, y_mean=y_mean,
+            n_points=n, batch=batch,
+        )
+        return to_host(out), total_ss, n
     if backend != "numpy":
         raise ValueError(f"unknown backend {backend!r}")
     out = _model_ss_batch(
@@ -149,8 +181,9 @@ def aov_power(
     frequencies: FloatArray,
     *,
     n_harmonics: int = 3,
-    backend: MHAOVBackend = "numpy",
+    backend: str = "numpy",
     batch: int = DEFAULT_BATCH,
+    precision: str = "auto",
 ) -> FloatArray:
     """Multiharmonic AOV statistic for each trial frequency.
 
@@ -174,7 +207,8 @@ def aov_power(
         constant signal or when there are too few points.
     """
     model_ss, total_ss, n = _compute_model_ss(
-        t, y, frequencies, n_harmonics=n_harmonics, backend=backend, batch=batch
+        t, y, frequencies, n_harmonics=n_harmonics, backend=backend, batch=batch,
+        precision=precision,
     )
     if total_ss <= 0.0:
         return model_ss
@@ -189,8 +223,9 @@ def aov_multiband_power(
     bands: list[tuple[FloatArray, FloatArray]],
     *,
     n_harmonics: int = 3,
-    backend: MHAOVBackend = "numpy",
+    backend: str = "numpy",
     batch: int = DEFAULT_BATCH,
+    precision: str = "auto",
 ) -> FloatArray:
     """Pooled multiband AOV F-statistic at a shared frequency, per-band amplitudes.
 
@@ -222,7 +257,8 @@ def aov_multiband_power(
     n_used_bands = 0
     for t, y in bands:
         model_ss, total_ss, n = _compute_model_ss(
-            t, y, freqs, n_harmonics=n_harmonics, backend=backend, batch=batch
+            t, y, freqs, n_harmonics=n_harmonics, backend=backend, batch=batch,
+            precision=precision,
         )
         if total_ss <= 0.0:
             continue
@@ -248,7 +284,8 @@ class MHAOVMethod(PeriodogramMethod):
     settings_cls: ClassVar[type] = MHAOVSettings
     cpu_backend: ClassVar[str] = "numpy"
     gpu_backend: ClassVar[str | None] = "cupy"
-    all_backends: ClassVar[tuple[str, ...]] = ("numpy", "cupy")
+    portable_gpu_backend: ClassVar[str | None] = "torch"
+    all_backends: ClassVar[tuple[str, ...]] = ("numpy", "cupy", "torch")
 
     def default_grid(self, lc: LightCurve, settings: MHAOVSettings) -> GridSpec:  # type: ignore[override]
         finite = lc.finite()
@@ -283,10 +320,13 @@ class MHAOVMethod(PeriodogramMethod):
         if finite.baseline <= 0.0:
             raise InsufficientDataError("MHAOV: no usable time baseline")
         frequency = grid.frequency
+        if backend == "torch" or backend.startswith("torch:"):
+            backend = f"torch:{resolve_torch_device(backend, settings.device)}"
         power = aov_power(
             finite.time, finite.value, frequency,
             n_harmonics=settings.n_harmonics,
-            backend=backend, batch=settings.batch_periods,  # type: ignore[arg-type]
+            backend=backend, batch=settings.batch_periods,
+            precision=settings.precision,
         )
         return Periodogram.from_spectrum(
             method="MHAOV",
@@ -308,6 +348,8 @@ class MHAOVMethod(PeriodogramMethod):
     ) -> Periodogram:
         from cuperiod.multiband.mhaov_mb import mhaov_multiband_power
 
+        if backend == "torch" or backend.startswith("torch:"):
+            backend = f"torch:{resolve_torch_device(backend, settings.device)}"
         return mhaov_multiband_power(grid, mblc, settings, backend)
 
     def estimate_device_bytes(self, n_points: int) -> int:

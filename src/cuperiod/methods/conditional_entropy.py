@@ -17,6 +17,14 @@ from typing import Any, ClassVar, Final, Literal
 
 import numpy as np
 
+from cuperiod.core._arrayapi import (
+    array_namespace,
+    resolve_precision,
+    resolve_torch_device,
+    scatter_add,
+    to_device_array,
+    to_host,
+)
 from cuperiod.core._typing import FloatArray, IntArray
 from cuperiod.core.backend import ensure_cuda_dll_path
 from cuperiod.core.config import CESettings
@@ -46,33 +54,39 @@ def _entropy_batch(
     n_mag: int,
     batch: int,
 ) -> Any:
-    """Conditional entropy H(m|phase) for each trial period, vectorized over periods."""
+    """Conditional entropy H(m|phase) for each trial period, vectorized over periods.
+
+    Array-API generic (numpy/cupy/torch via array_api_compat). The float dtype follows
+    ``periods`` (float64, or float32 on a float32 device); index/bin arrays are int64.
+    The cupy ``RawKernel`` fast path (NVIDIA) is separate and not this code.
+    """
+    fdtype = periods.dtype
+    idtype = xp.int64
     n_points = int(tau.shape[0])
     n_periods = int(periods.shape[0])
     n_cells = n_phase * n_mag
-    entropy = xp.empty(n_periods, dtype=np.float64)
+    entropy = xp.empty(n_periods, dtype=fdtype)
     for start in range(0, n_periods, batch):
         stop = min(start + batch, n_periods)
         pb = periods[start:stop]
         n_p = int(pb.shape[0])
-        rows = xp.arange(n_p)
-        phase = xp.mod(tau[None, :] / pb[:, None], 1.0)
-        phase_bin = (phase * n_phase).astype(np.int64)
-        xp.clip(phase_bin, 0, n_phase - 1, out=phase_bin)
+        rows = xp.arange(n_p, dtype=idtype)
+        phase = xp.remainder(tau[None, :] / pb[:, None], 1.0)
+        phase_bin = xp.clip(xp.astype(phase * n_phase, idtype), 0, n_phase - 1)
         cell = phase_bin * n_mag + mag_bin[None, :]  # (P, N) in [0, n_cells)
-        flat = (rows[:, None] * n_cells + cell).ravel()
-        count = xp.zeros(n_p * n_cells, dtype=np.float64)
-        xp.add.at(count, flat, xp.broadcast_to(xp.ones(1), (n_p, n_points)).ravel())
-        count = count.reshape(n_p, n_phase, n_mag)
+        flat = xp.reshape(rows[:, None] * n_cells + cell, (-1,))
+        count = xp.zeros(n_p * n_cells, dtype=fdtype)
+        scatter_add(count, flat, xp.ones(n_p * n_points, dtype=fdtype))
+        count = xp.reshape(count, (n_p, n_phase, n_mag))
 
-        phase_total = count.sum(axis=2, keepdims=True)  # (P, n_phase, 1)
+        phase_total = xp.sum(count, axis=2, keepdims=True)  # (P, n_phase, 1)
         mask = count > 0.0
         safe_count = xp.where(mask, count, 1.0)
         safe_total = xp.where(phase_total > 0.0, phase_total, 1.0)
         term = xp.where(
             mask, count * (xp.log(safe_total) - xp.log(safe_count)), 0.0
         )
-        entropy[start:stop] = term.sum(axis=(1, 2)) / n_points
+        entropy[start:stop] = xp.sum(term, axis=(1, 2)) / n_points
     return entropy
 
 
@@ -186,8 +200,9 @@ def conditional_entropy(
     *,
     n_phase_bins: int = 10,
     n_mag_bins: int = 10,
-    backend: CEBackend = "numpy",
+    backend: str = "numpy",
     batch: int = DEFAULT_BATCH,
+    precision: str = "auto",
 ) -> FloatArray:
     """Conditional entropy for each trial period (minimized at the true period).
 
@@ -227,15 +242,25 @@ def conditional_entropy(
         return _ce_cuda(
             tau, mag_bin, periods_host, n_phase=n_phase_bins, n_mag=n_mag_bins
         )
+    if backend == "torch" or backend.startswith("torch:"):
+        import torch
+
+        device = backend.split(":", 1)[1] if ":" in backend else "cpu"
+        fdt = (torch.float32
+               if resolve_precision(precision, device) == "float32" else torch.float64)
+        tau_d = to_device_array(tau, device=device, dtype=fdt)
+        mag_d = to_device_array(mag_bin, device=device, dtype=torch.int64)
+        per_d = to_device_array(periods_host, device=device, dtype=fdt)
+        return to_host(_entropy_batch(
+            array_namespace(per_d), tau_d, mag_d, per_d,
+            n_phase=n_phase_bins, n_mag=n_mag_bins, batch=batch,
+        ))
     if backend != "numpy":
         raise ValueError(f"unknown backend {backend!r}")
-    return np.asarray(
-        _entropy_batch(
-            np, tau, mag_bin, periods_host,
-            n_phase=n_phase_bins, n_mag=n_mag_bins, batch=batch,
-        ),
-        dtype=np.float64,
-    )
+    return to_host(_entropy_batch(
+        array_namespace(periods_host), tau, mag_bin, periods_host,
+        n_phase=n_phase_bins, n_mag=n_mag_bins, batch=batch,
+    ))
 
 
 class ConditionalEntropyMethod(PeriodogramMethod):
@@ -247,7 +272,8 @@ class ConditionalEntropyMethod(PeriodogramMethod):
     settings_cls: ClassVar[type] = CESettings
     cpu_backend: ClassVar[str] = "numpy"
     gpu_backend: ClassVar[str | None] = "cupy"
-    all_backends: ClassVar[tuple[str, ...]] = ("numpy", "cupy")
+    portable_gpu_backend: ClassVar[str | None] = "torch"
+    all_backends: ClassVar[tuple[str, ...]] = ("numpy", "cupy", "torch")
 
     def default_grid(self, lc: LightCurve, settings: CESettings) -> GridSpec:  # type: ignore[override]
         finite = lc.finite()
@@ -281,10 +307,13 @@ class ConditionalEntropyMethod(PeriodogramMethod):
         if finite.baseline <= 0.0:
             raise InsufficientDataError("CE: no usable time baseline")
         periods = grid.period
+        if backend == "torch" or backend.startswith("torch:"):
+            backend = f"torch:{resolve_torch_device(backend, settings.device)}"
         entropy = conditional_entropy(
             finite.time, finite.value, periods,
             n_phase_bins=settings.n_phase_bins, n_mag_bins=settings.n_mag_bins,
-            backend=backend, batch=settings.batch_periods,  # type: ignore[arg-type]
+            backend=backend, batch=settings.batch_periods,
+            precision=settings.precision,
         )
         return Periodogram.from_spectrum(
             method="CE",

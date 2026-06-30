@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 import cuperiod as cup
-from conftest import requires_gpu
+from conftest import requires_gpu, requires_torch
 from cuperiod.methods._bls_core import bls_power
 from cuperiod.methods.bls import BLSMethod
 from synth import synthetic_eclipser
@@ -103,3 +103,51 @@ def test_bls_gpu_matches_numpy() -> None:
     gpu = method.power(grid, lc, settings, "cupy")
     finite = np.isfinite(cpu.power) & np.isfinite(gpu.power)
     assert float(np.max(np.abs(cpu.power[finite] - gpu.power[finite]))) < 1e-7
+
+
+@requires_torch
+def test_bls_torch_cpu_matches_numpy() -> None:
+    # The torch box search shares the array-API body with numpy: bit-for-bit close.
+    grid, lc, settings = _grid_and_lc()
+    method = BLSMethod()
+    ref = method.power(grid, lc, settings, "numpy")
+    tor = method.power(grid, lc, settings, "torch:cpu")
+    assert tor.backend == "torch:cpu"
+    finite = np.isfinite(ref.power) & np.isfinite(tor.power)
+    assert float(np.max(np.abs(ref.power[finite] - tor.power[finite]))) < 1e-7
+    assert int(np.argmax(ref.power)) == int(np.argmax(tor.power))
+
+
+@requires_torch
+def test_bls_torch_recovers_period_and_depth() -> None:
+    t, flux, err = synthetic_eclipser(period=2.5, depth=0.05)
+    pg = cup.periodogram((t, flux, err), "BLS", domain=cup.Domain.FLUX, backend="torch")
+    peak = pg.best_periods(1, alias_diverse=True)[0]
+    assert peak.period == pytest.approx(2.5, rel=3e-3)
+    assert peak.extra["depth"] == pytest.approx(0.05, abs=0.01)
+
+
+@requires_torch
+def test_bls_torch_float32_tracks_float64_on_bjd_times() -> None:
+    # Regression: the absolute time origin must be subtracted in float64 *before* the
+    # float32 device cast. Synthetic times are real-scale BJD (~2.458e6), where float32
+    # spacing is ~0.25 d — coarser than a transit bin — so a raw cast destroys the phase
+    # fold and float32 power diverges by ~order-1 from float64. float32 is the default
+    # precision on Apple MPS, so this is the out-of-the-box Mac path. After the fix the
+    # only difference is float32 round-off.
+    t, flux, err = synthetic_eclipser(period=2.5, depth=0.05)
+    assert float(t.min()) > 2.4e6  # the catastrophic-cancellation regime
+    common = dict(domain=cup.Domain.FLUX, backend="torch:cpu")
+    p64 = cup.periodogram(
+        (t, flux, err), "BLS", settings=cup.BLSSettings(precision="float64"), **common
+    )
+    p32 = cup.periodogram(
+        (t, flux, err), "BLS", settings=cup.BLSSettings(precision="float32"), **common
+    )
+    assert p32.backend == "torch:cpu"
+    finite = np.isfinite(p64.power) & np.isfinite(p32.power)
+    scale = max(float(np.max(np.abs(p64.power[finite]))), 1e-30)
+    rel = float(np.max(np.abs(p64.power[finite] - p32.power[finite]))) / scale
+    assert rel < 5e-2  # pre-fix the lost timing made this ~order-1
+    best = p32.best_periods(1, alias_diverse=True)[0]
+    assert best.period == pytest.approx(2.5, rel=5e-3)

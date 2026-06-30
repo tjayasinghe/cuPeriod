@@ -6,7 +6,8 @@ code path. Commands:
 * ``run`` — one light curve, one or more methods; prints the N best periods.
 * ``batch`` — many light curves with CPU or GPU workers, written to Parquet/CSV.
 * ``methods`` — list registered methods and their backends.
-* ``gpu-info`` — show the GPU and suggested worker counts.
+* ``gpu-info`` — show the CUDA GPU and suggested worker counts.
+* ``doctor`` — diagnose available backends, torch devices, and the precision each uses.
 * ``grid-info`` — show a method's trial grid for a light curve without computing it.
 """
 
@@ -191,6 +192,78 @@ def gpu_info_cmd() -> None:
     for m in list_methods():
         if any(b in {"cupy", "cufinufft"} for b in m.all_backends):
             typer.echo(f"    {m.name}: {suggest_gpu_workers(m.name)}")
+
+
+@app.command()
+def doctor() -> None:
+    """Diagnose available backends, devices, and the precision each will use.
+
+    A one-stop "will the accelerated paths run here, and on what?" check: the installed
+    backends, the NVIDIA CUDA fast paths, the portable torch backend and its devices
+    (CUDA/ROCm/MPS/XPU/CPU), and what ``backend="auto"`` resolves to per method.
+    """
+    import os
+    import platform
+    import sys
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as _pkg_version
+
+    # This probe only enumerates devices (no numerics), so on Windows it allows the
+    # torch + numpy/MKL OpenMP duplicate so importing torch can't abort it. The library
+    # never sets this for compute paths (see the install docs) — a torch workload on a
+    # conflicting Windows env should set KMP_DUPLICATE_LIB_OK itself.
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+    from cuperiod.core._arrayapi import resolve_precision
+    from cuperiod.core.backend import (
+        available_backends,
+        best_torch_device,
+        torch_available,
+        torch_devices,
+    )
+
+    try:
+        ver = _pkg_version("cuperiod")
+    except PackageNotFoundError:  # pragma: no cover - editable/source runs
+        ver = "?"
+    typer.echo(
+        f"cuPeriod {ver}  |  Python {sys.version.split()[0]}  |  "
+        f"{platform.system()} {platform.machine()}"
+    )
+
+    avail = available_backends()
+    typer.echo("\nbackends installed:")
+    for name in ("numpy", "finufft", "numba", "astropy", "cupy", "cufinufft", "torch"):
+        typer.echo(f"  {'OK' if name in avail else '--':>2}  {name}")
+
+    typer.echo("\nNVIDIA CUDA fast paths (cufinufft, cupy kernels):")
+    info = _gpu_info()
+    typer.echo(
+        f"  {info}" if info is not None
+        else "  no CUDA device (needs the [gpu] extra and an NVIDIA GPU)"
+    )
+
+    typer.echo("\nportable torch backend (AMD/Intel/Mac/CPU):")
+    if not torch_available():
+        typer.echo("  torch not installed — `pip install 'cuperiod[torch]'`")
+    else:
+        devices = torch_devices()
+        best = best_torch_device()
+        for d in ("cuda", "xpu", "mps", "cpu"):
+            if d in devices:
+                tag = "   <- best (used by backend='auto')" if d == best else ""
+                prec = resolve_precision("auto", d)
+                typer.echo(f"  OK  torch:{d:4s} precision auto -> {prec}{tag}")
+            else:
+                typer.echo(f"  --  torch:{d}")
+
+    typer.echo("\nbackend='auto' resolves to:")
+    for m in list_methods():
+        try:
+            resolved = get_method(m.name).resolve_backend("auto")
+        except Exception as exc:  # pragma: no cover - defensive
+            resolved = f"error: {exc}"
+        typer.echo(f"  {m.name:14s} {resolved}")
 
 
 @app.command(name="grid-info")
