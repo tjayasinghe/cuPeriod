@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 import cuperiod as cup
-from conftest import requires_gpu
+from conftest import requires_gpu, requires_torch
 from cuperiod.methods._bls_core import bls_power
 from cuperiod.methods.bls import BLSMethod
 from synth import synthetic_eclipser
@@ -103,3 +103,25 @@ def test_bls_gpu_matches_numpy() -> None:
     gpu = method.power(grid, lc, settings, "cupy")
     finite = np.isfinite(cpu.power) & np.isfinite(gpu.power)
     assert float(np.max(np.abs(cpu.power[finite] - gpu.power[finite]))) < 1e-7
+
+
+@requires_torch
+def test_bls_torch_cpu_matches_numpy() -> None:
+    # The torch box search shares the array-API body with numpy: bit-for-bit close.
+    grid, lc, settings = _grid_and_lc()
+    method = BLSMethod()
+    ref = method.power(grid, lc, settings, "numpy")
+    tor = method.power(grid, lc, settings, "torch:cpu")
+    assert tor.backend == "torch:cpu"
+    finite = np.isfinite(ref.power) & np.isfinite(tor.power)
+    assert float(np.max(np.abs(ref.power[finite] - tor.power[finite]))) < 1e-7
+    assert int(np.argmax(ref.power)) == int(np.argmax(tor.power))
+
+
+@requires_torch
+def test_bls_torch_recovers_period_and_depth() -> None:
+    t, flux, err = synthetic_eclipser(period=2.5, depth=0.05)
+    pg = cup.periodogram((t, flux, err), "BLS", domain=cup.Domain.FLUX, backend="torch")
+    peak = pg.best_periods(1, alias_diverse=True)[0]
+    assert peak.period == pytest.approx(2.5, rel=3e-3)
+    assert peak.extra["depth"] == pytest.approx(0.05, abs=0.01)

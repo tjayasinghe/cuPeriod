@@ -17,7 +17,14 @@ from typing import ClassVar
 
 from pydantic_settings import BaseSettings
 
-from cuperiod.core.backend import available_backends, cuda_available
+from cuperiod.core._arrayapi import TORCH_DEVICES
+from cuperiod.core.backend import (
+    available_backends,
+    cuda_available,
+    torch_available,
+    torch_devices,
+    torch_gpu_available,
+)
 from cuperiod.core.columns import Domain
 from cuperiod.core.errors import BackendUnavailableError, UnknownMethodError
 from cuperiod.core.grid import GridSpec
@@ -47,8 +54,12 @@ class PeriodogramMethod(ABC):
     settings_cls: ClassVar[type[BaseSettings]]
     #: Best CPU backend name.
     cpu_backend: ClassVar[str]
-    #: GPU backend name, or ``None`` if the method has no GPU path yet.
+    #: NVIDIA fast-path GPU backend name (cufinufft / cupy), or ``None`` if the method
+    #: has no CUDA path.
     gpu_backend: ClassVar[str | None] = None
+    #: Portable GPU backend name (``"torch"``) reaching AMD/Intel/Mac/CPU, or ``None``
+    #: if the method has not been ported to the array-API path yet.
+    portable_gpu_backend: ClassVar[str | None] = None
     #: Every backend this method can run.
     all_backends: ClassVar[tuple[str, ...]]
 
@@ -68,37 +79,49 @@ class PeriodogramMethod(ABC):
     def resolve_backend(self, requested: str) -> str:
         """Resolve ``auto``/``cpu``/``gpu``/concrete to a runnable backend name.
 
+        ``"auto"`` prefers the NVIDIA fast-path (``gpu_backend``) when a CUDA device is
+        present, then the portable ``torch`` backend when torch sees a non-CPU device
+        (AMD/Intel/Mac), and otherwise the proven CPU path. ``"gpu"`` is the same but
+        raises when no GPU is available. A concrete ``"torch"`` / ``"torch:<device>"``
+        request selects the portable path explicitly.
+
         Parameters
         ----------
         requested : str
-            ``"auto"`` (GPU when present, else CPU), ``"cpu"``, ``"gpu"``, or a
-            concrete backend name belonging to this method.
+            ``"auto"``, ``"cpu"``, ``"gpu"``, ``"torch"``, ``"torch:cpu|cuda|mps|xpu"``,
+            or a concrete backend name belonging to this method.
 
         Returns
         -------
         str
-            A concrete, available backend name.
+            A concrete, available backend name (``"torch:<device>"`` kept as given).
 
         Raises
         ------
         BackendUnavailableError
-            If GPU was requested but is unavailable, or a named backend is unknown to
-            this method or not importable here.
+            If GPU/torch was requested but is unavailable, or a named backend is unknown
+            to this method or not importable here.
         """
         available = available_backends()
         if requested == "auto":
             if self.gpu_backend is not None and cuda_available():
                 return self.gpu_backend
+            if self.portable_gpu_backend is not None and torch_gpu_available():
+                return self.portable_gpu_backend
             return self.cpu_backend
         if requested == "cpu":
             return self.cpu_backend
         if requested == "gpu":
             if self.gpu_backend is not None and cuda_available():
                 return self.gpu_backend
+            if self.portable_gpu_backend is not None and torch_gpu_available():
+                return self.portable_gpu_backend
             raise BackendUnavailableError(
-                f"{self.name}: GPU backend unavailable (need the [gpu] extra and a "
-                "CUDA device)"
+                f"{self.name}: no GPU backend available (need the [gpu] extra and a "
+                "CUDA device, or the [torch] extra and a CUDA/ROCm/MPS/XPU device)"
             )
+        if requested == "torch" or requested.startswith("torch:"):
+            return self._resolve_torch(requested)
         if requested not in self.all_backends:
             raise BackendUnavailableError(
                 f"{self.name}: unknown backend {requested!r}; "
@@ -116,9 +139,37 @@ class PeriodogramMethod(ABC):
             )
         return requested
 
+    def _resolve_torch(self, requested: str) -> str:
+        """Validate a concrete ``torch``/``torch:<device>`` request for this method."""
+        if self.portable_gpu_backend != "torch":
+            raise BackendUnavailableError(
+                f"{self.name}: no portable 'torch' backend for this method"
+            )
+        if not torch_available():
+            raise BackendUnavailableError(
+                f"{self.name}: backend 'torch' needs the [torch] extra (pip install "
+                "'cuperiod[torch]')"
+            )
+        if ":" in requested:
+            device = requested.split(":", 1)[1]
+            if device not in TORCH_DEVICES:
+                raise BackendUnavailableError(
+                    f"{self.name}: unknown torch device {device!r}; "
+                    f"choose from {TORCH_DEVICES}"
+                )
+            if device not in torch_devices():
+                raise BackendUnavailableError(
+                    f"{self.name}: torch device {device!r} is not available here"
+                )
+        return requested
+
     def is_gpu_backend(self, backend: str) -> bool:
-        """Whether ``backend`` is this method's GPU backend."""
-        return backend == self.gpu_backend
+        """Whether ``backend`` runs on a GPU (NVIDIA fast-path or non-CPU torch)."""
+        if backend == self.gpu_backend:
+            return True
+        if backend == "torch" or backend.startswith("torch:"):
+            return backend != "torch:cpu"
+        return False
 
     # -- compute -----------------------------------------------------------------
     @abstractmethod

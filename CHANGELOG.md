@@ -4,6 +4,26 @@ All notable changes to cuPeriod are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Multi-vendor GPU support via PyTorch and the Python array API.** GLS and BLS gain a
+  portable `torch` backend that runs on AMD (ROCm), Intel (XPU), and Apple (MPS) GPUs as
+  well as a real CPU path — so the accelerated code is no longer NVIDIA-only, and works
+  even with no GPU at all. Select it with `backend="torch"` (or `"torch:cpu"`,
+  `"torch:cuda"`, `"torch:mps"`, `"torch:xpu"`); `backend="auto"` now reaches a torch GPU
+  on non-NVIDIA machines after the cufinufft/cupy fast paths.
+  - GLS adds a NUFFT-free direct trig-sum path (the portable formulation; cufinufft
+    remains the NVIDIA fast path).
+  - BLS runs its vectorized box search through the array-API namespace (the cupy
+    `RawKernel` remains the NVIDIA fast path).
+  - New `device` and `precision` settings: `precision="auto"` is float64 everywhere it is
+    supported and float32 only where the device forces it (Apple MPS cannot do float64);
+    an explicit `precision="float64"` on MPS raises rather than silently downgrading.
+- `array-api-compat` is now a dependency; install the portable accelerator with the
+  `[torch]` extra (`pip install 'cuperiod[torch]'`).
+
 ## [1.0.0] — 2026-06-29
 
 First public release.

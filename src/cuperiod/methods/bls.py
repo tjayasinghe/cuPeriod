@@ -17,6 +17,7 @@ from typing import Any, ClassVar, Literal
 
 import numpy as np
 
+from cuperiod.core._arrayapi import resolve_torch_device
 from cuperiod.core._typing import FloatArray
 from cuperiod.core.columns import Domain
 from cuperiod.core.config import BLSSettings
@@ -24,7 +25,7 @@ from cuperiod.core.errors import InsufficientDataError
 from cuperiod.core.grid import GridSpec
 from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
 from cuperiod.core.result import Periodogram
-from cuperiod.methods._bls_core import BLSBackend, bls_power
+from cuperiod.methods._bls_core import bls_power
 from cuperiod.methods.base import PeriodogramMethod, register
 
 #: Per-period fields shared by every backend (astropy + the in-house search).
@@ -41,7 +42,7 @@ def _segment_durations(p_lo: float, settings: BLSSettings) -> FloatArray:
     d_lo = max(settings.duration_min_frac * p_lo, settings.min_duration_days)
     if d_lo >= d_hi:
         return np.asarray([d_hi], dtype=np.float64)
-    return np.geomspace(d_lo, d_hi, settings.n_durations)
+    return np.asarray(np.geomspace(d_lo, d_hi, settings.n_durations), dtype=np.float64)
 
 
 def _max_period(baseline: float, settings: BLSSettings) -> float:
@@ -63,13 +64,14 @@ def _segment_grids(
         p_hi = min(p_lo * settings.segment_factor, max_period)
         freq = np.arange(1.0 / p_hi, 1.0 / p_lo, df)
         if freq.size:
-            grids.append((1.0 / freq[::-1], _segment_durations(p_lo, settings)))
+            periods = np.asarray(1.0 / freq[::-1], dtype=np.float64)
+            grids.append((periods, _segment_durations(p_lo, settings)))
         p_lo = p_hi
     return grids
 
 
 def _segment_power(
-    backend: BLSBackend | Literal["astropy"],
+    backend: str,
     jd: FloatArray,
     flux: FloatArray,
     err: FloatArray,
@@ -101,6 +103,7 @@ def _segment_power(
         objective=settings.objective,
         backend=backend,
         batch=settings.batch_periods,
+        precision=settings.precision,
     )
     return {name: getattr(power, name) for name in _SEGMENT_FIELDS}
 
@@ -152,15 +155,32 @@ class BLSMethod(PeriodogramMethod):
     settings_cls: ClassVar[type] = BLSSettings
     cpu_backend: ClassVar[str] = "astropy"
     gpu_backend: ClassVar[str | None] = "cupy"
-    all_backends: ClassVar[tuple[str, ...]] = ("numba", "numpy", "astropy", "cupy")
+    portable_gpu_backend: ClassVar[str | None] = "torch"
+    all_backends: ClassVar[tuple[str, ...]] = (
+        "numba", "numpy", "astropy", "cupy", "torch",
+    )
 
     def resolve_backend(self, requested: str) -> str:
-        """Prefer the multicore numba box search on the CPU when it is installed."""
-        from cuperiod.core.backend import available_backends, cuda_available
+        """Prefer cupy on NVIDIA, then torch on other GPUs, else the numba CPU search.
 
-        if requested == "auto" and self.gpu_backend is not None and cuda_available():
-            return self.gpu_backend
-        if requested in ("cpu", "auto"):
+        Keeps BLS's CPU preference (multicore numba when installed, else astropy) for
+        ``cpu``/``auto``, while ``auto`` still reaches a GPU: the cupy kernel on CUDA,
+        then the portable torch path on AMD/Intel/Mac. Concrete ``torch``/``torch:*``
+        requests are validated by the base method.
+        """
+        from cuperiod.core.backend import (
+            available_backends,
+            cuda_available,
+            torch_gpu_available,
+        )
+
+        if requested == "auto":
+            if self.gpu_backend is not None and cuda_available():
+                return self.gpu_backend
+            if self.portable_gpu_backend is not None and torch_gpu_available():
+                return self.portable_gpu_backend
+            return "numba" if "numba" in available_backends() else "astropy"
+        if requested == "cpu":
             return "numba" if "numba" in available_backends() else "astropy"
         return super().resolve_backend(requested)
 
@@ -199,7 +219,11 @@ class BLSMethod(PeriodogramMethod):
         jd = finite.time
         flux = finite.value
         err = finite.error if finite.error is not None else np.ones_like(flux)
-        bck: BLSBackend | Literal["astropy"] = backend  # type: ignore[assignment]
+        if backend == "torch" or backend.startswith("torch:"):
+            # Fully-qualify the device so both dispatch and the recorded backend are
+            # concrete (e.g. "torch:cpu"); settings.device picks the device for bare
+            # "torch"/"auto"/"gpu".
+            backend = f"torch:{resolve_torch_device(backend, settings.device)}"
 
         if grid.meta.get("segmented", False):
             segments = _segment_grids(finite.baseline, settings)
@@ -214,7 +238,7 @@ class BLSMethod(PeriodogramMethod):
 
         chunks: dict[str, list[FloatArray]] = {name: [] for name in _SEGMENT_FIELDS}
         for periods, durations in segments:
-            seg = _segment_power(bck, jd, flux, err, periods, durations, settings)
+            seg = _segment_power(backend, jd, flux, err, periods, durations, settings)
             for name in _SEGMENT_FIELDS:
                 chunks[name].append(seg[name])
         return _assemble(chunks, n, finite.baseline, backend, finite.meta)

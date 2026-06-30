@@ -95,7 +95,7 @@ def _period_grid(baseline: float, settings: TLSSettings) -> FloatArray:
     freq = np.arange(1.0 / max_period, 1.0 / settings.min_period_days, df)
     if freq.size == 0:
         return np.zeros(0, dtype=np.float64)
-    return (1.0 / freq[::-1]).copy()
+    return np.ascontiguousarray(1.0 / freq[::-1], dtype=np.float64)
 
 
 def _matched_filter(

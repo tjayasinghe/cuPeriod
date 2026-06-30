@@ -24,8 +24,17 @@ from typing import Any, Final, Literal
 
 import numpy as np
 
+from cuperiod.core._arrayapi import (
+    array_namespace,
+    resolve_precision,
+    scatter_add,
+    to_device_array,
+    to_host,
+)
 from cuperiod.core._typing import FloatArray
 
+#: Core single-array-library backends (the torch backend is device-qualified, e.g.
+#: ``"torch:cpu"``, so backend strings are typed as ``str`` where torch is accepted).
 BLSBackend = Literal["numpy", "cupy", "numba"]
 
 #: Inverse-variance floor: an empty in/out side (ivar sum 0) is skipped, not divided by.
@@ -58,11 +67,6 @@ class BLSPower:
     duration: FloatArray
     transit_time: FloatArray
     log_likelihood: FloatArray
-
-
-def _scatter_add(xp: ModuleType, target: Any, idx: Any, values: Any) -> None:
-    """``target[idx] += values`` with index repeats accumulated, on numpy/cupy."""
-    xp.add.at(target, idx, values)
 
 
 def _duration_bins(durations: FloatArray, bin_duration: float) -> list[int]:
@@ -118,23 +122,31 @@ def _bls_search(
     obj_flag: int,
     batch: int,
 ) -> dict[str, Any]:
-    """Vectorized port of astropy ``run_bls`` for one duration-homogeneous call."""
+    """Vectorized port of astropy ``run_bls`` for one duration-homogeneous call.
+
+    Array-API generic: ``xp`` is an :mod:`array_api_compat` namespace, so the identical
+    body runs on numpy (CPU) and torch (CPU/CUDA/ROCm/MPS/XPU). The working float dtype
+    follows ``periods`` (float64, or float32 on a float32 device); index/bin arrays are
+    int64. The cupy ``RawKernel`` fast path (NVIDIA) is separate and not this code.
+    """
+    fdtype = periods.dtype
+    idtype = xp.int64
     n_points = int(t.shape[0])
     yw = y * ivar
-    sum_y = float(yw.sum())
-    sum_ivar = float(ivar.sum())
-    t_min = float(t.min())
+    sum_y = float(xp.sum(yw))
+    sum_ivar = float(xp.sum(ivar))
+    t_min = float(xp.min(t))
     tau = t - t_min
 
     n_periods = int(periods.shape[0])
     out = {
-        "power": xp.full(n_periods, -np.inf, dtype=np.float64),
-        "depth": xp.zeros(n_periods, dtype=np.float64),
-        "depth_err": xp.zeros(n_periods, dtype=np.float64),
-        "depth_snr": xp.zeros(n_periods, dtype=np.float64),
-        "duration": xp.zeros(n_periods, dtype=np.float64),
-        "transit_time": xp.zeros(n_periods, dtype=np.float64),
-        "log_likelihood": xp.zeros(n_periods, dtype=np.float64),
+        "power": xp.full(n_periods, -np.inf, dtype=fdtype),
+        "depth": xp.zeros(n_periods, dtype=fdtype),
+        "depth_err": xp.zeros(n_periods, dtype=fdtype),
+        "depth_snr": xp.zeros(n_periods, dtype=fdtype),
+        "duration": xp.zeros(n_periods, dtype=fdtype),
+        "transit_time": xp.zeros(n_periods, dtype=fdtype),
+        "log_likelihood": xp.zeros(n_periods, dtype=fdtype),
     }
     if n_periods == 0 or not dur_bins:
         return out
@@ -143,21 +155,21 @@ def _bls_search(
         stop = min(start + batch, n_periods)
         pb = periods[start:stop]
         n_p = int(pb.shape[0])
-        rows = xp.arange(n_p)
-        n_bins = xp.ceil(pb / bin_duration).astype(np.int64) + oversample
+        rows = xp.arange(n_p, dtype=idtype)
+        n_bins = xp.astype(xp.ceil(pb / bin_duration), idtype) + oversample
 
-        phase_t = xp.mod(tau[None, :], pb[:, None])
-        ind = (phase_t / bin_duration).astype(np.int64) + 1
-        xp.clip(ind, 0, width - 1, out=ind)
-        flat = (rows[:, None] * width + ind).ravel()
-        mean_y = xp.zeros(n_p * width, dtype=np.float64)
-        mean_ivar = xp.zeros(n_p * width, dtype=np.float64)
-        yw_b = xp.broadcast_to(yw, (n_p, n_points)).ravel()
-        ivar_b = xp.broadcast_to(ivar, (n_p, n_points)).ravel()
-        _scatter_add(xp, mean_y, flat, yw_b)
-        _scatter_add(xp, mean_ivar, flat, ivar_b)
-        mean_y = mean_y.reshape(n_p, width)
-        mean_ivar = mean_ivar.reshape(n_p, width)
+        phase_t = xp.remainder(tau[None, :], pb[:, None])
+        ind = xp.astype(phase_t / bin_duration, idtype) + 1
+        ind = xp.clip(ind, 0, width - 1)
+        flat = xp.reshape(rows[:, None] * width + ind, (-1,))
+        mean_y = xp.zeros(n_p * width, dtype=fdtype)
+        mean_ivar = xp.zeros(n_p * width, dtype=fdtype)
+        yw_b = xp.reshape(xp.broadcast_to(yw, (n_p, n_points)), (-1,))
+        ivar_b = xp.reshape(xp.broadcast_to(ivar, (n_p, n_points)), (-1,))
+        scatter_add(mean_y, flat, yw_b)
+        scatter_add(mean_ivar, flat, ivar_b)
+        mean_y = xp.reshape(mean_y, (n_p, width))
+        mean_ivar = xp.reshape(mean_ivar, (n_p, width))
 
         for j in range(oversample):
             dst = xp.clip(n_bins - oversample + j, 0, width - 1)
@@ -168,16 +180,16 @@ def _bls_search(
         cw = xp.cumsum(mean_ivar, axis=1)
         del mean_y, mean_ivar
 
-        best_obj = xp.full(n_p, -np.inf, dtype=np.float64)
-        best_n = xp.zeros(n_p, dtype=np.int64)
-        best_d = xp.zeros(n_p, dtype=np.int64)
+        best_obj = xp.full(n_p, -np.inf, dtype=fdtype)
+        best_n = xp.zeros(n_p, dtype=idtype)
+        best_d = xp.zeros(n_p, dtype=idtype)
         for kd in dur_bins:
             if kd >= width:
                 continue
             y_in = cy[:, kd:] - cy[:, :-kd]
             ivar_in = cw[:, kd:] - cw[:, :-kd]
             ivar_out = sum_ivar - ivar_in
-            cols = xp.arange(y_in.shape[1])
+            cols = xp.arange(y_in.shape[1], dtype=idtype)
             valid = (
                 (cols[None, :] <= (n_bins[:, None] - kd))
                 & (ivar_in >= _IVAR_EPS)
@@ -188,8 +200,8 @@ def _bls_search(
             cand_obj = obj[rows, cand_n]
             improve = cand_obj > best_obj
             best_obj = xp.where(improve, cand_obj, best_obj)
-            best_n = xp.where(improve, cand_n.astype(np.int64), best_n)
-            best_d = xp.where(improve, np.int64(kd), best_d)
+            best_n = xp.where(improve, xp.astype(cand_n, idtype), best_n)
+            best_d = xp.where(improve, kd, best_d)
 
         finite = xp.isfinite(best_obj)
         y_in = cy[rows, best_n + best_d] - cy[rows, best_n]
@@ -203,15 +215,15 @@ def _bls_search(
         depth_err = xp.sqrt(1.0 / safe_in + 1.0 / safe_out)
         depth_snr = depth / depth_err
         log_like = 0.5 * ivar_in * depth * depth
-        duration = best_d.astype(np.float64) * bin_duration
+        duration = xp.astype(best_d, fdtype) * bin_duration
         transit_time = (
-            xp.mod(best_n.astype(np.float64) * bin_duration + 0.5 * duration, pb)
+            xp.remainder(xp.astype(best_n, fdtype) * bin_duration + 0.5 * duration, pb)
             + t_min
         )
         power = depth_snr if obj_flag == 0 else log_like
 
         sl = slice(start, stop)
-        zero = xp.zeros(n_p, dtype=np.float64)
+        zero = xp.zeros(n_p, dtype=fdtype)
         out["power"][sl] = xp.where(finite, power, -np.inf)
         out["depth"][sl] = xp.where(finite, depth, zero)
         out["depth_err"][sl] = xp.where(finite, depth_err, zero)
@@ -608,10 +620,11 @@ def bls_power(
     oversample: int,
     *,
     objective: str = "snr",
-    backend: BLSBackend = "numpy",
+    backend: str = "numpy",
     batch: int = DEFAULT_BATCH,
+    precision: str = "auto",
 ) -> BLSPower:
-    """BLS box search over ``periods`` via numpy (CPU) or cupy (GPU).
+    """BLS box search over ``periods`` via numpy/torch (portable), cupy, or numba.
 
     Equivalent to ``BoxLeastSquares(t, y, dy).power(periods, durations,
     objective=objective, oversample=oversample)`` — same binning and objective. ``y``
@@ -629,10 +642,14 @@ def bls_power(
         Phase bins per shortest duration.
     objective : {"snr", "likelihood"}, default "snr"
         Box objective.
-    backend : {"numpy", "cupy"}, default "numpy"
-        CPU reference or GPU kernel.
+    backend : str, default "numpy"
+        ``"numpy"`` (array-API CPU reference), ``"torch"`` / ``"torch:<device>"``
+        (portable array-API path, any torch device), ``"cupy"`` (NVIDIA RawKernel), or
+        ``"numba"`` (multicore CPU).
     batch : int, default 2048
-        Trial periods per vectorized batch (numpy backend).
+        Trial periods per vectorized batch (numpy/torch backends).
+    precision : {"auto", "float64", "float32"}, default "auto"
+        Device-side compute precision for the torch backend (float64 except on MPS).
 
     Returns
     -------
@@ -642,7 +659,8 @@ def bls_power(
     if objective not in ("snr", "likelihood"):
         raise ValueError("objective must be 'snr' or 'likelihood'")
     obj_flag = 0 if objective == "snr" else 1
-    if backend not in ("numpy", "cupy", "numba"):
+    is_torch = backend == "torch" or backend.startswith("torch:")
+    if not is_torch and backend not in ("numpy", "cupy", "numba"):
         raise ValueError(f"unknown backend {backend!r}")
 
     periods_host = np.ascontiguousarray(periods, dtype=np.float64)
@@ -655,68 +673,59 @@ def bls_power(
     max_n_bins = int(np.ceil(float(periods_host.max()) / bin_duration)) + oversample
     width = max_n_bins + 1
 
+    t_host = np.ascontiguousarray(t, dtype=np.float64)
+    y_host = np.ascontiguousarray(y, dtype=np.float64)
     ivar_host = 1.0 / (np.ascontiguousarray(dy, dtype=np.float64) ** 2)
+
     if backend == "cupy":
         from cuperiod.core.backend import ensure_cuda_dll_path
 
         ensure_cuda_dll_path()
         out = _bls_search_cuda(
-            np.ascontiguousarray(t, dtype=np.float64),
-            np.ascontiguousarray(y, dtype=np.float64),
-            ivar_host,
-            periods_host,
-            bin_duration=bin_duration,
-            dur_bins=dur_bins,
-            oversample=oversample,
-            width=width,
-            obj_flag=obj_flag,
+            t_host, y_host, ivar_host, periods_host,
+            bin_duration=bin_duration, dur_bins=dur_bins,
+            oversample=oversample, width=width, obj_flag=obj_flag,
         )
-        import cupy
-
-        def host(a: Any) -> FloatArray:
-            return np.asarray(cupy.asnumpy(a), dtype=np.float64)
     elif backend == "numba":
         out = _bls_search_numba(
-            np.ascontiguousarray(t, dtype=np.float64),
-            np.ascontiguousarray(y, dtype=np.float64),
-            ivar_host,
-            periods_host,
-            bin_duration=bin_duration,
-            dur_bins=dur_bins,
-            oversample=oversample,
-            width=width,
-            obj_flag=obj_flag,
+            t_host, y_host, ivar_host, periods_host,
+            bin_duration=bin_duration, dur_bins=dur_bins,
+            oversample=oversample, width=width, obj_flag=obj_flag,
         )
+    elif is_torch:
+        import torch
 
-        def host(a: Any) -> FloatArray:
-            return np.asarray(a, dtype=np.float64)
-    else:
+        device = backend.split(":", 1)[1] if ":" in backend else "cpu"
+        tdtype = (
+            torch.float32
+            if resolve_precision(precision, device) == "float32"
+            else torch.float64
+        )
+        t_d = to_device_array(t_host, device=device, dtype=tdtype)
+        y_d = to_device_array(y_host, device=device, dtype=tdtype)
+        ivar_d = to_device_array(ivar_host, device=device, dtype=tdtype)
+        periods_d = to_device_array(periods_host, device=device, dtype=tdtype)
         out = _bls_search(
-            np,
-            np.ascontiguousarray(t, dtype=np.float64),
-            np.ascontiguousarray(y, dtype=np.float64),
-            ivar_host,
-            periods_host,
-            bin_duration=bin_duration,
-            dur_bins=dur_bins,
-            oversample=oversample,
-            width=width,
-            obj_flag=obj_flag,
-            batch=batch,
+            array_namespace(periods_d), t_d, y_d, ivar_d, periods_d,
+            bin_duration=bin_duration, dur_bins=dur_bins,
+            oversample=oversample, width=width, obj_flag=obj_flag, batch=batch,
         )
-
-        def host(a: Any) -> FloatArray:
-            return np.asarray(a, dtype=np.float64)
+    else:  # numpy, through the array-API compat namespace
+        out = _bls_search(
+            array_namespace(periods_host), t_host, y_host, ivar_host, periods_host,
+            bin_duration=bin_duration, dur_bins=dur_bins,
+            oversample=oversample, width=width, obj_flag=obj_flag, batch=batch,
+        )
 
     return BLSPower(
         period=periods_host,
-        power=host(out["power"]),
-        depth=host(out["depth"]),
-        depth_err=host(out["depth_err"]),
-        depth_snr=host(out["depth_snr"]),
-        duration=host(out["duration"]),
-        transit_time=host(out["transit_time"]),
-        log_likelihood=host(out["log_likelihood"]),
+        power=to_host(out["power"]),
+        depth=to_host(out["depth"]),
+        depth_err=to_host(out["depth_err"]),
+        depth_snr=to_host(out["depth_snr"]),
+        duration=to_host(out["duration"]),
+        transit_time=to_host(out["transit_time"]),
+        log_likelihood=to_host(out["log_likelihood"]),
     )
 
 
