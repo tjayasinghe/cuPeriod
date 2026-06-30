@@ -10,6 +10,15 @@ case-insensitive and ordered, so the most specific/standard name wins.
 The brightness *domain* (magnitude vs flux) is inferred from the matched value
 column when possible (``flux`` → flux, ``mag`` → magnitude) and can always be set
 explicitly. Methods that are naturally flux-based (BLS, TLS) convert internally.
+
+The built-in detection lists cover the standard light-curve products of the major
+time-domain surveys — ASAS-SN, ASAS-3, ATLAS, CRTS/CSS, ZTF, Pan-STARRS, TESS, Kepler,
+Gaia, LSST, and MACHO — so a downloaded table usually needs no column hints. Error
+resolution is *domain-aware*: a flux value is paired with a flux error and a magnitude
+value with a magnitude error, which disambiguates surveys (e.g. ATLAS) that expose both
+``m``/``dm`` and ``uJy``/``duJy`` in one table. Headerless products (OGLE ``.dat``) have
+no column names to detect — pass the data as a ``(time, value, error)`` tuple or with an
+explicit :class:`ColumnMap`.
 """
 
 from __future__ import annotations
@@ -30,61 +39,110 @@ class Domain(StrEnum):
 
 #: Time-column name candidates, most-specific first. Barycentric/heliocentric
 #: corrected times precede plain JD so a table carrying both picks the better one.
+#: Covers JD/HJD/BJD (ASAS, ASAS-SN, OGLE, Gaia), MJD (ATLAS, CRTS, ZTF, Pan-STARRS),
+#: BTJD (TESS), BKJD (Kepler), ``midpointMjdTai`` (LSST), and ``obsTime`` (Pan-STARRS).
 TIME_NAMES: Final[tuple[str, ...]] = (
     "bjd_tdb",
     "bjd",
     "hjd",
     "btjd",
+    "bkjd",
     "mjd",
+    "hmjd",
+    "midpointmjdtai",
+    "midpointtai",
+    "obstime",
     "jd",
     "time",
     "date",
     "t",
 )
 
-#: Magnitude value-column candidates.
+#: Magnitude value-column candidates. Includes ASAS-3 ``MAG_0`` (first aperture),
+#: ``psfMag`` (Pan-STARRS/LSST), and ``Rmag``/``Bmag`` (MACHO red/blue).
 MAG_NAMES: Final[tuple[str, ...]] = (
     "mag",
     "magnitude",
     "vmag",
     "gmag",
     "rmag",
+    "bmag",
+    "imag",
+    "psfmag",
     "phot_mag",
+    "mag_0",
     "m",
 )
 
-#: Flux value-column candidates.
+#: Flux value-column candidates. Includes ``PDCSAP_FLUX``/``SAP_FLUX``/``KSPSAP_FLUX``
+#: (TESS/Kepler), ``psfFlux`` (Pan-STARRS/LSST), and ``uJy``/``mJy`` (ATLAS, ASAS-SN).
+#: ``uJy`` precedes the bare ``f`` so ATLAS's flux column wins over its ``F`` filter.
 FLUX_NAMES: Final[tuple[str, ...]] = (
     "pdcsap_flux",
+    "kspsap_flux",
     "sap_flux",
+    "psfflux",
+    "psflux",
+    "psfdiffflux",
     "norm_flux",
     "rel_flux",
     "flux",
+    "ujy",
+    "mjy",
     "fnu",
     "f",
 )
 
-#: Error-column candidates (both magnitude and flux error spellings).
-ERR_NAMES: Final[tuple[str, ...]] = (
+#: Magnitude-error candidates (used when the value column is a magnitude): ``magerr``
+#: (ZTF, CRTS, ASAS-SN), ``dm`` (ATLAS), ``MER_0`` (ASAS-3), ``e_mag``, ``dmag``, ...
+MAG_ERR_NAMES: Final[tuple[str, ...]] = (
     "mag_err",
     "magnitude_err",
     "mag_error",
+    "magerr",
     "e_mag",
     "merr",
     "dmag",
+    "dm",
+    "mer_0",
+)
+
+#: Flux-error candidates (used when the value column is a flux): ``flux_error`` (Gaia),
+#: ``*SAP_FLUX_ERR`` (TESS/Kepler), ``psfFluxErr`` (Pan-STARRS/LSST), ``duJy`` (ATLAS).
+FLUX_ERR_NAMES: Final[tuple[str, ...]] = (
     "flux_err",
+    "flux_error",
     "sap_flux_err",
     "pdcsap_flux_err",
+    "kspsap_flux_err",
+    "psfflux_err",
+    "psffluxerr",
+    "psfluxerr",
+    "psfdiffflux_err",
+    "psfdifffluxerr",
     "e_flux",
+    "dujy",
+)
+
+#: Domain-neutral error spellings, tried after the domain-specific lists.
+GENERIC_ERR_NAMES: Final[tuple[str, ...]] = (
     "err",
     "error",
     "sigma",
 )
 
-#: Band/filter-column candidates (used only by multi-band ingestion).
+#: All error spellings. Resolution is domain-aware (see :meth:`ColumnMap.resolve`): a
+#: flux value pairs with a flux error and a magnitude value with a magnitude error.
+ERR_NAMES: Final[tuple[str, ...]] = MAG_ERR_NAMES + FLUX_ERR_NAMES + GENERIC_ERR_NAMES
+
+#: Band/filter-column candidates (used only by multi-band ingestion): ``filtercode``
+#: (ZTF), ``filterID`` (Pan-STARRS), ``band`` (Gaia/LSST), ``fid`` (ZTF alerts).
 BAND_NAMES: Final[tuple[str, ...]] = (
     "band",
     "filter",
+    "filtercode",
+    "filterid",
+    "filtername",
     "phot_filter",
     "passband",
     "fid",
@@ -139,9 +197,10 @@ def infer_domain(value_column: str) -> Domain | None:
         explicit domain).
     """
     low = value_column.lower()
-    if any(tok in low for tok in ("flux", "fnu")):
+    flux_tokens = ("flux", "fnu", "ujy", "mjy", "njy", "nmgy", "jansky")
+    if any(tok in low for tok in flux_tokens):
         return Domain.FLUX
-    if "mag" in low or low in {"m", "vmag", "gmag", "rmag"}:
+    if "mag" in low or low in {"m", "vmag", "gmag", "rmag", "bmag", "imag"}:
         return Domain.MAGNITUDE
     return None
 
@@ -204,7 +263,6 @@ class ColumnMap:
         value = _match(
             "value", self.value, value_candidates, available, lower_to_actual
         )
-        error = _match("error", self.error, ERR_NAMES, available, lower_to_actual)
         band = _match("band", self.band, BAND_NAMES, available, lower_to_actual)
 
         if time is None:
@@ -220,6 +278,16 @@ class ColumnMap:
                 f"{available}"
             )
         resolved_domain = domain or infer_domain(value) or Domain.MAGNITUDE
+        # Resolve the error for the *same* measurement as the value: first try names
+        # derived from the value column (so ``PDCSAP_FLUX`` pairs with
+        # ``PDCSAP_FLUX_ERR`` and ``uJy`` with ``duJy``), then the spellings for the
+        # value's domain, then domain-neutral spellings. This keeps a flux value with a
+        # flux error and a magnitude value with a magnitude error.
+        v = value.lower()
+        derived = (f"{v}_err", f"{v}err", f"{v}_error", f"{v}error", f"e_{v}", f"d{v}")
+        domain_err = FLUX_ERR_NAMES if resolved_domain is Domain.FLUX else MAG_ERR_NAMES
+        err_candidates = derived + domain_err + GENERIC_ERR_NAMES
+        error = _match("error", self.error, err_candidates, available, lower_to_actual)
         return ResolvedColumns(
             time=time, value=value, error=error, band=band, domain=resolved_domain
         )
@@ -228,7 +296,10 @@ class ColumnMap:
 __all__ = [
     "BAND_NAMES",
     "ERR_NAMES",
+    "FLUX_ERR_NAMES",
     "FLUX_NAMES",
+    "GENERIC_ERR_NAMES",
+    "MAG_ERR_NAMES",
     "MAG_NAMES",
     "TIME_NAMES",
     "ColumnMap",
