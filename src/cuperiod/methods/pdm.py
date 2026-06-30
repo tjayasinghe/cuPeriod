@@ -22,6 +22,14 @@ from typing import Any, ClassVar, Final, Literal
 
 import numpy as np
 
+from cuperiod.core._arrayapi import (
+    array_namespace,
+    resolve_precision,
+    resolve_torch_device,
+    scatter_add,
+    to_device_array,
+    to_host,
+)
 from cuperiod.core._typing import FloatArray
 from cuperiod.core.backend import ensure_cuda_dll_path
 from cuperiod.core.config import PDMSettings
@@ -58,43 +66,47 @@ def _theta_batch(
     ``s^2 = sum_j SSD_j / (N*n_covers - n_nonempty)`` with ``SSD_j`` the within-bin sum
     of squared deviations across all covers, and ``Theta = s^2 / sigma^2``.
     """
+    fdtype = periods.dtype
+    idtype = xp.int64
+    inf = float("inf")
     n_points = int(tau.shape[0])
     n_periods = int(periods.shape[0])
     n_global = n_bins * n_covers
     cover_step = 1.0 / (n_bins * n_covers)
-    theta = xp.empty(n_periods, dtype=np.float64)
+    theta = xp.empty(n_periods, dtype=fdtype)
 
     for start in range(0, n_periods, batch):
         stop = min(start + batch, n_periods)
         pb = periods[start:stop]
         n_p = int(pb.shape[0])
-        rows = xp.arange(n_p)
-        phase = xp.mod(tau[None, :] / pb[:, None], 1.0)  # (P, N) in [0, 1)
+        rows = xp.arange(n_p, dtype=idtype)
+        phase = xp.remainder(tau[None, :] / pb[:, None], 1.0)  # (P, N) in [0, 1)
 
-        count = xp.zeros(n_p * n_global, dtype=np.float64)
-        ysum = xp.zeros(n_p * n_global, dtype=np.float64)
-        ysq = xp.zeros(n_p * n_global, dtype=np.float64)
-        ones = xp.broadcast_to(xp.ones(1), (n_p, n_points)).ravel()
-        y_b = xp.broadcast_to(y, (n_p, n_points)).ravel()
-        y2_b = xp.broadcast_to(y2, (n_p, n_points)).ravel()
+        count = xp.zeros(n_p * n_global, dtype=fdtype)
+        ysum = xp.zeros(n_p * n_global, dtype=fdtype)
+        ysq = xp.zeros(n_p * n_global, dtype=fdtype)
+        ones = xp.ones(n_p * n_points, dtype=fdtype)
+        y_b = xp.reshape(xp.broadcast_to(y, (n_p, n_points)), (-1,))
+        y2_b = xp.reshape(xp.broadcast_to(y2, (n_p, n_points)), (-1,))
         for cover in range(n_covers):
             offset = cover * cover_step
-            b = (xp.mod(phase + offset, 1.0) * n_bins).astype(np.int64)
-            xp.clip(b, 0, n_bins - 1, out=b)
-            flat = (rows[:, None] * n_global + (b + cover * n_bins)).ravel()
-            xp.add.at(count, flat, ones)
-            xp.add.at(ysum, flat, y_b)
-            xp.add.at(ysq, flat, y2_b)
+            b = xp.astype(xp.remainder(phase + offset, 1.0) * n_bins, idtype)
+            b = xp.clip(b, 0, n_bins - 1)
+            flat = xp.reshape(rows[:, None] * n_global + (b + cover * n_bins), (-1,))
+            scatter_add(count, flat, ones)
+            scatter_add(ysum, flat, y_b)
+            scatter_add(ysq, flat, y2_b)
 
-        count = count.reshape(n_p, n_global)
-        ysum = ysum.reshape(n_p, n_global)
-        ysq = ysq.reshape(n_p, n_global)
-        safe = xp.where(count > 0.0, count, 1.0)
-        ssd = xp.where(count > 0.0, ysq - ysum * ysum / safe, 0.0)
-        nonempty = (count > 0.0).sum(axis=1)
+        count = xp.reshape(count, (n_p, n_global))
+        ysum = xp.reshape(ysum, (n_p, n_global))
+        ysq = xp.reshape(ysq, (n_p, n_global))
+        mask = count > 0.0
+        safe = xp.where(mask, count, 1.0)
+        ssd = xp.where(mask, ysq - ysum * ysum / safe, 0.0)
+        nonempty = xp.sum(xp.astype(mask, fdtype), axis=1)
         den = float(n_points * n_covers) - nonempty
         safe_den = xp.where(den > 0.0, den, 1.0)
-        s2 = xp.where(den > 0.0, ssd.sum(axis=1) / safe_den, xp.inf)
+        s2 = xp.where(den > 0.0, xp.sum(ssd, axis=1) / safe_den, inf)
         theta[start:stop] = s2 / sigma2
     return theta
 
@@ -221,8 +233,9 @@ def pdm_theta(
     *,
     n_bins: int = 10,
     n_covers: int = 3,
-    backend: PDMBackend = "numpy",
+    backend: str = "numpy",
     batch: int = DEFAULT_BATCH,
+    precision: str = "auto",
 ) -> FloatArray:
     """PDM Theta statistic for each trial period.
 
@@ -264,10 +277,24 @@ def pdm_theta(
         return _pdm_cuda(
             tau, y, periods_host, n_bins=n_bins, n_covers=n_covers, sigma2=sigma2
         )
+    if backend == "torch" or backend.startswith("torch:"):
+        import torch
+
+        device = backend.split(":", 1)[1] if ":" in backend else "cpu"
+        fdt = (torch.float32
+               if resolve_precision(precision, device) == "float32" else torch.float64)
+        tau_d = to_device_array(tau, device=device, dtype=fdt)
+        y_d = to_device_array(y, device=device, dtype=fdt)
+        y2_d = to_device_array(y * y, device=device, dtype=fdt)
+        per_d = to_device_array(periods_host, device=device, dtype=fdt)
+        return to_host(_theta_batch(
+            array_namespace(per_d), tau_d, y_d, y2_d, per_d,
+            n_bins=n_bins, n_covers=n_covers, sigma2=sigma2, batch=batch,
+        ))
     if backend != "numpy":
         raise ValueError(f"unknown backend {backend!r}")
     theta = _theta_batch(
-        np, tau, y, y * y, periods_host,
+        array_namespace(periods_host), tau, y, y * y, periods_host,
         n_bins=n_bins, n_covers=n_covers, sigma2=sigma2, batch=batch,
     )
     return np.asarray(theta, dtype=np.float64)
@@ -282,7 +309,8 @@ class PDMMethod(PeriodogramMethod):
     settings_cls: ClassVar[type] = PDMSettings
     cpu_backend: ClassVar[str] = "numpy"
     gpu_backend: ClassVar[str | None] = "cupy"
-    all_backends: ClassVar[tuple[str, ...]] = ("numpy", "cupy")
+    portable_gpu_backend: ClassVar[str | None] = "torch"
+    all_backends: ClassVar[tuple[str, ...]] = ("numpy", "cupy", "torch")
 
     def default_grid(self, lc: LightCurve, settings: PDMSettings) -> GridSpec:  # type: ignore[override]
         finite = lc.finite()
@@ -316,14 +344,17 @@ class PDMMethod(PeriodogramMethod):
         if finite.baseline <= 0.0:
             raise InsufficientDataError("PDM: no usable time baseline")
         periods = grid.period
+        if backend == "torch" or backend.startswith("torch:"):
+            backend = f"torch:{resolve_torch_device(backend, settings.device)}"
         theta = pdm_theta(
             finite.time,
             finite.value,
             periods,
             n_bins=settings.n_bins,
             n_covers=settings.n_covers,
-            backend=backend,  # type: ignore[arg-type]
+            backend=backend,
             batch=settings.batch_periods,
+            precision=settings.precision,
         )
         return Periodogram.from_spectrum(
             method="PDM",

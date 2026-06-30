@@ -8,16 +8,18 @@ All notable changes to cuPeriod are documented here. The format is based on
 
 ### Added
 
-- **Multi-vendor GPU support via PyTorch and the Python array API.** GLS and BLS gain a
-  portable `torch` backend that runs on AMD (ROCm), Intel (XPU), and Apple (MPS) GPUs as
-  well as a real CPU path — so the accelerated code is no longer NVIDIA-only, and works
-  even with no GPU at all. Select it with `backend="torch"` (or `"torch:cpu"`,
-  `"torch:cuda"`, `"torch:mps"`, `"torch:xpu"`); `backend="auto"` now reaches a torch GPU
-  on non-NVIDIA machines after the cufinufft/cupy fast paths.
+- **Multi-vendor GPU support via PyTorch and the Python array API.** All seven
+  period-search methods (GLS, BLS, PDM, CE, String-Length, MHAOV, TLS) gain a portable
+  `torch` backend that runs on AMD (ROCm), Intel (XPU), and Apple (MPS) GPUs as well as a
+  real CPU path — so the accelerated code is no longer NVIDIA-only, and works even with no
+  GPU at all. Select it with `backend="torch"` (or `"torch:cpu"`, `"torch:cuda"`,
+  `"torch:mps"`, `"torch:xpu"`); `backend="auto"` now reaches a torch GPU on non-NVIDIA
+  machines after the cufinufft/cupy fast paths.
   - GLS adds a NUFFT-free direct trig-sum path (the portable formulation; cufinufft
     remains the NVIDIA fast path).
-  - BLS runs its vectorized box search through the array-API namespace (the cupy
-    `RawKernel` remains the NVIDIA fast path).
+  - BLS, PDM, CE, String-Length, MHAOV, and TLS run their vectorized kernels through the
+    array-API namespace; the cupy `RawKernel`s (BLS/PDM/CE/TLS), numba (BLS), and finufft
+    (GLS) remain the fast paths where present.
   - New `device` and `precision` settings: `precision="auto"` is float64 everywhere it is
     supported and float32 only where the device forces it (Apple MPS cannot do float64);
     an explicit `precision="float64"` on MPS raises rather than silently downgrading.
