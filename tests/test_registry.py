@@ -12,6 +12,27 @@ def test_lookup_is_case_insensitive() -> None:
     assert get_method("gls") is get_method("GLS")
 
 
+def test_lookup_ignores_separators() -> None:
+    # The documented "String-Length" spelling (and underscores) must resolve.
+    sl = get_method("STRINGLENGTH")
+    assert get_method("String-Length") is sl
+    assert get_method("StringLength") is sl
+    assert get_method("string_length") is sl
+
+
+def test_multiresult_getitem_normalizes() -> None:
+    import numpy as np
+
+    import cuperiod as cup
+
+    rng = np.random.default_rng(0)
+    t = np.sort(rng.uniform(0, 80, 300))
+    y = 12 + 0.3 * np.sin(2 * np.pi * t / 2.0) + 0.02 * rng.standard_normal(300)
+    res = cup.periodogram((t, y, np.full(300, 0.02)), ["GLS", "String-Length"])
+    assert res["String-Length"].method == "STRINGLENGTH"
+    assert res["stringlength"] is res["String-Length"]
+
+
 def test_unknown_method_raises() -> None:
     with pytest.raises(UnknownMethodError):
         get_method("not-a-method")

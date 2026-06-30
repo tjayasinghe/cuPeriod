@@ -32,8 +32,9 @@ First public release.
 - `cuperiod` command-line interface: `run`, `batch`, `methods`, `gpu-info`, `grid-info`.
 - Per-method settings models with `CUPERIOD_<METHOD>_<FIELD>` environment overrides, and
   GPU worker auto-sizing.
-- Full Sphinx documentation (hosted on Read the Docs) and a reproducible validation +
-  benchmark suite under `benchmarks/`.
+- Full Sphinx documentation (hosted on Read the Docs), a worked-example Jupyter notebook
+  (`examples/cuperiod_tour.ipynb`), and a reproducible validation + benchmark suite under
+  `benchmarks/`.
 
 ### Robustness
 
@@ -50,6 +51,8 @@ First public release.
 - The batch process pool uses the `spawn` start method on every platform, so a CPU/GPU
   pool no longer deadlocks on Linux (the default `fork` copies parent native thread pools
   / CUDA contexts into the workers).
+- Method-name lookup ignores case and non-alphanumeric separators, so `"String-Length"`,
+  `"StringLength"` and `"STRINGLENGTH"` all resolve (as documented).
 
 ### Validated
 
