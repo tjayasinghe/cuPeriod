@@ -68,6 +68,25 @@ def test_bonus_torch_recovers_period(method: str) -> None:
 
 
 @requires_torch
+def test_string_length_torch_matches_numpy_with_tied_phases() -> None:
+    # Regression: equal folded phases must sort *stably* and identically on numpy and
+    # torch. An unstable sort (raw numpy quicksort) breaks ties differently from the
+    # array-API stable sort the torch path uses — and quicksort's tie order is
+    # platform-dependent, so this passed locally but failed in CI. Force heavy ties
+    # (times on a period/8 lattice fold to only 8 distinct phases) to pin it everywhere.
+    from cuperiod.methods.string_length import string_length
+
+    rng = np.random.default_rng(0)
+    period = 2.0
+    t = 2458000.0 + (rng.integers(0, 400, 400) * (period / 8)).astype(float)
+    y = rng.normal(0.0, 1.0, t.size)
+    periods = np.linspace(1.5, 3.0, 200)
+    ref = string_length(t, y, periods, backend="numpy")
+    tor = string_length(t, y, periods, backend="torch:cpu")
+    assert float(np.max(np.abs(ref - tor))) < 1e-9
+
+
+@requires_torch
 def test_mhaov_multiband_torch_honours_precision() -> None:
     # Regression: the multiband wrapper must forward ``precision`` to the torch compute.
     # It previously dropped it (defaulting to auto→float64), so an explicit float32 was

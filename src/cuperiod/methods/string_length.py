@@ -51,6 +51,12 @@ def _length_batch(
     Array-API generic (numpy/cupy/torch). Uses only fancy indexing and slicing for the
     per-row sort/gather and the consecutive differences, avoiding ``take_along_axis`` /
     ``diff`` (not in every namespace); float dtype follows ``periods``.
+
+    The phase sort must be **stable** so equal phases keep a backend-independent
+    order: the string length depends on neighbour pairing, and an unstable sort breaks
+    ties differently across numpy/torch (even across platforms), drifting the result.
+    All backends therefore run through the array-API namespace, whose ``argsort``
+    defaults to ``stable=True`` — never raw ``numpy``/``cupy`` (quicksort, unstable).
     """
     idtype = xp.int64
     n_periods = int(periods.shape[0])
@@ -114,8 +120,9 @@ def string_length(
         ensure_cuda_dll_path()
         import cupy as cp
 
+        per_cp = cp.asarray(periods_host)
         length = _length_batch(
-            cp, cp.asarray(tau), cp.asarray(m_scaled), cp.asarray(periods_host),
+            array_namespace(per_cp), cp.asarray(tau), cp.asarray(m_scaled), per_cp,
             batch=batch,
         )
         return np.asarray(cp.asnumpy(length), dtype=np.float64)
@@ -134,7 +141,10 @@ def string_length(
     if backend != "numpy":
         raise ValueError(f"unknown backend {backend!r}")
     return np.asarray(
-        _length_batch(np, tau, m_scaled, periods_host, batch=batch), dtype=np.float64
+        _length_batch(
+            array_namespace(periods_host), tau, m_scaled, periods_host, batch=batch
+        ),
+        dtype=np.float64,
     )
 
 
