@@ -14,8 +14,14 @@ import os
 import pathlib
 import sys
 from types import ModuleType
+from typing import Any
+
+from cuperiod.core.errors import BackendUnavailableError
 
 _CUDA_DLL_READY = False
+
+#: The default per-block dynamic shared-memory cap (bytes); larger needs an opt-in.
+_DEFAULT_SHARED_MEM = 48 * 1024
 
 
 def ensure_cuda_dll_path() -> None:
@@ -85,6 +91,50 @@ def available_backends() -> set[str]:
     return out
 
 
+def ensure_shared_memory(
+    kernel: Any, dynamic_bytes: int, *, method: str, hint: str
+) -> None:
+    """Permit a cupy ``RawKernel`` to use ``dynamic_bytes`` of dynamic shared memory.
+
+    The per-block default cap is 48 KB; a larger request needs an explicit opt-in and is
+    still bounded by the device's ``MaxSharedMemoryPerBlockOptin``. When the request
+    exceeds what the device can provide, raise a clear :class:`BackendUnavailableError`
+    (pointing at the setting to reduce) instead of letting the kernel launch fail with a
+    raw ``CUDADriverError``.
+
+    Parameters
+    ----------
+    kernel : cupy.RawKernel
+        The kernel about to be launched.
+    dynamic_bytes : int
+        The ``shared_mem=`` size the launch will request.
+    method : str
+        Method name, for the error message.
+    hint : str
+        The setting(s) the user should reduce, for the error message.
+    """
+    import cupy
+
+    optin = int(
+        cupy.cuda.Device().attributes.get(
+            "MaxSharedMemoryPerBlockOptin", _DEFAULT_SHARED_MEM
+        )
+    )
+    try:
+        static = int(kernel.attributes.get("shared_size_bytes", 0))
+    except Exception:
+        static = 0
+    needed = int(dynamic_bytes) + static
+    if needed > optin:
+        raise BackendUnavailableError(
+            f"{method}: needs ~{needed // 1024} KB of GPU shared memory per block but "
+            f"the device allows at most {optin // 1024} KB; reduce {hint}, or use "
+            "backend='cpu'."
+        )
+    if int(dynamic_bytes) > _DEFAULT_SHARED_MEM:
+        kernel.max_dynamic_shared_size_bytes = int(dynamic_bytes)
+
+
 def array_module(a: object) -> ModuleType:
     """Return cupy for a device array, else numpy (for device-agnostic assembly)."""
     try:
@@ -103,5 +153,6 @@ __all__ = [
     "available_backends",
     "cuda_available",
     "ensure_cuda_dll_path",
+    "ensure_shared_memory",
     "has_module",
 ]

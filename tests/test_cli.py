@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -46,6 +47,22 @@ def test_run_writes_outputs(tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert out_json.exists()
     assert out_npz.exists()
+
+
+def test_run_out_is_valid_json(tmp_path: Path) -> None:
+    # Regression (M1): --out must be standard JSON, never bare NaN/Infinity tokens.
+    csv = _write_csv(tmp_path / "star.csv")
+    out_json = tmp_path / "out.json"
+    runner.invoke(app, ["run", str(csv), "-m", "GLS", "--out", str(out_json)])
+    text = out_json.read_text(encoding="utf-8")
+    assert "Infinity" not in text and "NaN" not in text
+    json.loads(text)  # must parse as standard JSON
+
+
+def test_run_bad_domain_is_usage_error(tmp_path: Path) -> None:
+    csv = _write_csv(tmp_path / "star.csv")
+    result = runner.invoke(app, ["run", str(csv), "-m", "GLS", "--domain", "lux"])
+    assert result.exit_code == 2  # typer BadParameter (usage), not a ValueError crash
 
 
 def test_batch_command(tmp_path: Path) -> None:

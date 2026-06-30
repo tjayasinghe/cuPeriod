@@ -559,7 +559,14 @@ def _bls_search_cuda(
         out["power"][...] = -np.inf
         return out
 
-    _cuda_kernel(block)(
+    from cuperiod.core.backend import ensure_shared_memory
+
+    smem = 2 * width * 8
+    kernel = _cuda_kernel(block)
+    ensure_shared_memory(
+        kernel, smem, method="BLS", hint="the period range (max_period_days)"
+    )
+    kernel(
         (n_periods,),
         (block,),
         (
@@ -587,7 +594,7 @@ def _bls_search_cuda(
             out["transit_time"],
             out["log_likelihood"],
         ),
-        shared_mem=2 * width * 8,
+        shared_mem=smem,
     )
     return out
 

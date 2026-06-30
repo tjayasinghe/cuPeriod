@@ -15,6 +15,7 @@ chunk and is resumable: a re-run skips chunks whose part already exists.
 
 from __future__ import annotations
 
+import json
 import warnings
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -165,6 +166,29 @@ def _part_path(sink_dir: Path, idx: int) -> Path:
     return sink_dir / f"part-{idx:05d}.parquet"
 
 
+def _dir_manifest_guard(sink_dir: Path, chunk_size: int, resume: bool) -> None:
+    """Pin a directory sink's chunk_size so a resume cannot realign part indices.
+
+    Part files are named purely by chunk index, so resuming with a different chunk_size
+    would silently drop or duplicate light curves. Refuse the mismatch and record the
+    size for the next run.
+    """
+    manifest = sink_dir / "_manifest.json"
+    if resume and manifest.exists():
+        try:
+            prev = int(json.loads(manifest.read_text(encoding="utf-8"))["chunk_size"])
+        except Exception:  # noqa: BLE001 - a corrupt manifest must not abort the run
+            prev = chunk_size
+        if prev != chunk_size:
+            raise ValueError(
+                f"directory sink {sink_dir} was written with chunk_size={prev}; "
+                f"resuming requires the same chunk_size (got {chunk_size}). Use the "
+                "same chunk_size, a fresh directory, or resume=False."
+            )
+    sink_dir.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(json.dumps({"chunk_size": chunk_size}), encoding="utf-8")
+
+
 def batch_periodograms(
     inputs: Any,
     method: str | Sequence[str] = "GLS",
@@ -232,6 +256,8 @@ def batch_periodograms(
 
     method_names = (method,) if isinstance(method, str) else tuple(method)
     methods = tuple(get_method(m).name for m in method_names)
+    if not methods:
+        raise ValueError("no methods specified")
     settings_map = {name: _settings_for(name, settings) for name in methods}
     cfg = _ChunkConfig(
         methods=methods,
@@ -243,11 +269,19 @@ def batch_periodograms(
         store_raw=store_raw,
     )
 
+    sink_kind, sink_dir, sink_file = _classify_sink(sink)
+    if store_raw and sink_kind == "file" and sink_file.suffix.lower() == ".csv":
+        raise ValueError(
+            "store_raw=True produces array-valued spectrum columns that a CSV sink "
+            "cannot hold; use a .parquet sink or a directory sink."
+        )
+
     items = resolve_inputs(
         inputs, columns=columns, domain=domain, band_column=band_column
     )
     chunks = _chunked(items, max(1, chunk_size))
-    sink_kind, sink_dir, sink_file = _classify_sink(sink)
+    if sink_kind == "dir":
+        _dir_manifest_guard(sink_dir, max(1, chunk_size), resume)
 
     pending = _pending_chunks(chunks, sink_kind, sink_dir, resume)
     n_skipped = len(items) - sum(len(chunks[i]) for i in pending)
@@ -322,8 +356,14 @@ def _classify_sink(sink: str | Path | None) -> tuple[str, Path, Path]:
     if sink is None:
         return "memory", Path(), Path()
     path = Path(sink)
-    if path.suffix.lower() in {".parquet", ".pq", ".csv"}:
+    suffix = path.suffix.lower()
+    if suffix in {".parquet", ".pq", ".csv"}:
         return "file", path.parent, path
+    if suffix and not path.is_dir():
+        raise ValueError(
+            f"unsupported sink {str(sink)!r}: a file sink must end in .parquet or "
+            ".csv; pass a directory (no extension) for a resumable multi-part sink."
+        )
     return "dir", path, path
 
 
@@ -376,8 +416,12 @@ def _run_pool(
 def _finalize_file(rows: list[dict[str, Any]], path: Path, resume: bool) -> None:
     if resume and path.exists():
         existing = _read_existing_rows(path)
-        seen = {r.get("key") for r in existing}
-        merged = existing + [r for r in rows if r.get("key") not in seen]
+        # Dedup on (key, method): a later run adding a different method to the same file
+        # must not be discarded as an already-seen key.
+        seen = {(r.get("key"), r.get("method")) for r in existing}
+        merged = existing + [
+            r for r in rows if (r.get("key"), r.get("method")) not in seen
+        ]
         write_rows(merged, path)
     else:
         write_rows(rows, path)

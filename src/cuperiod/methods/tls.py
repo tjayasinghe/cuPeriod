@@ -71,13 +71,18 @@ def limb_darkened_template(n: int, u1: float, u2: float) -> FloatArray:
 
 
 def _duration_bins(settings: TLSSettings) -> list[int]:
-    """Transit widths in phase bins (deduped, ascending)."""
+    """Transit widths in phase bins (deduped, ascending), clamped to ``[1, n_bins-1]``.
+
+    Clamping (rather than filtering) guarantees at least one valid width even when the
+    duration fractions are too small or too large for ``n_phase_bins`` — otherwise the
+    search would silently return an all-zero spectrum.
+    """
     n_bins = settings.n_phase_bins
     fracs = np.geomspace(
         settings.duration_min_frac, settings.duration_max_frac, settings.n_durations
     )
-    widths = sorted({int(round(f * n_bins)) for f in fracs})
-    return [w for w in widths if 1 <= w < n_bins]
+    widths = {min(max(int(round(f * n_bins)), 1), n_bins - 1) for f in fracs}
+    return sorted(widths)
 
 
 def _period_grid(baseline: float, settings: TLSSettings) -> FloatArray:
@@ -306,7 +311,12 @@ def _tls_cuda(
     out = {name: cp.empty(n_periods, dtype=cp.float64) for name in names}
     if n_periods == 0:
         return {name: np.zeros(0, dtype=np.float64) for name in names}
-    _tls_kernel(block)(
+    from cuperiod.core.backend import ensure_shared_memory
+
+    smem = 2 * n_bins * 8
+    kernel = _tls_kernel(block)
+    ensure_shared_memory(kernel, smem, method="TLS", hint="n_phase_bins")
+    kernel(
         (n_periods,),
         (block,),
         (
@@ -315,7 +325,7 @@ def _tls_cuda(
             np.int32(n_bins), np.float64(_W_EPS),
             out["sr"], out["depth"], out["duration"], out["t0"],
         ),
-        shared_mem=2 * n_bins * 8,
+        shared_mem=smem,
     )
     return {name: np.asarray(cp.asnumpy(out[name]), dtype=np.float64) for name in names}
 

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 import pyarrow.parquet as pq
+import pytest
 
 import cuperiod as cup
 from synth import synthetic_sine
@@ -78,3 +79,36 @@ def test_batch_store_raw(tmp_path: Path) -> None:
     assert "pgram_power" in table.column_names
     first = table.column("pgram_power")[0].as_py()
     assert isinstance(first, list) and len(first) > 0
+
+
+def test_batch_file_sink_keeps_second_method(tmp_path: Path) -> None:
+    # Regression (M3): adding a second method to an existing file sink must not drop it.
+    lcs = _light_curves(2)
+    out = tmp_path / "r.parquet"
+    cup.batch_periodograms(lcs, "GLS", workers=1, sink=out)
+    cup.batch_periodograms(lcs, "BLS", workers=1, sink=out)
+    table = pq.read_table(out)
+    assert set(table.column("method").to_pylist()) == {"GLS", "BLS"}
+    assert table.num_rows == 4
+
+
+def test_batch_dir_resume_chunksize_mismatch_raises(tmp_path: Path) -> None:
+    # Regression (M4): a resumed dir sink with a different chunk_size would realign part
+    # indices and silently drop/duplicate rows; refuse it.
+    lcs = _light_curves(4)
+    cup.batch_periodograms(lcs, "GLS", workers=1, sink=tmp_path, chunk_size=2)
+    with pytest.raises(ValueError, match="chunk_size"):
+        cup.batch_periodograms(lcs, "GLS", workers=1, sink=tmp_path, chunk_size=3)
+
+
+def test_batch_csv_store_raw_rejected(tmp_path: Path) -> None:
+    # Regression (M5): CSV can't hold raw spectrum arrays; must fail loudly.
+    with pytest.raises(ValueError, match="CSV"):
+        cup.batch_periodograms(
+            _light_curves(1), "GLS", workers=1, sink=tmp_path / "r.csv", store_raw=True
+        )
+
+
+def test_batch_empty_methods_raises() -> None:
+    with pytest.raises(ValueError, match="no methods"):
+        cup.batch_periodograms(_light_curves(1), [], workers=1)

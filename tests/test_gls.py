@@ -12,6 +12,21 @@ from cuperiod.methods.gls import GLSMethod, lombscargle_power
 from synth import synthetic_sine
 
 
+def test_gls_empty_grid_raises() -> None:
+    # Regression: an empty trial grid must raise InsufficientDataError, not IndexError.
+    from cuperiod.core.errors import InsufficientDataError
+    from cuperiod.core.grid import GridSpec
+
+    t, mag, err = synthetic_sine(n=200)
+    lc = cup.LightCurve.from_arrays(t, mag, err)
+    method = GLSMethod()
+    with pytest.raises(InsufficientDataError):
+        method.power(
+            GridSpec(kind="frequency", values=np.zeros(0), uniform=True),
+            lc, cup.GLSSettings(), method.resolve_backend("cpu"),
+        )
+
+
 def test_gls_matches_astropy_cython() -> None:
     t, mag, err = synthetic_sine()
     pg = cup.periodogram((t, mag, err), "GLS", backend="finufft")

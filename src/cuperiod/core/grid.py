@@ -118,6 +118,11 @@ def uniform_frequency_grid(
         raise ValueError("baseline must be positive")
     df = 1.0 / (samples_per_peak * baseline)
     f0 = df if minimum_frequency is None else float(minimum_frequency)
+    if f0 >= maximum_frequency:
+        raise ValueError(
+            f"minimum frequency ({f0}) must be < "
+            f"maximum_frequency ({maximum_frequency})"
+        )
     nf = int(np.ceil((maximum_frequency - f0) / df)) + 1
     nf = max(nf, 1)
     freq = f0 + df * np.arange(nf, dtype=np.float64)

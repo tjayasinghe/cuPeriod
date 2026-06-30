@@ -10,6 +10,21 @@ from cuperiod.core.columns import ColumnMap, Domain
 from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
 
 
+def test_as_magnitude_handles_nonpositive_flux() -> None:
+    # Negative/zero flux has no magnitude: it must become non-finite *without* a bare
+    # NumPy RuntimeWarning (which crashes under -W error) and then be dropped by finite.
+    import warnings
+
+    flux = np.array([1.0, 2.0, -0.5, 0.0, 3.0])
+    lc = LightCurve.from_arrays(
+        np.arange(5.0), flux, np.full(5, 0.1), domain=Domain.FLUX
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        mlc = lc.as_magnitude()  # must not raise
+    assert mlc.finite().n == 3  # the two non-positive-flux points are removed
+
+
 def test_from_arrays_and_properties() -> None:
     lc = LightCurve.from_arrays([1.0, 2.0, 4.0], [10.0, 11.0, 12.0], [0.1, 0.1, 0.1])
     assert lc.n == 3

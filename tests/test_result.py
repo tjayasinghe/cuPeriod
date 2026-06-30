@@ -67,3 +67,54 @@ def test_sorted_ascending_frequency() -> None:
     assert np.all(np.diff(pg.frequency) > 0)
     # power must travel with its frequency
     assert pg.power[np.argmin(pg.frequency)] == 2.0
+
+
+def test_best_period_at_low_frequency_edge() -> None:
+    # Regression: the global maximum sitting on the first grid sample (a signal whose
+    # period ~ the baseline) must not be discarded in favor of a smaller interior bump.
+    power = np.zeros(200)
+    power[0] = 10.0   # true peak at the low-frequency / long-period edge
+    power[80] = 4.0   # a smaller interior local maximum
+    pg = _make(power, "max")
+    assert pg.best_period() == pg.period[0]
+    assert pg.best_periods(2)[0].power == 10.0
+
+
+def test_best_period_at_high_frequency_edge() -> None:
+    power = np.zeros(200)
+    power[-1] = 10.0  # true peak at the high-frequency / short-period edge
+    power[80] = 4.0
+    pg = _make(power, "max")
+    assert pg.best_period() == pg.period[-1]
+
+
+def test_min_objective_edge_peak() -> None:
+    stat = np.ones(200)
+    stat[0] = 0.0     # deepest (most significant) minimum at the edge
+    stat[120] = 0.5
+    pg = _make(stat, "min")
+    assert pg.best_period() == pg.period[0]
+
+
+def test_non_finite_samples_never_selected() -> None:
+    # A frequency==0 sample (period inf) and a NaN-power sample must never be reported.
+    freq = np.array([0.0, 0.1, 0.2, 0.3])
+    power = np.array([np.nan, 1.0, 5.0, 2.0])
+    pg = Periodogram.from_spectrum(
+        method="X", backend="b", frequency=freq, power=power,
+        objective_sense="max", n_samples=10, baseline=10.0,
+    )
+    peaks = pg.best_periods(4)
+    assert all(np.isfinite(p.period) and np.isfinite(p.power) for p in peaks)
+    assert peaks[0].power == 5.0
+
+
+def test_all_non_finite_spectrum_is_safe() -> None:
+    freq = np.array([0.1, 0.2, 0.3])
+    power = np.array([np.nan, np.nan, np.nan])
+    pg = Periodogram.from_spectrum(
+        method="X", backend="b", frequency=freq, power=power,
+        objective_sense="max", n_samples=10, baseline=10.0,
+    )
+    assert pg.best_periods(3) == []
+    assert np.isnan(pg.best_period())

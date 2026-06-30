@@ -358,14 +358,20 @@ class GLSMethod(PeriodogramMethod):
             )
         if finite.baseline <= 0.0:
             raise InsufficientDataError("GLS: no usable time baseline")
+        if grid.size == 0:
+            raise InsufficientDataError("GLS: empty trial grid")
 
         ls = _astropy_lombscargle(finite, settings)
         if backend == "astropy" or not grid.uniform:
+            # A non-uniform grid is evaluated by astropy regardless of the requested
+            # NUFFT backend, so report astropy as the backend that actually ran.
+            actual_backend = "astropy"
             frequency = grid.frequency
             power = np.asarray(
                 ls.power(frequency, normalization="standard"), dtype=np.float64
             )
         else:
+            actual_backend = backend
             f0, df, nf = grid.uniform_frequency_params()
             frequency = f0 + df * np.arange(nf, dtype=np.float64)
             if backend == "cufinufft" and engine is not None:
@@ -388,7 +394,7 @@ class GLSMethod(PeriodogramMethod):
         )
         return Periodogram.from_spectrum(
             method="GLS",
-            backend=backend,
+            backend=actual_backend,
             frequency=frequency,
             power=power,
             objective_sense="max",

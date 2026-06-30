@@ -161,7 +161,12 @@ def _ce_cuda(
     if n_periods == 0:
         return np.zeros(0, dtype=np.float64)
     out = cp.empty(n_periods, dtype=cp.float64)
-    _ce_kernel(block)(
+    from cuperiod.core.backend import ensure_shared_memory
+
+    smem = n_phase * n_mag * 8
+    kernel = _ce_kernel(block)
+    ensure_shared_memory(kernel, smem, method="CE", hint="n_phase_bins / n_mag_bins")
+    kernel(
         (n_periods,),
         (block,),
         (
@@ -169,7 +174,7 @@ def _ce_cuda(
             np.int32(tau_d.size), np.int32(n_periods),
             np.int32(n_phase), np.int32(n_mag), out,
         ),
-        shared_mem=n_phase * n_mag * 8,
+        shared_mem=smem,
     )
     return np.asarray(cp.asnumpy(out), dtype=np.float64)
 

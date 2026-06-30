@@ -13,7 +13,9 @@ code path. Commands:
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import typer
@@ -47,7 +49,28 @@ def _parse_methods(method: str) -> list[str]:
 
 
 def _domain(value: str | None) -> Domain | None:
-    return None if value is None else Domain(value.lower())
+    if value is None:
+        return None
+    try:
+        return Domain(value.lower())
+    except ValueError as exc:
+        raise typer.BadParameter("domain must be 'magnitude' or 'flux'") from exc
+
+
+def _json_safe(obj: Any) -> Any:
+    """Recursively replace non-finite floats with ``None`` for standard JSON output.
+
+    ``json.dumps`` defaults to emitting bare ``Infinity``/``NaN`` tokens that most
+    non-Python JSON parsers reject. Peaks are finite by construction, but this sanitizes
+    the serialization boundary so a written ``--out`` file is always valid JSON.
+    """
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
 
 
 @app.command()
@@ -81,7 +104,10 @@ def run(
             if isinstance(result, (MultiResult, Periodogram))
             else {}
         )
-        out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        out.write_text(
+            json.dumps(_json_safe(payload), indent=2, allow_nan=False),
+            encoding="utf-8",
+        )
         typer.echo(f"\nWrote {out}")
     if save_periodogram is not None:
         arrays: dict[str, np.ndarray] = {}
