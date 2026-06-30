@@ -41,7 +41,7 @@ All notable changes to cuPeriod are documented here. The format is based on
   exact tie (e.g. BLS `transit_time`, TLS `t0`/`duration` at non-transit periods), the
   chosen index is device-dependent; the periodogram power and best period are unaffected.
 
-## [1.0.0] — 2026-06-29
+## [1.0.0] — 2026-06-30
 
 First public release.
 
