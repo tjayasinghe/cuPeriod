@@ -58,9 +58,10 @@ The originating path is recorded in `lc.meta["source"]`.
 
 ## Column auto-detection with `ColumnMap`
 
-Astronomers' tables carry the same three quantities under wildly different names. cuPeriod
-detects the common spellings case-insensitively, most-specific first, so a table with both
-`BJD_TDB` and `JD` picks the corrected time. The detection lists are:
+Light curves will always carry temporal and magnitude/flux measurements, with optional
+magnitude/flux errors. cuPeriod detects the common spellings case-insensitively,
+most-specific first, so a table with both `BJD_TDB` and `JD` picks the corrected time.
+The detection lists are:
 
 - **Time** — `bjd_tdb`, `bjd`, `hjd`, `btjd`, `bkjd`, `mjd`, `hmjd`, `midpointMjdTai`,
   `obsTime`, `jd`, `time`, `date`, `t`
