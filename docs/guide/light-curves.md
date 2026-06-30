@@ -58,15 +58,25 @@ The originating path is recorded in `lc.meta["source"]`.
 
 ## Column auto-detection with `ColumnMap`
 
-Astronomers' tables carry the same three quantities under wildly different names. cuPeriod
-detects the common spellings case-insensitively, most-specific first, so a table with both
-`BJD_TDB` and `JD` picks the corrected time. The detection lists are:
+Light curves will always carry temporal and magnitude/flux measurements, with optional
+magnitude/flux errors. cuPeriod detects the common spellings case-insensitively,
+most-specific first, so a table with both `BJD_TDB` and `JD` picks the corrected time.
+The detection lists are:
 
-- **Time** — `bjd_tdb`, `bjd`, `hjd`, `btjd`, `mjd`, `jd`, `time`, `date`, `t`
-- **Magnitude** — `mag`, `magnitude`, `vmag`, `gmag`, `rmag`, `phot_mag`, `m`
-- **Flux** — `pdcsap_flux`, `sap_flux`, `norm_flux`, `rel_flux`, `flux`, `fnu`, `f`
-- **Error** — `mag_err`, `e_mag`, `dmag`, `flux_err`, `err`, `sigma`, … (mag & flux spellings)
-- **Band** — `band`, `filter`, `phot_filter`, `passband`, `fid`
+- **Time** — `bjd_tdb`, `bjd`, `hjd`, `btjd`, `bkjd`, `mjd`, `hmjd`, `midpointMjdTai`,
+  `obsTime`, `jd`, `time`, `date`, `t`
+- **Magnitude** — `mag`, `magnitude`, `vmag`/`gmag`/`rmag`/`bmag`/`imag`, `psfMag`,
+  `MAG_0`, `m`
+- **Flux** — `PDCSAP_FLUX`, `KSPSAP_FLUX`, `SAP_FLUX`, `psfFlux`, `flux`, `uJy`, `mJy`, …
+  (corrected/detrended fluxes are preferred over raw)
+- **Error** — resolved to match the value's measurement and domain: a flux value pairs
+  with `flux_err`/`flux_error`/`psfFluxErr`/`duJy`, a magnitude value with
+  `mag_err`/`magerr`/`dm`/`MER_0`, then the neutral `err`/`error`/`sigma`
+- **Band** — `band`, `filter`, `filtercode`, `filterID`, `phot_filter`, `passband`, `fid`
+
+The error is matched to the **same measurement** as the value, so a table that carries
+both (e.g. ATLAS's `m`/`dm` and `uJy`/`duJy`) pairs `uJy` with `duJy`, never with the
+magnitude error.
 
 When detection isn't enough — ambiguous names, or a column you want to force — pin it with
 {class}`~cuperiod.ColumnMap`:
@@ -81,6 +91,104 @@ pg = cup.periodogram(df, "GLS", columns=cmap)
 Any field left `None` is auto-detected; a non-`None` field is honored verbatim (and
 raises {exc}`~cuperiod.ColumnResolutionError` if that column is absent). Only `time` and
 `value` are required; `error` and `band` are optional.
+
+## Supported surveys
+
+The detection lists cover the standard light-curve products of the major time-domain
+surveys, so a downloaded table usually needs **no column hints** — `cup.periodogram(df,
+"GLS")` just works:
+
+```{list-table}
+:header-rows: 1
+:widths: 18 16 22 22 16
+
+* - Survey
+  - Time
+  - Value
+  - Error
+  - Band
+* - ASAS-SN (Sky Patrol)
+  - `jd` / `hjd`
+  - `mag` / `flux`
+  - `mag_err` / `flux_err`
+  - `phot_filter`
+* - ASAS-3
+  - `HJD`
+  - `MAG_0`..`MAG_4`
+  - `MER_0`..`MER_4`
+  - —
+* - ATLAS
+  - `MJD`
+  - `uJy` (or `m`)
+  - `duJy` (or `dm`)
+  - `F` ¹
+* - CRTS / CSS
+  - `MJD`
+  - `Mag`
+  - `Magerr`
+  - —
+* - ZTF
+  - `mjd` / `HMJD`
+  - `mag`
+  - `magerr`
+  - `filtercode` / `filterID`
+* - Pan-STARRS (PS1)
+  - `obsTime`
+  - `psfFlux`
+  - `psfFluxErr`
+  - `filterID`
+* - LSST / Rubin
+  - `midpointMjdTai` ²
+  - `psfFlux` ²
+  - `psfFluxErr` ²
+  - `band`
+* - TESS (SPOC / QLP)
+  - `TIME`
+  - `PDCSAP_FLUX` / `KSPSAP_FLUX`
+  - `*_FLUX_ERR`
+  - —
+* - Kepler (SPOC)
+  - `TIME`
+  - `PDCSAP_FLUX`
+  - `PDCSAP_FLUX_ERR`
+  - —
+* - Gaia (DR3 epoch)
+  - `time`
+  - `flux` (or `mag`)
+  - `flux_error`
+  - `band`
+* - MACHO
+  - `time` / `mjd`
+  - `mag` (red/blue)
+  - `error`
+  - red / blue ³
+* - OGLE
+  - `HJD`
+  - magnitude
+  - error
+  - — (per file)
+```
+
+¹ ATLAS's single-character `F` filter isn't auto-detected (to avoid clashing with a flux
+`f`); pass `ColumnMap(band="F")` if you need it for multi-band. The value defaults to the
+flux (`uJy`); pin `ColumnMap(value="m")` for magnitudes. ² LSST DP0.2 uses the older
+`midPointTai` / `psFlux` / `psFluxErr` / `filterName`, which are also detected. ³ MACHO's
+raw per-column header spellings are not consistently documented; if a file uses
+non-standard names, pass an explicit {class}`~cuperiod.ColumnMap`.
+
+:::{note}
+**Headerless files** — OGLE `.dat` photometry (and some raw ASAS-3 dumps) have no column
+names to detect. Read them positionally instead, e.g. with
+[`numpy.loadtxt`](https://numpy.org/doc/stable/reference/generated/numpy.loadtxt.html):
+
+```python
+import numpy as np
+from cuperiod import LightCurve
+
+hjd, mag, err = np.loadtxt("OGLE-LMC-CEP-0001.dat", usecols=(0, 1, 2), unpack=True)
+pg = cup.periodogram(LightCurve.from_arrays(hjd, mag, err), "GLS")
+```
+:::
 
 ## Magnitude vs flux: the `Domain`
 

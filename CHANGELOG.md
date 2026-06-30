@@ -24,8 +24,10 @@ First public release.
   `cuperiod.batch_periodograms` (CPU process pool or GPU, resumable Parquet/CSV output).
 - Multi-band joint modelling for GLS, BLS, and MHAOV.
 - Frictionless inputs: arrays, dicts, pandas/astropy/pyarrow tables, and
-  CSV/ECSV/FITS/Parquet files, with case-insensitive column auto-detection (`ColumnMap`)
-  and automatic magnitude/flux handling.
+  CSV/ECSV/FITS/Parquet files, with case-insensitive, **survey-aware** column
+  auto-detection (`ColumnMap` — ASAS-SN, ASAS-3, ATLAS, CRTS/CSS, ZTF, Pan-STARRS, LSST,
+  TESS, Kepler, Gaia, MACHO) and domain-aware error pairing, plus automatic
+  magnitude/flux handling.
 - N-best-period peak finding with alias- and harmonic-aware selection.
 - `cuperiod` command-line interface: `run`, `batch`, `methods`, `gpu-info`, `grid-info`.
 - Per-method settings models with `CUPERIOD_<METHOD>_<FIELD>` environment overrides, and
