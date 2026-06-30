@@ -47,6 +47,9 @@ First public release.
 - Batch sinks are correct across re-runs: a file sink is keyed by `(key, method)`, a
   directory sink refuses a mismatched `chunk_size` on resume, and a CSV sink asked to
   store raw spectra fails loudly rather than dropping the columns.
+- The batch process pool uses the `spawn` start method on every platform, so a CPU/GPU
+  pool no longer deadlocks on Linux (the default `fork` copies parent native thread pools
+  / CUDA contexts into the workers).
 
 ### Validated
 
