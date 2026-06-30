@@ -677,6 +677,12 @@ def bls_power(
     y_host = np.ascontiguousarray(y, dtype=np.float64)
     ivar_host = 1.0 / (np.ascontiguousarray(dy, dtype=np.float64) ** 2)
 
+    # Time origin subtracted before any (possibly float32) device cast; restored
+    # into the absolute ``transit_time`` on the host below. Stays 0.0 for the float64
+    # host paths (numpy/numba/cupy), which build the absolute time directly. See the
+    # torch branch.
+    t_ref = 0.0
+
     if backend == "cupy":
         from cuperiod.core.backend import ensure_cuda_dll_path
 
@@ -701,7 +707,13 @@ def bls_power(
             if resolve_precision(precision, device) == "float32"
             else torch.float64
         )
-        t_d = to_device_array(t_host, device=device, dtype=tdtype)
+        # Subtract the time origin in float64 *before* the device cast. Absolute BJDs
+        # (~2.458e6) lose all sub-0.25-day timing when cast to float32 — the default
+        # precision on Apple MPS — so a raw cast would silently corrupt the phase fold.
+        # The small t-min-relative tau survives float32; ``transit_time`` is shifted
+        # back to absolute on the host (float64) at the return. Mirrors ``gls._prep``.
+        t_ref = float(np.min(t_host))
+        t_d = to_device_array(t_host - t_ref, device=device, dtype=tdtype)
         y_d = to_device_array(y_host, device=device, dtype=tdtype)
         ivar_d = to_device_array(ivar_host, device=device, dtype=tdtype)
         periods_d = to_device_array(periods_host, device=device, dtype=tdtype)
@@ -724,7 +736,7 @@ def bls_power(
         depth_err=to_host(out["depth_err"]),
         depth_snr=to_host(out["depth_snr"]),
         duration=to_host(out["duration"]),
-        transit_time=to_host(out["transit_time"]),
+        transit_time=to_host(out["transit_time"]) + t_ref,
         log_likelihood=to_host(out["log_likelihood"]),
     )
 

@@ -26,6 +26,21 @@ All notable changes to cuPeriod are documented here. The format is based on
 - `array-api-compat` is now a dependency; install the portable accelerator with the
   `[torch]` extra (`pip install 'cuperiod[torch]'`).
 
+### Known limitations
+
+- **Non-NVIDIA GPU numerics are written-to-spec and CPU-validated, not yet hardware-
+  verified.** The torch CUDA/ROCm/MPS/XPU paths share the array-API body that is parity-
+  tested on the CPU torch device; on-device parity self-skips (`requires_torch_gpu`) until
+  such hardware is available.
+- **No fp64 capability probe on Intel XPU.** `precision="auto"` resolves to float64 on an
+  XPU; a device without native float64 will error at compute time rather than falling back
+  to float32. Pass `precision="float32"` explicitly on such a device.
+- **The torch GPU path does not auto-shrink to small VRAM.** A large period×bin grid on a
+  small consumer GPU can raise an out-of-memory error; reduce `batch_periods`.
+- **Tie-broken best-fit *extras* may differ across devices.** Where an `argmax` lands on an
+  exact tie (e.g. BLS `transit_time`, TLS `t0`/`duration` at non-transit periods), the
+  chosen index is device-dependent; the periodogram power and best period are unaffected.
+
 ## [1.0.0] — 2026-06-29
 
 First public release.

@@ -104,3 +104,16 @@ def test_gls_torch_recovers_period() -> None:
     t, mag, err = synthetic_sine(period=0.6234)
     pg = cup.periodogram((t, mag, err), "GLS", backend="torch")
     assert pg.best_period() == pytest.approx(0.6234, rel=1e-3)
+
+
+@requires_torch
+def test_gls_torch_float32_recovers_period() -> None:
+    # float32 is the forced precision on Apple MPS; the direct trig-sum's power drifts
+    # but the peak must stay robust (the float32 path previously had no test coverage).
+    t, mag, err = synthetic_sine(period=0.6234)
+    pg = cup.periodogram(
+        (t, mag, err), "GLS", backend="torch:cpu",
+        settings=cup.GLSSettings(precision="float32"),
+    )
+    assert pg.backend == "torch:cpu"
+    assert pg.best_period() == pytest.approx(0.6234, rel=1e-3)

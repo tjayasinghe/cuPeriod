@@ -79,6 +79,10 @@ def scatter_add(target: Any, index: Any, values: Any) -> None:
     ``target`` is 1-D and ``index``/``values`` are 1-D and aligned. ``numpy.add.at`` is
     not part of the array-API standard and PyTorch has no equivalent *function*, so this
     dispatches per backend: torch uses ``Tensor.index_add_``; numpy/cupy use ``add.at``.
+
+    ``values.dtype`` must equal ``target.dtype``: torch ``index_add_`` rejects a
+    mismatch (numpy/cupy would silently cast), so callers build both at the same
+    working float dtype. ``index`` may be any integer dtype (coerced to int64).
     """
     if is_torch_array(target):
         target.index_add_(0, index.long(), values)
