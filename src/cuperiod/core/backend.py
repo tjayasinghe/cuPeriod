@@ -73,17 +73,79 @@ def cuda_available() -> bool:
         return False
 
 
+def torch_available() -> bool:
+    """Whether PyTorch is importable.
+
+    A CPU device always exists, so once torch is installed the portable ``torch``
+    backend is never *unavailable* — this is what lets users with no GPU (or an
+    unsupported GPU) still run the accelerated code paths. Cheap: no import.
+    """
+    return has_module("torch")
+
+
+def torch_devices() -> set[str]:
+    """Torch device kinds usable here: ``{"cpu"}`` plus any of ``cuda``/``mps``/``xpu``.
+
+    Imports torch to query the runtimes (so call only when a torch path is actually
+    being taken). ROCm builds report AMD GPUs as ``"cuda"``, so AMD needs no separate
+    name. Returns an empty set if torch is absent or fails to import.
+    """
+    if not has_module("torch"):
+        return set()
+    try:
+        import torch
+    except Exception:
+        return set()
+    out = {"cpu"}
+    try:
+        if torch.cuda.is_available():
+            out.add("cuda")
+    except Exception:
+        pass
+    try:
+        if torch.backends.mps.is_available():
+            out.add("mps")
+    except Exception:
+        pass
+    try:
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            out.add("xpu")
+    except Exception:
+        pass
+    return out
+
+
+def torch_gpu_available() -> bool:
+    """Whether torch sees any non-CPU device (CUDA/ROCm, MPS, or XPU)."""
+    return bool(torch_devices() - {"cpu"})
+
+
+def best_torch_device() -> str:
+    """Preferred torch device, in order ``cuda`` → ``xpu`` → ``mps`` → ``cpu``."""
+    devices = torch_devices()
+    for kind in ("cuda", "xpu", "mps"):
+        if kind in devices:
+            return kind
+    return "cpu"
+
+
 def available_backends() -> set[str]:
     """The set of backend names importable in this environment.
 
     Returns a union across methods: always includes ``numpy``; adds ``finufft``,
-    ``astropy``, ``numba`` when importable, and the GPU names ``cufinufft``/``cupy``
-    only when a CUDA device is present.
+    ``astropy``, ``numba``, ``torch`` when importable, and the GPU names
+    ``cufinufft``/``cupy`` only when a CUDA device is present.
+
+    ``torch`` is added on a cheap import-spec check (no torch import here): a CPU device
+    always exists, so an installed torch is always a usable backend. Which torch
+    *devices* are present is answered separately by :func:`torch_devices`.
     """
     out: set[str] = {"numpy"}
     for name in ("finufft", "astropy", "numba"):
         if has_module(name):
             out.add(name)
+    if torch_available():
+        out.add("torch")
     if cuda_available():
         out.add("cupy")
         if has_module("cufinufft"):
@@ -151,8 +213,12 @@ def array_module(a: object) -> ModuleType:
 __all__ = [
     "array_module",
     "available_backends",
+    "best_torch_device",
     "cuda_available",
     "ensure_cuda_dll_path",
     "ensure_shared_memory",
     "has_module",
+    "torch_available",
+    "torch_devices",
+    "torch_gpu_available",
 ]

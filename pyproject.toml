@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cuperiod"
-version = "1.0.0"
+version = "1.1.0.dev0"
 description = "Optimized, GPU-accelerated periodograms for astronomy"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -19,6 +19,12 @@ keywords = [
     "time-series",
     "gpu",
     "cuda",
+    "rocm",
+    "amd",
+    "intel",
+    "metal",
+    "array-api",
+    "pytorch",
 ]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
@@ -36,6 +42,9 @@ dependencies = [
     "scipy>=1.10",
     "astropy>=6.0",
     "finufft>=2.2",
+    # Array-API dispatch: the portable (numpy/cupy/torch) compute paths run through one
+    # standard namespace. Lightweight, pure-Python — always installed.
+    "array-api-compat>=1.9",
     "pydantic>=2.5",
     "pydantic-settings>=2.1",
     "typer>=0.12",
@@ -59,6 +68,11 @@ pandas = ["pandas>=2.0"]
 # astropy's compiled BoxLeastSquares by ~20x and is auto-selected on the CPU when
 # present (otherwise BLS falls back to astropy).
 fast = ["numba>=0.59"]
+# Portable accelerator reaching AMD (ROCm), Intel (XPU), Apple (MPS), and a fast CPU
+# path. Install the wheel matching your accelerator from https://pytorch.org/ — the
+# plain wheel is CPU-only; CUDA/ROCm/XPU builds come from PyTorch's own index, so we do
+# not pin a hardware-specific build here.
+torch = ["torch>=2.2"]
 # Documentation toolchain (Sphinx + Furo theme). pandas is included so the
 # DataFrame-ingestion examples and the autodoc of from_dataframe build cleanly.
 docs = [
@@ -77,6 +91,8 @@ dev = [
     "pandas>=2.0",
     "hypothesis>=6",
     "numba>=0.59",
+    # Exercise the portable torch-CPU path in CI (GPU devices auto-skip).
+    "torch>=2.2",
 ]
 
 [project.scripts]
@@ -112,6 +128,9 @@ src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "NPY"]
+# UP038 (use `X | Y` in isinstance) is deprecated upstream: the tuple form
+# `isinstance(x, (A, B))` is faster at runtime, so we keep it.
+ignore = ["UP038"]
 
 [tool.ruff.lint.per-file-ignores]
 # typer's API requires function calls (Option/Argument) in parameter defaults.
@@ -140,6 +159,10 @@ module = [
     "astropy.*",
     "scipy",
     "scipy.*",
+    "torch",
+    "torch.*",
+    "array_api_compat",
+    "array_api_compat.*",
 ]
 ignore_missing_imports = true
 

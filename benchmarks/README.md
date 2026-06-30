@@ -18,6 +18,12 @@ The rendered results are in **[REPORT.md](REPORT.md)** with figures in `figures/
 | Period recovery | all 7 | VSX literature period | find the real period? |
 | Performance | all 7 | astropy / PyAstronomy | how much faster, and how does it scale? |
 
+The performance benchmark also times the **portable `torch` backend** (`backend="torch"`;
+the resolved device is shown in the `torch_backend` column) for the ported methods — GLS
+and BLS — alongside the CPU and CUDA paths, so the cross-vendor path (AMD/Intel/Mac/CPU) is
+tracked. A backend absent on the host (no CUDA GPU, or no torch) is recorded blank rather
+than failing the sweep.
+
 ## Data
 
 * **`dataset/light_curves.parquet`** — 72 real ASAS-SN g-band light curves

@@ -432,21 +432,27 @@ def main():
                      f"({b.cpu_s*1e3:.0f} ms vs {b.ref_s:.1f} s on this light curve), matching it "
                      f"to floating-point{par}. The GPU then adds another {b.gpu_speedup:.0f}× "
                      f"({b.ref_s/b.gpu_s:.0f}× over astropy).\n")
-        cols = ["method", "cpu_backend", "cpu_s", "gpu_s", "ref", "ref_s", "cpu_vs_ref", "gpu_speedup"]
+        cols = ["method", "cpu_backend", "cpu_s", "gpu_s", "torch_s", "torch_backend",
+                "ref", "ref_s", "cpu_vs_ref", "gpu_speedup"]
         cols = [c for c in cols if c in s.columns]
+        nan_dash = lambda fmt: (lambda v: ("—" if not np.isfinite(v) else fmt(v)))
         L.append(md_table(s, cols, {
-            "cpu_s": lambda v: f"{v:.3f}", "gpu_s": lambda v: f"{v:.4f}",
-            "gpu_speedup": lambda v: f"{v:.0f}x",
-            "cpu_vs_ref": lambda v: ("—" if not np.isfinite(v) else f"{v:.0f}x"),
-            "ref_s": lambda v: ("—" if not np.isfinite(v) else f"{v:.2f}"),
+            "cpu_s": lambda v: f"{v:.3f}",
+            "gpu_s": nan_dash(lambda v: f"{v:.4f}"),
+            "torch_s": nan_dash(lambda v: f"{v:.3f}"),
+            "gpu_speedup": nan_dash(lambda v: f"{v:.0f}x"),
+            "cpu_vs_ref": nan_dash(lambda v: f"{v:.0f}x"),
+            "ref_s": nan_dash(lambda v: f"{v:.2f}"),
             "method": ml}))
         L.append("\n*cpu_backend* = what `backend=\"cpu\"` resolves to — the fast default a user "
                  "gets: finufft (GLS), the multicore numba box search (BLS), numpy (the rest). "
                  "*ref* = the established external tool; *cpu_vs_ref* = how much faster cuPeriod's "
-                 "CPU is than that tool; *gpu_speedup* = GPU over cuPeriod's CPU. cuPeriod's CPU "
-                 "path already beats every reference tool it has (GLS, PDM, BLS) — so the GPU's "
-                 "marginal gain is small where the CPU is already fast (BLS, GLS) and large where "
-                 "it is not (PDM, MHAOV, TLS).\n")
+                 "CPU is than that tool; *gpu_speedup* = GPU over cuPeriod's CPU. *torch_s* = the "
+                 "portable PyTorch backend (device shown in *torch_backend*: cpu/cuda/mps/xpu) — "
+                 "the cross-vendor path that also runs on AMD/Intel/Mac; blank for methods not yet "
+                 "ported to it. cuPeriod's CPU path already beats every reference tool it has "
+                 "(GLS, PDM, BLS) — so the GPU's marginal gain is small where the CPU is already "
+                 "fast (BLS, GLS) and large where it is not (PDM, MHAOV, TLS).\n")
         if len(bls) and "cpu_port_s" in bls and np.isfinite(bls.cpu_port_s.iloc[0]):
             b = bls.iloc[0]
             L.append(f"\n> The pure-`numpy` BLS backend shares one array-module-generic source "
