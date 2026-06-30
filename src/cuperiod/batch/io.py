@@ -205,11 +205,15 @@ def _write_parquet(rows: Sequence[Mapping[str, Any]], path: Path) -> None:
 def _write_csv(rows: Sequence[Mapping[str, Any]], path: Path) -> None:
     import csv
 
-    columns = [
-        col
-        for col in _union_columns(rows)
-        if not any(isinstance(row.get(col), list) for row in rows)
+    columns = _union_columns(rows)
+    list_cols = [
+        col for col in columns if any(isinstance(row.get(col), list) for row in rows)
     ]
+    if list_cols:
+        raise ValueError(
+            f"CSV sink cannot store array-valued columns {list_cols} (e.g. from "
+            "store_raw); use a .parquet sink."
+        )
     tmp = path.with_suffix(path.suffix + ".tmp")
     with tmp.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=columns, extrasaction="ignore")

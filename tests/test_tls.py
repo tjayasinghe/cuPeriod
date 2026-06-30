@@ -8,7 +8,19 @@ import pytest
 import cuperiod as cup
 from conftest import requires_gpu
 from cuperiod.core.errors import BackendUnavailableError
-from cuperiod.methods.tls import limb_darkened_template, tls_power
+from cuperiod.methods.tls import _duration_bins, limb_darkened_template, tls_power
+
+
+def test_duration_bins_never_empty() -> None:
+    # Regression: fractions too small for n_phase_bins must still yield >=1 valid width,
+    # not an empty list (which made tls_power return a silent all-zero spectrum).
+    db = _duration_bins(
+        cup.TLSSettings(
+            n_phase_bins=16, duration_min_frac=0.001,
+            duration_max_frac=0.01, n_durations=5,
+        )
+    )
+    assert db and all(1 <= w < 16 for w in db)
 
 
 def _inject_transit(

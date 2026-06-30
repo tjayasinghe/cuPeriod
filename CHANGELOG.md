@@ -33,6 +33,19 @@ First public release.
 - Full Sphinx documentation (hosted on Read the Docs) and a reproducible validation +
   benchmark suite under `benchmarks/`.
 
+### Robustness
+
+- Peak selection returns the true peak even when it sits at a frequency-grid edge (a
+  signal whose period is comparable to the observing baseline), and never reports a
+  non-finite period or NaN-power sample.
+- Settings reject transposed frequency / period / duration-fraction bounds at
+  construction; the CLI's `--out` JSON is always standard JSON (no `NaN`/`Infinity`).
+- GPU kernels opt into larger shared memory where the device allows, and otherwise raise
+  a clear error naming the setting to reduce — instead of a raw CUDA driver error.
+- Batch sinks are correct across re-runs: a file sink is keyed by `(key, method)`, a
+  directory sink refuses a mismatched `chunk_size` on resume, and a CSV sink asked to
+  store raw spectra fails loudly rather than dropping the columns.
+
 ### Validated
 
 - Every method matches an established reference (astropy `LombScargle` / `BoxLeastSquares`,

@@ -196,7 +196,12 @@ def _pdm_cuda(
     if n_periods == 0:
         return np.zeros(0, dtype=np.float64)
     out = cp.empty(n_periods, dtype=cp.float64)
-    _pdm_kernel(block)(
+    from cuperiod.core.backend import ensure_shared_memory
+
+    smem = 3 * n_bins * n_covers * 8
+    kernel = _pdm_kernel(block)
+    ensure_shared_memory(kernel, smem, method="PDM", hint="n_bins / n_covers")
+    kernel(
         (n_periods,),
         (block,),
         (
@@ -204,7 +209,7 @@ def _pdm_cuda(
             np.int32(tau_d.size), np.int32(n_periods),
             np.int32(n_bins), np.int32(n_covers), np.float64(sigma2), out,
         ),
-        shared_mem=3 * n_bins * n_covers * 8,
+        shared_mem=smem,
     )
     return np.asarray(cp.asnumpy(out), dtype=np.float64)
 

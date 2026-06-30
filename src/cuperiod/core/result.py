@@ -15,7 +15,7 @@ from typing import Any, Literal
 
 import numpy as np
 
-from cuperiod.core._typing import Float32Array, FloatArray
+from cuperiod.core._typing import Float32Array, FloatArray, IntArray
 from cuperiod.core.peaks import (
     local_maxima,
     peak_preserving_downsample,
@@ -175,9 +175,9 @@ class Periodogram:
         if self.size == 0:
             return []
         score = self._score()
-        candidates = local_maxima(score)
-        if candidates.size == 0:  # fall back to the global extreme
-            candidates = np.asarray([int(np.argmax(score))], dtype=np.int64)
+        candidates = self._peak_candidates(score)
+        if candidates.size == 0:
+            return []
         tol = (
             min_separation_rayleigh / self.baseline if self.baseline > 0.0 else 0.0
         )
@@ -188,6 +188,39 @@ class Periodogram:
         else:
             chosen = select_top_peaks(self.frequency, score, candidates, n, tol)
         return [self._make_peak(int(idx), rank) for rank, idx in enumerate(chosen, 1)]
+
+    def _peak_candidates(self, score: FloatArray) -> IntArray:
+        """Finite peak candidates: interior local maxima plus boundary peaks.
+
+        :func:`~cuperiod.core.peaks.local_maxima` excludes the grid endpoints by
+        contract, but a true peak can sit at the lowest or highest frequency (a signal
+        whose period is comparable to the baseline), so boundary samples that exceed
+        their single neighbor are added too. Non-finite scores and non-finite periods
+        (e.g. a ``frequency == 0`` sample, period ``inf``) are dropped so they can never
+        be reported as a best period.
+        """
+        candidates = local_maxima(score)
+        boundary: list[int] = []
+        if self.size == 1:
+            boundary.append(0)
+        elif self.size >= 2:
+            if score[0] >= score[1]:
+                boundary.append(0)
+            if score[-1] > score[-2]:
+                boundary.append(self.size - 1)
+        if boundary:
+            candidates = np.concatenate(
+                [candidates, np.asarray(boundary, dtype=np.int64)]
+            )
+        if candidates.size:
+            ok = np.isfinite(score[candidates]) & np.isfinite(self.period[candidates])
+            candidates = candidates[ok]
+        if candidates.size == 0:
+            finite = np.flatnonzero(np.isfinite(score) & np.isfinite(self.period))
+            if finite.size == 0:
+                return np.empty(0, dtype=np.int64)
+            return finite[[int(np.argmax(score[finite]))]]
+        return candidates
 
     def _make_peak(self, idx: int, rank: int) -> Peak:
         extra = {k: float(v[idx]) for k, v in self.extras.items()}
@@ -200,12 +233,9 @@ class Periodogram:
         )
 
     def best_period(self) -> float:
-        """The single most significant period in days."""
+        """The single most significant period in days (NaN if none is finite)."""
         peaks = self.best_periods(1)
-        if peaks:
-            return peaks[0].period
-        score = self._score()
-        return float(self.period[int(np.argmax(score))])
+        return peaks[0].period if peaks else float("nan")
 
     def downsample(self, n_points: int = 2000) -> tuple[Float32Array, Float32Array]:
         """Peak-preserving downsample of ``(frequency, power)`` to ``n_points``."""

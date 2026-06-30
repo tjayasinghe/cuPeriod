@@ -11,19 +11,33 @@ throughout, matching :meth:`cuperiod.Periodogram.best_periods`.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 #: Backend selector accepted by every method (concrete names are method-specific).
 BackendName = str
 
 
+def _require_lt(lo: float | None, hi: float | None, lo_name: str, hi_name: str) -> None:
+    """Raise ``ValueError`` if both bounds are set and ``lo`` is not below ``hi``."""
+    if lo is not None and hi is not None and lo >= hi:
+        raise ValueError(f"{lo_name} ({lo}) must be < {hi_name} ({hi})")
+
+
 class GLSSettings(BaseSettings):
     """Settings for the generalized Lomb-Scargle (GLS) periodogram."""
 
     model_config = SettingsConfigDict(env_prefix="CUPERIOD_GLS_", extra="forbid")
+
+    @model_validator(mode="after")
+    def _check_bounds(self) -> Self:
+        _require_lt(
+            self.minimum_frequency, self.maximum_frequency,
+            "minimum_frequency", "maximum_frequency",
+        )
+        return self
 
     minimum_frequency: float | None = Field(
         default=None,
@@ -67,6 +81,18 @@ class BLSSettings(BaseSettings):
     """Settings for the box least squares (BLS) search."""
 
     model_config = SettingsConfigDict(env_prefix="CUPERIOD_BLS_", extra="forbid")
+
+    @model_validator(mode="after")
+    def _check_bounds(self) -> Self:
+        _require_lt(
+            self.min_period_days, self.max_period_days,
+            "min_period_days", "max_period_days",
+        )
+        _require_lt(
+            self.duration_min_frac, self.duration_max_frac,
+            "duration_min_frac", "duration_max_frac",
+        )
+        return self
 
     min_period_days: float = Field(default=0.2, gt=0.0, description="Minimum period.")
     max_period_days: float = Field(default=100.0, gt=0.0, description="Maximum period.")
@@ -129,6 +155,14 @@ class PDMSettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="CUPERIOD_PDM_", extra="forbid")
 
+    @model_validator(mode="after")
+    def _check_bounds(self) -> Self:
+        _require_lt(
+            self.minimum_frequency, self.maximum_frequency,
+            "minimum_frequency", "maximum_frequency",
+        )
+        return self
+
     minimum_frequency: float | None = Field(
         default=None,
         description="Lowest trial frequency (cycles/day); None -> 1/baseline.",
@@ -170,6 +204,14 @@ class MHAOVSettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="CUPERIOD_MHAOV_", extra="forbid")
 
+    @model_validator(mode="after")
+    def _check_bounds(self) -> Self:
+        _require_lt(
+            self.minimum_frequency, self.maximum_frequency,
+            "minimum_frequency", "maximum_frequency",
+        )
+        return self
+
     minimum_frequency: float | None = Field(
         default=None,
         description="Lowest trial frequency (cycles/day); None -> 1/baseline.",
@@ -210,6 +252,14 @@ class CESettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="CUPERIOD_CE_", extra="forbid")
 
+    @model_validator(mode="after")
+    def _check_bounds(self) -> Self:
+        _require_lt(
+            self.minimum_frequency, self.maximum_frequency,
+            "minimum_frequency", "maximum_frequency",
+        )
+        return self
+
     minimum_frequency: float | None = Field(
         default=None,
         description="Lowest trial frequency (cycles/day); None -> 1/baseline.",
@@ -249,6 +299,14 @@ class StringLengthSettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="CUPERIOD_SL_", extra="forbid")
 
+    @model_validator(mode="after")
+    def _check_bounds(self) -> Self:
+        _require_lt(
+            self.minimum_frequency, self.maximum_frequency,
+            "minimum_frequency", "maximum_frequency",
+        )
+        return self
+
     minimum_frequency: float | None = Field(
         default=None,
         description="Lowest trial frequency (cycles/day); None -> 1/baseline.",
@@ -285,6 +343,18 @@ class TLSSettings(BaseSettings):
     """Settings for the transit least squares (TLS) search."""
 
     model_config = SettingsConfigDict(env_prefix="CUPERIOD_TLS_", extra="forbid")
+
+    @model_validator(mode="after")
+    def _check_bounds(self) -> Self:
+        _require_lt(
+            self.min_period_days, self.max_period_days,
+            "min_period_days", "max_period_days",
+        )
+        _require_lt(
+            self.duration_min_frac, self.duration_max_frac,
+            "duration_min_frac", "duration_max_frac",
+        )
+        return self
 
     min_period_days: float = Field(default=0.5, gt=0.0, description="Minimum period.")
     max_period_days: float = Field(default=100.0, gt=0.0, description="Maximum period.")

@@ -46,3 +46,9 @@ def test_invalid_grids_raise() -> None:
         uniform_frequency_grid(-1.0, maximum_frequency=2.0)
     with pytest.raises(ValueError):
         log_period_grid(minimum_period=5.0, maximum_period=1.0, n_periods=10)
+
+
+def test_uniform_frequency_grid_rejects_min_ge_max() -> None:
+    # Regression: transposed bounds must raise, not return a 1-sample grid above max.
+    with pytest.raises(ValueError, match="must be <"):
+        uniform_frequency_grid(10.0, maximum_frequency=0.5, minimum_frequency=2.0)

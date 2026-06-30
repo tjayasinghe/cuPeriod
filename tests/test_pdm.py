@@ -79,3 +79,16 @@ def test_pdm_gpu_matches_cpu() -> None:
     gpu = pdm_theta(t, mag, periods, backend="cupy")  # one-block-per-period CUDA kernel
     # atomicAdd reorders the summation, so allow a small relative tolerance.
     assert np.allclose(cpu, gpu, rtol=1e-6, atol=1e-9)
+
+
+@requires_gpu
+def test_pdm_gpu_shared_memory_overflow_is_clean() -> None:
+    # Regression: a bin count whose per-block shared memory exceeds any device's opt-in
+    # limit must raise a clear BackendUnavailableError, not a raw CUDADriverError.
+    t, mag, err = synthetic_sine(n=300)
+    lc = cup.LightCurve.from_arrays(t, mag, err)
+    with pytest.raises(cup.BackendUnavailableError, match="shared memory"):
+        cup.periodogram(
+            lc, "PDM", backend="gpu",
+            settings=cup.PDMSettings(n_bins=10000, n_covers=3),
+        )

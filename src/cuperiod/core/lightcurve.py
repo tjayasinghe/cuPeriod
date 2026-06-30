@@ -220,12 +220,19 @@ class LightCurve:
         """Convert to the magnitude domain (no-op if already magnitude).
 
         Uses ``mag = -2.5 log10(flux) + zeropoint`` and propagates the error as
-        ``mag_err = (2.5 / ln 10) * flux_err / flux``.
+        ``mag_err = (2.5 / ln 10) * flux_err / flux``. Non-positive flux has no real
+        magnitude; those points become non-finite (without a spurious NumPy warning)
+        and are removed by :meth:`finite`.
         """
         if self.domain is Domain.MAGNITUDE:
             return self
-        mag = -2.5 * np.log10(self.value) + zeropoint
-        error = None if self.error is None else _MAG_PER_DEX * self.error / self.value
+        with np.errstate(invalid="ignore", divide="ignore"):
+            mag = -2.5 * np.log10(self.value) + zeropoint
+            error = (
+                None
+                if self.error is None
+                else _MAG_PER_DEX * self.error / self.value
+            )
         return LightCurve(self.time, mag, error, Domain.MAGNITUDE, self.meta)
 
     def in_domain(self, domain: Domain, *, zeropoint: float = 0.0) -> LightCurve:
