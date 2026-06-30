@@ -50,8 +50,15 @@ MHAOVBackend = Literal["numpy", "cupy"]
 #: Trial frequencies per vectorized batch (bounds the (F, N, 2H+1) design tensor).
 DEFAULT_BATCH: Final = 512
 
-#: Diagonal ridge to keep the normal equations solvable at degenerate frequencies.
-_RIDGE: Final = 1e-10
+#: Diagonal ridge that keeps the harmonic normal equations solvable at degenerate
+#: frequencies (f→0, where the cosine columns collapse onto the constant column). It is
+#: applied as ``_RIDGE_EPS · eps(dtype) · n_points``: scaling by the working precision's
+#: machine epsilon and the Gram diagonal magnitude (≈ ``n_points``, from the all-ones
+#: constant column) makes it representable in float32. A fixed absolute 1e-10 underflows
+#: against the ~N-sized diagonal on a float32 device (1e-10 ≪ eps_f32·N), leaving the
+#: matrix singular so ``linalg.solve`` raises. In float64 this reproduces the previous
+#: ~1e-10 ridge to within rounding, so float64 results are unchanged.
+_RIDGE_EPS: Final = 1.0e3
 
 
 def _design(xp: ModuleType, angle: Any, n_harmonics: int) -> Any:
@@ -86,7 +93,8 @@ def _model_ss_batch(
     d = 2 * n_harmonics + 1
     n_freq = int(frequencies.shape[0])
     fdtype = frequencies.dtype
-    eye = xp.eye(d, dtype=fdtype) * _RIDGE
+    ridge = _RIDGE_EPS * float(xp.finfo(fdtype).eps) * float(n_points)
+    eye = xp.eye(d, dtype=fdtype) * ridge
     out = xp.empty(n_freq, dtype=fdtype)
     two_pi = 2.0 * float(np.pi)
 

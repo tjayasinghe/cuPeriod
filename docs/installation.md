@@ -18,6 +18,7 @@ line, and batch processing over a process pool.
 | Extra | Command | Adds |
 | --- | --- | --- |
 | **gpu** | `pip install "cuperiod[gpu]"` | CUDA-12 GPU backends (`cupy-cuda12x`, `cufinufft`, the NVIDIA runtime wheels) |
+| **torch** | `pip install "cuperiod[torch]"` | the portable **PyTorch** backend — runs every method on AMD (ROCm), Intel (XPU), Apple (MPS), and a CPU path |
 | **fast** | `pip install "cuperiod[fast]"` | a multicore `numba` box search — BLS's CPU default, ~20× faster than astropy's compiled `BoxLeastSquares` |
 | **pandas** | `pip install "cuperiod[pandas]"` | pandas `DataFrame` ingestion |
 
@@ -56,6 +57,49 @@ first used, so no manual `PATH` editing is needed. cupy may print a benign
 system toolkit — this is harmless.
 :::
 
+## Portable GPU backend (PyTorch)
+
+The `[torch]` extra adds a **PyTorch backend** that runs every method beyond NVIDIA — on
+AMD (ROCm), Intel (XPU), and Apple-Silicon (MPS) GPUs, and on a CPU path everywhere (handy
+even with no GPU at all):
+
+```bash
+pip install "cuperiod[torch]"
+```
+
+The plain wheel above is **CPU-only**. To use a GPU, install the PyTorch build matching
+your accelerator from the [official index](https://pytorch.org/get-started/locally/) — we
+deliberately don't pin a hardware-specific wheel:
+
+| Hardware | PyTorch build |
+| --- | --- |
+| NVIDIA (CUDA) | the CUDA wheel — or just use the `[gpu]` extra's faster cufinufft/cupy paths |
+| AMD (ROCm) | the ROCm wheel (Linux only) |
+| Intel (XPU) | the XPU wheel (`torch.xpu`) |
+| Apple Silicon | the standard macOS wheel (MPS is built in) |
+| CPU only | the default wheel |
+
+Select it with `backend="torch"` (or `"torch:cpu"`, `"torch:cuda"`, `"torch:mps"`,
+`"torch:xpu"`); `backend="auto"` reaches a torch GPU on non-NVIDIA machines after the
+cufinufft/cupy fast paths. See {doc}`guide/backends`.
+
+:::{note}
+**Apple MPS** cannot compute in float64 (a Metal limitation), so the Mac-GPU path uses
+float32. `precision="auto"` (the default) keeps float64 everywhere it is supported and
+drops to float32 only where the device forces it (MPS, and some Intel GPUs); an explicit
+`precision="float64"` on MPS raises rather than silently downgrading.
+:::
+
+:::{warning}
+**Windows OpenMP clash.** PyTorch and NumPy/SciPy (MKL) each ship an OpenMP runtime, and
+importing torch after numpy can abort with *"OMP: Error #15 … libiomp5md.dll already
+initialized."* cuPeriod does **not** set a workaround for you — it can silently affect
+numerical results. If you hit this running a torch workload on Windows, set
+`KMP_DUPLICATE_LIB_OK=TRUE` in your environment, or install torch and numpy builds that
+share one OpenMP runtime. (`cuperiod doctor` sets it only for its own read-only device
+probe.)
+:::
+
 ## Verifying the install
 
 List the registered methods and the backends available in your environment:
@@ -68,6 +112,13 @@ Check whether a GPU is visible and how many batch workers it would suggest:
 
 ```bash
 cuperiod gpu-info
+```
+
+For the full picture — every installed backend, the available torch devices and the
+precision each will use, and what `backend="auto"` resolves to for every method — run:
+
+```bash
+cuperiod doctor
 ```
 
 If no CUDA device is present, `gpu-info` says so and exits cleanly — the CPU paths still

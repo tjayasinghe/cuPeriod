@@ -70,6 +70,7 @@ def mhaov_multiband_power(
         n_harmonics=settings.n_harmonics,
         backend=backend,  # type: ignore[arg-type]
         batch=settings.batch_periods,
+        precision=settings.precision,
     )
     n_total = sum(t.size for t, _ in bands)
     return Periodogram.from_spectrum(

@@ -82,6 +82,13 @@ def test_gpu_info_command() -> None:
     assert result.exit_code == 0
 
 
+def test_doctor_command() -> None:
+    result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 0
+    assert "backends installed" in result.stdout
+    assert "backend='auto' resolves to" in result.stdout
+
+
 def test_grid_info_command(tmp_path: Path) -> None:
     csv = _write_csv(tmp_path / "star.csv")
     result = runner.invoke(app, ["grid-info", str(csv), "--method", "GLS"])

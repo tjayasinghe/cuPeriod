@@ -29,8 +29,28 @@ requires_gpu = pytest.mark.skipif(
 )
 
 #: Skip a test unless PyTorch (the ``[torch]`` extra) is importable. The torch-CPU path
-#: always runs once torch is installed; GPU-device tests add their own skips in PR2.
+#: always runs once torch is installed; GPU-device parity adds the marker below.
 requires_torch = pytest.mark.skipif(
     not _importable("torch"),
     reason="torch (the [torch] extra) is not installed",
+)
+
+
+def _torch_gpu_available() -> bool:
+    if not _importable("torch"):
+        return False
+    try:
+        from cuperiod.core.backend import torch_gpu_available
+
+        return torch_gpu_available()
+    except Exception:
+        return False
+
+
+#: Skip a test unless torch sees a non-CPU device (CUDA/ROCm, MPS, or XPU). The portable
+#: torch GPU numeric paths are written to spec and CPU-validated; on-hardware parity
+#: self-skips until such a device is available (none on the current dev machine/CI).
+requires_torch_gpu = pytest.mark.skipif(
+    not _torch_gpu_available(),
+    reason="no non-CPU torch device (CUDA/ROCm/MPS/XPU) available",
 )
