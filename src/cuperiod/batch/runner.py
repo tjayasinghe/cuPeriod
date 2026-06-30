@@ -16,6 +16,7 @@ chunk and is resumable: a re-run skips chunks whose part already exists.
 from __future__ import annotations
 
 import json
+import multiprocessing
 import warnings
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -401,8 +402,14 @@ def _run_pool(
     initializer: Any = None,
     initargs: tuple[Any, ...] = (),
 ) -> None:
+    # Always use "spawn". Linux's default "fork" copies the parent's already-built
+    # native thread pools (numba / OpenBLAS / OpenMP, plus any CUDA context for the
+    # GPU pool) into the child and deadlocks the workers. Spawn starts fresh,
+    # thread-pinned workers (the Windows/macOS default) — see pin_worker_threads.
+    ctx = multiprocessing.get_context("spawn")
     with ProcessPoolExecutor(
-        max_workers=max_workers, initializer=initializer, initargs=initargs
+        max_workers=max_workers, mp_context=ctx,
+        initializer=initializer, initargs=initargs,
     ) as pool:
         futures = {
             pool.submit(_process_chunk, chunks[idx], cfg): idx for idx in pending
