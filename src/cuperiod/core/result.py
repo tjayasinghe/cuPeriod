@@ -267,7 +267,8 @@ class MultiResult:
     results: Mapping[str, Periodogram]
 
     def __getitem__(self, method: str) -> Periodogram:
-        return self.results[method.upper()]
+        key = "".join(ch for ch in method if ch.isalnum()).upper()
+        return self.results[key]
 
     def __iter__(self) -> Any:
         return iter(self.results)

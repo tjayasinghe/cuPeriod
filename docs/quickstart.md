@@ -150,6 +150,9 @@ See {doc}`guide/cli`.
 
 **Next steps**
 
+- 📓 The [example notebook](https://github.com/tjayasinghe/cuPeriod/blob/main/examples/cuperiod_tour.ipynb)
+  — a guided tour over real light curves (Cepheid, RR Lyrae, eclipsing binary, Mira, and a
+  *Kepler* exoplanet) with every periodogram and phase-fold.
 - {doc}`guide/methods` — pick the right method for your signal.
 - {doc}`guide/results` — everything `best_periods` and `Periodogram` can do.
 - {doc}`guide/batch` — scale to thousands or millions of light curves.

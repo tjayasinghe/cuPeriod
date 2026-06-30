@@ -172,14 +172,26 @@ class MethodInfo:
     all_backends: tuple[str, ...]
 
 
+def _normalize_name(name: str) -> str:
+    """Canonical registry key: uppercase with non-alphanumerics removed.
+
+    Lets ``"String-Length"``, ``"StringLength"`` and ``"STRINGLENGTH"`` (and ``"gls"`` /
+    ``"GLS"``) all resolve to the same method.
+    """
+    return "".join(ch for ch in name if ch.isalnum()).upper()
+
+
 def register(method: PeriodogramMethod) -> PeriodogramMethod:
-    """Register ``method`` under its uppercase name. Returns it (for decoration)."""
-    _REGISTRY[method.name.upper()] = method
+    """Register ``method`` under its normalized name. Returns it (for decoration)."""
+    _REGISTRY[_normalize_name(method.name)] = method
     return method
 
 
 def get_method(name: str) -> PeriodogramMethod:
-    """Look up a registered method by (case-insensitive) name.
+    """Look up a registered method by name.
+
+    Matching ignores case and any non-alphanumeric characters, so ``"String-Length"``,
+    ``"StringLength"`` and ``"STRINGLENGTH"`` all resolve to the same method.
 
     Raises
     ------
@@ -187,7 +199,7 @@ def get_method(name: str) -> PeriodogramMethod:
         If no method is registered under ``name``.
     """
     try:
-        return _REGISTRY[name.upper()]
+        return _REGISTRY[_normalize_name(name)]
     except KeyError:
         raise UnknownMethodError(
             f"unknown method {name!r}; registered: {sorted(_REGISTRY)}"

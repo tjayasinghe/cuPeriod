@@ -74,6 +74,10 @@ frequency, power = pg.frequency, pg.power
 
 Method names are case-insensitive (`"gls"` == `"GLS"`).
 
+> 📓 **New here?** The [`examples/cuperiod_tour.ipynb`](examples/cuperiod_tour.ipynb)
+> notebook works through real light curves — a Cepheid, an RR Lyrae, an eclipsing binary,
+> a Mira, and a *Kepler* exoplanet — showing each periodogram and phase-folded result.
+
 ### Multi-band (one star, several filters)
 
 GLS, BLS, and (soon) MHAOV jointly model two or more bands of the same star:
