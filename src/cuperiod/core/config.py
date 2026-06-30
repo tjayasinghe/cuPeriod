@@ -175,7 +175,7 @@ class BLSSettings(_DeviceSettings):
     )
 
 
-class PDMSettings(BaseSettings):
+class PDMSettings(_DeviceSettings):
     """Settings for phase dispersion minimization (PDM)."""
 
     model_config = SettingsConfigDict(env_prefix="CUPERIOD_PDM_", extra="forbid")
@@ -213,7 +213,7 @@ class PDMSettings(BaseSettings):
     min_detections: int = Field(
         default=20, ge=3, description="Skip if fewer finite points."
     )
-    backend: Literal["auto", "cpu", "gpu", "numpy", "cupy"] = Field(
+    backend: Literal["auto", "cpu", "gpu", "numpy", "cupy", "torch"] = Field(
         default="auto", description="Compute backend."
     )
     batch_periods: int = Field(
@@ -224,7 +224,7 @@ class PDMSettings(BaseSettings):
     )
 
 
-class MHAOVSettings(BaseSettings):
+class MHAOVSettings(_DeviceSettings):
     """Settings for the multiharmonic Analysis of Variance (MHAOV) periodogram."""
 
     model_config = SettingsConfigDict(env_prefix="CUPERIOD_MHAOV_", extra="forbid")
@@ -261,7 +261,7 @@ class MHAOVSettings(BaseSettings):
     min_detections: int = Field(
         default=20, ge=5, description="Skip if fewer finite points (need > 2H+1)."
     )
-    backend: Literal["auto", "cpu", "gpu", "numpy", "cupy"] = Field(
+    backend: Literal["auto", "cpu", "gpu", "numpy", "cupy", "torch"] = Field(
         default="auto", description="Compute backend."
     )
     batch_periods: int = Field(
@@ -272,7 +272,7 @@ class MHAOVSettings(BaseSettings):
     )
 
 
-class CESettings(BaseSettings):
+class CESettings(_DeviceSettings):
     """Settings for the conditional-entropy (CE) period search."""
 
     model_config = SettingsConfigDict(env_prefix="CUPERIOD_CE_", extra="forbid")
@@ -308,7 +308,7 @@ class CESettings(BaseSettings):
     min_detections: int = Field(
         default=20, ge=3, description="Skip if fewer finite points."
     )
-    backend: Literal["auto", "cpu", "gpu", "numpy", "cupy"] = Field(
+    backend: Literal["auto", "cpu", "gpu", "numpy", "cupy", "torch"] = Field(
         default="auto", description="Compute backend."
     )
     batch_periods: int = Field(
@@ -319,7 +319,7 @@ class CESettings(BaseSettings):
     )
 
 
-class StringLengthSettings(BaseSettings):
+class StringLengthSettings(_DeviceSettings):
     """Settings for the string-length (Lafler-Kinman / Dworetsky) period search."""
 
     model_config = SettingsConfigDict(env_prefix="CUPERIOD_SL_", extra="forbid")
@@ -353,7 +353,7 @@ class StringLengthSettings(BaseSettings):
     min_detections: int = Field(
         default=20, ge=3, description="Skip if fewer finite points."
     )
-    backend: Literal["auto", "cpu", "gpu", "numpy", "cupy"] = Field(
+    backend: Literal["auto", "cpu", "gpu", "numpy", "cupy", "torch"] = Field(
         default="auto", description="Compute backend."
     )
     batch_periods: int = Field(
@@ -364,7 +364,7 @@ class StringLengthSettings(BaseSettings):
     )
 
 
-class TLSSettings(BaseSettings):
+class TLSSettings(_DeviceSettings):
     """Settings for the transit least squares (TLS) search."""
 
     model_config = SettingsConfigDict(env_prefix="CUPERIOD_TLS_", extra="forbid")
@@ -425,7 +425,7 @@ class TLSSettings(BaseSettings):
     min_detections: int = Field(
         default=20, ge=3, description="Skip if fewer finite points."
     )
-    backend: Literal["auto", "cpu", "gpu", "numpy", "cupy"] = Field(
+    backend: Literal["auto", "cpu", "gpu", "numpy", "cupy", "torch"] = Field(
         default="auto", description="Compute backend."
     )
     period_batch: int = Field(
