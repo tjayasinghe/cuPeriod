@@ -94,12 +94,16 @@ def _entropy_batch(
 CUDA_BLOCK: Final = 128
 
 #: One-block-per-period CE kernel: a block folds its points into a shared-memory 2-D
-#: phase-magnitude histogram (magnitude bins precomputed on the host), then one thread
-#: reduces it to the Shannon conditional entropy H(m | phase).
+#: phase-magnitude histogram (magnitude bins precomputed on the host), then reduces it
+#: to the Shannon conditional entropy H(m | phase). Counts are **integer** shared
+#: atomics — exact, faster than double atomics, and half the shared memory — and the
+#: entropy reduction is spread across the block (phase rows striped over threads, then
+#: a tree sum). ``REAL`` is the working precision for the fold (float64 by default;
+#: float32 opt-in via ``precision``); counts and entropy stay exact/double either way.
 _CE_CUDA_SRC: Final = r"""
 extern "C" __global__ void ce_block(
-    const double* __restrict__ tau, const int* __restrict__ mag_bin,
-    const double* __restrict__ periods,
+    const REAL* __restrict__ tau, const int* __restrict__ mag_bin,
+    const REAL* __restrict__ periods,
     const int n_points, const int n_periods, const int n_phase, const int n_mag,
     double* o_entropy)
 {
@@ -107,52 +111,60 @@ extern "C" __global__ void ce_block(
     if (pidx >= n_periods) return;
     const int tid = threadIdx.x;
     const int nth = blockDim.x;
-    const double period = periods[pidx];
+    const REAL period = periods[pidx];
     const int M = n_phase * n_mag;
 
-    extern __shared__ double cnt[];  // (M) point count per (phase, mag) cell
-    for (int i = tid; i < M; i += nth) cnt[i] = 0.0;
+    extern __shared__ int cnt[];  // (M) point count per (phase, mag) cell
+    for (int i = tid; i < M; i += nth) cnt[i] = 0;
     __syncthreads();
 
     for (int j = tid; j < n_points; j += nth) {
-        double x = tau[j];
-        double ph = (x - period * floor(x / period)) / period;  // mod(tau/period, 1)
-        int pb = (int)(ph * n_phase);
+        REAL x = tau[j];
+        REAL ph = (x - period * floor(x / period)) / period;  // mod(tau/period, 1)
+        int pb = (int)(ph * (REAL)n_phase);
         if (pb >= n_phase) pb = n_phase - 1;
         if (pb < 0) pb = 0;
-        atomicAdd(&cnt[pb * n_mag + mag_bin[j]], 1.0);
+        atomicAdd(&cnt[pb * n_mag + mag_bin[j]], 1);
     }
     __syncthreads();
 
-    if (tid == 0) {
-        double h = 0.0;
-        for (int p = 0; p < n_phase; ++p) {
-            double ci = 0.0;
-            for (int m = 0; m < n_mag; ++m) ci += cnt[p * n_mag + m];
-            if (ci > 0.0) {
-                double lci = log(ci);
-                for (int m = 0; m < n_mag; ++m) {
-                    double c = cnt[p * n_mag + m];
-                    if (c > 0.0) h += c * (lci - log(c));
-                }
+    double h = 0.0;
+    for (int p = tid; p < n_phase; p += nth) {
+        double ci = 0.0;
+        for (int m = 0; m < n_mag; ++m) ci += (double)cnt[p * n_mag + m];
+        if (ci > 0.0) {
+            double lci = log(ci);
+            for (int m = 0; m < n_mag; ++m) {
+                double c = (double)cnt[p * n_mag + m];
+                if (c > 0.0) h += c * (lci - log(c));
             }
         }
-        o_entropy[pidx] = h / (double)n_points;
     }
+    __shared__ double r_h[CUDA_BLOCK];
+    r_h[tid] = h;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) r_h[tid] += r_h[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) o_entropy[pidx] = r_h[0] / (double)n_points;
 }
 """
 
-_ce_kernel_cache: dict[int, Any] = {}
+_ce_kernel_cache: dict[tuple[int, str], Any] = {}
 
 
-def _ce_kernel(block: int) -> Any:
-    """Compile (once) and cache the CE RawKernel for a given block size."""
-    kernel = _ce_kernel_cache.get(block)
+def _ce_kernel(block: int, real: str) -> Any:
+    """Compile (once) and cache the CE RawKernel for a block size and precision."""
+    kernel = _ce_kernel_cache.get((block, real))
     if kernel is None:
         import cupy
 
-        kernel = cupy.RawKernel(_CE_CUDA_SRC, "ce_block")
-        _ce_kernel_cache[block] = kernel
+        src = _CE_CUDA_SRC.replace("CUDA_BLOCK", str(block)).replace(
+            "REAL", "float" if real == "float32" else "double"
+        )
+        kernel = cupy.RawKernel(src, "ce_block")
+        _ce_kernel_cache[(block, real)] = kernel
     return kernel
 
 
@@ -163,22 +175,24 @@ def _ce_cuda(
     *,
     n_phase: int,
     n_mag: int,
+    precision: str = "float64",
     block: int = CUDA_BLOCK,
 ) -> FloatArray:
     """One-block-per-period CUDA conditional entropy; returns a host float64 array."""
     import cupy as cp
 
-    tau_d = cp.asarray(np.ascontiguousarray(tau, dtype=np.float64))
+    rdtype = np.float32 if precision == "float32" else np.float64
+    tau_d = cp.asarray(np.ascontiguousarray(tau, dtype=rdtype))
     mag_d = cp.asarray(np.ascontiguousarray(mag_bin, dtype=np.int32))
-    per_d = cp.asarray(np.ascontiguousarray(periods, dtype=np.float64))
+    per_d = cp.asarray(np.ascontiguousarray(periods, dtype=rdtype))
     n_periods = int(per_d.size)
     if n_periods == 0:
         return np.zeros(0, dtype=np.float64)
     out = cp.empty(n_periods, dtype=cp.float64)
     from cuperiod.core.backend import ensure_shared_memory
 
-    smem = n_phase * n_mag * 8
-    kernel = _ce_kernel(block)
+    smem = n_phase * n_mag * 4
+    kernel = _ce_kernel(block, precision)
     ensure_shared_memory(kernel, smem, method="CE", hint="n_phase_bins / n_mag_bins")
     kernel(
         (n_periods,),
@@ -293,7 +307,8 @@ def conditional_entropy(
     if backend == "cupy":
         ensure_cuda_dll_path()
         return _ce_cuda(
-            tau, mag_bin, periods_host, n_phase=n_phase_bins, n_mag=n_mag_bins
+            tau, mag_bin, periods_host, n_phase=n_phase_bins, n_mag=n_mag_bins,
+            precision=resolve_precision(precision, "cuda"),
         )
     if backend == "numba":
         kernel = _numba_ce_kernel()

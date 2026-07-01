@@ -137,8 +137,8 @@ CUDA_BLOCK: Final = 128
 #: dominant atomic work per point from ``3*n_covers`` to 3.
 _PDM_CUDA_SRC: Final = r"""
 extern "C" __global__ void pdm_block(
-    const double* __restrict__ tau, const double* __restrict__ y,
-    const double* __restrict__ periods,
+    const REAL* __restrict__ tau, const REAL* __restrict__ y,
+    const REAL* __restrict__ periods,
     const int n_points, const int n_periods, const int n_bins, const int n_covers,
     const double sigma2, double* o_theta)
 {
@@ -146,9 +146,11 @@ extern "C" __global__ void pdm_block(
     if (pidx >= n_periods) return;
     const int tid = threadIdx.x;
     const int nth = blockDim.x;
-    const double period = periods[pidx];
+    const REAL period = periods[pidx];
     const int M = n_bins * n_covers;
 
+    // Accumulators stay double even at REAL=float: the within-bin sum of squared
+    // deviations (sq - sum^2/cnt) is cancellation-prone in float32.
     extern __shared__ double sh[];
     double* s_sum = sh;          // (M) sum of y per fine bin
     double* s_sq = sh + M;       // (M) sum of y^2 per fine bin
@@ -159,10 +161,10 @@ extern "C" __global__ void pdm_block(
     __syncthreads();
 
     for (int j = tid; j < n_points; j += nth) {
-        double x = tau[j];
-        double ph = (x - period * floor(x / period)) / period;  // mod(tau/period, 1)
-        double yj = y[j];
-        int f = (int)(ph * (double)M);
+        REAL x = tau[j];
+        REAL ph = (x - period * floor(x / period)) / period;  // mod(tau/period, 1)
+        double yj = (double)y[j];
+        int f = (int)(ph * (REAL)M);
         if (f >= M) f = M - 1;
         if (f < 0) f = 0;
         atomicAdd(&s_sum[f], yj);
@@ -197,17 +199,18 @@ extern "C" __global__ void pdm_block(
 }
 """
 
-_pdm_kernel_cache: dict[int, Any] = {}
+_pdm_kernel_cache: dict[tuple[int, str], Any] = {}
 
 
-def _pdm_kernel(block: int) -> Any:
-    """Compile (once) and cache the PDM RawKernel for a given block size."""
-    kernel = _pdm_kernel_cache.get(block)
+def _pdm_kernel(block: int, real: str) -> Any:
+    """Compile (once) and cache the PDM RawKernel for a block size and precision."""
+    kernel = _pdm_kernel_cache.get((block, real))
     if kernel is None:
         import cupy
 
-        kernel = cupy.RawKernel(_PDM_CUDA_SRC, "pdm_block")
-        _pdm_kernel_cache[block] = kernel
+        src = _PDM_CUDA_SRC.replace("REAL", "float" if real == "float32" else "double")
+        kernel = cupy.RawKernel(src, "pdm_block")
+        _pdm_kernel_cache[(block, real)] = kernel
     return kernel
 
 
@@ -219,14 +222,16 @@ def _pdm_cuda(
     n_bins: int,
     n_covers: int,
     sigma2: float,
+    precision: str = "float64",
     block: int = CUDA_BLOCK,
 ) -> FloatArray:
     """One-block-per-period CUDA PDM Theta; returns a host float64 array."""
     import cupy as cp
 
-    tau_d = cp.asarray(np.ascontiguousarray(tau, dtype=np.float64))
-    y_d = cp.asarray(np.ascontiguousarray(y, dtype=np.float64))
-    per_d = cp.asarray(np.ascontiguousarray(periods, dtype=np.float64))
+    rdtype = np.float32 if precision == "float32" else np.float64
+    tau_d = cp.asarray(np.ascontiguousarray(tau, dtype=rdtype))
+    y_d = cp.asarray(np.ascontiguousarray(y, dtype=rdtype))
+    per_d = cp.asarray(np.ascontiguousarray(periods, dtype=rdtype))
     n_periods = int(per_d.size)
     if n_periods == 0:
         return np.zeros(0, dtype=np.float64)
@@ -234,7 +239,7 @@ def _pdm_cuda(
     from cuperiod.core.backend import ensure_shared_memory
 
     smem = 3 * n_bins * n_covers * 8
-    kernel = _pdm_kernel(block)
+    kernel = _pdm_kernel(block, precision)
     ensure_shared_memory(kernel, smem, method="PDM", hint="n_bins / n_covers")
     kernel(
         (n_periods,),
@@ -369,7 +374,8 @@ def pdm_theta(
     if backend == "cupy":
         ensure_cuda_dll_path()
         return _pdm_cuda(
-            tau, y, periods_host, n_bins=n_bins, n_covers=n_covers, sigma2=sigma2
+            tau, y, periods_host, n_bins=n_bins, n_covers=n_covers, sigma2=sigma2,
+            precision=resolve_precision(precision, "cuda"),
         )
     if backend == "numba":
         kernel = _numba_pdm_kernel()

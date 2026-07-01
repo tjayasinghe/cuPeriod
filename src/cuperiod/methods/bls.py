@@ -78,8 +78,13 @@ def _segment_power(
     periods: FloatArray,
     durations: FloatArray,
     settings: BLSSettings,
+    device_cache: dict[str, Any] | None = None,
 ) -> dict[str, FloatArray]:
-    """One segment's per-period box maxima via the configured backend."""
+    """One segment's per-period box maxima via the configured backend.
+
+    ``device_cache`` is a caller-owned dict shared by the segments of one light
+    curve, so the GPU backends upload the curve once per run rather than per segment.
+    """
     if backend == "astropy":
         from astropy.timeseries import BoxLeastSquares
 
@@ -104,6 +109,7 @@ def _segment_power(
         backend=backend,
         batch=settings.batch_periods,
         precision=settings.precision,
+        device_cache=device_cache,
     )
     return {name: getattr(power, name) for name in _SEGMENT_FIELDS}
 
@@ -214,8 +220,11 @@ class BLSMethod(PeriodogramMethod):
             )
 
         chunks: dict[str, list[FloatArray]] = {name: [] for name in _SEGMENT_FIELDS}
+        device_cache: dict[str, Any] = {}
         for periods, durations in segments:
-            seg = _segment_power(backend, jd, flux, err, periods, durations, settings)
+            seg = _segment_power(
+                backend, jd, flux, err, periods, durations, settings, device_cache
+            )
             for name in _SEGMENT_FIELDS:
                 chunks[name].append(seg[name])
         return _assemble(chunks, n, finite.baseline, backend, finite.meta)

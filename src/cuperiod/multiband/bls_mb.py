@@ -81,9 +81,10 @@ def bls_multiband_power(
     dsnr_parts: list[FloatArray] = []
     dur_parts: list[FloatArray] = []
     t0_parts: list[FloatArray] = []
+    band_caches: list[dict[str, object]] = [{} for _ in bands]
     for periods, durations in segments:
         per_band = []
-        for lc in bands:
+        for lc, device_cache in zip(bands, band_caches):
             err = lc.error if lc.error is not None else np.ones_like(lc.value)
             seg = _segment_power(
                 backend,  # type: ignore[arg-type]
@@ -93,6 +94,7 @@ def bls_multiband_power(
                 periods,
                 durations,
                 settings,
+                device_cache,  # type: ignore[arg-type]
             )
             per_band.append(seg)
         dsnr = np.vstack([np.clip(s["depth_snr"], 0.0, None) for s in per_band])
