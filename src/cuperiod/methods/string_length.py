@@ -19,6 +19,7 @@ import numpy as np
 
 from cuperiod.core._arrayapi import (
     array_namespace,
+    device_ref,
     resolve_precision,
     resolve_torch_device,
     to_device_array,
@@ -59,15 +60,16 @@ def _length_batch(
     defaults to ``stable=True`` — never raw ``numpy``/``cupy`` (quicksort, unstable).
     """
     idtype = xp.int64
+    dev = device_ref(periods)
     n_periods = int(periods.shape[0])
-    length = xp.empty(n_periods, dtype=periods.dtype)
+    length = xp.empty(n_periods, dtype=periods.dtype, device=dev)
     for start in range(0, n_periods, batch):
         stop = min(start + batch, n_periods)
         pb = periods[start:stop]
         n_p = int(pb.shape[0])
         phase = xp.remainder(tau[None, :] / pb[:, None], 1.0)  # (P, N)
         order = xp.argsort(phase, axis=1)
-        rows = xp.arange(n_p, dtype=idtype)[:, None]
+        rows = xp.arange(n_p, dtype=idtype, device=dev)[:, None]
         ph = phase[rows, order]            # phase sorted per row
         mm = m_scaled[order]               # magnitudes gathered in the same order
         dphi = ph[:, 1:] - ph[:, :-1]

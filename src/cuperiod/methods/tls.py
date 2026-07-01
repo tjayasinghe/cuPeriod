@@ -26,6 +26,7 @@ import numpy as np
 
 from cuperiod.core._arrayapi import (
     array_namespace,
+    device_ref,
     resolve_precision,
     resolve_torch_device,
     scatter_add,
@@ -128,24 +129,25 @@ def _matched_filter(
     """
     fdtype = periods.dtype
     idtype = xp.int64
+    dev = device_ref(periods)
     n_periods = int(periods.shape[0])
     out = {
-        "sr": xp.zeros(n_periods, dtype=fdtype),
-        "depth": xp.zeros(n_periods, dtype=fdtype),
-        "duration": xp.zeros(n_periods, dtype=fdtype),
-        "t0": xp.zeros(n_periods, dtype=fdtype),
+        "sr": xp.zeros(n_periods, dtype=fdtype, device=dev),
+        "depth": xp.zeros(n_periods, dtype=fdtype, device=dev),
+        "duration": xp.zeros(n_periods, dtype=fdtype, device=dev),
+        "t0": xp.zeros(n_periods, dtype=fdtype, device=dev),
     }
     n_points = int(tau.shape[0])
     for start in range(0, n_periods, period_batch):
         stop = min(start + period_batch, n_periods)
         pb = periods[start:stop]
         n_p = int(pb.shape[0])
-        rows_p = xp.arange(n_p, dtype=idtype)
+        rows_p = xp.arange(n_p, dtype=idtype, device=dev)
         phase = xp.remainder(tau[None, :] / pb[:, None], 1.0)
         bin_idx = xp.clip(xp.astype(phase * n_bins, idtype), 0, n_bins - 1)
         flat = xp.reshape(rows_p[:, None] * n_bins + bin_idx, (-1,))
-        a_flat = xp.zeros(n_p * n_bins, dtype=fdtype)  # sum w*y' per bin
-        b_flat = xp.zeros(n_p * n_bins, dtype=fdtype)  # sum w per bin
+        a_flat = xp.zeros(n_p * n_bins, dtype=fdtype, device=dev)  # sum w*y' per bin
+        b_flat = xp.zeros(n_p * n_bins, dtype=fdtype, device=dev)  # sum w per bin
         yw_b = xp.reshape(xp.broadcast_to(yw, (n_p, n_points)), (-1,))
         w_b = xp.reshape(xp.broadcast_to(w, (n_p, n_points)), (-1,))
         scatter_add(a_flat, flat, yw_b)
@@ -153,16 +155,16 @@ def _matched_filter(
         a = xp.reshape(a_flat, (n_p, n_bins))
         b = xp.reshape(b_flat, (n_p, n_bins))
 
-        best_sr = xp.zeros(n_p, dtype=fdtype)
-        best_depth = xp.zeros(n_p, dtype=fdtype)
-        best_start = xp.zeros(n_p, dtype=idtype)
-        best_width = xp.zeros(n_p, dtype=idtype)
+        best_sr = xp.zeros(n_p, dtype=fdtype, device=dev)
+        best_depth = xp.zeros(n_p, dtype=fdtype, device=dev)
+        best_start = xp.zeros(n_p, dtype=idtype, device=dev)
+        best_width = xp.zeros(n_p, dtype=idtype, device=dev)
         for width in dur_bins:
             g = templates[width]
             a_ext = xp.concat([a, a[:, : width - 1]], axis=1)
             b_ext = xp.concat([b, b[:, : width - 1]], axis=1)
-            num = xp.zeros((n_p, n_bins), dtype=fdtype)
-            den = xp.zeros((n_p, n_bins), dtype=fdtype)
+            num = xp.zeros((n_p, n_bins), dtype=fdtype, device=dev)
+            den = xp.zeros((n_p, n_bins), dtype=fdtype, device=dev)
             for k in range(width):  # correlate the folded data with the template
                 gk = float(g[k])
                 num = num + gk * a_ext[:, k : k + n_bins]

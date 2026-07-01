@@ -14,6 +14,9 @@ The recommended import alias is ``cup``. The two entry points are
 
 from __future__ import annotations
 
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _version
+
 # Importing the methods package registers the built-in methods (GLS, BLS, ...).
 from cuperiod import methods as methods
 from cuperiod.api import best_periods, periodogram, to_input
@@ -42,7 +45,10 @@ from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
 from cuperiod.core.result import MultiResult, Peak, Periodogram
 from cuperiod.methods.base import MethodInfo, get_method, list_methods, method_names
 
-__version__ = "1.0.0"
+try:
+    __version__ = _version("cuperiod")
+except PackageNotFoundError:  # pragma: no cover - source tree, no metadata
+    __version__ = "1.1.0.dev0"
 
 __all__ = [
     "BLSSettings",

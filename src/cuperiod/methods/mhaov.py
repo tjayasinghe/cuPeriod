@@ -27,6 +27,9 @@ import numpy as np
 
 from cuperiod.core._arrayapi import (
     array_namespace,
+    device_ref,
+    is_cupy_array,
+    is_torch_array,
     resolve_precision,
     resolve_torch_device,
     to_device_array,
@@ -65,7 +68,8 @@ def _design(xp: ModuleType, angle: Any, n_harmonics: int) -> Any:
     """Trig-polynomial design tensor ``(F, N, 2H+1)`` = [1, cos kθ, sin kθ]."""
     n_freq, n_points = angle.shape
     d = 2 * n_harmonics + 1
-    design = xp.empty((n_freq, n_points, d), dtype=angle.dtype)
+    dev = device_ref(angle)
+    design = xp.empty((n_freq, n_points, d), dtype=angle.dtype, device=dev)
     design[:, :, 0] = 1.0
     for k in range(1, n_harmonics + 1):
         design[:, :, 2 * k - 1] = xp.cos(k * angle)
@@ -93,9 +97,10 @@ def _model_ss_batch(
     d = 2 * n_harmonics + 1
     n_freq = int(frequencies.shape[0])
     fdtype = frequencies.dtype
+    dev = device_ref(frequencies)
     ridge = _RIDGE_EPS * float(xp.finfo(fdtype).eps) * float(n_points)
-    eye = xp.eye(d, dtype=fdtype) * ridge
-    out = xp.empty(n_freq, dtype=fdtype)
+    eye = xp.eye(d, dtype=fdtype, device=dev) * ridge
+    out = xp.empty(n_freq, dtype=fdtype, device=dev)
     two_pi = 2.0 * float(np.pi)
 
     for start in range(0, n_freq, batch):
@@ -103,8 +108,18 @@ def _model_ss_batch(
         fb = frequencies[start:stop]
         angle = (two_pi * fb)[:, None] * tau[None, :]
         design = _design(xp, angle, n_harmonics)
-        gram = xp.einsum("fni,fnj->fij", design, design) + eye
-        proj = xp.einsum("fni,n->fi", design, y)
+        if is_cupy_array(design) or is_torch_array(design):
+            # GPU batched cuBLAS gemm intermittently raises CUBLAS_STATUS_INVALID_VALUE
+            # on some GPUs (Blackwell / sm_120, in both cupy and torch). These gemm-free
+            # reductions match the einsum; the ``d`` loop avoids a (F,N,d,d) blowup.
+            gram = eye + xp.stack(
+                [xp.sum(design * design[:, :, j : j + 1], axis=1) for j in range(d)],
+                axis=-1,
+            )
+            proj = xp.sum(design * y[None, :, None], axis=1)
+        else:
+            gram = xp.einsum("fni,fnj->fij", design, design) + eye
+            proj = xp.einsum("fni,n->fi", design, y)
         # numpy 2.x batched solve treats a 2-D RHS as matrices, so add a trailing
         # singleton to keep it a per-frequency vector solve.
         beta = xp.linalg.solve(gram, proj[..., None])[..., 0]
@@ -144,8 +159,11 @@ def _compute_model_ss(
         ensure_cuda_dll_path()
         import cupy as cp
 
+        # Route through the array-API namespace (not raw cupy) so device-matched
+        # creation (``xp.zeros(..., device=)``) works — raw cupy rejects ``device=``.
+        freqs_cp = cp.asarray(freqs)
         out = _model_ss_batch(
-            cp, cp.asarray(tau), cp.asarray(y), cp.asarray(freqs),
+            array_namespace(freqs_cp), cp.asarray(tau), cp.asarray(y), freqs_cp,
             n_harmonics=n_harmonics, total_ss=total_ss, y_mean=y_mean,
             n_points=n, batch=batch,
         )

@@ -34,6 +34,7 @@ import numpy as np
 
 from cuperiod.core._arrayapi import (
     array_namespace,
+    device_ref,
     resolve_precision,
     resolve_torch_device,
     to_device_array,
@@ -222,9 +223,10 @@ def _trig_sums_direct(
     """
     two_pi = 2.0 * float(np.pi)
     fdtype = tau.dtype
-    freqs = f0 + df * xp.arange(nf, dtype=fdtype)
-    cos_sum = xp.empty(nf, dtype=fdtype)
-    sin_sum = xp.empty(nf, dtype=fdtype)
+    dev = device_ref(tau)
+    freqs = f0 + df * xp.arange(nf, dtype=fdtype, device=dev)
+    cos_sum = xp.empty(nf, dtype=fdtype, device=dev)
+    sin_sum = xp.empty(nf, dtype=fdtype, device=dev)
     strength_row = strengths[None, :]
     for start in range(0, nf, freq_batch):
         stop = min(start + freq_batch, nf)

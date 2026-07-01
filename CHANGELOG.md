@@ -25,13 +25,43 @@ All notable changes to cuPeriod are documented here. The format is based on
     an explicit `precision="float64"` on MPS raises rather than silently downgrading.
 - `array-api-compat` is now a dependency; install the portable accelerator with the
   `[torch]` extra (`pip install 'cuperiod[torch]'`).
+- **`cuperiod doctor` CLI command.** A one-stop environment diagnosis: which backends are
+  installed, the NVIDIA CUDA fast paths, the portable `torch` backend and every device it
+  sees (CUDA/ROCm/MPS/XPU/CPU) with the precision each would use, and what `backend="auto"`
+  resolves to for every method. Reach for it first when a GPU isn't being picked up or
+  you're unsure which PyTorch build you have.
+- **Interactive desktop GUI (`cuperiod-gui`).** A PySide6 + pyqtgraph periodogram explorer
+  over the existing API: load a light curve (or a whole folder in batch mode), run any
+  method with all of its options, and explore the full-resolution spectrum with a live
+  phased light curve — pick peaks and watch the fold update, overlay multi-band curves,
+  and toggle a dark/light theme (remembered across launches). Install with the `[gui]`
+  extra (`pip install 'cuperiod[gui]'`) and launch with `cuperiod-gui` or
+  `python -m cuperiod.gui`. It is a pure presentation layer — the compute core is unchanged.
+
+### Fixed
+
+- **torch GPU device placement (all seven methods).** The portable kernels built their
+  trial grids and accumulators (`xp.zeros`/`arange`/…) on the host, so a run on a torch
+  *GPU* device raised "Expected all tensors to be on the same device". The array-API bodies
+  had only ever been exercised on the torch **CPU** device (where the bug is invisible);
+  they now create arrays on the input's device. Surfaced by first running the torch CUDA
+  path on real GPU hardware.
+- **MHAOV GPU crash on some GPUs.** MHAOV's batched normal-equations solve went through
+  cuBLAS gemm, which intermittently raised `CUBLAS_STATUS_INVALID_VALUE` on a cold handle
+  (observed on NVIDIA Blackwell / sm_120, in **both** cupy and torch). Its GPU paths now use
+  gemm-free reductions — numerically identical to the einsum, and here no slower — while the
+  numpy CPU path keeps the einsum. (MHAOV's cupy path is now routed through the array-API
+  namespace, like the other vectorized methods, so it can build device-matched arrays.)
+- **`cuperiod.__version__`** returned a stale hard-coded `"1.0.0"`; it now derives from the
+  installed package metadata so it always matches the real version.
 
 ### Known limitations
 
-- **Non-NVIDIA GPU numerics are written-to-spec and CPU-validated, not yet hardware-
-  verified.** The torch CUDA/ROCm/MPS/XPU paths share the array-API body that is parity-
-  tested on the CPU torch device; on-device parity self-skips (`requires_torch_gpu`) until
-  such hardware is available.
+- **AMD/Intel/Apple torch GPUs are written-to-spec and CPU-validated, not yet on-device-
+  verified.** The torch **CUDA** path is now validated on NVIDIA hardware (RTX 5070 Ti,
+  Blackwell / sm_120): all seven methods match the CPU reference to round-off. The ROCm,
+  MPS, and XPU paths share that same array-API body, but their on-device parity self-skips
+  (`requires_torch_gpu`) until such hardware is available.
 - **No fp64 capability probe on Intel XPU.** `precision="auto"` resolves to float64 on an
   XPU; a device without native float64 will error at compute time rather than falling back
   to float32. Pass `precision="float32"` explicitly on such a device.

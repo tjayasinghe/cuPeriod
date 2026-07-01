@@ -19,6 +19,7 @@ import numpy as np
 
 from cuperiod.core._arrayapi import (
     array_namespace,
+    device_ref,
     resolve_precision,
     resolve_torch_device,
     scatter_add,
@@ -62,21 +63,22 @@ def _entropy_batch(
     """
     fdtype = periods.dtype
     idtype = xp.int64
+    dev = device_ref(periods)
     n_points = int(tau.shape[0])
     n_periods = int(periods.shape[0])
     n_cells = n_phase * n_mag
-    entropy = xp.empty(n_periods, dtype=fdtype)
+    entropy = xp.empty(n_periods, dtype=fdtype, device=dev)
     for start in range(0, n_periods, batch):
         stop = min(start + batch, n_periods)
         pb = periods[start:stop]
         n_p = int(pb.shape[0])
-        rows = xp.arange(n_p, dtype=idtype)
+        rows = xp.arange(n_p, dtype=idtype, device=dev)
         phase = xp.remainder(tau[None, :] / pb[:, None], 1.0)
         phase_bin = xp.clip(xp.astype(phase * n_phase, idtype), 0, n_phase - 1)
         cell = phase_bin * n_mag + mag_bin[None, :]  # (P, N) in [0, n_cells)
         flat = xp.reshape(rows[:, None] * n_cells + cell, (-1,))
-        count = xp.zeros(n_p * n_cells, dtype=fdtype)
-        scatter_add(count, flat, xp.ones(n_p * n_points, dtype=fdtype))
+        count = xp.zeros(n_p * n_cells, dtype=fdtype, device=dev)
+        scatter_add(count, flat, xp.ones(n_p * n_points, dtype=fdtype, device=dev))
         count = xp.reshape(count, (n_p, n_phase, n_mag))
 
         phase_total = xp.sum(count, axis=2, keepdims=True)  # (P, n_phase, 1)

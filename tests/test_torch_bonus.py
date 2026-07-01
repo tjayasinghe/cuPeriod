@@ -61,7 +61,7 @@ def test_bonus_torch_recovers_period(method: str) -> None:
     # String-Length and MHAOV legitimately lock onto 3P here, identically to numpy).
     t, mag, err = synthetic_sine(period=0.6234)
     pg = cup.periodogram((t, mag, err), method, backend="torch")
-    assert pg.backend == "torch:cpu"
+    assert pg.backend.startswith("torch:")  # torch:cpu, or a GPU device (cuda/mps/xpu)
     ratio = pg.best_period() / 0.6234
     harmonics = (1.0, 0.5, 2.0, 1 / 3, 3.0, 2 / 3, 1.5)
     assert min(abs(ratio / r - 1.0) for r in harmonics) < 5e-3

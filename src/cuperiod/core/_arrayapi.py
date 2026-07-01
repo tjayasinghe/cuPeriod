@@ -73,6 +73,21 @@ def device_of(x: Any) -> str:
     return "cpu"
 
 
+def device_ref(x: Any) -> Any:
+    """The array-API device object of ``x``, for device-matched array creation.
+
+    Unlike :func:`device_of` (a coarse kind string), this returns the exact device a
+    namespace's creation functions accept as ``device=``: a ``torch.device`` (with
+    index), a cupy ``Device``, or numpy ``"cpu"``. Arrays a portable kernel builds with
+    ``xp.zeros``/``arange`` then land on the input's device; without it they default to
+    the host on torch (whose data may be on cuda), a cross-device error. numpy and cupy
+    inherit the device from context, so it is a harmless no-op for them.
+    """
+    import array_api_compat
+
+    return array_api_compat.device(x)
+
+
 def scatter_add(target: Any, index: Any, values: Any) -> None:
     """In-place ``target[index] += values`` with repeated indices accumulated.
 
@@ -178,6 +193,7 @@ __all__ = [
     "Precision",
     "array_namespace",
     "device_of",
+    "device_ref",
     "float_dtype",
     "int_dtype",
     "is_cupy_array",

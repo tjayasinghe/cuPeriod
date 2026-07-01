@@ -26,6 +26,7 @@ import numpy as np
 
 from cuperiod.core._arrayapi import (
     array_namespace,
+    device_ref,
     resolve_precision,
     scatter_add,
     to_device_array,
@@ -131,6 +132,7 @@ def _bls_search(
     """
     fdtype = periods.dtype
     idtype = xp.int64
+    dev = device_ref(periods)
     n_points = int(t.shape[0])
     yw = y * ivar
     sum_y = float(xp.sum(yw))
@@ -140,13 +142,13 @@ def _bls_search(
 
     n_periods = int(periods.shape[0])
     out = {
-        "power": xp.full(n_periods, -np.inf, dtype=fdtype),
-        "depth": xp.zeros(n_periods, dtype=fdtype),
-        "depth_err": xp.zeros(n_periods, dtype=fdtype),
-        "depth_snr": xp.zeros(n_periods, dtype=fdtype),
-        "duration": xp.zeros(n_periods, dtype=fdtype),
-        "transit_time": xp.zeros(n_periods, dtype=fdtype),
-        "log_likelihood": xp.zeros(n_periods, dtype=fdtype),
+        "power": xp.full(n_periods, -np.inf, dtype=fdtype, device=dev),
+        "depth": xp.zeros(n_periods, dtype=fdtype, device=dev),
+        "depth_err": xp.zeros(n_periods, dtype=fdtype, device=dev),
+        "depth_snr": xp.zeros(n_periods, dtype=fdtype, device=dev),
+        "duration": xp.zeros(n_periods, dtype=fdtype, device=dev),
+        "transit_time": xp.zeros(n_periods, dtype=fdtype, device=dev),
+        "log_likelihood": xp.zeros(n_periods, dtype=fdtype, device=dev),
     }
     if n_periods == 0 or not dur_bins:
         return out
@@ -155,15 +157,15 @@ def _bls_search(
         stop = min(start + batch, n_periods)
         pb = periods[start:stop]
         n_p = int(pb.shape[0])
-        rows = xp.arange(n_p, dtype=idtype)
+        rows = xp.arange(n_p, dtype=idtype, device=dev)
         n_bins = xp.astype(xp.ceil(pb / bin_duration), idtype) + oversample
 
         phase_t = xp.remainder(tau[None, :], pb[:, None])
         ind = xp.astype(phase_t / bin_duration, idtype) + 1
         ind = xp.clip(ind, 0, width - 1)
         flat = xp.reshape(rows[:, None] * width + ind, (-1,))
-        mean_y = xp.zeros(n_p * width, dtype=fdtype)
-        mean_ivar = xp.zeros(n_p * width, dtype=fdtype)
+        mean_y = xp.zeros(n_p * width, dtype=fdtype, device=dev)
+        mean_ivar = xp.zeros(n_p * width, dtype=fdtype, device=dev)
         yw_b = xp.reshape(xp.broadcast_to(yw, (n_p, n_points)), (-1,))
         ivar_b = xp.reshape(xp.broadcast_to(ivar, (n_p, n_points)), (-1,))
         scatter_add(mean_y, flat, yw_b)
@@ -180,16 +182,16 @@ def _bls_search(
         cw = xp.cumsum(mean_ivar, axis=1)
         del mean_y, mean_ivar
 
-        best_obj = xp.full(n_p, -np.inf, dtype=fdtype)
-        best_n = xp.zeros(n_p, dtype=idtype)
-        best_d = xp.zeros(n_p, dtype=idtype)
+        best_obj = xp.full(n_p, -np.inf, dtype=fdtype, device=dev)
+        best_n = xp.zeros(n_p, dtype=idtype, device=dev)
+        best_d = xp.zeros(n_p, dtype=idtype, device=dev)
         for kd in dur_bins:
             if kd >= width:
                 continue
             y_in = cy[:, kd:] - cy[:, :-kd]
             ivar_in = cw[:, kd:] - cw[:, :-kd]
             ivar_out = sum_ivar - ivar_in
-            cols = xp.arange(y_in.shape[1], dtype=idtype)
+            cols = xp.arange(y_in.shape[1], dtype=idtype, device=dev)
             valid = (
                 (cols[None, :] <= (n_bins[:, None] - kd))
                 & (ivar_in >= _IVAR_EPS)
@@ -223,7 +225,7 @@ def _bls_search(
         power = depth_snr if obj_flag == 0 else log_like
 
         sl = slice(start, stop)
-        zero = xp.zeros(n_p, dtype=fdtype)
+        zero = xp.zeros(n_p, dtype=fdtype, device=dev)
         out["power"][sl] = xp.where(finite, power, -np.inf)
         out["depth"][sl] = xp.where(finite, depth, zero)
         out["depth_err"][sl] = xp.where(finite, depth_err, zero)

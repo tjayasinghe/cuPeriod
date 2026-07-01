@@ -24,6 +24,7 @@ import numpy as np
 
 from cuperiod.core._arrayapi import (
     array_namespace,
+    device_ref,
     resolve_precision,
     resolve_torch_device,
     scatter_add,
@@ -68,24 +69,25 @@ def _theta_batch(
     """
     fdtype = periods.dtype
     idtype = xp.int64
+    dev = device_ref(periods)
     inf = float("inf")
     n_points = int(tau.shape[0])
     n_periods = int(periods.shape[0])
     n_global = n_bins * n_covers
     cover_step = 1.0 / (n_bins * n_covers)
-    theta = xp.empty(n_periods, dtype=fdtype)
+    theta = xp.empty(n_periods, dtype=fdtype, device=dev)
 
     for start in range(0, n_periods, batch):
         stop = min(start + batch, n_periods)
         pb = periods[start:stop]
         n_p = int(pb.shape[0])
-        rows = xp.arange(n_p, dtype=idtype)
+        rows = xp.arange(n_p, dtype=idtype, device=dev)
         phase = xp.remainder(tau[None, :] / pb[:, None], 1.0)  # (P, N) in [0, 1)
 
-        count = xp.zeros(n_p * n_global, dtype=fdtype)
-        ysum = xp.zeros(n_p * n_global, dtype=fdtype)
-        ysq = xp.zeros(n_p * n_global, dtype=fdtype)
-        ones = xp.ones(n_p * n_points, dtype=fdtype)
+        count = xp.zeros(n_p * n_global, dtype=fdtype, device=dev)
+        ysum = xp.zeros(n_p * n_global, dtype=fdtype, device=dev)
+        ysq = xp.zeros(n_p * n_global, dtype=fdtype, device=dev)
+        ones = xp.ones(n_p * n_points, dtype=fdtype, device=dev)
         y_b = xp.reshape(xp.broadcast_to(y, (n_p, n_points)), (-1,))
         y2_b = xp.reshape(xp.broadcast_to(y2, (n_p, n_points)), (-1,))
         for cover in range(n_covers):
