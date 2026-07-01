@@ -82,6 +82,58 @@ def _length_batch(
     return length
 
 
+# --- CPU fast path: numba-parallel, one loop-iteration per trial period -------
+
+_NUMBA_SL_KERNEL: Any = None
+
+
+def _numba_sl_kernel() -> Any:
+    """Lazily compile (once) and cache the numba string-length kernel.
+
+    Per period: fold (``q - floor(q)``, the vectorized path's formula), **stable**
+    ``mergesort`` argsort (matching the array-API paths' stable sort, so equal phases
+    keep the same backend-independent neighbour pairing), and accumulate the string.
+    ``prange`` over periods; no ``(P, N)`` transients at all.
+    """
+    global _NUMBA_SL_KERNEL
+    if _NUMBA_SL_KERNEL is not None:
+        return _NUMBA_SL_KERNEL
+    from numba import njit, prange
+
+    @njit(parallel=True, cache=True, fastmath=False)  # pragma: no cover - njit
+    def _kernel(tau, m_scaled, periods):  # type: ignore[no-untyped-def]
+        n_periods = periods.shape[0]
+        n_points = tau.shape[0]
+        out = np.empty(n_periods)
+        for pidx in prange(n_periods):
+            period = periods[pidx]
+            phase = np.empty(n_points)
+            for j in range(n_points):
+                q = tau[j] / period
+                phase[j] = q - np.floor(q)
+            order = np.argsort(phase, kind="mergesort")
+            first = order[0]
+            prev_ph = phase[first]
+            prev_m = m_scaled[first]
+            total = 0.0
+            for j in range(1, n_points):
+                idx = order[j]
+                ph = phase[idx]
+                mm = m_scaled[idx]
+                dphi = ph - prev_ph
+                dmag = mm - prev_m
+                total += np.sqrt(dphi * dphi + dmag * dmag)
+                prev_ph = ph
+                prev_m = mm
+            wrap_phi = (phase[first] + 1.0) - prev_ph
+            wrap_mag = m_scaled[first] - prev_m
+            out[pidx] = total + np.sqrt(wrap_phi * wrap_phi + wrap_mag * wrap_mag)
+        return out
+
+    _NUMBA_SL_KERNEL = _kernel
+    return _kernel
+
+
 def string_length(
     t: FloatArray,
     y: FloatArray,
@@ -128,6 +180,9 @@ def string_length(
             batch=batch,
         )
         return np.asarray(cp.asnumpy(length), dtype=np.float64)
+    if backend == "numba":
+        kernel = _numba_sl_kernel()
+        return np.asarray(kernel(tau, m_scaled, periods_host), dtype=np.float64)
     if backend == "torch" or backend.startswith("torch:"):
         import torch
 
@@ -151,16 +206,17 @@ def string_length(
 
 
 class StringLengthMethod(PeriodogramMethod):
-    """String-length period search (numpy CPU, cupy GPU)."""
+    """String-length period search (numba/numpy CPU, cupy GPU)."""
 
     name: ClassVar[str] = "STRINGLENGTH"
     objective_sense: ClassVar[Literal["max", "min"]] = "min"
     supports_multiband: ClassVar[bool] = False
     settings_cls: ClassVar[type] = StringLengthSettings
     cpu_backend: ClassVar[str] = "numpy"
+    fast_cpu_backend: ClassVar[str | None] = "numba"
     gpu_backend: ClassVar[str | None] = "cupy"
     portable_gpu_backend: ClassVar[str | None] = "torch"
-    all_backends: ClassVar[tuple[str, ...]] = ("numpy", "cupy", "torch")
+    all_backends: ClassVar[tuple[str, ...]] = ("numba", "numpy", "cupy", "torch")
 
     def default_grid(self, lc: LightCurve, settings: StringLengthSettings) -> GridSpec:  # type: ignore[override]
         finite = lc.finite()

@@ -343,6 +343,109 @@ def _tls_cuda(
     return {name: np.asarray(cp.asnumpy(out[name]), dtype=np.float64) for name in names}
 
 
+# --- CPU fast path: numba-parallel, one loop-iteration per trial period -------
+
+_NUMBA_TLS_KERNEL: Any = None
+
+
+def _numba_tls_kernel() -> Any:
+    """Lazily compile (once) and cache the numba TLS kernel.
+
+    The same fold-bin-correlate sweep as the CUDA kernel — bin the weighted residuals
+    into phase bins, slide every limb-darkened template over every start phase, keep
+    the best signal residue — JIT-run across all cores with ``prange``. The duration
+    then start iteration order and strict ``>`` improvement reproduce the vectorized
+    path's tie-breaking exactly.
+    """
+    global _NUMBA_TLS_KERNEL
+    if _NUMBA_TLS_KERNEL is not None:
+        return _NUMBA_TLS_KERNEL
+    from numba import njit, prange
+
+    @njit(parallel=True, cache=True, fastmath=False)  # pragma: no cover - njit
+    def _kernel(tau, yw, wv, periods, dur_bins, tmpl_off, tmpl, n_bins, w_eps):  # type: ignore[no-untyped-def]
+        n_periods = periods.shape[0]
+        n_points = tau.shape[0]
+        n_dur = dur_bins.shape[0]
+        o_sr = np.zeros(n_periods)
+        o_depth = np.zeros(n_periods)
+        o_duration = np.zeros(n_periods)
+        o_t0 = np.zeros(n_periods)
+        for pidx in prange(n_periods):
+            period = periods[pidx]
+            a = np.zeros(n_bins)
+            b = np.zeros(n_bins)
+            for j in range(n_points):
+                q = tau[j] / period
+                ph = q - np.floor(q)
+                bb = int(ph * n_bins)
+                if bb > n_bins - 1:
+                    bb = n_bins - 1
+                elif bb < 0:
+                    bb = 0
+                a[bb] += yw[j]
+                b[bb] += wv[j]
+            loc_sr = 0.0
+            loc_depth = 0.0
+            loc_start = 0
+            loc_width = 0
+            for di in range(n_dur):
+                width = dur_bins[di]
+                off = tmpl_off[di]
+                for start in range(n_bins):
+                    num = 0.0
+                    den = 0.0
+                    for k in range(width):
+                        bb = start + k
+                        if bb >= n_bins:
+                            bb -= n_bins  # circular wrap
+                        gk = tmpl[off + k]
+                        num += gk * a[bb]
+                        den += gk * gk * b[bb]
+                    if den > w_eps and num < 0.0:
+                        sr = num * num / den
+                        if sr > loc_sr:
+                            loc_sr = sr
+                            loc_start = start
+                            loc_width = width
+                            loc_depth = -num / den
+            o_sr[pidx] = loc_sr
+            o_depth[pidx] = loc_depth
+            o_duration[pidx] = loc_width / n_bins * period
+            centre = (loc_start + loc_width / 2.0) / n_bins
+            o_t0[pidx] = (centre - np.floor(centre)) * period
+        return o_sr, o_depth, o_duration, o_t0
+
+    _NUMBA_TLS_KERNEL = _kernel
+    return _kernel
+
+
+def _tls_numba(
+    tau: FloatArray,
+    yw: FloatArray,
+    w: FloatArray,
+    periods: FloatArray,
+    *,
+    n_bins: int,
+    dur_bins: list[int],
+    templates: dict[int, FloatArray],
+) -> dict[str, FloatArray]:
+    """Numba CPU matched filter; same output dict as :func:`_matched_filter`."""
+    kernel = _numba_tls_kernel()
+    tmpl = np.concatenate([templates[wd] for wd in dur_bins]).astype(np.float64)
+    widths = np.asarray([len(templates[wd]) for wd in dur_bins], dtype=np.int64)
+    offsets = np.zeros(len(dur_bins), dtype=np.int64)
+    if len(dur_bins) > 1:
+        offsets[1:] = np.cumsum(widths[:-1])
+    sr, depth, duration, t0 = kernel(
+        np.ascontiguousarray(tau), np.ascontiguousarray(yw), np.ascontiguousarray(w),
+        np.ascontiguousarray(periods),
+        np.asarray(dur_bins, dtype=np.int64), offsets, tmpl,
+        int(n_bins), float(_W_EPS),
+    )
+    return {"sr": sr, "depth": depth, "duration": duration, "t0": t0}
+
+
 def tls_power(
     t: FloatArray,
     y: FloatArray,
@@ -404,6 +507,11 @@ def tls_power(
             tau, yw, w, periods_host,
             n_bins=n_bins, dur_bins=dur_bins, templates=templates,
         )
+    elif backend == "numba":
+        res = _tls_numba(
+            tau, yw, w, periods_host,
+            n_bins=n_bins, dur_bins=dur_bins, templates=templates,
+        )
     elif backend == "torch" or backend.startswith("torch:"):
         import torch
 
@@ -438,7 +546,7 @@ def tls_power(
 
 
 class TLSMethod(PeriodogramMethod):
-    """Transit Least Squares — limb-darkened matched filter (numpy CPU, cupy GPU)."""
+    """Transit Least Squares — limb-darkened matched filter (numba/numpy CPU, cupy GPU)."""
 
     name: ClassVar[str] = "TLS"
     objective_sense: ClassVar[Literal["max", "min"]] = "max"
@@ -446,9 +554,10 @@ class TLSMethod(PeriodogramMethod):
     natural_domain: ClassVar[Domain] = Domain.FLUX
     settings_cls: ClassVar[type] = TLSSettings
     cpu_backend: ClassVar[str] = "numpy"
+    fast_cpu_backend: ClassVar[str | None] = "numba"
     gpu_backend: ClassVar[str | None] = "cupy"
     portable_gpu_backend: ClassVar[str | None] = "torch"
-    all_backends: ClassVar[tuple[str, ...]] = ("numpy", "cupy", "torch")
+    all_backends: ClassVar[tuple[str, ...]] = ("numba", "numpy", "cupy", "torch")
 
     def default_grid(self, lc: LightCurve, settings: TLSSettings) -> GridSpec:  # type: ignore[override]
         finite = lc.finite()

@@ -154,35 +154,12 @@ class BLSMethod(PeriodogramMethod):
     natural_domain: ClassVar[Domain] = Domain.FLUX
     settings_cls: ClassVar[type] = BLSSettings
     cpu_backend: ClassVar[str] = "astropy"
+    fast_cpu_backend: ClassVar[str | None] = "numba"
     gpu_backend: ClassVar[str | None] = "cupy"
     portable_gpu_backend: ClassVar[str | None] = "torch"
     all_backends: ClassVar[tuple[str, ...]] = (
         "numba", "numpy", "astropy", "cupy", "torch",
     )
-
-    def resolve_backend(self, requested: str) -> str:
-        """Prefer cupy on NVIDIA, then torch on other GPUs, else the numba CPU search.
-
-        Keeps BLS's CPU preference (multicore numba when installed, else astropy) for
-        ``cpu``/``auto``, while ``auto`` still reaches a GPU: the cupy kernel on CUDA,
-        then the portable torch path on AMD/Intel/Mac. Concrete ``torch``/``torch:*``
-        requests are validated by the base method.
-        """
-        from cuperiod.core.backend import (
-            available_backends,
-            cuda_available,
-            torch_gpu_available,
-        )
-
-        if requested == "auto":
-            if self.gpu_backend is not None and cuda_available():
-                return self.gpu_backend
-            if self.portable_gpu_backend is not None and torch_gpu_available():
-                return self.portable_gpu_backend
-            return "numba" if "numba" in available_backends() else "astropy"
-        if requested == "cpu":
-            return "numba" if "numba" in available_backends() else "astropy"
-        return super().resolve_backend(requested)
 
     def default_grid(self, lc: LightCurve, settings: BLSSettings) -> GridSpec:  # type: ignore[override]
         finite = lc.finite()

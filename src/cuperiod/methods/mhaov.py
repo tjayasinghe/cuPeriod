@@ -183,6 +183,105 @@ def _model_ss_batch(
     return out
 
 
+# --- CPU fast path: numba-parallel, one loop-iteration per trial frequency ----
+
+_NUMBA_MHAOV_KERNEL: Any = None
+
+
+def _numba_mhaov_kernel() -> Any:
+    """Lazily compile (once) and cache the numba MHAOV kernel.
+
+    The same harmonic-trig-sum normal equations as :func:`_model_ss_batch`, with the
+    Chebyshev recurrence run per point in scalar registers — no ``(F, N)`` transients
+    at all — and the tiny ``d×d`` solve done per frequency. ``prange`` over the
+    frequency grid.
+    """
+    global _NUMBA_MHAOV_KERNEL
+    if _NUMBA_MHAOV_KERNEL is not None:
+        return _NUMBA_MHAOV_KERNEL
+    from numba import njit, prange
+
+    @njit(parallel=True, cache=True, fastmath=False)  # pragma: no cover - njit
+    def _kernel(tau, y, freqs, n_harmonics, ridge, sum_y, y_mean, total_ss):  # type: ignore[no-untyped-def]
+        n_freq = freqs.shape[0]
+        n_points = tau.shape[0]
+        h = n_harmonics
+        m_max = 2 * h
+        d = 2 * h + 1
+        two_pi = 2.0 * np.pi
+        out = np.empty(n_freq)
+        for fi in prange(n_freq):
+            f = freqs[fi]
+            c_sums = np.zeros(m_max + 1)
+            s_sums = np.zeros(m_max + 1)
+            a_sums = np.zeros(h + 1)
+            b_sums = np.zeros(h + 1)
+            for j in range(n_points):
+                theta = two_pi * f * tau[j]
+                c1 = np.cos(theta)
+                s1 = np.sin(theta)
+                two_c1 = 2.0 * c1
+                cm = c1
+                sm = s1
+                c_prev = 1.0
+                s_prev = 0.0
+                yj = y[j]
+                for m in range(1, m_max + 1):
+                    c_sums[m] += cm
+                    s_sums[m] += sm
+                    if m <= h:
+                        a_sums[m] += yj * cm
+                        b_sums[m] += yj * sm
+                    c_next = two_c1 * cm - c_prev
+                    s_next = two_c1 * sm - s_prev
+                    c_prev = cm
+                    s_prev = sm
+                    cm = c_next
+                    sm = s_next
+            gram = np.zeros((d, d))
+            proj = np.zeros(d)
+            gram[0, 0] = n_points + ridge
+            proj[0] = sum_y
+            for k in range(1, h + 1):
+                gram[0, 2 * k - 1] = c_sums[k]
+                gram[2 * k - 1, 0] = c_sums[k]
+                gram[0, 2 * k] = s_sums[k]
+                gram[2 * k, 0] = s_sums[k]
+                proj[2 * k - 1] = a_sums[k]
+                proj[2 * k] = b_sums[k]
+                for line in range(1, h + 1):
+                    m_diff = k - line if k >= line else line - k
+                    c_diff = c_sums[m_diff] if m_diff else float(n_points)
+                    cc = 0.5 * (c_diff + c_sums[k + line])
+                    ss = 0.5 * (c_diff - c_sums[k + line])
+                    if k == line:
+                        s_diff = 0.0
+                    elif k > line:
+                        s_diff = s_sums[m_diff]
+                    else:
+                        s_diff = -s_sums[m_diff]
+                    cs = 0.5 * (s_sums[k + line] - s_diff)
+                    extra = ridge if k == line else 0.0
+                    gram[2 * k - 1, 2 * line - 1] = cc + extra
+                    gram[2 * k, 2 * line] = ss + extra
+                    gram[2 * k - 1, 2 * line] = cs
+                    gram[2 * line, 2 * k - 1] = cs
+            beta = np.linalg.solve(gram, proj)
+            model_ss = 0.0
+            for i in range(d):
+                model_ss += beta[i] * proj[i]
+            model_ss -= n_points * y_mean * y_mean
+            if model_ss < 0.0:
+                model_ss = 0.0
+            elif model_ss > total_ss:
+                model_ss = total_ss
+            out[fi] = model_ss
+        return out
+
+    _NUMBA_MHAOV_KERNEL = _kernel
+    return _kernel
+
+
 def _compute_model_ss(
     t: FloatArray,
     y: FloatArray,
@@ -210,6 +309,13 @@ def _compute_model_ss(
     if total_ss <= 0.0:
         return np.zeros(freqs.size, dtype=np.float64), 0.0, n
 
+    if backend == "numba":
+        kernel = _numba_mhaov_kernel()
+        ridge = _RIDGE_EPS * float(np.finfo(np.float64).eps) * float(n)
+        out = kernel(
+            tau, y, freqs, n_harmonics, ridge, float(y.sum()), y_mean, total_ss
+        )
+        return np.asarray(out, dtype=np.float64), total_ss, n
     if backend == "cupy":
         ensure_cuda_dll_path()
         import cupy as cp
@@ -349,16 +455,17 @@ def aov_multiband_power(
 
 
 class MHAOVMethod(PeriodogramMethod):
-    """Multiharmonic Analysis of Variance (numpy CPU, cupy GPU)."""
+    """Multiharmonic Analysis of Variance (numba/numpy CPU, cupy GPU)."""
 
     name: ClassVar[str] = "MHAOV"
     objective_sense: ClassVar[Literal["max", "min"]] = "max"
     supports_multiband: ClassVar[bool] = True
     settings_cls: ClassVar[type] = MHAOVSettings
     cpu_backend: ClassVar[str] = "numpy"
+    fast_cpu_backend: ClassVar[str | None] = "numba"
     gpu_backend: ClassVar[str | None] = "cupy"
     portable_gpu_backend: ClassVar[str | None] = "torch"
-    all_backends: ClassVar[tuple[str, ...]] = ("numpy", "cupy", "torch")
+    all_backends: ClassVar[tuple[str, ...]] = ("numba", "numpy", "cupy", "torch")
 
     def default_grid(self, lc: LightCurve, settings: MHAOVSettings) -> GridSpec:  # type: ignore[override]
         finite = lc.finite()

@@ -193,6 +193,59 @@ def _ce_cuda(
     return np.asarray(cp.asnumpy(out), dtype=np.float64)
 
 
+# --- CPU fast path: numba-parallel, one loop-iteration per trial period -------
+
+_NUMBA_CE_KERNEL: Any = None
+
+
+def _numba_ce_kernel() -> Any:
+    """Lazily compile (once) and cache the numba CE kernel.
+
+    The same fold-bin-reduce as the CUDA kernel, JIT-run across all cores with
+    ``prange``. The phase is ``q - floor(q)``, the formula of the vectorized numpy
+    path, so the two CPU backends bin identically.
+    """
+    global _NUMBA_CE_KERNEL
+    if _NUMBA_CE_KERNEL is not None:
+        return _NUMBA_CE_KERNEL
+    from numba import njit, prange
+
+    @njit(parallel=True, cache=True, fastmath=False)  # pragma: no cover - njit
+    def _kernel(tau, mag_bin, periods, n_phase, n_mag):  # type: ignore[no-untyped-def]
+        n_periods = periods.shape[0]
+        n_points = tau.shape[0]
+        n_cells = n_phase * n_mag
+        out = np.empty(n_periods)
+        for pidx in prange(n_periods):
+            period = periods[pidx]
+            cnt = np.zeros(n_cells)
+            for j in range(n_points):
+                q = tau[j] / period
+                ph = q - np.floor(q)
+                pb = int(ph * n_phase)
+                if pb > n_phase - 1:
+                    pb = n_phase - 1
+                elif pb < 0:
+                    pb = 0
+                cnt[pb * n_mag + mag_bin[j]] += 1.0
+            h = 0.0
+            for p in range(n_phase):
+                ci = 0.0
+                for m in range(n_mag):
+                    ci += cnt[p * n_mag + m]
+                if ci > 0.0:
+                    lci = np.log(ci)
+                    for m in range(n_mag):
+                        c = cnt[p * n_mag + m]
+                        if c > 0.0:
+                            h += c * (lci - np.log(c))
+            out[pidx] = h / n_points
+        return out
+
+    _NUMBA_CE_KERNEL = _kernel
+    return _kernel
+
+
 def conditional_entropy(
     t: FloatArray,
     y: FloatArray,
@@ -242,6 +295,12 @@ def conditional_entropy(
         return _ce_cuda(
             tau, mag_bin, periods_host, n_phase=n_phase_bins, n_mag=n_mag_bins
         )
+    if backend == "numba":
+        kernel = _numba_ce_kernel()
+        return np.asarray(
+            kernel(tau, mag_bin, periods_host, n_phase_bins, n_mag_bins),
+            dtype=np.float64,
+        )
     if backend == "torch" or backend.startswith("torch:"):
         import torch
 
@@ -264,16 +323,17 @@ def conditional_entropy(
 
 
 class ConditionalEntropyMethod(PeriodogramMethod):
-    """Conditional-entropy period search (numpy CPU, cupy GPU)."""
+    """Conditional-entropy period search (numba/numpy CPU, cupy GPU)."""
 
     name: ClassVar[str] = "CE"
     objective_sense: ClassVar[Literal["max", "min"]] = "min"
     supports_multiband: ClassVar[bool] = False
     settings_cls: ClassVar[type] = CESettings
     cpu_backend: ClassVar[str] = "numpy"
+    fast_cpu_backend: ClassVar[str | None] = "numba"
     gpu_backend: ClassVar[str | None] = "cupy"
     portable_gpu_backend: ClassVar[str | None] = "torch"
-    all_backends: ClassVar[tuple[str, ...]] = ("numpy", "cupy", "torch")
+    all_backends: ClassVar[tuple[str, ...]] = ("numba", "numpy", "cupy", "torch")
 
     def default_grid(self, lc: LightCurve, settings: CESettings) -> GridSpec:  # type: ignore[override]
         finite = lc.finite()

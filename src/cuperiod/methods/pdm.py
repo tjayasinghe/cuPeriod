@@ -249,6 +249,76 @@ def _pdm_cuda(
     return np.asarray(cp.asnumpy(out), dtype=np.float64)
 
 
+# --- CPU fast path: numba-parallel, one loop-iteration per trial period -------
+
+_NUMBA_PDM_KERNEL: Any = None
+
+
+def _numba_pdm_kernel() -> Any:
+    """Lazily compile (once) and cache the numba PDM kernel.
+
+    The same fine-bin search as the CUDA kernel — bin each folded point once into
+    ``n_bins*n_covers`` fine bins, regroup covers exactly in the reduction — JIT-run
+    across all cores with ``prange`` (each trial period is independent). The phase is
+    ``q - floor(q)``, the formula of the vectorized numpy path, so the two CPU
+    backends bin identically.
+    """
+    global _NUMBA_PDM_KERNEL
+    if _NUMBA_PDM_KERNEL is not None:
+        return _NUMBA_PDM_KERNEL
+    from numba import njit, prange
+
+    @njit(parallel=True, cache=True, fastmath=False)  # pragma: no cover - njit
+    def _kernel(tau, y, periods, n_bins, n_covers, sigma2):  # type: ignore[no-untyped-def]
+        n_periods = periods.shape[0]
+        n_points = tau.shape[0]
+        m_fine = n_bins * n_covers
+        out = np.empty(n_periods)
+        for pidx in prange(n_periods):
+            period = periods[pidx]
+            s_sum = np.zeros(m_fine)
+            s_sq = np.zeros(m_fine)
+            s_cnt = np.zeros(m_fine)
+            for j in range(n_points):
+                q = tau[j] / period
+                ph = q - np.floor(q)
+                f = int(ph * m_fine)
+                if f > m_fine - 1:
+                    f = m_fine - 1
+                elif f < 0:
+                    f = 0
+                yj = y[j]
+                s_sum[f] += yj
+                s_sq[f] += yj * yj
+                s_cnt[f] += 1.0
+            ssd = 0.0
+            nonempty = 0
+            for c in range(n_covers):
+                for b in range(n_bins):
+                    cnt = 0.0
+                    su = 0.0
+                    sq = 0.0
+                    f0 = b * n_covers - c
+                    if f0 < 0:
+                        f0 += m_fine
+                    for k in range(n_covers):
+                        f = f0 + k
+                        if f >= m_fine:
+                            f -= m_fine
+                        cnt += s_cnt[f]
+                        su += s_sum[f]
+                        sq += s_sq[f]
+                    if cnt > 0.0:
+                        ssd += sq - su * su / cnt
+                        nonempty += 1
+            den = float(n_points * n_covers - nonempty)
+            out[pidx] = (ssd / den) / sigma2 if den > 0.0 else np.inf
+        return out
+
+    _NUMBA_PDM_KERNEL = _kernel
+    return _kernel
+
+
 def pdm_theta(
     t: FloatArray,
     y: FloatArray,
@@ -272,8 +342,9 @@ def pdm_theta(
         Phase bins per cover.
     n_covers : int, default 3
         Overlapping bin sets, offset by ``1/(n_bins*n_covers)`` in phase.
-    backend : {"numpy", "cupy"}, default "numpy"
-        CPU or GPU.
+    backend : str, default "numpy"
+        ``"numpy"`` (vectorized CPU), ``"numba"`` (multicore CPU), ``"cupy"``
+        (NVIDIA RawKernel), or ``"torch"`` / ``"torch:<device>"`` (portable).
     batch : int, default 2048
         Trial periods per vectorized batch.
 
@@ -300,6 +371,11 @@ def pdm_theta(
         return _pdm_cuda(
             tau, y, periods_host, n_bins=n_bins, n_covers=n_covers, sigma2=sigma2
         )
+    if backend == "numba":
+        kernel = _numba_pdm_kernel()
+        return np.asarray(
+            kernel(tau, y, periods_host, n_bins, n_covers, sigma2), dtype=np.float64
+        )
     if backend == "torch" or backend.startswith("torch:"):
         import torch
 
@@ -324,16 +400,17 @@ def pdm_theta(
 
 
 class PDMMethod(PeriodogramMethod):
-    """Phase Dispersion Minimization (numpy CPU, cupy GPU)."""
+    """Phase Dispersion Minimization (numba/numpy CPU, cupy GPU)."""
 
     name: ClassVar[str] = "PDM"
     objective_sense: ClassVar[Literal["max", "min"]] = "min"
     supports_multiband: ClassVar[bool] = False
     settings_cls: ClassVar[type] = PDMSettings
     cpu_backend: ClassVar[str] = "numpy"
+    fast_cpu_backend: ClassVar[str | None] = "numba"
     gpu_backend: ClassVar[str | None] = "cupy"
     portable_gpu_backend: ClassVar[str | None] = "torch"
-    all_backends: ClassVar[tuple[str, ...]] = ("numpy", "cupy", "torch")
+    all_backends: ClassVar[tuple[str, ...]] = ("numba", "numpy", "cupy", "torch")
 
     def default_grid(self, lc: LightCurve, settings: PDMSettings) -> GridSpec:  # type: ignore[override]
         finite = lc.finite()

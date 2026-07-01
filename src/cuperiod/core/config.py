@@ -165,7 +165,7 @@ class BLSSettings(_DeviceSettings):
         default=20, ge=3, description="Skip if fewer finite points."
     )
     backend: Literal[
-        "auto", "cpu", "gpu", "numpy", "astropy", "cupy", "torch"
+        "auto", "cpu", "gpu", "numba", "numpy", "astropy", "cupy", "torch"
     ] = Field(default="auto", description="Compute backend.")
     batch_periods: int = Field(
         default=2048, ge=1, description="Trial periods per vectorized batch."
@@ -213,9 +213,9 @@ class PDMSettings(_DeviceSettings):
     min_detections: int = Field(
         default=20, ge=3, description="Skip if fewer finite points."
     )
-    backend: Literal["auto", "cpu", "gpu", "numpy", "cupy", "torch"] = Field(
-        default="auto", description="Compute backend."
-    )
+    backend: Literal[
+        "auto", "cpu", "gpu", "numba", "numpy", "cupy", "torch"
+    ] = Field(default="auto", description="Compute backend.")
     batch_periods: int = Field(
         default=2048, ge=1, description="Trial periods per vectorized batch."
     )
@@ -261,9 +261,9 @@ class MHAOVSettings(_DeviceSettings):
     min_detections: int = Field(
         default=20, ge=5, description="Skip if fewer finite points (need > 2H+1)."
     )
-    backend: Literal["auto", "cpu", "gpu", "numpy", "cupy", "torch"] = Field(
-        default="auto", description="Compute backend."
-    )
+    backend: Literal[
+        "auto", "cpu", "gpu", "numba", "numpy", "cupy", "torch"
+    ] = Field(default="auto", description="Compute backend.")
     batch_periods: int = Field(
         default=512, ge=1, description="Trial frequencies per vectorized batch."
     )
@@ -308,9 +308,9 @@ class CESettings(_DeviceSettings):
     min_detections: int = Field(
         default=20, ge=3, description="Skip if fewer finite points."
     )
-    backend: Literal["auto", "cpu", "gpu", "numpy", "cupy", "torch"] = Field(
-        default="auto", description="Compute backend."
-    )
+    backend: Literal[
+        "auto", "cpu", "gpu", "numba", "numpy", "cupy", "torch"
+    ] = Field(default="auto", description="Compute backend.")
     batch_periods: int = Field(
         default=1024, ge=1, description="Trial periods per vectorized batch."
     )
@@ -353,9 +353,9 @@ class StringLengthSettings(_DeviceSettings):
     min_detections: int = Field(
         default=20, ge=3, description="Skip if fewer finite points."
     )
-    backend: Literal["auto", "cpu", "gpu", "numpy", "cupy", "torch"] = Field(
-        default="auto", description="Compute backend."
-    )
+    backend: Literal[
+        "auto", "cpu", "gpu", "numba", "numpy", "cupy", "torch"
+    ] = Field(default="auto", description="Compute backend.")
     batch_periods: int = Field(
         default=1024, ge=1, description="Trial periods per vectorized batch."
     )
@@ -425,9 +425,9 @@ class TLSSettings(_DeviceSettings):
     min_detections: int = Field(
         default=20, ge=3, description="Skip if fewer finite points."
     )
-    backend: Literal["auto", "cpu", "gpu", "numpy", "cupy", "torch"] = Field(
-        default="auto", description="Compute backend."
-    )
+    backend: Literal[
+        "auto", "cpu", "gpu", "numba", "numpy", "cupy", "torch"
+    ] = Field(default="auto", description="Compute backend.")
     period_batch: int = Field(
         default=256, ge=1, description="Trial periods per vectorized batch."
     )
