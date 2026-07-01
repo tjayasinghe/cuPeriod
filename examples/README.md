@@ -32,3 +32,29 @@ the GPU automatically (`backend="auto"`).
   light curves (one per variability class), each with its VSX literature period.
 - `data/kepler_KIC7532973.csv` — *Kepler* PDCSAP flux for a confirmed hot-Jupiter host,
   fetched once with [lightkurve](https://docs.lightkurve.org/).
+
+## The desktop GUI (`cuperiod-gui`)
+
+An interactive periodogram explorer built on PySide6 + pyqtgraph: run any method with all
+of its options, explore the full-resolution spectrum, and watch the phased light curve
+update live as you pick peaks — single curves or a whole folder in batch mode.
+
+```bash
+pip install "cuperiod[gui]"     # add [gpu] or [torch] for accelerated backends
+cuperiod-gui                    # or:  python -m cuperiod.gui
+```
+
+### A two-minute smoke test
+
+1. **Load demo → *Kepler KIC 7532973*.** Pick method **BLS**, press **Compute**. The
+   spectrum draws (peak-preserving, smooth to zoom); the phased panel shows the transit as
+   a **dip** at the best period.
+2. **Slide the teal line** across the spectrum (or click a row in the **Peaks** dock) and
+   watch the phased curve re-fold live. Toggle the spectrum's **x-axis** (frequency ↔
+   period) and **log** scales, and the **2 cycles** checkbox on the phased panel.
+3. **Load demo → *Synthetic multiband*.** With **GLS** the phased panel overlays all three
+   bands (colour-coded, legend); the **Band** selector chooses *combined* or one band.
+4. **Load demo → *Batch: browse all demo sources*.** Scroll the **Sources** dock (arrow
+   keys or Prev/Next); each source computes on demand and revisits are instant (cached).
+5. **Toggle the theme** (dark ↔ light, remembered next launch). With `[gpu]`/`[torch]`
+   installed, the info bar names the backend and device actually used.

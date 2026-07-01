@@ -73,6 +73,11 @@ fast = ["numba>=0.59"]
 # plain wheel is CPU-only; CUDA/ROCm/XPU builds come from PyTorch's own index, so we do
 # not pin a hardware-specific build here.
 torch = ["torch>=2.2"]
+# Desktop GUI: an interactive periodogram explorer (`cuperiod-gui`). PySide6 is the
+# Qt6 toolkit (LGPL); pyqtgraph renders the full-resolution spectrum and light-curve
+# panels at interactive speed; pandas backs the demo-data adapters and grouped-batch
+# input. Purely a presentation layer over the existing API — no core dependency.
+gui = ["PySide6>=6.6", "pyqtgraph>=0.13", "pandas>=2.0"]
 # Documentation toolchain (Sphinx + Furo theme). pandas is included so the
 # DataFrame-ingestion examples and the autodoc of from_dataframe build cleanly.
 docs = [
@@ -93,10 +98,15 @@ dev = [
     "numba>=0.59",
     # Exercise the portable torch-CPU path in CI (GPU devices auto-skip).
     "torch>=2.2",
+    # Drive the Qt GUI headlessly (QT_QPA_PLATFORM=offscreen) in tests.
+    "PySide6>=6.6",
+    "pyqtgraph>=0.13",
+    "pytest-qt>=4",
 ]
 
 [project.scripts]
 cuperiod = "cuperiod.cli.app:main"
+cuperiod-gui = "cuperiod.gui:main"
 
 [project.urls]
 Homepage = "https://github.com/tjayasinghe/cuPeriod"
@@ -170,6 +180,17 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = ["pyarrow", "pyarrow.*"]
 follow_imports = "skip"
+
+# pyqtgraph ships no type stubs.
+[[tool.mypy.overrides]]
+module = ["pyqtgraph", "pyqtgraph.*"]
+ignore_missing_imports = true
+
+# The GUI subclasses pyqtgraph view classes (untyped -> Any); strict mode's
+# disallow_subclassing_any would reject that. Everything else stays strict.
+[[tool.mypy.overrides]]
+module = ["cuperiod.gui.*"]
+disallow_subclassing_any = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

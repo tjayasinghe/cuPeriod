@@ -10,6 +10,9 @@ import os
 # harmless elsewhere. The library itself does not set this — see the install docs.
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
+# Run the Qt GUI tests (tests/gui) headlessly; harmless for the non-Qt tests.
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 import importlib.util  # noqa: E402
 
 import pytest  # noqa: E402
