@@ -28,7 +28,7 @@ from cuperiod.core._arrayapi import (
     array_namespace,
     device_ref,
     resolve_precision,
-    scatter_add,
+    scatter_add_rows,
     to_device_array,
     to_host,
 )
@@ -133,7 +133,6 @@ def _bls_search(
     fdtype = periods.dtype
     idtype = xp.int64
     dev = device_ref(periods)
-    n_points = int(t.shape[0])
     yw = y * ivar
     sum_y = float(xp.sum(yw))
     sum_ivar = float(xp.sum(ivar))
@@ -152,6 +151,7 @@ def _bls_search(
     }
     if n_periods == 0 or not dur_bins:
         return out
+    cols_full = xp.arange(width, dtype=idtype, device=dev)
 
     for start in range(0, n_periods, batch):
         stop = min(start + batch, n_periods)
@@ -163,15 +163,10 @@ def _bls_search(
         phase_t = xp.remainder(tau[None, :], pb[:, None])
         ind = xp.astype(phase_t / bin_duration, idtype) + 1
         ind = xp.clip(ind, 0, width - 1)
-        flat = xp.reshape(rows[:, None] * width + ind, (-1,))
-        mean_y = xp.zeros(n_p * width, dtype=fdtype, device=dev)
-        mean_ivar = xp.zeros(n_p * width, dtype=fdtype, device=dev)
-        yw_b = xp.reshape(xp.broadcast_to(yw, (n_p, n_points)), (-1,))
-        ivar_b = xp.reshape(xp.broadcast_to(ivar, (n_p, n_points)), (-1,))
-        scatter_add(mean_y, flat, yw_b)
-        scatter_add(mean_ivar, flat, ivar_b)
-        mean_y = xp.reshape(mean_y, (n_p, width))
-        mean_ivar = xp.reshape(mean_ivar, (n_p, width))
+        mean_y = xp.zeros((n_p, width), dtype=fdtype, device=dev)
+        mean_ivar = xp.zeros((n_p, width), dtype=fdtype, device=dev)
+        scatter_add_rows(mean_y, ind, yw)
+        scatter_add_rows(mean_ivar, ind, ivar)
 
         for j in range(oversample):
             dst = xp.clip(n_bins - oversample + j, 0, width - 1)
@@ -191,7 +186,7 @@ def _bls_search(
             y_in = cy[:, kd:] - cy[:, :-kd]
             ivar_in = cw[:, kd:] - cw[:, :-kd]
             ivar_out = sum_ivar - ivar_in
-            cols = xp.arange(y_in.shape[1], dtype=idtype, device=dev)
+            cols = cols_full[: width - kd]
             valid = (
                 (cols[None, :] <= (n_bins[:, None] - kd))
                 & (ivar_in >= _IVAR_EPS)

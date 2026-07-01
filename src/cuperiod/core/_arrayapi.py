@@ -93,7 +93,10 @@ def scatter_add(target: Any, index: Any, values: Any) -> None:
 
     ``target`` is 1-D and ``index``/``values`` are 1-D and aligned. ``numpy.add.at`` is
     not part of the array-API standard and PyTorch has no equivalent *function*, so this
-    dispatches per backend: torch uses ``Tensor.index_add_``; numpy/cupy use ``add.at``.
+    dispatches per backend: torch uses ``Tensor.index_add_``; cupy uses
+    ``cupyx.scatter_add`` (its fast documented scatter); numpy uses ``bincount``, which
+    computes the same float64 sums in one buffered pass — ``np.add.at`` is unbuffered
+    and an order of magnitude slower on large inputs.
 
     ``values.dtype`` must equal ``target.dtype``: torch ``index_add_`` rejects a
     mismatch (numpy/cupy would silently cast), so callers build both at the same
@@ -103,11 +106,71 @@ def scatter_add(target: Any, index: Any, values: Any) -> None:
         target.index_add_(0, index.long(), values)
         return
     if is_cupy_array(target):
-        import cupy
+        import cupyx
 
-        cupy.add.at(target, index, values)
+        cupyx.scatter_add(target, index, values)
         return
-    np.add.at(target, index, values)
+    binned = np.bincount(
+        np.asarray(index), weights=np.asarray(values), minlength=target.size
+    )
+    target += binned.astype(target.dtype, copy=False)
+
+
+def scatter_add_rows(target: Any, index: Any, values: Any) -> None:
+    """In-place ``target[p, index[p, j]] += values[j]`` with repeats accumulated.
+
+    The batch-kernel binning primitive: ``target`` is 2-D ``(P, W)``, ``index`` is
+    ``(P, N)`` int64, and ``values`` is one shared row ``(N,)`` (the usual case — the
+    same light curve binned at ``P`` trial periods) or a full ``(P, N)``. Compared to
+    flattening and calling :func:`scatter_add`, this avoids materializing the broadcast
+    ``(P, N)`` values *and* the flat ``(P, N)`` int64 index on torch — the scatter
+    reads a stride-0 expanded view — and gives numpy one fused ``bincount`` pass.
+    """
+    if is_torch_array(target):
+        src = values if values.ndim == 2 else values.unsqueeze(0).expand_as(index)
+        target.scatter_add_(1, index, src)
+        return
+    if is_cupy_array(target):
+        import cupy
+        import cupyx
+
+        rows = cupy.arange(target.shape[0])[:, None]
+        cupyx.scatter_add(target, (rows, index), values)
+        return
+    n_rows, n_cols = target.shape
+    flat = index + (np.arange(n_rows, dtype=np.int64) * n_cols)[:, None]
+    weights = np.broadcast_to(values, index.shape)
+    binned = np.bincount(
+        flat.reshape(-1), weights=weights.reshape(-1), minlength=target.size
+    )
+    target += binned.reshape(target.shape).astype(target.dtype, copy=False)
+
+
+def scatter_counts_rows(target: Any, index: Any) -> None:
+    """In-place ``target[p, index[p, j]] += 1`` — a per-row histogram count.
+
+    Same layout contract as :func:`scatter_add_rows` but without a values array:
+    numpy uses weightless ``bincount`` and torch scatters a stride-0 view of a single
+    one, so no ``(P, N)`` ones array is ever built. ``target`` is float (counts are
+    accumulated in the working dtype for the entropy/variance math downstream).
+    """
+    if is_torch_array(target):
+        import torch
+
+        one = torch.ones((1, 1), dtype=target.dtype, device=target.device)
+        target.scatter_add_(1, index, one.expand_as(index))
+        return
+    if is_cupy_array(target):
+        import cupy
+        import cupyx
+
+        rows = cupy.arange(target.shape[0])[:, None]
+        cupyx.scatter_add(target, (rows, index), target.dtype.type(1))
+        return
+    n_rows, n_cols = target.shape
+    flat = index + (np.arange(n_rows, dtype=np.int64) * n_cols)[:, None]
+    binned = np.bincount(flat.reshape(-1), minlength=target.size)
+    target += binned.reshape(target.shape).astype(target.dtype, copy=False)
 
 
 def to_host(a: Any) -> np.ndarray:
@@ -201,6 +264,8 @@ __all__ = [
     "resolve_precision",
     "resolve_torch_device",
     "scatter_add",
+    "scatter_add_rows",
+    "scatter_counts_rows",
     "to_device_array",
     "to_host",
 ]

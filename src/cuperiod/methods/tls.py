@@ -29,7 +29,7 @@ from cuperiod.core._arrayapi import (
     device_ref,
     resolve_precision,
     resolve_torch_device,
-    scatter_add,
+    scatter_add_rows,
     to_device_array,
     to_host,
 )
@@ -137,7 +137,6 @@ def _matched_filter(
         "duration": xp.zeros(n_periods, dtype=fdtype, device=dev),
         "t0": xp.zeros(n_periods, dtype=fdtype, device=dev),
     }
-    n_points = int(tau.shape[0])
     for start in range(0, n_periods, period_batch):
         stop = min(start + period_batch, n_periods)
         pb = periods[start:stop]
@@ -145,15 +144,14 @@ def _matched_filter(
         rows_p = xp.arange(n_p, dtype=idtype, device=dev)
         phase = xp.remainder(tau[None, :] / pb[:, None], 1.0)
         bin_idx = xp.clip(xp.astype(phase * n_bins, idtype), 0, n_bins - 1)
-        flat = xp.reshape(rows_p[:, None] * n_bins + bin_idx, (-1,))
-        a_flat = xp.zeros(n_p * n_bins, dtype=fdtype, device=dev)  # sum w*y' per bin
-        b_flat = xp.zeros(n_p * n_bins, dtype=fdtype, device=dev)  # sum w per bin
-        yw_b = xp.reshape(xp.broadcast_to(yw, (n_p, n_points)), (-1,))
-        w_b = xp.reshape(xp.broadcast_to(w, (n_p, n_points)), (-1,))
-        scatter_add(a_flat, flat, yw_b)
-        scatter_add(b_flat, flat, w_b)
-        a = xp.reshape(a_flat, (n_p, n_bins))
-        b = xp.reshape(b_flat, (n_p, n_bins))
+        a = xp.zeros((n_p, n_bins), dtype=fdtype, device=dev)  # sum w*y' per bin
+        b = xp.zeros((n_p, n_bins), dtype=fdtype, device=dev)  # sum w per bin
+        scatter_add_rows(a, bin_idx, yw)
+        scatter_add_rows(b, bin_idx, w)
+        # One circular pad sized for the widest template serves every width below.
+        max_pad = max(dur_bins) - 1
+        a_ext = xp.concat([a, a[:, :max_pad]], axis=1) if max_pad else a
+        b_ext = xp.concat([b, b[:, :max_pad]], axis=1) if max_pad else b
 
         best_sr = xp.zeros(n_p, dtype=fdtype, device=dev)
         best_depth = xp.zeros(n_p, dtype=fdtype, device=dev)
@@ -161,14 +159,12 @@ def _matched_filter(
         best_width = xp.zeros(n_p, dtype=idtype, device=dev)
         for width in dur_bins:
             g = templates[width]
-            a_ext = xp.concat([a, a[:, : width - 1]], axis=1)
-            b_ext = xp.concat([b, b[:, : width - 1]], axis=1)
-            num = xp.zeros((n_p, n_bins), dtype=fdtype, device=dev)
-            den = xp.zeros((n_p, n_bins), dtype=fdtype, device=dev)
-            for k in range(width):  # correlate the folded data with the template
+            num = float(g[0]) * a_ext[:, :n_bins]
+            den = float(g[0] * g[0]) * b_ext[:, :n_bins]
+            for k in range(1, width):  # correlate the folded data with the template
                 gk = float(g[k])
-                num = num + gk * a_ext[:, k : k + n_bins]
-                den = den + (gk * gk) * b_ext[:, k : k + n_bins]
+                num += gk * a_ext[:, k : k + n_bins]
+                den += (gk * gk) * b_ext[:, k : k + n_bins]
             safe_den = xp.where(den > _W_EPS, den, 1.0)
             # a dip means the in-transit weighted residual is negative -> num < 0
             sr = xp.where((den > _W_EPS) & (num < 0.0), num * num / safe_den, 0.0)
