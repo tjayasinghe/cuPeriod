@@ -20,6 +20,7 @@ import numpy as np
 from cuperiod.core._arrayapi import (
     array_namespace,
     device_ref,
+    is_torch_array,
     resolve_precision,
     resolve_torch_device,
     to_device_array,
@@ -63,14 +64,22 @@ def _length_batch(
     dev = device_ref(periods)
     n_periods = int(periods.shape[0])
     length = xp.empty(n_periods, dtype=periods.dtype, device=dev)
+    torch_input = is_torch_array(periods)
     for start in range(0, n_periods, batch):
         stop = min(start + batch, n_periods)
         pb = periods[start:stop]
         n_p = int(pb.shape[0])
         phase = xp.remainder(tau[None, :] / pb[:, None], 1.0)  # (P, N)
-        order = xp.argsort(phase, axis=1)
-        rows = xp.arange(n_p, dtype=idtype, device=dev)[:, None]
-        ph = phase[rows, order]            # phase sorted per row
+        if torch_input:
+            # torch.sort returns sorted values and the (stable) order in one kernel,
+            # replacing the argsort + row-gather pair.
+            import torch
+
+            ph, order = torch.sort(phase, dim=1, stable=True)
+        else:
+            order = xp.argsort(phase, axis=1)
+            rows = xp.arange(n_p, dtype=idtype, device=dev)[:, None]
+            ph = phase[rows, order]        # phase sorted per row
         mm = m_scaled[order]               # magnitudes gathered in the same order
         dphi = ph[:, 1:] - ph[:, :-1]
         dmag = mm[:, 1:] - mm[:, :-1]
@@ -80,6 +89,148 @@ def _length_batch(
         total = total + xp.sqrt(wrap_phi * wrap_phi + wrap_mag * wrap_mag)
         length[start:stop] = total
     return length
+
+
+# --- GPU fast path: one CUDA block per trial period ---------------------------
+
+#: CUDA threads per block for the sort kernel (one block per trial period).
+CUDA_BLOCK: Final = 256
+
+#: Shared-memory bytes per point in the sort kernel: a float64 phase + int32 index.
+_SL_BYTES_PER_POINT: Final = 12
+
+#: One-block-per-period string-length kernel: a block folds its points, bitonic-sorts
+#: the (phase, original index) pairs in shared memory — comparing the index on equal
+#: phases makes the order *stable*, matching the array-API paths' stable argsort — and
+#: accumulates the string length from the sorted neighbours. No (P, N) intermediates
+#: and no global sort scratch. Fits light curves up to the shared-memory capacity
+#: (~4096 points at the default 48 KB); larger curves take the vectorized path.
+_SL_CUDA_SRC: Final = r"""
+extern "C" __global__ void sl_block(
+    const double* __restrict__ tau, const double* __restrict__ mag,
+    const double* __restrict__ periods,
+    const int n_points, const int n_pad, const int n_periods,
+    double* o_length)
+{
+    const int pidx = blockIdx.x;
+    if (pidx >= n_periods) return;
+    const int tid = threadIdx.x;
+    const int nth = blockDim.x;
+    const double period = periods[pidx];
+
+    extern __shared__ double sh[];
+    double* ph = sh;                    // (n_pad) folded phases
+    int* idx = (int*)(sh + n_pad);      // (n_pad) original indices
+
+    for (int i = tid; i < n_pad; i += nth) {
+        if (i < n_points) {
+            double q = tau[i] / period;
+            ph[i] = q - floor(q);       // mod(tau/period, 1), as the CPU paths
+            idx[i] = i;
+        } else {
+            ph[i] = 2.0;                // pad above any phase; sorts to the end
+            idx[i] = 0x7fffffff;
+        }
+    }
+    __syncthreads();
+
+    for (int k = 2; k <= n_pad; k <<= 1) {
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            for (int i = tid; i < n_pad; i += nth) {
+                int ixj = i ^ j;
+                if (ixj > i) {
+                    bool up = ((i & k) == 0);
+                    double pa = ph[i], pb = ph[ixj];
+                    int ia = idx[i], ib = idx[ixj];
+                    bool greater = (pa > pb) || (pa == pb && ia > ib);
+                    if (greater == up) {
+                        ph[i] = pb; ph[ixj] = pa;
+                        idx[i] = ib; idx[ixj] = ia;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    double total = 0.0;
+    for (int i = tid; i < n_points - 1; i += nth) {
+        double dphi = ph[i + 1] - ph[i];
+        double dmag = mag[idx[i + 1]] - mag[idx[i]];
+        total += sqrt(dphi * dphi + dmag * dmag);
+    }
+    if (tid == 0) {
+        double dphi = (ph[0] + 1.0) - ph[n_points - 1];
+        double dmag = mag[idx[0]] - mag[idx[n_points - 1]];
+        total += sqrt(dphi * dphi + dmag * dmag);
+    }
+    __shared__ double r_t[CUDA_BLOCK];
+    r_t[tid] = total;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) r_t[tid] += r_t[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) o_length[pidx] = r_t[0];
+}
+"""
+
+_sl_kernel_cache: dict[int, Any] = {}
+
+
+def _sl_kernel(block: int) -> Any:
+    """Compile (once) and cache the string-length RawKernel for a block size."""
+    kernel = _sl_kernel_cache.get(block)
+    if kernel is None:
+        import cupy
+
+        src = _SL_CUDA_SRC.replace("CUDA_BLOCK", str(block))
+        kernel = cupy.RawKernel(src, "sl_block")
+        _sl_kernel_cache[block] = kernel
+    return kernel
+
+
+def _sl_cuda_capacity() -> int:
+    """Largest light curve the sort kernel can hold in opt-in shared memory."""
+    import cupy
+
+    optin = int(
+        cupy.cuda.Device().attributes.get("MaxSharedMemoryPerBlockOptin", 48 * 1024)
+    )
+    return (optin - CUDA_BLOCK * 8) // _SL_BYTES_PER_POINT  # static reduce buffer
+
+
+def _sl_cuda(
+    tau: FloatArray,
+    m_scaled: FloatArray,
+    periods: FloatArray,
+    *,
+    block: int = CUDA_BLOCK,
+) -> FloatArray:
+    """One-block-per-period CUDA string length; returns a host float64 array."""
+    import cupy as cp
+
+    n = int(tau.size)
+    n_pad = 1
+    while n_pad < n:
+        n_pad <<= 1
+    tau_d = cp.asarray(np.ascontiguousarray(tau, dtype=np.float64))
+    mag_d = cp.asarray(np.ascontiguousarray(m_scaled, dtype=np.float64))
+    per_d = cp.asarray(np.ascontiguousarray(periods, dtype=np.float64))
+    n_periods = int(per_d.size)
+    out = cp.empty(n_periods, dtype=cp.float64)
+    from cuperiod.core.backend import ensure_shared_memory
+
+    smem = n_pad * _SL_BYTES_PER_POINT
+    kernel = _sl_kernel(block)
+    ensure_shared_memory(kernel, smem, method="STRINGLENGTH", hint="n (light curve)")
+    kernel(
+        (n_periods,),
+        (block,),
+        (tau_d, mag_d, per_d, np.int32(n), np.int32(n_pad), np.int32(n_periods), out),
+        shared_mem=smem,
+    )
+    return np.asarray(cp.asnumpy(out), dtype=np.float64)
 
 
 # --- CPU fast path: numba-parallel, one loop-iteration per trial period -------
@@ -172,6 +323,10 @@ def string_length(
 
     if backend == "cupy":
         ensure_cuda_dll_path()
+        # The in-block sort kernel needs the whole curve in shared memory; longer
+        # curves fall back to the vectorized sort-based path.
+        if t.size <= _sl_cuda_capacity():
+            return _sl_cuda(tau, m_scaled, periods_host)
         import cupy as cp
 
         per_cp = cp.asarray(periods_host)
