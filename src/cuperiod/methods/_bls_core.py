@@ -628,7 +628,15 @@ def _bls_search_cuda(
             np.float64(data["t_min"]),
             np.int32(obj_flag),
             rdtype(-np.inf),
-            rdtype(_IVAR_EPS),
+            # In float64 an empty box window's ivar_in is exactly 0, so the absolute
+            # eps floor suffices. In float32 the cumsum difference of an empty window
+            # is cancellation *noise* of order sum_ivar*eps_f32 — an absolute 2.2e-16
+            # floor would admit garbage boxes — so the floor scales with the total.
+            rdtype(
+                max(_IVAR_EPS, data["sum_ivar"] * 8.0 * float(np.finfo(np.float32).eps))
+            )
+            if precision == "float32"
+            else np.float64(_IVAR_EPS),
             out["power"],
             out["depth"],
             out["depth_err"],

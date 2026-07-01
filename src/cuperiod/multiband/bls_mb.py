@@ -84,7 +84,7 @@ def bls_multiband_power(
     band_caches: list[dict[str, object]] = [{} for _ in bands]
     for periods, durations in segments:
         per_band = []
-        for lc, device_cache in zip(bands, band_caches):
+        for lc, device_cache in zip(bands, band_caches, strict=True):
             err = lc.error if lc.error is not None else np.ones_like(lc.value)
             seg = _segment_power(
                 backend,  # type: ignore[arg-type]

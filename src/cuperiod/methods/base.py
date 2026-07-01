@@ -144,7 +144,7 @@ class PeriodogramMethod(ABC):
         return requested
 
     def _best_cpu_backend(self, available: set[str]) -> str:
-        """``fast_cpu_backend`` when its dependency is installed, else ``cpu_backend``."""
+        """``fast_cpu_backend`` when its dependency is present, else ``cpu_backend``."""
         if self.fast_cpu_backend is not None and self.fast_cpu_backend in available:
             return self.fast_cpu_backend
         return self.cpu_backend

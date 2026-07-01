@@ -162,6 +162,8 @@ module = [
     "cufinufft",
     "cupy",
     "cupy.*",
+    "cupyx",
+    "cupyx.*",
     "numba",
     "numba.*",
     "pandas",

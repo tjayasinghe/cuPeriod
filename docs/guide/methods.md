@@ -83,7 +83,8 @@ for peak in pg.best_periods(5, alias_diverse=True):     # alias-aware for box se
 ```
 
 With the `[fast]` extra, BLS's CPU backend is a multicore `numba` search ~20× faster than
-astropy. Key settings ({class}`~cuperiod.BLSSettings`): `min_period_days` /
+astropy (PDM, CE, String-Length, MHAOV, and TLS gain `numba` CPU kernels too — see
+{doc}`backends`). Key settings ({class}`~cuperiod.BLSSettings`): `min_period_days` /
 `max_period_days`, `duration_min_frac` / `duration_max_frac`, `n_durations`, `objective`.
 
 ### TLS — transit least squares

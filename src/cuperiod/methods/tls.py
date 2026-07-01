@@ -558,7 +558,7 @@ def tls_power(
 
 
 class TLSMethod(PeriodogramMethod):
-    """Transit Least Squares — limb-darkened matched filter (numba/numpy CPU, cupy GPU)."""
+    """Transit Least Squares — limb-darkened matched filter (numba CPU, cupy GPU)."""
 
     name: ClassVar[str] = "TLS"
     objective_sense: ClassVar[Literal["max", "min"]] = "max"
