@@ -209,31 +209,51 @@ def lombscargle_power(
     )
 
 
-def _trig_sums_direct(
-    xp: Any, tau: Any, strengths: Any, f0: float, df: float, nf: int, *, freq_batch: int
-) -> tuple[Any, Any]:
-    """Direct (NUFFT-free) trig sums on the uniform grid ``f_k = f0 + k*df``.
+#: Elements per transient ``(chunk, N)`` matrix in the direct path (64 MB float64);
+#: the frequency chunk is capped so long light curves cannot blow device memory.
+_DIRECT_CHUNK_ELEMS: Final = 1 << 23
 
-    Returns ``(cos_sum, sin_sum)`` real arrays of length ``nf`` with
-    ``cos_sum[k] = sum_j strengths_j cos(2*pi*f_k*tau_j)`` and ``sin_sum`` the matching
-    ``+sin`` sum (the ``isign=+1`` convention of the NUFFT path). This is ``O(N*nf)``
-    rather than the NUFFT's ``O(nf log nf)``, but is pure array-API and so runs on any
-    backend/device — the portable GLS path for AMD/Intel/Mac. Batched over frequency to
-    bound the transient ``(chunk, N)`` angle matrix.
+
+def _gls_sums_direct(
+    xp: Any, tau: Any, w: Any, wy: Any, f0: float, df: float, nf: int, *,
+    freq_batch: int,
+) -> tuple[Any, Any, Any, Any, Any, Any]:
+    """All six GLS trig sums on ``f_k = f0 + k*df`` from one cos/sin evaluation.
+
+    Returns ``(c, s, yc, ys, c2, s2)`` — the cos/sin sums of the weights ``w`` and the
+    weighted data ``wy`` on the base grid, and of ``w`` on the doubled grid (the
+    ``isign=+1`` convention of the NUFFT path). The base-grid sums share one angle
+    matrix, and the doubled-frequency sums follow from the double-angle identities
+    ``cos2θ = 2cos²θ − 1`` and ``sin2θ = 2·sinθ·cosθ``, so ``cos``/``sin`` are
+    evaluated **once** per frequency instead of six times (twice per grid in the
+    three-call arrangement). ``O(N*nf)`` rather than the NUFFT's ``O(nf log nf)``, but
+    pure array-API — the portable GLS path for AMD/Intel/Mac. Batched over frequency
+    to bound the transient ``(chunk, N)`` matrices, with the chunk auto-capped so the
+    transients stay ~64 MB regardless of ``N``.
     """
     two_pi = 2.0 * float(np.pi)
     fdtype = tau.dtype
     dev = device_ref(tau)
+    n_points = int(tau.shape[0])
+    chunk = max(1, min(freq_batch, _DIRECT_CHUNK_ELEMS // max(1, n_points)))
     freqs = f0 + df * xp.arange(nf, dtype=fdtype, device=dev)
-    cos_sum = xp.empty(nf, dtype=fdtype, device=dev)
-    sin_sum = xp.empty(nf, dtype=fdtype, device=dev)
-    strength_row = strengths[None, :]
-    for start in range(0, nf, freq_batch):
-        stop = min(start + freq_batch, nf)
+    c, s, yc, ys, c2, s2 = (xp.empty(nf, dtype=fdtype, device=dev) for _ in range(6))
+    sum_w = float(xp.sum(w))
+    w_row = w[None, :]
+    wy_row = wy[None, :]
+    for start in range(0, nf, chunk):
+        stop = min(start + chunk, nf)
         ang = (two_pi * freqs[start:stop])[:, None] * tau[None, :]
-        cos_sum[start:stop] = xp.sum(strength_row * xp.cos(ang), axis=1)
-        sin_sum[start:stop] = xp.sum(strength_row * xp.sin(ang), axis=1)
-    return cos_sum, sin_sum
+        cos_a = xp.cos(ang)
+        sin_a = xp.sin(ang)
+        wc = w_row * cos_a
+        c[start:stop] = xp.sum(wc, axis=1)
+        s[start:stop] = xp.sum(w_row * sin_a, axis=1)
+        yc[start:stop] = xp.sum(wy_row * cos_a, axis=1)
+        ys[start:stop] = xp.sum(wy_row * sin_a, axis=1)
+        c2[start:stop] = 2.0 * xp.sum(wc * cos_a, axis=1) - sum_w
+        s2[start:stop] = 2.0 * xp.sum(wc * sin_a, axis=1)
+    return c, s, yc, ys, c2, s2
 
 
 def lombscargle_power_torch(
@@ -267,10 +287,8 @@ def lombscargle_power_torch(
     w_d = to_device_array(w, device=device, dtype=tdtype)
     wy_d = to_device_array(w * y, device=device, dtype=tdtype)
     xp = array_namespace(tau_d)
-    c, s = _trig_sums_direct(xp, tau_d, w_d, f0, df, nf, freq_batch=freq_batch)
-    yc, ys = _trig_sums_direct(xp, tau_d, wy_d, f0, df, nf, freq_batch=freq_batch)
-    c2, s2 = _trig_sums_direct(
-        xp, tau_d, w_d, 2.0 * f0, 2.0 * df, nf, freq_batch=freq_batch
+    c, s, yc, ys, c2, s2 = _gls_sums_direct(
+        xp, tau_d, w_d, wy_d, f0, df, nf, freq_batch=freq_batch
     )
     power = _assemble_power_parts(xp, c, s, yc, ys, c2, s2, y_mean, yy, fit_mean)
     return to_host(power)
