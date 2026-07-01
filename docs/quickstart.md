@@ -134,7 +134,8 @@ pg = cup.periodogram((time, mag, err), "GLS", backend="gpu")   # or "cpu"
 ```
 
 The result is identical to floating-point round-off; the GPU just computes it faster on
-large grids and big catalogs. See {doc}`guide/backends`.
+large grids and big catalogs. On a non-NVIDIA GPU (AMD, Intel, or Apple), install the
+`[torch]` extra and use `backend="torch"` instead. See {doc}`guide/backends`.
 
 ## From the command line
 

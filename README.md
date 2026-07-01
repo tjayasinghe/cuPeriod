@@ -5,9 +5,12 @@
 [![Documentation Status](https://readthedocs.org/projects/cuperiod/badge/?version=latest)](https://cuperiod.readthedocs.io/en/latest/)
 
 cuPeriod computes period-search statistics for variable stars and transiting systems with
-fast CPU backends and CUDA-accelerated paths that scale from a single light curve to
-millions. One API and CLI cover every method, with frictionless column handling, multi-band
-support, raw-spectrum output, and an N-best-periods utility.
+fast CPU backends and GPU-accelerated paths that scale from a single light curve to
+millions. The NVIDIA CUDA fast paths are joined by a portable **PyTorch** backend that also
+runs on AMD, Intel, and Apple GPUs (and a CPU-only path), so the accelerated code is no
+longer NVIDIA-only. One API, one CLI, and an optional desktop GUI cover every method, with
+frictionless column handling, multi-band support, raw-spectrum output, and an
+N-best-periods utility.
 
 📖 **Documentation:** <https://cuperiod.readthedocs.io> — a [5-minute
 quickstart](https://cuperiod.readthedocs.io/en/latest/quickstart.html), a full user guide,
@@ -37,15 +40,23 @@ All seven methods have CPU and GPU backends, plus the full single/batch/CLI mach
 ```bash
 pip install cuperiod            # CPU (numpy, scipy, astropy, finufft)
 pip install "cuperiod[gpu]"     # + CUDA 12 GPU backends (cupy, cufinufft)
+pip install "cuperiod[torch]"   # + portable PyTorch backend (AMD/Intel/Apple GPUs + CPU)
 pip install "cuperiod[fast]"    # + numba (multicore box search, ~20x astropy BLS on CPU)
+pip install "cuperiod[gui]"     # + interactive desktop GUI (cuperiod-gui)
 pip install "cuperiod[pandas]"  # + pandas DataFrame ingestion
 ```
 
-GPU acceleration needs an NVIDIA GPU with the CUDA 12 runtime; the `[gpu]` extra pulls in
-`cupy-cuda12x`, `cufinufft`, and the CUDA runtime wheels. The `[fast]` extra adds a
-multicore `numba` box search that becomes BLS's default CPU backend — an order of
-magnitude faster than astropy's compiled `BoxLeastSquares`, and matching it to
-floating-point.
+The `[gpu]` extra needs an NVIDIA GPU with the CUDA 12 runtime; it pulls in `cupy-cuda12x`,
+`cufinufft`, and the CUDA runtime wheels. The `[torch]` extra adds a portable PyTorch
+backend that reaches AMD (ROCm), Intel (XPU), and Apple-Silicon (MPS) GPUs — and a CPU path
+everywhere — so the accelerated code runs beyond NVIDIA (install the wheel matching your
+accelerator from [pytorch.org](https://pytorch.org/get-started/locally/); the default is
+CPU-only). The `[fast]` extra adds a multicore `numba` box search that becomes BLS's default
+CPU backend — an order of magnitude faster than astropy's compiled `BoxLeastSquares`, and
+matching it to floating-point.
+
+Not sure what will run where? `cuperiod doctor` reports every installed backend, the torch
+devices it sees and the precision each uses, and what `backend="auto"` resolves to.
 
 ## Quick start (Python)
 
@@ -80,7 +91,7 @@ Method names are case-insensitive (`"gls"` == `"GLS"`).
 
 ### Multi-band (one star, several filters)
 
-GLS, BLS, and (soon) MHAOV jointly model two or more bands of the same star:
+GLS, BLS, and MHAOV jointly model two or more bands of the same star:
 
 ```python
 mb = cup.MultiBandLightCurve.from_light_curves({"g": lc_g, "r": lc_r})
@@ -91,7 +102,10 @@ pg = cup.periodogram(mb, "GLS")          # VanderPlas & Ivezić shared-phase mod
 
 `backend="auto"` (default) uses the GPU when available and falls back to CPU. Force a path
 with `backend="cpu"`, `backend="gpu"`, or a concrete name (`"finufft"`, `"cufinufft"`,
-`"numpy"`, `"astropy"`, `"cupy"`).
+`"numpy"`, `"astropy"`, `"cupy"`). The portable PyTorch backend runs any method on any torch
+device: `backend="torch"` (best device present) or `"torch:cpu"` / `"torch:cuda"` /
+`"torch:mps"` / `"torch:xpu"`. On Apple MPS (no float64) it uses float32; `precision="auto"`
+keeps float64 everywhere else.
 
 ## Batch processing (millions of light curves)
 
@@ -116,11 +130,27 @@ cuperiod run star.csv --method GLS,BLS --n-best 10
 cuperiod batch "lcs/*.csv" --method GLS --device gpu --out results/
 cuperiod methods                 # list methods and backends
 cuperiod gpu-info                # device + suggested worker counts
+cuperiod doctor                  # backends, torch devices, precision, auto-resolution
 cuperiod grid-info star.fits -m GLS
 ```
 
 `run` accepts `--time/--value/--error/--band` overrides and `--domain magnitude|flux`, and
 can write JSON (`--out`) and the raw spectrum (`--save-periodogram`).
+
+## Desktop GUI
+
+An interactive periodogram explorer ships with the `[gui]` extra — run any method with all
+of its options, explore the full-resolution spectrum, and watch the phased light curve
+update live as you drag across peaks. Single curves or a whole folder in batch mode,
+multi-band overlays, and a dark/light theme remembered across launches.
+
+```bash
+pip install "cuperiod[gui]"      # add [gpu] or [torch] for accelerated backends
+cuperiod-gui                     # or:  python -m cuperiod.gui
+```
+
+It opens with bundled demo light curves (a *Kepler* transit, six ASAS-SN variables, a
+synthetic multi-band curve), so there's something to explore on first launch.
 
 ## Light-curve inputs
 

@@ -15,10 +15,11 @@ Optimized, GPU-accelerated periodograms for astronomy
 <br>
 
 **cuPeriod** computes period-search statistics for variable stars and transiting
-systems — from a single light curve to millions. One Python API and one command-line
-tool cover seven methods, each with a fast CPU backend and a CUDA-accelerated path,
-plus frictionless column handling, multi-band support, raw-spectrum output, and an
-N-best-periods utility.
+systems — from a single light curve to millions. One Python API, one command-line
+tool, and an optional desktop GUI cover seven methods, each with a fast CPU backend and
+GPU-accelerated paths: the NVIDIA CUDA fast paths plus a portable PyTorch backend that
+also reaches AMD, Intel, and Apple GPUs (and a CPU-only path). Add frictionless column
+handling, multi-band support, raw-spectrum output, and an N-best-periods utility.
 
 Every implementation is validated against an established reference (astropy's
 `LombScargle` / `BoxLeastSquares`, and others) to floating-point round-off.
@@ -55,6 +56,11 @@ The {doc}`benchmarks` page shows parity, period recovery, and speedups on real
 survey data.
 :::
 
+:::{grid-item-card} 🖥️ Explore interactively
+The {doc}`desktop GUI <guide/gui>` runs any method and folds the light curve live as
+you drag across peaks — `pip install "cuperiod[gui]"`, then `cuperiod-gui`.
+:::
+
 ::::
 
 ## Which method should I use?
@@ -77,7 +83,9 @@ All seven share one API, one CLI, and the full single/batch machinery. See
 ```bash
 pip install cuperiod            # CPU (numpy, scipy, astropy, finufft)
 pip install "cuperiod[gpu]"     # + CUDA 12 GPU backends (cupy, cufinufft)
+pip install "cuperiod[torch]"   # + portable PyTorch backend (AMD/Intel/Apple GPUs + CPU)
 pip install "cuperiod[fast]"    # + numba multicore box search (~20× astropy BLS on CPU)
+pip install "cuperiod[gui]"     # + interactive desktop GUI (cuperiod-gui)
 ```
 
 See {doc}`installation` for the full matrix and GPU requirements.
@@ -103,6 +111,7 @@ guide/tuning
 guide/multiband
 guide/batch
 guide/cli
+guide/gui
 :::
 
 :::{toctree}

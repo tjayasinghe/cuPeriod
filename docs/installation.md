@@ -10,8 +10,8 @@ pip install cuperiod
 ```
 
 This pulls in the core dependencies — `numpy`, `scipy`, `astropy`, `finufft`,
-`pydantic`, `typer`, and `pyarrow` — and gives you every method on the CPU, the command
-line, and batch processing over a process pool.
+`array-api-compat`, `pydantic`, `typer`, and `pyarrow` — and gives you every method on the
+CPU, the command line, and batch processing over a process pool.
 
 ## Optional extras
 
@@ -20,9 +20,10 @@ line, and batch processing over a process pool.
 | **gpu** | `pip install "cuperiod[gpu]"` | CUDA-12 GPU backends (`cupy-cuda12x`, `cufinufft`, the NVIDIA runtime wheels) |
 | **torch** | `pip install "cuperiod[torch]"` | the portable **PyTorch** backend — runs every method on AMD (ROCm), Intel (XPU), Apple (MPS), and a CPU path |
 | **fast** | `pip install "cuperiod[fast]"` | a multicore `numba` box search — BLS's CPU default, ~20× faster than astropy's compiled `BoxLeastSquares` |
+| **gui** | `pip install "cuperiod[gui]"` | the interactive desktop GUI, `cuperiod-gui` (PySide6 + pyqtgraph) — see {doc}`guide/gui` |
 | **pandas** | `pip install "cuperiod[pandas]"` | pandas `DataFrame` ingestion |
 
-Extras combine, e.g. `pip install "cuperiod[gpu,fast]"`.
+Extras combine, e.g. `pip install "cuperiod[gpu,fast]"` or `"cuperiod[gui,torch]"`.
 
 :::{tip}
 The `[fast]` extra is worth installing even without a GPU: it makes BLS an order of

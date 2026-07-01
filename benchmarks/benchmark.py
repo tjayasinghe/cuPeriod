@@ -225,6 +225,12 @@ def bench_batch(t, y, e):
                for i in range(n_lc)]
         for method in ["GLS", "PDM"]:
             st = FREQ_SETTINGS[method]
+            # One batch pass. This is a *single-shot* rate: it includes the one-off
+            # worker-pool spin-up (spawn + per-worker CUDA context), so it is a
+            # conservative floor — a warmed pool sustains a higher rate over many chunks.
+            # (We don't loop for a best-of-N here: repeatedly recreating the GPU process
+            # pool in one process can deadlock the spawn pool against the parent's CUDA
+            # context.)
             t0 = time.perf_counter()
             cup.batch_periodograms(lcs, method, device="gpu", grid=grid, settings=st(), n_best=5)
             tg = time.perf_counter() - t0

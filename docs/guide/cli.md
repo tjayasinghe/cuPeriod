@@ -13,6 +13,11 @@ cuperiod doctor      diagnose backends, torch devices, and the precision each us
 cuperiod grid-info   show a method's trial grid for a light curve (no compute)
 ```
 
+:::{tip}
+Prefer to explore interactively? `cuperiod-gui` opens a desktop periodogram explorer over
+the same API — see {doc}`gui`.
+:::
+
 ## `run` — a single light curve
 
 ```bash

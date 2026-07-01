@@ -114,48 +114,56 @@ RTX 5070 Ti vs the CPU backends):
 
 ```{list-table}
 :header-rows: 1
-:widths: 16 24 20 20 20
+:widths: 15 18 14 14 14 15
 
 * - Method
   - CPU backend
   - CPU time
   - GPU time
+  - torch:cuda
   - GPU speed-up
 * - GLS
   - finufft
-  - 0.019 s
+  - 0.016 s
   - 0.007 s
-  - ~3×
+  - 0.013 s
+  - ~2×
 * - BLS
   - numba
-  - 0.187 s
-  - 0.091 s
+  - 0.195 s
+  - 0.092 s
+  - 0.391 s
   - ~2×
 * - PDM
   - numpy
-  - 1.79 s
+  - 1.89 s
   - 0.010 s
-  - **178×**
+  - 0.016 s
+  - **186×**
 * - CE
   - numpy
-  - 0.53 s
+  - 0.585 s
   - 0.012 s
-  - 45×
+  - 0.011 s
+  - 49×
 * - String-Length
   - numpy
-  - 0.92 s
-  - 0.023 s
-  - 39×
+  - 1.41 s
+  - 0.027 s
+  - 0.011 s
+  - 51×
 * - MHAOV
   - numpy
-  - 3.56 s
-  - 0.111 s
-  - 32×
+  - 3.30 s
+  - 0.062 s
+  - 0.048 s
+  - 53×
 * - TLS
   - numpy
-  - 4.49 s
-  - 0.042 s
-  - 106×
+  - 4.78 s
+  - 0.044 s
+  - 2.42 s
+  - 108×
 ```
 
 How to read this:
@@ -165,10 +173,12 @@ How to read this:
   modest — but the GPU still wins decisively for **large grids and big catalogs**
   ({doc}`batch`).
 - **PDM, CE, String-Length, MHAOV, TLS run on numpy on the CPU**, so the GPU's
-  data-parallelism delivers 30–180× on a single curve. If you're searching many periods or
-  many stars with these, the GPU is a large win.
+  data-parallelism delivers roughly 50–190× on a single curve. If you're searching many
+  periods or many stars with these, the GPU is a large win. The portable **`torch:cuda`**
+  column tracks alongside — competitive for these methods, and the same code reaches
+  AMD/Intel/Apple GPUs (see the portable-backend note above).
 - cuPeriod's **CPU** path already beats the established reference tools it was checked
-  against (GLS ~3× astropy, PDM ~4× PyAstronomy, BLS ~20× astropy's `BoxLeastSquares`).
+  against (GLS ~3× astropy, PDM ~4× PyAstronomy, BLS ~18× astropy's `BoxLeastSquares`).
 
 :::{tip}
 Write `backend="auto"` and let cuPeriod choose. Reach for `"cpu"`/`"gpu"` or a concrete

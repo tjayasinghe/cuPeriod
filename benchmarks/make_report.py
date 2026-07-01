@@ -16,6 +16,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
+import cuperiod as cup  # noqa: E402
 from _common import FIGURES, RESULTS, load_dataset  # noqa: E402
 
 plt.rcParams.update({
@@ -51,11 +52,6 @@ def fig_parity_and_reference(val):
     ax.set_xticklabels([ml(m) for m in methods], rotation=30, ha="right")
     ax.set_ylabel("max relative |stat$_{\\rm CPU}$ − stat$_{\\rm GPU}$|")
     ax.set_title("(a) CPU vs GPU backend parity")
-    if "STRINGLENGTH" in methods:
-        sx = methods.index("STRINGLENGTH") + 1
-        ax.annotate("isolated phase-tie\nsort ordering", xy=(sx, 1.4e-2),
-                    xytext=(sx - 1.3, 4e-3), fontsize=6, color="gray", ha="center",
-                    arrowprops=dict(arrowstyle="->", color="gray", lw=0.6))
     ax.legend(fontsize=7, loc="lower left")
 
     # (b) cuPeriod vs reference implementation
@@ -312,9 +308,16 @@ def main():
     # ---- assemble REPORT.md ----------------------------------------------
     L = []
     L.append("# cuPeriod — Validation & Benchmark Report\n")
+    torch_backend = "—"
+    if single is not None and "torch_backend" in single.columns:
+        tb = single["torch_backend"].dropna()
+        tb = tb[tb != "—"]
+        if len(tb):
+            torch_backend = str(tb.iloc[0])
     L.append("GPU: **NVIDIA RTX 5070 Ti** (compute capability 12.0, sm_120) · "
              "CPU backends: finufft / numpy / astropy · "
-             "cuPeriod 1.0.0, CUDA 12, Python 3.12.\n")
+             f"portable **torch** backend ({torch_backend}, PyTorch cu128) · "
+             f"cuPeriod {cup.__version__}, CUDA 12 (cupy) + 12.8 (torch), Python 3.12.\n")
     L.append("**Validation data** — "
              f"{len(meta)} real ASAS-SN g-band light curves across "
              f"{meta.broad_class.nunique()} variability classes (eclipsing binaries, RR Lyrae, "
@@ -350,13 +353,15 @@ def main():
         tbl = pd.DataFrame(rows)
         L.append(md_table(tbl, ["Method", "N", "parity", "same", "ref", "refagree"]))
         L.append("\n*parity* = worst-case max relative \\|stat_CPU − stat_GPU\\| over all "
-                 "stars (GLS/MHAOV GPU paths are single precision, ≈1e-6/1e-7; the others are "
-                 "double). String-Length's looser parity is isolated trial frequencies where "
-                 "near-equal phases sort in a different order on the GPU — the recovered "
-                 "period is unaffected (*same* = 100%). *same* = fraction of stars where CPU "
-                 "and GPU pick the identical best period; *refagree* = worst-case max\\|"
-                 "cuPeriod − reference\\| on an identical grid (Pearson r for PDM, whose "
-                 "PyAstronomy reference uses a different θ normalisation).\n")
+                 "stars (GLS/MHAOV GPU paths are single precision, ≈1e-6/1e-7; the others — "
+                 "String-Length now included, via a stable phase sort on every backend — are "
+                 "double). *same* = fraction of stars where CPU and GPU pick the identical "
+                 "best period. *refagree* = worst-case max\\|cuPeriod − reference\\| on an "
+                 "identical grid (Pearson r for PDM, whose PyAstronomy reference uses a "
+                 "different θ normalisation). String-Length's max is an isolated outlier on "
+                 "1–2 heavily phase-tied stars, where the textbook reference breaks ties with "
+                 "an unstable sort (correlation ≈1, median \\|Δ\\| ≈ 6e-12, recovered period "
+                 "unaffected).\n")
         L.append("![parity](figures/fig1_parity_reference.png)\n")
         if spectra:
             L.append("![spectra](figures/fig2_spectra_overlay.png)\n")
@@ -466,7 +471,10 @@ def main():
             cmp = batch.dropna(subset=["cpu_lc_per_s"])
             msg = (f"Batch throughput on one GPU peaks at **{gpeak.gpu_lc_per_s:,.0f} "
                    f"light curves/s** ({ml(gpeak.method)}, n={int(gpeak.n_lc)}) — "
-                   f"**>{gpeak.gpu_lc_per_s*3600/1e6:.1f} million light curves/hour**.")
+                   f"**>{gpeak.gpu_lc_per_s*3600/1e6:.1f} million light curves/hour**. "
+                   f"This is a *single-batch* rate that includes the one-off worker-pool "
+                   f"spin-up (process spawn + per-worker CUDA context); a warmed pool "
+                   f"sustains a higher rate (≈490 lc/s here) over many chunks.")
             if len(cmp):
                 c = cmp.loc[cmp.n_lc.idxmax()]
                 msg += (f" For these short (~900-point) curves on a small grid the per-curve "

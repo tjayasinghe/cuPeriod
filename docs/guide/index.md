@@ -42,7 +42,12 @@ output.
 :::
 
 :::{grid-item-card} {doc}`cli`
-The `cuperiod` command line: `run`, `batch`, `methods`, `gpu-info`, `grid-info`.
+The `cuperiod` command line: `run`, `batch`, `methods`, `gpu-info`, `doctor`, `grid-info`.
+:::
+
+:::{grid-item-card} {doc}`gui`
+The `cuperiod-gui` desktop explorer: run any method and fold the light curve live as you
+drag across peaks.
 :::
 
 ::::
