@@ -28,8 +28,6 @@ import numpy as np
 from cuperiod.core._arrayapi import (
     array_namespace,
     device_ref,
-    is_cupy_array,
-    is_torch_array,
     resolve_precision,
     resolve_torch_device,
     to_device_array,
@@ -64,17 +62,44 @@ DEFAULT_BATCH: Final = 512
 _RIDGE_EPS: Final = 1.0e3
 
 
-def _design(xp: ModuleType, angle: Any, n_harmonics: int) -> Any:
-    """Trig-polynomial design tensor ``(F, N, 2H+1)`` = [1, cos kθ, sin kθ]."""
-    n_freq, n_points = angle.shape
-    d = 2 * n_harmonics + 1
-    dev = device_ref(angle)
-    design = xp.empty((n_freq, n_points, d), dtype=angle.dtype, device=dev)
-    design[:, :, 0] = 1.0
-    for k in range(1, n_harmonics + 1):
-        design[:, :, 2 * k - 1] = xp.cos(k * angle)
-        design[:, :, 2 * k] = xp.sin(k * angle)
-    return design
+def _harmonic_sums(
+    xp: ModuleType, angle: Any, y: Any, n_harmonics: int
+) -> tuple[list[Any], list[Any], list[Any], list[Any]]:
+    """Per-frequency harmonic trig sums from one ``(F, N)`` angle matrix.
+
+    Returns ``(C, S, A, B)`` with ``C[m] = Σ_n cos(m·θ)``, ``S[m] = Σ_n sin(m·θ)`` for
+    ``m = 1..2H`` (index 0 unused: those sums are the constants ``N`` and ``0``) and
+    ``A[k] = Σ_n y_n cos(k·θ)``, ``B[k] = Σ_n y_n sin(k·θ)`` for ``k = 1..H``. The
+    higher harmonics come from the Chebyshev recurrence ``T_m = 2·cosθ·T_{m-1} −
+    T_{m-2}``, so ``cos``/``sin`` are evaluated **once** regardless of ``H``.
+    """
+    m_max = 2 * n_harmonics
+    c1 = xp.cos(angle)
+    s1 = xp.sin(angle)
+    C: list[Any] = [None] * (m_max + 1)
+    S: list[Any] = [None] * (m_max + 1)
+    A: list[Any] = [None] * (n_harmonics + 1)
+    B: list[Any] = [None] * (n_harmonics + 1)
+    two_c1 = 2.0 * c1
+    cm, sm = c1, s1
+    prev_c: Any = None
+    prev_s: Any = None
+    for m in range(1, m_max + 1):
+        C[m] = xp.sum(cm, axis=1)
+        S[m] = xp.sum(sm, axis=1)
+        if m <= n_harmonics:
+            A[m] = xp.sum(y[None, :] * cm, axis=1)
+            B[m] = xp.sum(y[None, :] * sm, axis=1)
+        if m < m_max:
+            if m == 1:  # T_0 is the constant 1 / 0, kept out of the arrays
+                next_c = two_c1 * cm - 1.0
+                next_s = two_c1 * sm
+            else:
+                next_c = two_c1 * cm - prev_c
+                next_s = two_c1 * sm - prev_s
+            prev_c, prev_s = cm, sm
+            cm, sm = next_c, next_s
+    return C, S, A, B
 
 
 def _model_ss_batch(
@@ -93,33 +118,63 @@ def _model_ss_batch(
 
     This is the projection norm of the data onto the ``2H+1`` harmonic basis; the AOV
     F-statistic (single- or multi-band) is formed from it by the callers.
+
+    Every entry of the normal equations is analytically a harmonic trig sum — by the
+    product-to-sum identities, ``Σ cos(kθ)cos(lθ) = ½(C_{|k−l|} + C_{k+l})`` and so on
+    — so instead of materializing the ``(F, N, 2H+1)`` design tensor and forming its
+    ``O(F·N·d²)`` Gram, the sums ``C_m``/``S_m`` (``m ≤ 2H``) are computed in
+    ``O(F·N·H)`` from one ``cos``/``sin`` evaluation (:func:`_harmonic_sums`) and the
+    tiny ``(F, d, d)`` Gram is assembled from them. Mathematically identical (same
+    normal equations, same ridge), gemm-free on every backend, and ``O(d)`` less
+    transient memory.
     """
     d = 2 * n_harmonics + 1
     n_freq = int(frequencies.shape[0])
     fdtype = frequencies.dtype
     dev = device_ref(frequencies)
     ridge = _RIDGE_EPS * float(xp.finfo(fdtype).eps) * float(n_points)
-    eye = xp.eye(d, dtype=fdtype, device=dev) * ridge
     out = xp.empty(n_freq, dtype=fdtype, device=dev)
     two_pi = 2.0 * float(np.pi)
+    sum_y = float(xp.sum(y))
+    h = n_harmonics
 
     for start in range(0, n_freq, batch):
         stop = min(start + batch, n_freq)
         fb = frequencies[start:stop]
+        n_f = int(fb.shape[0])
         angle = (two_pi * fb)[:, None] * tau[None, :]
-        design = _design(xp, angle, n_harmonics)
-        if is_cupy_array(design) or is_torch_array(design):
-            # GPU batched cuBLAS gemm intermittently raises CUBLAS_STATUS_INVALID_VALUE
-            # on some GPUs (Blackwell / sm_120, in both cupy and torch). These gemm-free
-            # reductions match the einsum; the ``d`` loop avoids a (F,N,d,d) blowup.
-            gram = eye + xp.stack(
-                [xp.sum(design * design[:, :, j : j + 1], axis=1) for j in range(d)],
-                axis=-1,
-            )
-            proj = xp.sum(design * y[None, :, None], axis=1)
-        else:
-            gram = xp.einsum("fni,fnj->fij", design, design) + eye
-            proj = xp.einsum("fni,n->fi", design, y)
+        C, S, A, B = _harmonic_sums(xp, angle, y, h)
+        del angle
+
+        gram = xp.zeros((n_f, d, d), dtype=fdtype, device=dev)
+        proj = xp.empty((n_f, d), dtype=fdtype, device=dev)
+        gram[:, 0, 0] = float(n_points) + ridge
+        proj[:, 0] = sum_y
+        for k in range(1, h + 1):
+            gram[:, 0, 2 * k - 1] = C[k]
+            gram[:, 2 * k - 1, 0] = C[k]
+            gram[:, 0, 2 * k] = S[k]
+            gram[:, 2 * k, 0] = S[k]
+            proj[:, 2 * k - 1] = A[k]
+            proj[:, 2 * k] = B[k]
+            for line in range(1, h + 1):
+                # Σ cos·cos, Σ sin·sin, Σ cos·sin over n from the m-sums; C_0 = N,
+                # S_0 = 0, S_{-m} = -S_m.
+                m_diff = abs(k - line)
+                c_diff = C[m_diff] if m_diff else float(n_points)
+                cc = 0.5 * (c_diff + C[k + line])
+                ss = 0.5 * (c_diff - C[k + line])
+                if k == line:
+                    s_diff = 0.0
+                elif k > line:
+                    s_diff = S[m_diff]
+                else:
+                    s_diff = -S[m_diff]
+                cs = 0.5 * (S[k + line] - s_diff)
+                gram[:, 2 * k - 1, 2 * line - 1] = cc + (ridge if k == line else 0.0)
+                gram[:, 2 * k, 2 * line] = ss + (ridge if k == line else 0.0)
+                gram[:, 2 * k - 1, 2 * line] = cs
+                gram[:, 2 * line, 2 * k - 1] = cs
         # numpy 2.x batched solve treats a 2-D RHS as matrices, so add a trailing
         # singleton to keep it a per-frequency vector solve.
         beta = xp.linalg.solve(gram, proj[..., None])[..., 0]
