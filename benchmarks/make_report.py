@@ -450,14 +450,24 @@ def main():
             "ref_s": nan_dash(lambda v: f"{v:.2f}"),
             "method": ml}))
         L.append("\n*cpu_backend* = what `backend=\"cpu\"` resolves to — the fast default a user "
-                 "gets: finufft (GLS), the multicore numba box search (BLS), numpy (the rest). "
-                 "*ref* = the established external tool; *cpu_vs_ref* = how much faster cuPeriod's "
-                 "CPU is than that tool; *gpu_speedup* = GPU over cuPeriod's CPU. *torch_s* = the "
-                 "portable PyTorch backend (device shown in *torch_backend*: cpu/cuda/mps/xpu) — "
-                 "the cross-vendor path that also runs on AMD/Intel/Mac; blank for methods not yet "
-                 "ported to it. cuPeriod's CPU path already beats every reference tool it has "
-                 "(GLS, PDM, BLS) — so the GPU's marginal gain is small where the CPU is already "
-                 "fast (BLS, GLS) and large where it is not (PDM, MHAOV, TLS).\n")
+                 "gets: finufft (GLS), the multicore numba box search (BLS), numba for the rest "
+                 "(with the `[fast]` extra) or numpy otherwise. *ref* = the established external "
+                 "tool; *cpu_vs_ref* = how much faster cuPeriod's CPU is than that tool; "
+                 "*gpu_speedup* = GPU over cuPeriod's CPU. *torch_s* = the portable PyTorch "
+                 "backend (device shown in *torch_backend*: cpu/cuda/mps/xpu) — the cross-vendor "
+                 "path that also runs on AMD/Intel/Mac; blank for methods not yet ported to it. "
+                 "cuPeriod's CPU path already beats every reference tool it has (GLS, PDM, BLS). "
+                 "**With the multicore numba tier, the GPU's single-curve margin over the CPU is "
+                 "now modest almost everywhere** on this 32-thread machine — 1-4x for BLS/"
+                 "String-Length/TLS, essentially a wash for PDM/CE, and the GPU is actually a "
+                 "touch slower than the warm CPU kernel for MHAOV at this size. GLS is the one "
+                 "consistent exception (~3x): its CPU path is finufft, not a numba kernel. The "
+                 "scaling sweep (up to 30k points / a 100k-frequency grid; see the figure below) "
+                 "shows the same pattern holds across that whole range for PDM and MHAOV — the "
+                 "GPU's fixed per-call overhead (kernel launch, host↔device transfer) doesn't "
+                 "amortize at these sizes on a CPU this wide. The GPU's case is now catalog "
+                 "throughput and non-NVIDIA hardware (the portable torch backend), not "
+                 "single-curve latency on the CPU-tier methods.\n")
         if len(bls) and "cpu_port_s" in bls and np.isfinite(bls.cpu_port_s.iloc[0]):
             b = bls.iloc[0]
             L.append(f"\n> The pure-`numpy` BLS backend shares one array-module-generic source "
@@ -476,12 +486,14 @@ def main():
                    f"spin-up (process spawn + per-worker CUDA context); a warmed pool "
                    f"sustains a higher rate (≈490 lc/s here) over many chunks.")
             if len(cmp):
-                c = cmp.loc[cmp.n_lc.idxmax()]
-                msg += (f" For these short (~900-point) curves on a small grid the per-curve "
-                        f"work is tiny, so the GPU's edge over the CPU pool is modest "
-                        f"({c.speedup:.1f}× at n={int(c.n_lc)}, {ml(c.method)}); the GPU's "
-                        f"decisive wins are the large-grid / many-point / box-and-fold cases "
-                        f"in §4's single-curve and scaling results.")
+                rows_txt = "; ".join(
+                    f"{ml(r.method)} n={int(r.n_lc)} {r.speedup:.1f}×"
+                    for _, r in cmp.sort_values(["method", "n_lc"]).iterrows())
+                msg += (f" On this 32-thread machine the CPU process pool keeps pace with the "
+                        f"GPU for the numba-tier methods — {rows_txt} — with GLS the one method "
+                        f"that shows a consistent GPU edge at batch scale too. Expect a wider "
+                        f"GPU margin on a narrower CPU, or at batch sizes beyond what's swept "
+                        f"here.")
             L.append(msg + "\n")
 
     L.append("## Reproduce\n"

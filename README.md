@@ -41,7 +41,7 @@ All seven methods have CPU and GPU backends, plus the full single/batch/CLI mach
 pip install cuperiod            # CPU (numpy, scipy, astropy, finufft)
 pip install "cuperiod[gpu]"     # + CUDA 12 GPU backends (cupy, cufinufft)
 pip install "cuperiod[torch]"   # + portable PyTorch backend (AMD/Intel/Apple GPUs + CPU)
-pip install "cuperiod[fast]"    # + numba (multicore box search, ~20x astropy BLS on CPU)
+pip install "cuperiod[fast]"    # + numba multicore CPU kernels (all 7 methods, 20-300x)
 pip install "cuperiod[gui]"     # + interactive desktop GUI (cuperiod-gui)
 pip install "cuperiod[pandas]"  # + pandas DataFrame ingestion
 ```
@@ -51,9 +51,10 @@ The `[gpu]` extra needs an NVIDIA GPU with the CUDA 12 runtime; it pulls in `cup
 backend that reaches AMD (ROCm), Intel (XPU), and Apple-Silicon (MPS) GPUs — and a CPU path
 everywhere — so the accelerated code runs beyond NVIDIA (install the wheel matching your
 accelerator from [pytorch.org](https://pytorch.org/get-started/locally/); the default is
-CPU-only). The `[fast]` extra adds a multicore `numba` box search that becomes BLS's default
-CPU backend — an order of magnitude faster than astropy's compiled `BoxLeastSquares`, and
-matching it to floating-point.
+CPU-only). The `[fast]` extra adds multicore `numba` CPU kernels that become the default
+`"cpu"`/`"auto"` backend for **every** method — BLS, PDM, CE, String-Length, MHAOV, and
+TLS — one to two orders of magnitude faster than the fallback CPU paths and matching them
+to floating point.
 
 Not sure what will run where? `cuperiod doctor` reports every installed backend, the torch
 devices it sees and the precision each uses, and what `backend="auto"` resolves to.

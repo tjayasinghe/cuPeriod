@@ -116,7 +116,8 @@ recover P/2 for contact binaries); *exact* requires the VSX literature period it
 
 ## 3. Performance
 
-Single light curve (~900 points), NVIDIA RTX 5070 Ti vs the CPU backends:
+Single light curve (~900 points), NVIDIA RTX 5070 Ti vs. the `[fast]`-extra CPU backends,
+on a 32-thread machine:
 
 ```{list-table}
 :header-rows: 1
@@ -131,87 +132,96 @@ Single light curve (~900 points), NVIDIA RTX 5070 Ti vs the CPU backends:
   - GPU speed-up
 * - GLS
   - finufft
-  - 0.016 s
-  - 0.007 s
-  - 0.013 s
-  - 3× astropy
-  - ~2×
+  - 0.015 s
+  - 0.005 s
+  - 0.008 s
+  - 2× astropy
+  - ~3×
 * - BLS
   - numba
-  - 0.195 s
+  - 0.188 s
   - 0.092 s
-  - 0.391 s
+  - 0.392 s
   - **18× astropy**
   - ~2×
 * - PDM
-  - numpy
-  - 1.89 s
-  - 0.010 s
-  - 0.016 s
-  - 4× PyAstronomy
-  - **186×**
+  - numba
+  - 0.003 s
+  - 0.005 s
+  - 0.011 s
+  - **>2,000× PyAstronomy**
+  - ~0.6× (GPU slower)
 * - CE
-  - numpy
-  - 0.585 s
-  - 0.012 s
-  - 0.011 s
+  - numba
+  - 0.003 s
+  - 0.004 s
+  - 0.009 s
   - —
-  - 49×
+  - ~0.8× (GPU slower)
 * - String-Length
-  - numpy
-  - 1.41 s
-  - 0.027 s
-  - 0.011 s
+  - numba
+  - 0.043 s
+  - 0.012 s
+  - 0.009 s
   - —
-  - 51×
+  - ~4×
 * - MHAOV
-  - numpy
-  - 3.30 s
-  - 0.062 s
-  - 0.048 s
+  - numba
+  - 0.025 s
+  - 0.135 s
+  - 0.114 s
   - —
-  - 53×
+  - ~0.2× (GPU slower)
 * - TLS
-  - numpy
-  - 4.78 s
-  - 0.044 s
-  - 2.42 s
+  - numba
+  - 0.150 s
+  - 0.043 s
+  - 2.110 s
   - —
-  - 108×
+  - ~4×
 ```
 
 Two takeaways:
 
 - cuPeriod's **CPU** path already beats every reference tool it was checked against — most
-  dramatically BLS, where the multicore `numba` box search is **18× faster than astropy's
-  compiled `BoxLeastSquares`** while matching it to floating point.
-- The **GPU** delivers roughly 50–190× on the methods whose CPU path is plain numpy (PDM,
-  CE, String-Length, MHAOV, TLS), and a smaller single-curve margin on GLS/BLS — whose CPU
-  backends are already specialized. The GPU's decisive win for GLS/BLS is at **catalog
-  scale**.
+  dramatically PDM (a multicore `numba` port over PyAstronomy's pure-Python `pyPDM`) and
+  BLS, where the multicore `numba` box search is **18× faster than astropy's compiled
+  `BoxLeastSquares`** while matching it to floating point.
+- **The multicore numba CPU tier changes the GPU calculus for a single curve.** Now that
+  PDM, CE, String-Length, MHAOV, and TLS all default to numba kernels rather than plain
+  numpy, the GPU's single-curve margin is modest (BLS/String-Length/TLS, ~2-4×), a wash
+  (CE), or the GPU is actually a touch *slower* than the CPU (PDM, MHAOV) — kernel-launch
+  and host↔device transfer overhead no longer amortizes once the CPU kernel itself runs in
+  low single-digit milliseconds. That holds across the benchmark's scaling sweep too (up to
+  30k points, a 100k-frequency grid — see the full report). GLS is the exception, with a
+  consistent ~3× GPU edge since its CPU path is finufft, not numba. The GPU's clear,
+  reproducible win is now **catalog throughput**, not single-curve latency.
 
 :::{note}
 The **`torch:cuda`** column is the portable PyTorch backend on the *same* RTX 5070 Ti — now
 validated on NVIDIA hardware, where all seven methods match the CPU reference to round-off.
-It is competitive with the cupy fast paths on the numpy-CPU methods (PDM/CE/String-Length/
-MHAOV) and slower on BLS/TLS, whose cupy `RawKernel`s are hand-tuned. Its real value is
-reaching **AMD, Intel, and Apple** GPUs the CUDA paths can't (those share the same code and
-are CPU-validated; see {doc}`guide/backends`). On the CPU it is correct but not the speed
-champion — finufft (GLS) and the numba box search (BLS) win there.
+It is competitive with the cupy fast paths on PDM/CE/String-Length/MHAOV and slower on
+BLS/TLS, whose cupy `RawKernel`s are hand-tuned. Its real value is reaching **AMD, Intel,
+and Apple** GPUs the CUDA paths can't (those share the same code and are CPU-validated; see
+{doc}`guide/backends`). On the CPU it is correct but not the speed champion — finufft (GLS)
+and the numba kernels win there.
 :::
 
 ## 4. Batch throughput & transits
 
-- **Batch:** ~417 light curves/second on one GPU for GLS on short survey curves
-  (>1.5 million/hour) — a *single-batch* rate that includes one-off worker-pool spin-up
+- **Batch:** up to 587 light curves/second on one GPU for GLS on short survey curves
+  (>2.1 million/hour) — a *single-batch* rate that includes one-off worker-pool spin-up
   (process spawn + per-worker CUDA context); a warmed pool sustains ~490 lc/s over many
-  chunks. Batch throughput on these tiny curves is bound by worker scheduling, so it is
-  noisy run-to-run.
+  chunks. On the same 32-thread machine, the CPU process pool keeps pace with the GPU for
+  the numba-tier methods at the batch sizes tested (PDM: ~1.0× at n=256 and n=1024); GLS is
+  the one method with a consistent GPU edge at batch scale too (~1.3-1.4× up to n=1024).
+  Expect a wider GPU margin on a narrower CPU, or at larger batch sizes than swept here.
 - **Kepler transits (TLS):** on 12 confirmed KOIs with a blind 0.5–12 d search, cuPeriod
-  recovers 10/12 within 2% (the `transitleastsquares` reference recovers 11/12); both miss
-  only the shallowest, where a blind search aliases — a shared, honest failure mode, not a
-  backend defect. On the CPU-timed subset the GPU is a median **184×** faster at
-  CPU↔GPU agreement ≤ 2.1e-14.
+  recovers 10/12 within 2% (the `transitleastsquares` reference recovers 11/12); both
+  struggle only on the shallowest transits, where a blind search aliases — a shared,
+  honest failure mode, not a backend defect. On the CPU-timed subset the GPU is a median
+  **~1.6×** faster at CPU↔GPU agreement ≤ 2.1e-14 (the numba CPU tier narrowed what used
+  to be a much larger single-curve gap).
 
 See the
 [full report](https://github.com/tjayasinghe/cuPeriod/blob/main/benchmarks/REPORT.md)

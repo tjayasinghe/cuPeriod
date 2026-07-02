@@ -104,9 +104,12 @@ the batch continues.
 
 ## Throughput
 
-On one GPU, batch GLS peaks at **~620 light curves/second** for short survey curves
-(>2 million/hour). The GPU's edge grows with grid size, point count, and the
-box/fold methods — see {doc}`../benchmarks`.
+On one GPU, batch GLS peaks at **~590 light curves/second** for short survey curves
+(>2 million/hour) — GLS is the method with the most consistent GPU edge, at both single-
+curve and batch scale. With the `[fast]` extra's multicore `numba` CPU tier, the CPU
+process pool now keeps pace with the GPU for several other methods (PDM, CE) at the batch
+sizes and curve lengths benchmarked so far — see {doc}`../benchmarks` for the current
+breakdown before assuming the GPU wins by default.
 
 ---
 

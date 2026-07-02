@@ -109,8 +109,8 @@ for info in cup.list_methods():
 
 ## What's fast where
 
-The headline from the {doc}`../benchmarks` (single light curve, ~900 points; an
-RTX 5070 Ti vs the CPU backends):
+The headline from the {doc}`../benchmarks` (single light curve, ~900 points; an RTX 5070 Ti
+vs. the `[fast]`-extra CPU backends, on a 32-thread machine):
 
 ```{list-table}
 :header-rows: 1
@@ -124,65 +124,73 @@ RTX 5070 Ti vs the CPU backends):
   - GPU speed-up
 * - GLS
   - finufft
-  - 0.016 s
-  - 0.007 s
-  - 0.013 s
-  - ~2×
+  - 0.015 s
+  - 0.005 s
+  - 0.008 s
+  - ~3×
 * - BLS
   - numba
-  - 0.195 s
+  - 0.188 s
   - 0.092 s
-  - 0.391 s
+  - 0.392 s
   - ~2×
 * - PDM
-  - numpy
-  - 1.89 s
-  - 0.010 s
-  - 0.016 s
-  - **186×**
+  - numba
+  - 0.003 s
+  - 0.005 s
+  - 0.011 s
+  - ~0.6× (GPU slower)
 * - CE
-  - numpy
-  - 0.585 s
-  - 0.012 s
-  - 0.011 s
-  - 49×
+  - numba
+  - 0.003 s
+  - 0.004 s
+  - 0.009 s
+  - ~0.8× (GPU slower)
 * - String-Length
-  - numpy
-  - 1.41 s
-  - 0.027 s
-  - 0.011 s
-  - 51×
+  - numba
+  - 0.043 s
+  - 0.012 s
+  - 0.009 s
+  - ~4×
 * - MHAOV
-  - numpy
-  - 3.30 s
-  - 0.062 s
-  - 0.048 s
-  - 53×
+  - numba
+  - 0.025 s
+  - 0.135 s
+  - 0.114 s
+  - ~0.2× (GPU slower)
 * - TLS
-  - numpy
-  - 4.78 s
-  - 0.044 s
-  - 2.42 s
-  - 108×
+  - numba
+  - 0.150 s
+  - 0.043 s
+  - 2.110 s
+  - ~4×
 ```
 
 How to read this:
 
-- **GLS and BLS already have specialized CPU backends** (finufft; the multicore numba box
-  search). They're so fast on the CPU that the GPU's marginal gain on a single curve is
-  modest — but the GPU still wins decisively for **large grids and big catalogs**
-  ({doc}`batch`).
-- The **CPU times in the table are the vectorized numpy paths**. With the `[fast]` extra
-  installed, PDM, CE, String-Length, MHAOV, and TLS now run multicore **numba** kernels
-  on `"cpu"`/`"auto"` — one to two orders of magnitude faster than the numpy column
-  (e.g. PDM ~300×, CE ~135×, MHAOV ~57× on a 3k-point curve) — which puts a warm CPU
-  within reach of the GPU for a *single* curve. The GPU remains the throughput champion
-  for large grids and catalogs.
+- **The CPU backend for every method is now the multicore `numba` kernel** (with the
+  `[fast]` extra installed — one to two orders of magnitude faster than the vectorized
+  numpy fallback, see {doc}`../installation`). On this 32-thread machine, that CPU tier is
+  now fast enough that a single-curve GPU run is only a modest win for BLS/String-Length/TLS
+  (~2-4×), a wash for CE, and the GPU is actually a touch *slower* than the CPU for PDM and
+  MHAOV at this curve size — kernel-launch and host↔device transfer overhead no longer
+  amortizes when the CPU kernel itself takes low single-digit milliseconds. GLS is the one
+  consistent exception (~3×), because its CPU path is finufft, not a numba kernel.
+- This holds up in the benchmark's scaling sweep too, up to 30k points and a 100k-frequency
+  grid — the GPU doesn't pull ahead of the numba CPU tier for PDM/MHAOV anywhere in that
+  range on this machine. Expect a wider GPU margin on a narrower CPU. The GPU's clear,
+  reproducible win is **catalog throughput** — many curves in flight at once — and reaching
+  non-NVIDIA hardware via the portable torch backend, not single-curve latency on the
+  CPU-tier methods ({doc}`batch`).
+- Without the `[fast]` extra, PDM/CE/String-Length/MHAOV/TLS fall back to the **vectorized
+  numpy paths** on the CPU — one to two orders of magnitude slower than the numba column
+  above (e.g. PDM ~300×, CE ~135×, MHAOV ~57× on a 3k-point curve).
 - On **consumer NVIDIA cards** (GeForce), whose float64 throughput is 1/64 of float32,
   the opt-in `precision="float32"` runs the BLS/TLS CUDA kernels ~8-9× faster at
   detection-grade accuracy; float64 stays the default.
 - cuPeriod's **CPU** path already beats the established reference tools it was checked
-  against (GLS ~3× astropy, PDM ~4× PyAstronomy, BLS ~18× astropy's `BoxLeastSquares`).
+  against — GLS ~2× astropy, BLS ~18× astropy's `BoxLeastSquares`, and PDM's numba kernel
+  over 2,000× PyAstronomy's pure-Python `pyPDM` (the numpy PDM path alone is already ~4×).
 
 :::{tip}
 Write `backend="auto"` and let cuPeriod choose. Reach for `"cpu"`/`"gpu"` or a concrete
