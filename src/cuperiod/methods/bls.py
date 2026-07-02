@@ -78,8 +78,13 @@ def _segment_power(
     periods: FloatArray,
     durations: FloatArray,
     settings: BLSSettings,
+    device_cache: dict[str, Any] | None = None,
 ) -> dict[str, FloatArray]:
-    """One segment's per-period box maxima via the configured backend."""
+    """One segment's per-period box maxima via the configured backend.
+
+    ``device_cache`` is a caller-owned dict shared by the segments of one light
+    curve, so the GPU backends upload the curve once per run rather than per segment.
+    """
     if backend == "astropy":
         from astropy.timeseries import BoxLeastSquares
 
@@ -104,6 +109,7 @@ def _segment_power(
         backend=backend,
         batch=settings.batch_periods,
         precision=settings.precision,
+        device_cache=device_cache,
     )
     return {name: getattr(power, name) for name in _SEGMENT_FIELDS}
 
@@ -154,35 +160,12 @@ class BLSMethod(PeriodogramMethod):
     natural_domain: ClassVar[Domain] = Domain.FLUX
     settings_cls: ClassVar[type] = BLSSettings
     cpu_backend: ClassVar[str] = "astropy"
+    fast_cpu_backend: ClassVar[str | None] = "numba"
     gpu_backend: ClassVar[str | None] = "cupy"
     portable_gpu_backend: ClassVar[str | None] = "torch"
     all_backends: ClassVar[tuple[str, ...]] = (
         "numba", "numpy", "astropy", "cupy", "torch",
     )
-
-    def resolve_backend(self, requested: str) -> str:
-        """Prefer cupy on NVIDIA, then torch on other GPUs, else the numba CPU search.
-
-        Keeps BLS's CPU preference (multicore numba when installed, else astropy) for
-        ``cpu``/``auto``, while ``auto`` still reaches a GPU: the cupy kernel on CUDA,
-        then the portable torch path on AMD/Intel/Mac. Concrete ``torch``/``torch:*``
-        requests are validated by the base method.
-        """
-        from cuperiod.core.backend import (
-            available_backends,
-            cuda_available,
-            torch_gpu_available,
-        )
-
-        if requested == "auto":
-            if self.gpu_backend is not None and cuda_available():
-                return self.gpu_backend
-            if self.portable_gpu_backend is not None and torch_gpu_available():
-                return self.portable_gpu_backend
-            return "numba" if "numba" in available_backends() else "astropy"
-        if requested == "cpu":
-            return "numba" if "numba" in available_backends() else "astropy"
-        return super().resolve_backend(requested)
 
     def default_grid(self, lc: LightCurve, settings: BLSSettings) -> GridSpec:  # type: ignore[override]
         finite = lc.finite()
@@ -237,8 +220,11 @@ class BLSMethod(PeriodogramMethod):
             )
 
         chunks: dict[str, list[FloatArray]] = {name: [] for name in _SEGMENT_FIELDS}
+        device_cache: dict[str, Any] = {}
         for periods, durations in segments:
-            seg = _segment_power(backend, jd, flux, err, periods, durations, settings)
+            seg = _segment_power(
+                backend, jd, flux, err, periods, durations, settings, device_cache
+            )
             for name in _SEGMENT_FIELDS:
                 chunks[name].append(seg[name])
         return _assemble(chunks, n, finite.baseline, backend, finite.meta)

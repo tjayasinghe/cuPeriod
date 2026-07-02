@@ -84,7 +84,7 @@ All seven share one API, one CLI, and the full single/batch machinery. See
 pip install cuperiod            # CPU (numpy, scipy, astropy, finufft)
 pip install "cuperiod[gpu]"     # + CUDA 12 GPU backends (cupy, cufinufft)
 pip install "cuperiod[torch]"   # + portable PyTorch backend (AMD/Intel/Apple GPUs + CPU)
-pip install "cuperiod[fast]"    # + numba multicore box search (~20× astropy BLS on CPU)
+pip install "cuperiod[fast]"    # + numba multicore CPU kernels (all methods, 20-300×)
 pip install "cuperiod[gui]"     # + interactive desktop GUI (cuperiod-gui)
 ```
 

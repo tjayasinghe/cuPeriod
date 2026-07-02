@@ -52,8 +52,12 @@ class PeriodogramMethod(ABC):
     natural_domain: ClassVar[Domain | None] = None
     #: The settings model class for this method.
     settings_cls: ClassVar[type[BaseSettings]]
-    #: Best CPU backend name.
+    #: Best always-available CPU backend name.
     cpu_backend: ClassVar[str]
+    #: Preferred CPU backend when its optional dependency is installed (the multicore
+    #: ``numba`` kernels of the ``[fast]`` extra), or ``None`` to always use
+    #: ``cpu_backend``.
+    fast_cpu_backend: ClassVar[str | None] = None
     #: NVIDIA fast-path GPU backend name (cufinufft / cupy), or ``None`` if the method
     #: has no CUDA path.
     gpu_backend: ClassVar[str | None] = None
@@ -108,9 +112,9 @@ class PeriodogramMethod(ABC):
                 return self.gpu_backend
             if self.portable_gpu_backend is not None and torch_gpu_available():
                 return self.portable_gpu_backend
-            return self.cpu_backend
+            return self._best_cpu_backend(available)
         if requested == "cpu":
-            return self.cpu_backend
+            return self._best_cpu_backend(available)
         if requested == "gpu":
             if self.gpu_backend is not None and cuda_available():
                 return self.gpu_backend
@@ -138,6 +142,12 @@ class PeriodogramMethod(ABC):
                 f"{self.name}: backend {requested!r} is not installed"
             )
         return requested
+
+    def _best_cpu_backend(self, available: set[str]) -> str:
+        """``fast_cpu_backend`` when its dependency is present, else ``cpu_backend``."""
+        if self.fast_cpu_backend is not None and self.fast_cpu_backend in available:
+            return self.fast_cpu_backend
+        return self.cpu_backend
 
     def _resolve_torch(self, requested: str) -> str:
         """Validate a concrete ``torch``/``torch:<device>`` request for this method."""

@@ -27,7 +27,8 @@ from cuperiod.core._arrayapi import (
     device_ref,
     resolve_precision,
     resolve_torch_device,
-    scatter_add,
+    scatter_add_rows,
+    scatter_counts_rows,
     to_device_array,
     to_host,
 )
@@ -50,6 +51,24 @@ PDMBackend = Literal["numpy", "cupy"]
 DEFAULT_BATCH: Final = 2048
 
 
+def _cover_hists(xp: ModuleType, fine: Any, n_bins: int, n_covers: int) -> Any:
+    """All covers' bin histograms from one fine histogram, laid side by side.
+
+    ``fine`` is ``(P, n_bins*n_covers)``; cover ``c``'s ``n_bins`` histogram is an
+    exact integer regroup of the fine bins — roll right by ``c`` and sum groups of
+    ``n_covers`` — so the folded points are binned **once** rather than per cover.
+    Returns ``(P, n_bins*n_covers)`` with cover ``c`` at columns ``[c*n_bins, ...)``.
+    """
+    n_p = int(fine.shape[0])
+    parts = [
+        xp.sum(
+            xp.reshape(xp.roll(fine, cover, axis=1), (n_p, n_bins, n_covers)), axis=2
+        )
+        for cover in range(n_covers)
+    ]
+    return xp.concat(parts, axis=1)
+
+
 def _theta_batch(
     xp: ModuleType,
     tau: Any,
@@ -65,7 +84,10 @@ def _theta_batch(
     """Stellingwerf Theta for each trial period, vectorized over ``periods``.
 
     ``s^2 = sum_j SSD_j / (N*n_covers - n_nonempty)`` with ``SSD_j`` the within-bin sum
-    of squared deviations across all covers, and ``Theta = s^2 / sigma^2``.
+    of squared deviations across all covers, and ``Theta = s^2 / sigma^2``. The points
+    are binned once into ``n_bins*n_covers`` fine bins; every cover's bin statistics
+    are exact regroups of that histogram (see :func:`_cover_hists`), which cuts the
+    scatter work by ``n_covers``.
     """
     fdtype = periods.dtype
     idtype = xp.int64
@@ -74,34 +96,26 @@ def _theta_batch(
     n_points = int(tau.shape[0])
     n_periods = int(periods.shape[0])
     n_global = n_bins * n_covers
-    cover_step = 1.0 / (n_bins * n_covers)
     theta = xp.empty(n_periods, dtype=fdtype, device=dev)
 
     for start in range(0, n_periods, batch):
         stop = min(start + batch, n_periods)
         pb = periods[start:stop]
         n_p = int(pb.shape[0])
-        rows = xp.arange(n_p, dtype=idtype, device=dev)
         phase = xp.remainder(tau[None, :] / pb[:, None], 1.0)  # (P, N) in [0, 1)
+        fine = xp.clip(
+            xp.astype(phase * float(n_global), idtype), 0, n_global - 1
+        )
+        f_count = xp.zeros((n_p, n_global), dtype=fdtype, device=dev)
+        f_ysum = xp.zeros((n_p, n_global), dtype=fdtype, device=dev)
+        f_ysq = xp.zeros((n_p, n_global), dtype=fdtype, device=dev)
+        scatter_counts_rows(f_count, fine)
+        scatter_add_rows(f_ysum, fine, y)
+        scatter_add_rows(f_ysq, fine, y2)
 
-        count = xp.zeros(n_p * n_global, dtype=fdtype, device=dev)
-        ysum = xp.zeros(n_p * n_global, dtype=fdtype, device=dev)
-        ysq = xp.zeros(n_p * n_global, dtype=fdtype, device=dev)
-        ones = xp.ones(n_p * n_points, dtype=fdtype, device=dev)
-        y_b = xp.reshape(xp.broadcast_to(y, (n_p, n_points)), (-1,))
-        y2_b = xp.reshape(xp.broadcast_to(y2, (n_p, n_points)), (-1,))
-        for cover in range(n_covers):
-            offset = cover * cover_step
-            b = xp.astype(xp.remainder(phase + offset, 1.0) * n_bins, idtype)
-            b = xp.clip(b, 0, n_bins - 1)
-            flat = xp.reshape(rows[:, None] * n_global + (b + cover * n_bins), (-1,))
-            scatter_add(count, flat, ones)
-            scatter_add(ysum, flat, y_b)
-            scatter_add(ysq, flat, y2_b)
-
-        count = xp.reshape(count, (n_p, n_global))
-        ysum = xp.reshape(ysum, (n_p, n_global))
-        ysq = xp.reshape(ysq, (n_p, n_global))
+        count = _cover_hists(xp, f_count, n_bins, n_covers)
+        ysum = _cover_hists(xp, f_ysum, n_bins, n_covers)
+        ysq = _cover_hists(xp, f_ysq, n_bins, n_covers)
         mask = count > 0.0
         safe = xp.where(mask, count, 1.0)
         ssd = xp.where(mask, ysq - ysum * ysum / safe, 0.0)
@@ -116,12 +130,15 @@ def _theta_batch(
 #: CUDA threads per block (one block per trial period).
 CUDA_BLOCK: Final = 128
 
-#: One-block-per-period PDM kernel: a block bins its folded points in shared memory
-#: (sum, sum of squares, count per cover) and reduces them to Theta on one thread.
+#: One-block-per-period PDM kernel: a block bins its folded points **once** into
+#: ``n_bins*n_covers`` fine shared-memory bins (sum, sum of squares, count); every
+#: cover's bin statistics are exact regroups of ``n_covers`` consecutive fine bins
+#: (rolled by the cover index), assembled in the one-thread reduction. Cuts the
+#: dominant atomic work per point from ``3*n_covers`` to 3.
 _PDM_CUDA_SRC: Final = r"""
 extern "C" __global__ void pdm_block(
-    const double* __restrict__ tau, const double* __restrict__ y,
-    const double* __restrict__ periods,
+    const REAL* __restrict__ tau, const REAL* __restrict__ y,
+    const REAL* __restrict__ periods,
     const int n_points, const int n_periods, const int n_bins, const int n_covers,
     const double sigma2, double* o_theta)
 {
@@ -129,45 +146,51 @@ extern "C" __global__ void pdm_block(
     if (pidx >= n_periods) return;
     const int tid = threadIdx.x;
     const int nth = blockDim.x;
-    const double period = periods[pidx];
+    const REAL period = periods[pidx];
     const int M = n_bins * n_covers;
 
+    // Accumulators stay double even at REAL=float: the within-bin sum of squared
+    // deviations (sq - sum^2/cnt) is cancellation-prone in float32.
     extern __shared__ double sh[];
-    double* s_sum = sh;          // (M) sum of y per bin
-    double* s_sq = sh + M;       // (M) sum of y^2 per bin
-    double* s_cnt = sh + 2 * M;  // (M) point count per bin
+    double* s_sum = sh;          // (M) sum of y per fine bin
+    double* s_sq = sh + M;       // (M) sum of y^2 per fine bin
+    double* s_cnt = sh + 2 * M;  // (M) point count per fine bin
     for (int i = tid; i < M; i += nth) {
         s_sum[i] = 0.0; s_sq[i] = 0.0; s_cnt[i] = 0.0;
     }
     __syncthreads();
 
-    const double cover_step = 1.0 / ((double)n_bins * (double)n_covers);
     for (int j = tid; j < n_points; j += nth) {
-        double x = tau[j];
-        double ph = (x - period * floor(x / period)) / period;  // mod(tau/period, 1)
-        double yj = y[j];
-        for (int c = 0; c < n_covers; ++c) {
-            double pc = ph + (double)c * cover_step;
-            pc -= floor(pc);
-            int b = (int)(pc * n_bins);
-            if (b >= n_bins) b = n_bins - 1;
-            if (b < 0) b = 0;
-            int gid = c * n_bins + b;
-            atomicAdd(&s_sum[gid], yj);
-            atomicAdd(&s_sq[gid], yj * yj);
-            atomicAdd(&s_cnt[gid], 1.0);
-        }
+        REAL x = tau[j];
+        REAL ph = (x - period * floor(x / period)) / period;  // mod(tau/period, 1)
+        double yj = (double)y[j];
+        int f = (int)(ph * (REAL)M);
+        if (f >= M) f = M - 1;
+        if (f < 0) f = 0;
+        atomicAdd(&s_sum[f], yj);
+        atomicAdd(&s_sq[f], yj * yj);
+        atomicAdd(&s_cnt[f], 1.0);
     }
     __syncthreads();
 
     if (tid == 0) {
         double ssd = 0.0;
         int nonempty = 0;
-        for (int i = 0; i < M; ++i) {
-            double cnt = s_cnt[i];
-            if (cnt > 0.0) {
-                ssd += s_sq[i] - s_sum[i] * s_sum[i] / cnt;
-                nonempty += 1;
+        for (int c = 0; c < n_covers; ++c) {
+            for (int b = 0; b < n_bins; ++b) {
+                // cover-c bin b = fine bins (b*n_covers - c .. +n_covers-1) mod M
+                double cnt = 0.0, sum = 0.0, sq = 0.0;
+                int f0 = b * n_covers - c;
+                if (f0 < 0) f0 += M;
+                for (int k = 0; k < n_covers; ++k) {
+                    int f = f0 + k;
+                    if (f >= M) f -= M;
+                    cnt += s_cnt[f]; sum += s_sum[f]; sq += s_sq[f];
+                }
+                if (cnt > 0.0) {
+                    ssd += sq - sum * sum / cnt;
+                    nonempty += 1;
+                }
             }
         }
         double den = (double)(n_points * n_covers - nonempty);
@@ -176,17 +199,18 @@ extern "C" __global__ void pdm_block(
 }
 """
 
-_pdm_kernel_cache: dict[int, Any] = {}
+_pdm_kernel_cache: dict[tuple[int, str], Any] = {}
 
 
-def _pdm_kernel(block: int) -> Any:
-    """Compile (once) and cache the PDM RawKernel for a given block size."""
-    kernel = _pdm_kernel_cache.get(block)
+def _pdm_kernel(block: int, real: str) -> Any:
+    """Compile (once) and cache the PDM RawKernel for a block size and precision."""
+    kernel = _pdm_kernel_cache.get((block, real))
     if kernel is None:
         import cupy
 
-        kernel = cupy.RawKernel(_PDM_CUDA_SRC, "pdm_block")
-        _pdm_kernel_cache[block] = kernel
+        src = _PDM_CUDA_SRC.replace("REAL", "float" if real == "float32" else "double")
+        kernel = cupy.RawKernel(src, "pdm_block")
+        _pdm_kernel_cache[(block, real)] = kernel
     return kernel
 
 
@@ -198,14 +222,16 @@ def _pdm_cuda(
     n_bins: int,
     n_covers: int,
     sigma2: float,
+    precision: str = "float64",
     block: int = CUDA_BLOCK,
 ) -> FloatArray:
     """One-block-per-period CUDA PDM Theta; returns a host float64 array."""
     import cupy as cp
 
-    tau_d = cp.asarray(np.ascontiguousarray(tau, dtype=np.float64))
-    y_d = cp.asarray(np.ascontiguousarray(y, dtype=np.float64))
-    per_d = cp.asarray(np.ascontiguousarray(periods, dtype=np.float64))
+    rdtype = np.float32 if precision == "float32" else np.float64
+    tau_d = cp.asarray(np.ascontiguousarray(tau, dtype=rdtype))
+    y_d = cp.asarray(np.ascontiguousarray(y, dtype=rdtype))
+    per_d = cp.asarray(np.ascontiguousarray(periods, dtype=rdtype))
     n_periods = int(per_d.size)
     if n_periods == 0:
         return np.zeros(0, dtype=np.float64)
@@ -213,7 +239,7 @@ def _pdm_cuda(
     from cuperiod.core.backend import ensure_shared_memory
 
     smem = 3 * n_bins * n_covers * 8
-    kernel = _pdm_kernel(block)
+    kernel = _pdm_kernel(block, precision)
     ensure_shared_memory(kernel, smem, method="PDM", hint="n_bins / n_covers")
     kernel(
         (n_periods,),
@@ -226,6 +252,76 @@ def _pdm_cuda(
         shared_mem=smem,
     )
     return np.asarray(cp.asnumpy(out), dtype=np.float64)
+
+
+# --- CPU fast path: numba-parallel, one loop-iteration per trial period -------
+
+_NUMBA_PDM_KERNEL: Any = None
+
+
+def _numba_pdm_kernel() -> Any:
+    """Lazily compile (once) and cache the numba PDM kernel.
+
+    The same fine-bin search as the CUDA kernel — bin each folded point once into
+    ``n_bins*n_covers`` fine bins, regroup covers exactly in the reduction — JIT-run
+    across all cores with ``prange`` (each trial period is independent). The phase is
+    ``q - floor(q)``, the formula of the vectorized numpy path, so the two CPU
+    backends bin identically.
+    """
+    global _NUMBA_PDM_KERNEL
+    if _NUMBA_PDM_KERNEL is not None:
+        return _NUMBA_PDM_KERNEL
+    from numba import njit, prange
+
+    @njit(parallel=True, cache=True, fastmath=False)  # pragma: no cover - njit
+    def _kernel(tau, y, periods, n_bins, n_covers, sigma2):  # type: ignore[no-untyped-def]
+        n_periods = periods.shape[0]
+        n_points = tau.shape[0]
+        m_fine = n_bins * n_covers
+        out = np.empty(n_periods)
+        for pidx in prange(n_periods):
+            period = periods[pidx]
+            s_sum = np.zeros(m_fine)
+            s_sq = np.zeros(m_fine)
+            s_cnt = np.zeros(m_fine)
+            for j in range(n_points):
+                q = tau[j] / period
+                ph = q - np.floor(q)
+                f = int(ph * m_fine)
+                if f > m_fine - 1:
+                    f = m_fine - 1
+                elif f < 0:
+                    f = 0
+                yj = y[j]
+                s_sum[f] += yj
+                s_sq[f] += yj * yj
+                s_cnt[f] += 1.0
+            ssd = 0.0
+            nonempty = 0
+            for c in range(n_covers):
+                for b in range(n_bins):
+                    cnt = 0.0
+                    su = 0.0
+                    sq = 0.0
+                    f0 = b * n_covers - c
+                    if f0 < 0:
+                        f0 += m_fine
+                    for k in range(n_covers):
+                        f = f0 + k
+                        if f >= m_fine:
+                            f -= m_fine
+                        cnt += s_cnt[f]
+                        su += s_sum[f]
+                        sq += s_sq[f]
+                    if cnt > 0.0:
+                        ssd += sq - su * su / cnt
+                        nonempty += 1
+            den = float(n_points * n_covers - nonempty)
+            out[pidx] = (ssd / den) / sigma2 if den > 0.0 else np.inf
+        return out
+
+    _NUMBA_PDM_KERNEL = _kernel
+    return _kernel
 
 
 def pdm_theta(
@@ -251,8 +347,9 @@ def pdm_theta(
         Phase bins per cover.
     n_covers : int, default 3
         Overlapping bin sets, offset by ``1/(n_bins*n_covers)`` in phase.
-    backend : {"numpy", "cupy"}, default "numpy"
-        CPU or GPU.
+    backend : str, default "numpy"
+        ``"numpy"`` (vectorized CPU), ``"numba"`` (multicore CPU), ``"cupy"``
+        (NVIDIA RawKernel), or ``"torch"`` / ``"torch:<device>"`` (portable).
     batch : int, default 2048
         Trial periods per vectorized batch.
 
@@ -277,7 +374,13 @@ def pdm_theta(
     if backend == "cupy":
         ensure_cuda_dll_path()
         return _pdm_cuda(
-            tau, y, periods_host, n_bins=n_bins, n_covers=n_covers, sigma2=sigma2
+            tau, y, periods_host, n_bins=n_bins, n_covers=n_covers, sigma2=sigma2,
+            precision=resolve_precision(precision, "cuda"),
+        )
+    if backend == "numba":
+        kernel = _numba_pdm_kernel()
+        return np.asarray(
+            kernel(tau, y, periods_host, n_bins, n_covers, sigma2), dtype=np.float64
         )
     if backend == "torch" or backend.startswith("torch:"):
         import torch
@@ -303,16 +406,17 @@ def pdm_theta(
 
 
 class PDMMethod(PeriodogramMethod):
-    """Phase Dispersion Minimization (numpy CPU, cupy GPU)."""
+    """Phase Dispersion Minimization (numba/numpy CPU, cupy GPU)."""
 
     name: ClassVar[str] = "PDM"
     objective_sense: ClassVar[Literal["max", "min"]] = "min"
     supports_multiband: ClassVar[bool] = False
     settings_cls: ClassVar[type] = PDMSettings
     cpu_backend: ClassVar[str] = "numpy"
+    fast_cpu_backend: ClassVar[str | None] = "numba"
     gpu_backend: ClassVar[str | None] = "cupy"
     portable_gpu_backend: ClassVar[str | None] = "torch"
-    all_backends: ClassVar[tuple[str, ...]] = ("numpy", "cupy", "torch")
+    all_backends: ClassVar[tuple[str, ...]] = ("numba", "numpy", "cupy", "torch")
 
     def default_grid(self, lc: LightCurve, settings: PDMSettings) -> GridSpec:  # type: ignore[override]
         finite = lc.finite()

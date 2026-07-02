@@ -28,7 +28,7 @@ from cuperiod.core._arrayapi import (
     array_namespace,
     device_ref,
     resolve_precision,
-    scatter_add,
+    scatter_add_rows,
     to_device_array,
     to_host,
 )
@@ -133,7 +133,6 @@ def _bls_search(
     fdtype = periods.dtype
     idtype = xp.int64
     dev = device_ref(periods)
-    n_points = int(t.shape[0])
     yw = y * ivar
     sum_y = float(xp.sum(yw))
     sum_ivar = float(xp.sum(ivar))
@@ -152,6 +151,7 @@ def _bls_search(
     }
     if n_periods == 0 or not dur_bins:
         return out
+    cols_full = xp.arange(width, dtype=idtype, device=dev)
 
     for start in range(0, n_periods, batch):
         stop = min(start + batch, n_periods)
@@ -163,15 +163,10 @@ def _bls_search(
         phase_t = xp.remainder(tau[None, :], pb[:, None])
         ind = xp.astype(phase_t / bin_duration, idtype) + 1
         ind = xp.clip(ind, 0, width - 1)
-        flat = xp.reshape(rows[:, None] * width + ind, (-1,))
-        mean_y = xp.zeros(n_p * width, dtype=fdtype, device=dev)
-        mean_ivar = xp.zeros(n_p * width, dtype=fdtype, device=dev)
-        yw_b = xp.reshape(xp.broadcast_to(yw, (n_p, n_points)), (-1,))
-        ivar_b = xp.reshape(xp.broadcast_to(ivar, (n_p, n_points)), (-1,))
-        scatter_add(mean_y, flat, yw_b)
-        scatter_add(mean_ivar, flat, ivar_b)
-        mean_y = xp.reshape(mean_y, (n_p, width))
-        mean_ivar = xp.reshape(mean_ivar, (n_p, width))
+        mean_y = xp.zeros((n_p, width), dtype=fdtype, device=dev)
+        mean_ivar = xp.zeros((n_p, width), dtype=fdtype, device=dev)
+        scatter_add_rows(mean_y, ind, yw)
+        scatter_add_rows(mean_ivar, ind, ivar)
 
         for j in range(oversample):
             dst = xp.clip(n_bins - oversample + j, 0, width - 1)
@@ -191,7 +186,7 @@ def _bls_search(
             y_in = cy[:, kd:] - cy[:, :-kd]
             ivar_in = cw[:, kd:] - cw[:, :-kd]
             ivar_out = sum_ivar - ivar_in
-            cols = xp.arange(y_in.shape[1], dtype=idtype, device=dev)
+            cols = cols_full[: width - kd]
             valid = (
                 (cols[None, :] <= (n_bins[:, None] - kd))
                 & (ivar_in >= _IVAR_EPS)
@@ -275,8 +270,14 @@ def _numba_bls_kernel() -> Any:
             n_bins = int(np.ceil(period / bin_duration)) + oversample
             if n_bins > width - 1:
                 n_bins = width - 1
-            my = np.zeros(width)
-            mi = np.zeros(width)
+            # Only bins [0, n_bins] are ever written or read for this period, so
+            # zero just that prefix — width is sized for the *longest* period in
+            # the batch and can be ~2x larger than n_bins for the shortest.
+            my = np.empty(width)
+            mi = np.empty(width)
+            for i in range(n_bins + 1):
+                my[i] = 0.0
+                mi[i] = 0.0
             for j in range(n_points):
                 x = tau[j]
                 w = x - period * np.floor(x / period)
@@ -375,15 +376,15 @@ def _bls_search_numba(
 
 _BLS_CUDA_SRC: Final = r"""
 extern "C" __global__ void bls_block(
-    const double* __restrict__ tau,      // (N) times - t_min
-    const double* __restrict__ yw,       // (N) y * ivar
-    const double* __restrict__ wv,       // (N) ivar
-    const double* __restrict__ periods,  // (P)
+    const REAL* __restrict__ tau,        // (N) times - t_min
+    const REAL* __restrict__ yw,         // (N) y * ivar
+    const REAL* __restrict__ wv,         // (N) ivar
+    const REAL* __restrict__ periods,    // (P)
     const int* __restrict__ dur_bins,    // (D) box widths in bins
     const int n_points, const int n_periods, const int n_dur,
-    const double bin_duration, const int oversample, const int width,
-    const double sum_y, const double sum_ivar, const double t_min,
-    const int obj_flag, const double NEG_INF,
+    const REAL bin_duration, const int oversample, const int width,
+    const REAL sum_y, const REAL sum_ivar, const double t_min,
+    const int obj_flag, const REAL NEG_INF, const REAL IVAR_EPS,
     double* o_power, double* o_depth, double* o_depth_err, double* o_depth_snr,
     double* o_duration, double* o_transit_time, double* o_loglike)
 {
@@ -391,21 +392,21 @@ extern "C" __global__ void bls_block(
     if (pidx >= n_periods) return;
     const int tid = threadIdx.x;
     const int nth = blockDim.x;
-    const double period = periods[pidx];
+    const REAL period = periods[pidx];
 
     int n_bins = (int)ceil(period / bin_duration) + oversample;
     if (n_bins > width - 1) n_bins = width - 1;
 
-    extern __shared__ double sh[];
-    double* my = sh;          // weighted-y per bin
-    double* mi = sh + width;  // ivar per bin
+    extern __shared__ REAL sh[];
+    REAL* my = sh;          // weighted-y per bin
+    REAL* mi = sh + width;  // ivar per bin
 
     for (int i = tid; i < width; i += nth) { my[i] = 0.0; mi[i] = 0.0; }
     __syncthreads();
 
     for (int j = tid; j < n_points; j += nth) {
-        double x = tau[j];
-        double w = x - period * floor(x / period);
+        REAL x = tau[j];
+        REAL w = x - period * floor(x / period);
         int ind = (int)(w / bin_duration) + 1;
         if (ind < 0) ind = 0;
         if (ind > width - 1) ind = width - 1;
@@ -422,56 +423,56 @@ extern "C" __global__ void bls_block(
     }
     __syncthreads();
 
-    __shared__ double cof_y[CUDA_BLOCK];
-    __shared__ double cof_i[CUDA_BLOCK];
+    __shared__ REAL cof_y[CUDA_BLOCK];
+    __shared__ REAL cof_i[CUDA_BLOCK];
     {
         int span = n_bins + 1;
         int chunk = (span + nth - 1) / nth;
         int lo = tid * chunk;
         int hi = lo + chunk; if (hi > span) hi = span;
-        double ay = 0.0, ai = 0.0;
+        REAL ay = 0.0, ai = 0.0;
         for (int i = lo; i < hi; ++i) {
             ay += my[i]; my[i] = ay; ai += mi[i]; mi[i] = ai;
         }
         cof_y[tid] = ay; cof_i[tid] = ai;
         __syncthreads();
         if (tid == 0) {
-            double sy = 0.0, si = 0.0;
+            REAL sy = 0.0, si = 0.0;
             for (int k = 0; k < nth; ++k) {
-                double ty = cof_y[k], ti = cof_i[k];
+                REAL ty = cof_y[k], ti = cof_i[k];
                 cof_y[k] = sy; cof_i[k] = si; sy += ty; si += ti;
             }
         }
         __syncthreads();
-        double oy = cof_y[tid], oi = cof_i[tid];
+        REAL oy = cof_y[tid], oi = cof_i[tid];
         for (int i = lo; i < hi; ++i) { my[i] += oy; mi[i] += oi; }
     }
     __syncthreads();
 
-    double loc_obj = NEG_INF;
+    REAL loc_obj = NEG_INF;
     int loc_n = 0, loc_d = 0;
     for (int di = 0; di < n_dur; ++di) {
         const int d = dur_bins[di];
         if (d < 1 || d >= n_bins) continue;
         const int n_max = n_bins - d;
         for (int n = tid; n <= n_max; n += nth) {
-            double y_in = my[n + d] - my[n];
-            double iv_in = mi[n + d] - mi[n];
-            double iv_out = sum_ivar - iv_in;
-            if (iv_in < 2.2204460492503131e-16) continue;
-            if (iv_out < 2.2204460492503131e-16) continue;
-            double yin = y_in / iv_in;
-            double yout = (sum_y - y_in) / iv_out;
+            REAL y_in = my[n + d] - my[n];
+            REAL iv_in = mi[n + d] - mi[n];
+            REAL iv_out = sum_ivar - iv_in;
+            if (iv_in < IVAR_EPS) continue;
+            if (iv_out < IVAR_EPS) continue;
+            REAL yin = y_in / iv_in;
+            REAL yout = (sum_y - y_in) / iv_out;
             if (yout < yin) continue;
-            double depth = yout - yin;
-            double obj = (obj_flag == 0)
-                ? depth / sqrt(1.0 / iv_in + 1.0 / iv_out)
-                : 0.5 * iv_in * depth * depth;
+            REAL depth = yout - yin;
+            REAL obj = (obj_flag == 0)
+                ? depth / sqrt((REAL)1.0 / iv_in + (REAL)1.0 / iv_out)
+                : (REAL)0.5 * iv_in * depth * depth;
             if (obj > loc_obj) { loc_obj = obj; loc_n = n; loc_d = d; }
         }
     }
 
-    __shared__ double r_obj[CUDA_BLOCK];
+    __shared__ REAL r_obj[CUDA_BLOCK];
     __shared__ int r_n[CUDA_BLOCK];
     __shared__ int r_d[CUDA_BLOCK];
     r_obj[tid] = loc_obj; r_n[tid] = loc_n; r_d[tid] = loc_d;
@@ -486,7 +487,7 @@ extern "C" __global__ void bls_block(
     }
 
     if (tid == 0) {
-        double best = r_obj[0];
+        REAL best = r_obj[0];
         if (best <= NEG_INF) {
             o_power[pidx] = NEG_INF; o_depth[pidx] = 0.0; o_depth_err[pidx] = 0.0;
             o_depth_snr[pidx] = 0.0; o_duration[pidx] = 0.0;
@@ -494,40 +495,42 @@ extern "C" __global__ void bls_block(
             return;
         }
         int bn = r_n[0], bd = r_d[0];
-        double y_in = my[bn + bd] - my[bn];
-        double iv_in = mi[bn + bd] - mi[bn];
-        double iv_out = sum_ivar - iv_in;
+        double y_in = (double)my[bn + bd] - (double)my[bn];
+        double iv_in = (double)mi[bn + bd] - (double)mi[bn];
+        double iv_out = (double)sum_ivar - iv_in;
         double yin = y_in / iv_in;
-        double yout = (sum_y - y_in) / iv_out;
+        double yout = ((double)sum_y - y_in) / iv_out;
         double depth = yout - yin;
         double derr = sqrt(1.0 / iv_in + 1.0 / iv_out);
         double dsnr = depth / derr;
         double loglike = 0.5 * iv_in * depth * depth;
-        double dur = (double)bd * bin_duration;
+        double dur = (double)bd * (double)bin_duration;
         o_power[pidx] = (obj_flag == 0) ? dsnr : loglike;
         o_depth[pidx] = depth;
         o_depth_err[pidx] = derr;
         o_depth_snr[pidx] = dsnr;
         o_duration[pidx] = dur;
         o_transit_time[pidx] =
-            fmod((double)bn * bin_duration + 0.5 * dur, period) + t_min;
+            fmod((double)bn * (double)bin_duration + 0.5 * dur, (double)period) + t_min;
         o_loglike[pidx] = loglike;
     }
 }
 """
 
-_cuda_kernel_cache: dict[int, Any] = {}
+_cuda_kernel_cache: dict[tuple[int, str], Any] = {}
 
 
-def _cuda_kernel(block: int) -> Any:
-    """Compile (once) and cache the BLS RawKernel for a given block size."""
-    kernel = _cuda_kernel_cache.get(block)
+def _cuda_kernel(block: int, real: str) -> Any:
+    """Compile (once) and cache the BLS RawKernel for a block size and precision."""
+    kernel = _cuda_kernel_cache.get((block, real))
     if kernel is None:
         import cupy
 
-        src = _BLS_CUDA_SRC.replace("CUDA_BLOCK", str(block))
+        src = _BLS_CUDA_SRC.replace("CUDA_BLOCK", str(block)).replace(
+            "REAL", "float" if real == "float32" else "double"
+        )
         kernel = cupy.RawKernel(src, "bls_block")
-        _cuda_kernel_cache[block] = kernel
+        _cuda_kernel_cache[(block, real)] = kernel
     return kernel
 
 
@@ -542,20 +545,43 @@ def _bls_search_cuda(
     oversample: int,
     width: int,
     obj_flag: int,
+    precision: str = "float64",
+    device_cache: dict[str, Any] | None = None,
     block: int = CUDA_BLOCK,
 ) -> dict[str, Any]:
-    """One-block-per-period CUDA box search; returns cupy arrays per output."""
+    """One-block-per-period CUDA box search; returns host float64 arrays per output.
+
+    ``device_cache`` (caller-owned, one per light curve) keeps the uploaded
+    ``tau``/``yw``/``ivar`` device arrays and their float64 sums across calls, so the
+    segmented search uploads each light curve once instead of once per segment. The
+    time origin is subtracted on the host in float64 before any (possibly float32)
+    device cast; the kernel adds ``t_min`` back into ``transit_time`` in double.
+    """
     import cupy as cp
 
-    t_d = cp.asarray(np.ascontiguousarray(t, dtype=np.float64))
-    ivar_d = cp.asarray(np.ascontiguousarray(ivar, dtype=np.float64))
-    y_d = cp.asarray(np.ascontiguousarray(y, dtype=np.float64))
-    t_min = float(t_d.min())
-    tau = t_d - t_min
-    yw = y_d * ivar_d
-    sum_y = float(yw.sum())
-    sum_ivar = float(ivar_d.sum())
-    periods_d = cp.asarray(np.ascontiguousarray(periods, dtype=np.float64))
+    rdtype = np.float32 if precision == "float32" else np.float64
+    data: dict[str, Any] | None = None
+    if device_cache is not None:
+        data = device_cache.get("cuda")
+        if data is not None and (data["n"] != t.shape[0] or data["dtype"] != rdtype):
+            data = None
+    if data is None:
+        t_min = float(t.min())
+        yw_h = y * ivar
+        data = {
+            "n": int(t.shape[0]),
+            "dtype": rdtype,
+            "t_min": t_min,
+            "tau": cp.asarray(np.ascontiguousarray(t - t_min, dtype=rdtype)),
+            "yw": cp.asarray(np.ascontiguousarray(yw_h, dtype=rdtype)),
+            "ivar": cp.asarray(np.ascontiguousarray(ivar, dtype=rdtype)),
+            "sum_y": float(yw_h.sum()),
+            "sum_ivar": float(ivar.sum()),
+        }
+        if device_cache is not None:
+            device_cache["cuda"] = data
+
+    periods_d = cp.asarray(np.ascontiguousarray(periods, dtype=rdtype))
     n_periods = int(periods_d.shape[0])
     dur_d = cp.asarray(np.asarray(dur_bins, dtype=np.int32))
 
@@ -568,15 +594,17 @@ def _bls_search_cuda(
         "transit_time",
         "log_likelihood",
     )
-    out = {name: cp.empty(n_periods, dtype=cp.float64) for name in names}
     if n_periods == 0 or len(dur_bins) == 0:
-        out["power"][...] = -np.inf
-        return out
+        out_empty = {name: np.zeros(n_periods, dtype=np.float64) for name in names}
+        out_empty["power"][...] = -np.inf
+        return out_empty
+    out = {name: cp.empty(n_periods, dtype=cp.float64) for name in names}
 
     from cuperiod.core.backend import ensure_shared_memory
 
-    smem = 2 * width * 8
-    kernel = _cuda_kernel(block)
+    real_size = 4 if precision == "float32" else 8
+    smem = 2 * width * real_size
+    kernel = _cuda_kernel(block, precision)
     ensure_shared_memory(
         kernel, smem, method="BLS", hint="the period range (max_period_days)"
     )
@@ -584,22 +612,31 @@ def _bls_search_cuda(
         (n_periods,),
         (block,),
         (
-            tau,
-            yw,
-            ivar_d,
+            data["tau"],
+            data["yw"],
+            data["ivar"],
             periods_d,
             dur_d,
-            np.int32(t_d.shape[0]),
+            np.int32(data["n"]),
             np.int32(n_periods),
             np.int32(dur_d.shape[0]),
-            np.float64(bin_duration),
+            rdtype(bin_duration),
             np.int32(oversample),
             np.int32(width),
-            np.float64(sum_y),
-            np.float64(sum_ivar),
-            np.float64(t_min),
+            rdtype(data["sum_y"]),
+            rdtype(data["sum_ivar"]),
+            np.float64(data["t_min"]),
             np.int32(obj_flag),
-            np.float64(-np.inf),
+            rdtype(-np.inf),
+            # In float64 an empty box window's ivar_in is exactly 0, so the absolute
+            # eps floor suffices. In float32 the cumsum difference of an empty window
+            # is cancellation *noise* of order sum_ivar*eps_f32 — an absolute 2.2e-16
+            # floor would admit garbage boxes — so the floor scales with the total.
+            rdtype(
+                max(_IVAR_EPS, data["sum_ivar"] * 8.0 * float(np.finfo(np.float32).eps))
+            )
+            if precision == "float32"
+            else np.float64(_IVAR_EPS),
             out["power"],
             out["depth"],
             out["depth_err"],
@@ -610,7 +647,9 @@ def _bls_search_cuda(
         ),
         shared_mem=smem,
     )
-    return out
+    # One stacked D2H copy instead of seven independent transfers.
+    host = cp.asnumpy(cp.stack([out[name] for name in names]))
+    return {name: host[i] for i, name in enumerate(names)}
 
 
 def bls_power(
@@ -625,6 +664,7 @@ def bls_power(
     backend: str = "numpy",
     batch: int = DEFAULT_BATCH,
     precision: str = "auto",
+    device_cache: dict[str, Any] | None = None,
 ) -> BLSPower:
     """BLS box search over ``periods`` via numpy/torch (portable), cupy, or numba.
 
@@ -651,7 +691,12 @@ def bls_power(
     batch : int, default 2048
         Trial periods per vectorized batch (numpy/torch backends).
     precision : {"auto", "float64", "float32"}, default "auto"
-        Device-side compute precision for the torch backend (float64 except on MPS).
+        Device-side compute precision for the torch and cupy backends (float64
+        except on MPS; ``"float32"`` is an opt-in speedup on consumer GPUs).
+    device_cache : dict or None
+        Caller-owned scratch dict reused across calls that share the *same*
+        ``t``/``y``/``dy`` (the segmented search): device uploads happen once per
+        light curve instead of once per call. Pass a fresh ``{}`` per light curve.
 
     Returns
     -------
@@ -693,6 +738,8 @@ def bls_power(
             t_host, y_host, ivar_host, periods_host,
             bin_duration=bin_duration, dur_bins=dur_bins,
             oversample=oversample, width=width, obj_flag=obj_flag,
+            precision=resolve_precision(precision, "cuda"),
+            device_cache=device_cache,
         )
     elif backend == "numba":
         out = _bls_search_numba(
@@ -714,13 +761,32 @@ def bls_power(
         # precision on Apple MPS — so a raw cast would silently corrupt the phase fold.
         # The small t-min-relative tau survives float32; ``transit_time`` is shifted
         # back to absolute on the host (float64) at the return. Mirrors ``gls._prep``.
-        t_ref = float(np.min(t_host))
-        t_d = to_device_array(t_host - t_ref, device=device, dtype=tdtype)
-        y_d = to_device_array(y_host, device=device, dtype=tdtype)
-        ivar_d = to_device_array(ivar_host, device=device, dtype=tdtype)
+        data: dict[str, Any] | None = None
+        if device_cache is not None:
+            data = device_cache.get("torch")
+            if data is not None and (
+                data["n"] != t_host.shape[0]
+                or data["dtype"] != tdtype
+                or data["device"] != device
+            ):
+                data = None
+        if data is None:
+            t_ref_val = float(np.min(t_host))
+            data = {
+                "n": int(t_host.shape[0]),
+                "dtype": tdtype,
+                "device": device,
+                "t_ref": t_ref_val,
+                "t": to_device_array(t_host - t_ref_val, device=device, dtype=tdtype),
+                "y": to_device_array(y_host, device=device, dtype=tdtype),
+                "ivar": to_device_array(ivar_host, device=device, dtype=tdtype),
+            }
+            if device_cache is not None:
+                device_cache["torch"] = data
+        t_ref = data["t_ref"]
         periods_d = to_device_array(periods_host, device=device, dtype=tdtype)
         out = _bls_search(
-            array_namespace(periods_d), t_d, y_d, ivar_d, periods_d,
+            array_namespace(periods_d), data["t"], data["y"], data["ivar"], periods_d,
             bin_duration=bin_duration, dur_bins=dur_bins,
             oversample=oversample, width=width, obj_flag=obj_flag, batch=batch,
         )

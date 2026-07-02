@@ -39,25 +39,25 @@ The selectors:
   - `cupy`
   - `numba` if installed, else `astropy`
 * - PDM
-  - `numpy`
+  - `numba` *(with `[fast]`)*, `numpy`
   - `cupy`
-  - `numpy`
+  - `numba` if installed, else `numpy`
 * - CE
-  - `numpy`
+  - `numba` *(with `[fast]`)*, `numpy`
   - `cupy`
-  - `numpy`
+  - `numba` if installed, else `numpy`
 * - String-Length
-  - `numpy`
+  - `numba` *(with `[fast]`)*, `numpy`
   - `cupy`
-  - `numpy`
+  - `numba` if installed, else `numpy`
 * - MHAOV
-  - `numpy`
+  - `numba` *(with `[fast]`)*, `numpy`
   - `cupy`
-  - `numpy`
+  - `numba` if installed, else `numpy`
 * - TLS
-  - `numpy`
+  - `numba` *(with `[fast]`)*, `numpy`
   - `cupy`
-  - `numpy`
+  - `numba` if installed, else `numpy`
 ```
 
 † BLS's `numpy` backend is a GPU-parity *reference*, not the product path — it shares one
@@ -172,11 +172,15 @@ How to read this:
   search). They're so fast on the CPU that the GPU's marginal gain on a single curve is
   modest — but the GPU still wins decisively for **large grids and big catalogs**
   ({doc}`batch`).
-- **PDM, CE, String-Length, MHAOV, TLS run on numpy on the CPU**, so the GPU's
-  data-parallelism delivers roughly 50–190× on a single curve. If you're searching many
-  periods or many stars with these, the GPU is a large win. The portable **`torch:cuda`**
-  column tracks alongside — competitive for these methods, and the same code reaches
-  AMD/Intel/Apple GPUs (see the portable-backend note above).
+- The **CPU times in the table are the vectorized numpy paths**. With the `[fast]` extra
+  installed, PDM, CE, String-Length, MHAOV, and TLS now run multicore **numba** kernels
+  on `"cpu"`/`"auto"` — one to two orders of magnitude faster than the numpy column
+  (e.g. PDM ~300×, CE ~135×, MHAOV ~57× on a 3k-point curve) — which puts a warm CPU
+  within reach of the GPU for a *single* curve. The GPU remains the throughput champion
+  for large grids and catalogs.
+- On **consumer NVIDIA cards** (GeForce), whose float64 throughput is 1/64 of float32,
+  the opt-in `precision="float32"` runs the BLS/TLS CUDA kernels ~8-9× faster at
+  detection-grade accuracy; float64 stays the default.
 - cuPeriod's **CPU** path already beats the established reference tools it was checked
   against (GLS ~3× astropy, PDM ~4× PyAstronomy, BLS ~18× astropy's `BoxLeastSquares`).
 

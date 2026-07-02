@@ -57,39 +57,47 @@ DEFAULT_EPS: Final = 1e-9
 
 
 def _trig_sums(
-    tau: FloatArray,
-    strengths: FloatArray,
+    tau: Any,
+    strengths: Any,
     f0: float,
     df: float,
     nf: int,
     backend: NufftBackend,
     eps: float,
-) -> np.ndarray:
-    """``out[k] = sum_j strengths_j exp(2j*pi*(f0 + k*df)*tau_j)`` via a type-1 NUFFT.
+) -> Any:
+    """``out[i, k] = sum_j strengths[i, j] exp(2j*pi*(f0 + k*df)*tau_j)`` via NUFFT.
 
-    finufft's default mode ordering puts mode ``m = k - nf//2`` at output index ``k``,
-    so the strengths are modulated by ``exp(2j*pi*f_center*tau)`` with
-    ``f_center = f0 + (nf//2)*df`` and the times scaled to ``x = 2*pi*df*tau`` (wrapped
-    to ``[-pi, pi)``); output index ``k`` then lands on frequency ``f0 + k*df``.
+    ``strengths`` is a ``(n_trans, N)`` stack: transforms that share the same
+    nonuniform points (the base-grid pair ``w`` and ``w*y``) go through **one**
+    batched NUFFT call, sharing the point sort/spread setup. finufft's default mode
+    ordering puts mode ``m = k - nf//2`` at output index ``k``, so the strengths are
+    modulated by ``exp(2j*pi*f_center*tau)`` with ``f_center = f0 + (nf//2)*df`` and
+    the times scaled to ``x = 2*pi*df*tau`` (wrapped to ``[-pi, pi)``); output index
+    ``k`` then lands on frequency ``f0 + k*df``. For ``backend="cufinufft"`` the
+    inputs must already be cupy arrays and the ``(n_trans, nf)`` output **stays on
+    device** so the caller can assemble the power there.
     """
-    f_center = f0 + (nf // 2) * df
-    x = (2.0 * np.pi * df) * tau
-    x = np.mod(x + np.pi, 2.0 * np.pi) - np.pi
-    c = (strengths * np.exp(2j * np.pi * f_center * tau)).astype(np.complex128)
-
     if backend == "finufft":
         import finufft
 
-        out = finufft.nufft1d1(x, c, nf, eps=eps, isign=1)
-        return np.asarray(out, dtype=np.complex128)
-    if backend == "cufinufft":
+        xp: Any = np
+        nufft1d1 = finufft.nufft1d1
+    elif backend == "cufinufft":
         ensure_cuda_dll_path()
         import cufinufft
         import cupy as cp
 
-        out_g = cufinufft.nufft1d1(cp.asarray(x), cp.asarray(c), nf, eps=eps, isign=1)
-        return np.asarray(cp.asnumpy(out_g), dtype=np.complex128)
-    raise ValueError(f"unknown NUFFT backend {backend!r}")
+        xp = cp
+        nufft1d1 = cufinufft.nufft1d1
+    else:
+        raise ValueError(f"unknown NUFFT backend {backend!r}")
+
+    f_center = f0 + (nf // 2) * df
+    x = (2.0 * np.pi * df) * tau
+    x = xp.mod(x + np.pi, 2.0 * np.pi) - np.pi
+    c = (strengths * xp.exp(2j * np.pi * f_center * tau)[None, :]).astype(np.complex128)
+    out = nufft1d1(x, c, nf, eps=eps, isign=1)
+    return out if out.ndim == 2 else out[None, :]
 
 
 def _assemble_power_parts(
@@ -201,39 +209,66 @@ def lombscargle_power(
     if nf <= 0:
         return np.zeros(0, dtype=np.float64)
     tau, w, y, y_mean, yy = _prep(t, y, dy)
-    sw = _trig_sums(tau, w, f0, df, nf, backend, eps)
-    swy = _trig_sums(tau, w * y, f0, df, nf, backend, eps)
-    sw2 = _trig_sums(tau, w, 2.0 * f0, 2.0 * df, nf, backend, eps)
-    return np.asarray(
-        _assemble_power(sw, swy, sw2, y_mean, yy, fit_mean), dtype=np.float64
-    )
+    base = np.stack([w, w * y])
+    tau_b: Any = tau
+    if backend == "cufinufft":
+        # Device inputs in, device sums out: the power is assembled on the GPU and
+        # only the final spectrum crosses back to the host.
+        ensure_cuda_dll_path()
+        import cupy as cp
+
+        tau_b = cp.asarray(tau)
+        base = cp.asarray(base)
+    pair = _trig_sums(tau_b, base, f0, df, nf, backend, eps)
+    sw2 = _trig_sums(tau_b, base[:1], 2.0 * f0, 2.0 * df, nf, backend, eps)
+    return to_host(_assemble_power(pair[0], pair[1], sw2[0], y_mean, yy, fit_mean))
 
 
-def _trig_sums_direct(
-    xp: Any, tau: Any, strengths: Any, f0: float, df: float, nf: int, *, freq_batch: int
-) -> tuple[Any, Any]:
-    """Direct (NUFFT-free) trig sums on the uniform grid ``f_k = f0 + k*df``.
+#: Elements per transient ``(chunk, N)`` matrix in the direct path (64 MB float64);
+#: the frequency chunk is capped so long light curves cannot blow device memory.
+_DIRECT_CHUNK_ELEMS: Final = 1 << 23
 
-    Returns ``(cos_sum, sin_sum)`` real arrays of length ``nf`` with
-    ``cos_sum[k] = sum_j strengths_j cos(2*pi*f_k*tau_j)`` and ``sin_sum`` the matching
-    ``+sin`` sum (the ``isign=+1`` convention of the NUFFT path). This is ``O(N*nf)``
-    rather than the NUFFT's ``O(nf log nf)``, but is pure array-API and so runs on any
-    backend/device — the portable GLS path for AMD/Intel/Mac. Batched over frequency to
-    bound the transient ``(chunk, N)`` angle matrix.
+
+def _gls_sums_direct(
+    xp: Any, tau: Any, w: Any, wy: Any, f0: float, df: float, nf: int, *,
+    freq_batch: int,
+) -> tuple[Any, Any, Any, Any, Any, Any]:
+    """All six GLS trig sums on ``f_k = f0 + k*df`` from one cos/sin evaluation.
+
+    Returns ``(c, s, yc, ys, c2, s2)`` — the cos/sin sums of the weights ``w`` and the
+    weighted data ``wy`` on the base grid, and of ``w`` on the doubled grid (the
+    ``isign=+1`` convention of the NUFFT path). The base-grid sums share one angle
+    matrix, and the doubled-frequency sums follow from the double-angle identities
+    ``cos2θ = 2cos²θ − 1`` and ``sin2θ = 2·sinθ·cosθ``, so ``cos``/``sin`` are
+    evaluated **once** per frequency instead of six times (twice per grid in the
+    three-call arrangement). ``O(N*nf)`` rather than the NUFFT's ``O(nf log nf)``, but
+    pure array-API — the portable GLS path for AMD/Intel/Mac. Batched over frequency
+    to bound the transient ``(chunk, N)`` matrices, with the chunk auto-capped so the
+    transients stay ~64 MB regardless of ``N``.
     """
     two_pi = 2.0 * float(np.pi)
     fdtype = tau.dtype
     dev = device_ref(tau)
+    n_points = int(tau.shape[0])
+    chunk = max(1, min(freq_batch, _DIRECT_CHUNK_ELEMS // max(1, n_points)))
     freqs = f0 + df * xp.arange(nf, dtype=fdtype, device=dev)
-    cos_sum = xp.empty(nf, dtype=fdtype, device=dev)
-    sin_sum = xp.empty(nf, dtype=fdtype, device=dev)
-    strength_row = strengths[None, :]
-    for start in range(0, nf, freq_batch):
-        stop = min(start + freq_batch, nf)
+    c, s, yc, ys, c2, s2 = (xp.empty(nf, dtype=fdtype, device=dev) for _ in range(6))
+    sum_w = float(xp.sum(w))
+    w_row = w[None, :]
+    wy_row = wy[None, :]
+    for start in range(0, nf, chunk):
+        stop = min(start + chunk, nf)
         ang = (two_pi * freqs[start:stop])[:, None] * tau[None, :]
-        cos_sum[start:stop] = xp.sum(strength_row * xp.cos(ang), axis=1)
-        sin_sum[start:stop] = xp.sum(strength_row * xp.sin(ang), axis=1)
-    return cos_sum, sin_sum
+        cos_a = xp.cos(ang)
+        sin_a = xp.sin(ang)
+        wc = w_row * cos_a
+        c[start:stop] = xp.sum(wc, axis=1)
+        s[start:stop] = xp.sum(w_row * sin_a, axis=1)
+        yc[start:stop] = xp.sum(wy_row * cos_a, axis=1)
+        ys[start:stop] = xp.sum(wy_row * sin_a, axis=1)
+        c2[start:stop] = 2.0 * xp.sum(wc * cos_a, axis=1) - sum_w
+        s2[start:stop] = 2.0 * xp.sum(wc * sin_a, axis=1)
+    return c, s, yc, ys, c2, s2
 
 
 def lombscargle_power_torch(
@@ -267,10 +302,8 @@ def lombscargle_power_torch(
     w_d = to_device_array(w, device=device, dtype=tdtype)
     wy_d = to_device_array(w * y, device=device, dtype=tdtype)
     xp = array_namespace(tau_d)
-    c, s = _trig_sums_direct(xp, tau_d, w_d, f0, df, nf, freq_batch=freq_batch)
-    yc, ys = _trig_sums_direct(xp, tau_d, wy_d, f0, df, nf, freq_batch=freq_batch)
-    c2, s2 = _trig_sums_direct(
-        xp, tau_d, w_d, 2.0 * f0, 2.0 * df, nf, freq_batch=freq_batch
+    c, s, yc, ys, c2, s2 = _gls_sums_direct(
+        xp, tau_d, w_d, wy_d, f0, df, nf, freq_batch=freq_batch
     )
     power = _assemble_power_parts(xp, c, s, yc, ys, c2, s2, y_mean, yy, fit_mean)
     return to_host(power)
@@ -308,20 +341,16 @@ class CufinufftGLS:
         self._cp = cupy
         self._eps = eps
         self._bucket = max(1, int(nf_bucket))
-        self._plans: dict[int, Any] = {}
+        self._plans: dict[tuple[int, int], Any] = {}
 
-    def _plan(self, nf: int) -> Any:
-        plan = self._plans.get(nf)
+    def _plan(self, nf: int, n_trans: int) -> Any:
+        plan = self._plans.get((nf, n_trans))
         if plan is None:
             plan = self._cufinufft.Plan(
-                1, (nf,), eps=self._eps, isign=1, dtype="complex128"
+                1, (nf,), n_trans=n_trans, eps=self._eps, isign=1, dtype="complex128"
             )
-            self._plans[nf] = plan
+            self._plans[(nf, n_trans)] = plan
         return plan
-
-    @staticmethod
-    def _squeeze(arr: Any) -> Any:
-        return arr[0] if getattr(arr, "ndim", 1) == 2 else arr
 
     def power(
         self,
@@ -334,31 +363,35 @@ class CufinufftGLS:
         *,
         fit_mean: bool = True,
     ) -> FloatArray:
-        """GLS power on ``f0 + df*arange(nf)`` via a reused cufinufft plan."""
+        """GLS power on ``f0 + df*arange(nf)`` via reused cufinufft plans.
+
+        The base-grid pair (``w`` and ``w*y`` share the same points) runs as one
+        ``n_trans=2`` batched transform — one ``setpts``/execute instead of two — and
+        the doubled-grid sum uses an ``n_trans=1`` plan of the same bucketed size.
+        """
         if nf <= 0:
             return np.zeros(0, dtype=np.float64)
         cp = self._cp
         tau, w, y, y_mean, yy = _prep(t, y, dy)
         tau_g = cp.asarray(tau)
-        wg = cp.asarray(w)
-        wyg = cp.asarray(w * y)
+        base = cp.asarray(np.stack([w, w * y]))
         nf_plan = ((nf + self._bucket - 1) // self._bucket) * self._bucket
-        plan = self._plan(nf_plan)
         two_pi = 2.0 * np.pi
 
-        def sums(f0_: float, df_: float, strengths: tuple[Any, ...]) -> list[Any]:
+        def sums(f0_: float, df_: float, strengths: Any) -> Any:
             x = (two_pi * df_) * tau_g
             x = cp.mod(x + np.pi, two_pi) - np.pi
             mod = cp.exp(2j * np.pi * (f0_ + (nf_plan // 2) * df_) * tau_g)
+            plan = self._plan(nf_plan, int(strengths.shape[0]))
             plan.setpts(x)
-            return [
-                self._squeeze(plan.execute((c * mod).astype(cp.complex128)))
-                for c in strengths
-            ]
+            out = plan.execute((strengths * mod[None, :]).astype(cp.complex128))
+            return out if out.ndim == 2 else out[None, :]
 
-        sw, swy = sums(f0, df, (wg, wyg))
-        (sw2,) = sums(2.0 * f0, 2.0 * df, (wg,))
-        power = _assemble_power(sw[:nf], swy[:nf], sw2[:nf], y_mean, yy, fit_mean)
+        pair = sums(f0, df, base)
+        sw2 = sums(2.0 * f0, 2.0 * df, base[:1])
+        power = _assemble_power(
+            pair[0, :nf], pair[1, :nf], sw2[0, :nf], y_mean, yy, fit_mean
+        )
         return np.asarray(cp.asnumpy(power), dtype=np.float64)
 
 

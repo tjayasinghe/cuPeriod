@@ -193,7 +193,10 @@ def ensure_shared_memory(
             f"the device allows at most {optin // 1024} KB; reduce {hint}, or use "
             "backend='cpu'."
         )
-    if int(dynamic_bytes) > _DEFAULT_SHARED_MEM:
+    # The opt-in is needed whenever the *total* (dynamic + static) exceeds the
+    # default cap — a launch with 48 KB dynamic still fails if the kernel also has
+    # static shared arrays.
+    if needed > _DEFAULT_SHARED_MEM:
         kernel.max_dynamic_shared_size_bytes = int(dynamic_bytes)
 
 

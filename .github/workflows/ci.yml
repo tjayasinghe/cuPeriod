@@ -21,6 +21,11 @@ jobs:
         python: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
+      # PySide6 (the GUI tests, run offscreen) needs the EGL/OpenGL system
+      # libraries, which the ubuntu-latest image no longer preinstalls.
+      - name: Install Qt system libraries (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libopengl0 libgl1
       - uses: astral-sh/setup-uv@v5
       - name: Create environment
         run: uv venv --python ${{ matrix.python }}

@@ -29,7 +29,7 @@ from cuperiod.core._arrayapi import (
     device_ref,
     resolve_precision,
     resolve_torch_device,
-    scatter_add,
+    scatter_add_rows,
     to_device_array,
     to_host,
 )
@@ -137,7 +137,6 @@ def _matched_filter(
         "duration": xp.zeros(n_periods, dtype=fdtype, device=dev),
         "t0": xp.zeros(n_periods, dtype=fdtype, device=dev),
     }
-    n_points = int(tau.shape[0])
     for start in range(0, n_periods, period_batch):
         stop = min(start + period_batch, n_periods)
         pb = periods[start:stop]
@@ -145,15 +144,14 @@ def _matched_filter(
         rows_p = xp.arange(n_p, dtype=idtype, device=dev)
         phase = xp.remainder(tau[None, :] / pb[:, None], 1.0)
         bin_idx = xp.clip(xp.astype(phase * n_bins, idtype), 0, n_bins - 1)
-        flat = xp.reshape(rows_p[:, None] * n_bins + bin_idx, (-1,))
-        a_flat = xp.zeros(n_p * n_bins, dtype=fdtype, device=dev)  # sum w*y' per bin
-        b_flat = xp.zeros(n_p * n_bins, dtype=fdtype, device=dev)  # sum w per bin
-        yw_b = xp.reshape(xp.broadcast_to(yw, (n_p, n_points)), (-1,))
-        w_b = xp.reshape(xp.broadcast_to(w, (n_p, n_points)), (-1,))
-        scatter_add(a_flat, flat, yw_b)
-        scatter_add(b_flat, flat, w_b)
-        a = xp.reshape(a_flat, (n_p, n_bins))
-        b = xp.reshape(b_flat, (n_p, n_bins))
+        a = xp.zeros((n_p, n_bins), dtype=fdtype, device=dev)  # sum w*y' per bin
+        b = xp.zeros((n_p, n_bins), dtype=fdtype, device=dev)  # sum w per bin
+        scatter_add_rows(a, bin_idx, yw)
+        scatter_add_rows(b, bin_idx, w)
+        # One circular pad sized for the widest template serves every width below.
+        max_pad = max(dur_bins) - 1
+        a_ext = xp.concat([a, a[:, :max_pad]], axis=1) if max_pad else a
+        b_ext = xp.concat([b, b[:, :max_pad]], axis=1) if max_pad else b
 
         best_sr = xp.zeros(n_p, dtype=fdtype, device=dev)
         best_depth = xp.zeros(n_p, dtype=fdtype, device=dev)
@@ -161,14 +159,12 @@ def _matched_filter(
         best_width = xp.zeros(n_p, dtype=idtype, device=dev)
         for width in dur_bins:
             g = templates[width]
-            a_ext = xp.concat([a, a[:, : width - 1]], axis=1)
-            b_ext = xp.concat([b, b[:, : width - 1]], axis=1)
-            num = xp.zeros((n_p, n_bins), dtype=fdtype, device=dev)
-            den = xp.zeros((n_p, n_bins), dtype=fdtype, device=dev)
-            for k in range(width):  # correlate the folded data with the template
+            num = float(g[0]) * a_ext[:, :n_bins]
+            den = float(g[0] * g[0]) * b_ext[:, :n_bins]
+            for k in range(1, width):  # correlate the folded data with the template
                 gk = float(g[k])
-                num = num + gk * a_ext[:, k : k + n_bins]
-                den = den + (gk * gk) * b_ext[:, k : k + n_bins]
+                num += gk * a_ext[:, k : k + n_bins]
+                den += (gk * gk) * b_ext[:, k : k + n_bins]
             safe_den = xp.where(den > _W_EPS, den, 1.0)
             # a dip means the in-transit weighted residual is negative -> num < 0
             sr = xp.where((den > _W_EPS) & (num < 0.0), num * num / safe_den, 0.0)
@@ -202,29 +198,31 @@ CUDA_BLOCK: Final = 128
 #: block-reduce to the best signal residue. No (period, point) global intermediates.
 _TLS_CUDA_SRC: Final = r"""
 extern "C" __global__ void tls_block(
-    const double* __restrict__ tau, const double* __restrict__ yw,
-    const double* __restrict__ wv, const double* __restrict__ periods,
+    const REAL* __restrict__ tau, const REAL* __restrict__ yw,
+    const REAL* __restrict__ wv, const REAL* __restrict__ periods,
     const int* __restrict__ dur_bins, const int* __restrict__ tmpl_off,
-    const double* __restrict__ tmpl, const int n_dur,
-    const int n_points, const int n_periods, const int n_bins, const double W_EPS,
+    const REAL* __restrict__ tmpl, const int n_dur, const int tmpl_len,
+    const int n_points, const int n_periods, const int n_bins, const REAL W_EPS,
     double* o_sr, double* o_depth, double* o_duration, double* o_t0)
 {
     const int pidx = blockIdx.x;
     if (pidx >= n_periods) return;
     const int tid = threadIdx.x;
     const int nth = blockDim.x;
-    const double period = periods[pidx];
+    const REAL period = periods[pidx];
 
-    extern __shared__ double sh[];
-    double* a = sh;             // (n_bins) sum w*y' per bin
-    double* b = sh + n_bins;    // (n_bins) sum w per bin
+    extern __shared__ REAL sh[];
+    REAL* a = sh;                        // (n_bins) sum w*y' per bin
+    REAL* b = sh + n_bins;               // (n_bins) sum w per bin
+    REAL* s_tmpl = sh + 2 * n_bins;      // (tmpl_len) all templates, concatenated
     for (int i = tid; i < n_bins; i += nth) { a[i] = 0.0; b[i] = 0.0; }
+    for (int i = tid; i < tmpl_len; i += nth) s_tmpl[i] = tmpl[i];
     __syncthreads();
 
     for (int j = tid; j < n_points; j += nth) {
-        double x = tau[j];
-        double ph = (x - period * floor(x / period)) / period;
-        int bb = (int)(ph * n_bins);
+        REAL x = tau[j];
+        REAL ph = (x - period * floor(x / period)) / period;
+        int bb = (int)(ph * (REAL)n_bins);
         if (bb >= n_bins) bb = n_bins - 1;
         if (bb < 0) bb = 0;
         atomicAdd(&a[bb], yw[j]);
@@ -232,23 +230,23 @@ extern "C" __global__ void tls_block(
     }
     __syncthreads();
 
-    double loc_sr = 0.0, loc_depth = 0.0;
+    REAL loc_sr = 0.0, loc_depth = 0.0;
     int loc_start = 0, loc_width = 0;
     for (int idx = tid; idx < n_dur * n_bins; idx += nth) {
         const int di = idx / n_bins;
         const int start = idx % n_bins;
         const int width = dur_bins[di];
         const int off = tmpl_off[di];
-        double num = 0.0, den = 0.0;
+        REAL num = 0.0, den = 0.0;
         for (int k = 0; k < width; ++k) {
             int bb = start + k;
             if (bb >= n_bins) bb -= n_bins;  // circular wrap
-            double gk = tmpl[off + k];
+            REAL gk = s_tmpl[off + k];
             num += gk * a[bb];
             den += gk * gk * b[bb];
         }
         if (den > W_EPS && num < 0.0) {
-            double sr = num * num / den;
+            REAL sr = num * num / den;
             if (sr > loc_sr) {
                 loc_sr = sr; loc_start = start; loc_width = width;
                 loc_depth = -num / den;
@@ -256,8 +254,8 @@ extern "C" __global__ void tls_block(
         }
     }
 
-    __shared__ double r_sr[CUDA_BLOCK];
-    __shared__ double r_depth[CUDA_BLOCK];
+    __shared__ REAL r_sr[CUDA_BLOCK];
+    __shared__ REAL r_depth[CUDA_BLOCK];
     __shared__ int r_start[CUDA_BLOCK];
     __shared__ int r_width[CUDA_BLOCK];
     r_sr[tid] = loc_sr; r_depth[tid] = loc_depth;
@@ -282,18 +280,20 @@ extern "C" __global__ void tls_block(
 }
 """
 
-_tls_kernel_cache: dict[int, Any] = {}
+_tls_kernel_cache: dict[tuple[int, str], Any] = {}
 
 
-def _tls_kernel(block: int) -> Any:
-    """Compile (once) and cache the TLS RawKernel for a given block size."""
-    kernel = _tls_kernel_cache.get(block)
+def _tls_kernel(block: int, real: str) -> Any:
+    """Compile (once) and cache the TLS RawKernel for a block size and precision."""
+    kernel = _tls_kernel_cache.get((block, real))
     if kernel is None:
         import cupy
 
-        src = _TLS_CUDA_SRC.replace("CUDA_BLOCK", str(block))
+        src = _TLS_CUDA_SRC.replace("CUDA_BLOCK", str(block)).replace(
+            "REAL", "float" if real == "float32" else "double"
+        )
         kernel = cupy.RawKernel(src, "tls_block")
-        _tls_kernel_cache[block] = kernel
+        _tls_kernel_cache[(block, real)] = kernel
     return kernel
 
 
@@ -306,20 +306,23 @@ def _tls_cuda(
     n_bins: int,
     dur_bins: list[int],
     templates: dict[int, FloatArray],
+    precision: str = "float64",
     block: int = CUDA_BLOCK,
 ) -> dict[str, FloatArray]:
     """One-block-per-period CUDA matched filter; returns host arrays per output."""
     import cupy as cp
 
-    flat = np.concatenate([templates[wd] for wd in dur_bins]).astype(np.float64)
+    rdtype = np.float32 if precision == "float32" else np.float64
+    real_size = 4 if precision == "float32" else 8
+    flat = np.concatenate([templates[wd] for wd in dur_bins]).astype(rdtype)
     widths = [len(templates[wd]) for wd in dur_bins]
     offsets = np.zeros(len(dur_bins), dtype=np.int32)
     if len(widths) > 1:
         offsets[1:] = np.cumsum(widths[:-1])
-    tau_d = cp.asarray(np.ascontiguousarray(tau, dtype=np.float64))
-    yw_d = cp.asarray(np.ascontiguousarray(yw, dtype=np.float64))
-    w_d = cp.asarray(np.ascontiguousarray(w, dtype=np.float64))
-    per_d = cp.asarray(np.ascontiguousarray(periods, dtype=np.float64))
+    tau_d = cp.asarray(np.ascontiguousarray(tau, dtype=rdtype))
+    yw_d = cp.asarray(np.ascontiguousarray(yw, dtype=rdtype))
+    w_d = cp.asarray(np.ascontiguousarray(w, dtype=rdtype))
+    per_d = cp.asarray(np.ascontiguousarray(periods, dtype=rdtype))
     dur_d = cp.asarray(np.asarray(dur_bins, dtype=np.int32))
     off_d = cp.asarray(offsets)
     tmpl_d = cp.asarray(flat)
@@ -330,21 +333,128 @@ def _tls_cuda(
         return {name: np.zeros(0, dtype=np.float64) for name in names}
     from cuperiod.core.backend import ensure_shared_memory
 
-    smem = 2 * n_bins * 8
-    kernel = _tls_kernel(block)
+    # bins (a, b) plus the concatenated templates all live in shared memory.
+    smem = (2 * n_bins + int(flat.size)) * real_size
+    kernel = _tls_kernel(block, precision)
     ensure_shared_memory(kernel, smem, method="TLS", hint="n_phase_bins")
     kernel(
         (n_periods,),
         (block,),
         (
             tau_d, yw_d, w_d, per_d, dur_d, off_d, tmpl_d,
-            np.int32(len(dur_bins)), np.int32(tau_d.size), np.int32(n_periods),
-            np.int32(n_bins), np.float64(_W_EPS),
+            np.int32(len(dur_bins)), np.int32(flat.size),
+            np.int32(tau_d.size), np.int32(n_periods),
+            np.int32(n_bins),
+            # _W_EPS (1e-300) underflows to 0 in float32; use a float32-scale floor.
+            rdtype(1e-30) if precision == "float32" else np.float64(_W_EPS),
             out["sr"], out["depth"], out["duration"], out["t0"],
         ),
         shared_mem=smem,
     )
     return {name: np.asarray(cp.asnumpy(out[name]), dtype=np.float64) for name in names}
+
+
+# --- CPU fast path: numba-parallel, one loop-iteration per trial period -------
+
+_NUMBA_TLS_KERNEL: Any = None
+
+
+def _numba_tls_kernel() -> Any:
+    """Lazily compile (once) and cache the numba TLS kernel.
+
+    The same fold-bin-correlate sweep as the CUDA kernel — bin the weighted residuals
+    into phase bins, slide every limb-darkened template over every start phase, keep
+    the best signal residue — JIT-run across all cores with ``prange``. The duration
+    then start iteration order and strict ``>`` improvement reproduce the vectorized
+    path's tie-breaking exactly.
+    """
+    global _NUMBA_TLS_KERNEL
+    if _NUMBA_TLS_KERNEL is not None:
+        return _NUMBA_TLS_KERNEL
+    from numba import njit, prange
+
+    @njit(parallel=True, cache=True, fastmath=False)  # pragma: no cover - njit
+    def _kernel(tau, yw, wv, periods, dur_bins, tmpl_off, tmpl, n_bins, w_eps):  # type: ignore[no-untyped-def]
+        n_periods = periods.shape[0]
+        n_points = tau.shape[0]
+        n_dur = dur_bins.shape[0]
+        o_sr = np.zeros(n_periods)
+        o_depth = np.zeros(n_periods)
+        o_duration = np.zeros(n_periods)
+        o_t0 = np.zeros(n_periods)
+        for pidx in prange(n_periods):
+            period = periods[pidx]
+            a = np.zeros(n_bins)
+            b = np.zeros(n_bins)
+            for j in range(n_points):
+                q = tau[j] / period
+                ph = q - np.floor(q)
+                bb = int(ph * n_bins)
+                if bb > n_bins - 1:
+                    bb = n_bins - 1
+                elif bb < 0:
+                    bb = 0
+                a[bb] += yw[j]
+                b[bb] += wv[j]
+            loc_sr = 0.0
+            loc_depth = 0.0
+            loc_start = 0
+            loc_width = 0
+            for di in range(n_dur):
+                width = dur_bins[di]
+                off = tmpl_off[di]
+                for start in range(n_bins):
+                    num = 0.0
+                    den = 0.0
+                    for k in range(width):
+                        bb = start + k
+                        if bb >= n_bins:
+                            bb -= n_bins  # circular wrap
+                        gk = tmpl[off + k]
+                        num += gk * a[bb]
+                        den += gk * gk * b[bb]
+                    if den > w_eps and num < 0.0:
+                        sr = num * num / den
+                        if sr > loc_sr:
+                            loc_sr = sr
+                            loc_start = start
+                            loc_width = width
+                            loc_depth = -num / den
+            o_sr[pidx] = loc_sr
+            o_depth[pidx] = loc_depth
+            o_duration[pidx] = loc_width / n_bins * period
+            centre = (loc_start + loc_width / 2.0) / n_bins
+            o_t0[pidx] = (centre - np.floor(centre)) * period
+        return o_sr, o_depth, o_duration, o_t0
+
+    _NUMBA_TLS_KERNEL = _kernel
+    return _kernel
+
+
+def _tls_numba(
+    tau: FloatArray,
+    yw: FloatArray,
+    w: FloatArray,
+    periods: FloatArray,
+    *,
+    n_bins: int,
+    dur_bins: list[int],
+    templates: dict[int, FloatArray],
+) -> dict[str, FloatArray]:
+    """Numba CPU matched filter; same output dict as :func:`_matched_filter`."""
+    kernel = _numba_tls_kernel()
+    tmpl = np.concatenate([templates[wd] for wd in dur_bins]).astype(np.float64)
+    widths = np.asarray([len(templates[wd]) for wd in dur_bins], dtype=np.int64)
+    offsets = np.zeros(len(dur_bins), dtype=np.int64)
+    if len(dur_bins) > 1:
+        offsets[1:] = np.cumsum(widths[:-1])
+    sr, depth, duration, t0 = kernel(
+        np.ascontiguousarray(tau), np.ascontiguousarray(yw), np.ascontiguousarray(w),
+        np.ascontiguousarray(periods),
+        np.asarray(dur_bins, dtype=np.int64), offsets, tmpl,
+        int(n_bins), float(_W_EPS),
+    )
+    return {"sr": sr, "depth": depth, "duration": duration, "t0": t0}
 
 
 def tls_power(
@@ -407,6 +517,12 @@ def tls_power(
         res = _tls_cuda(
             tau, yw, w, periods_host,
             n_bins=n_bins, dur_bins=dur_bins, templates=templates,
+            precision=resolve_precision(settings.precision, "cuda"),
+        )
+    elif backend == "numba":
+        res = _tls_numba(
+            tau, yw, w, periods_host,
+            n_bins=n_bins, dur_bins=dur_bins, templates=templates,
         )
     elif backend == "torch" or backend.startswith("torch:"):
         import torch
@@ -442,7 +558,7 @@ def tls_power(
 
 
 class TLSMethod(PeriodogramMethod):
-    """Transit Least Squares — limb-darkened matched filter (numpy CPU, cupy GPU)."""
+    """Transit Least Squares — limb-darkened matched filter (numba CPU, cupy GPU)."""
 
     name: ClassVar[str] = "TLS"
     objective_sense: ClassVar[Literal["max", "min"]] = "max"
@@ -450,9 +566,10 @@ class TLSMethod(PeriodogramMethod):
     natural_domain: ClassVar[Domain] = Domain.FLUX
     settings_cls: ClassVar[type] = TLSSettings
     cpu_backend: ClassVar[str] = "numpy"
+    fast_cpu_backend: ClassVar[str | None] = "numba"
     gpu_backend: ClassVar[str | None] = "cupy"
     portable_gpu_backend: ClassVar[str | None] = "torch"
-    all_backends: ClassVar[tuple[str, ...]] = ("numpy", "cupy", "torch")
+    all_backends: ClassVar[tuple[str, ...]] = ("numba", "numpy", "cupy", "torch")
 
     def default_grid(self, lc: LightCurve, settings: TLSSettings) -> GridSpec:  # type: ignore[override]
         finite = lc.finite()

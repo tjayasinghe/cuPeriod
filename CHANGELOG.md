@@ -6,6 +6,51 @@ All notable changes to cuPeriod are documented here. The format is based on
 
 ## [Unreleased]
 
+### Performance
+
+- **Multicore `numba` CPU kernels for PDM, CE, String-Length, MHAOV, and TLS** (BLS
+  already had one). With the `[fast]` extra installed, `backend="cpu"`/`"auto"` now
+  resolve to them; warm-kernel speedups over the vectorized numpy paths on a 3k-point
+  curve: PDM ~300x, CE ~135x, MHAOV ~57x, TLS ~53x, String-Length ~23x, with parity to
+  the numpy results at or below ~1e-11.
+- **MHAOV is rewritten around harmonic trig sums.** Every entry of the normal equations
+  is analytically a trig sum, so the Gram matrix is now assembled from `C_m`/`S_m`
+  sums computed with the Chebyshev recurrence (one `cos`/`sin` evaluation regardless of
+  the harmonic order) instead of materializing the `(F, N, 2H+1)` design tensor:
+  ~2.7-3.2x faster on numpy/cupy/torch alike, an order of magnitude less transient
+  memory (no more multi-GB tensors at 1e5 points), and gemm-free by construction —
+  the Blackwell cuBLAS workaround branch is gone because nothing calls gemm anymore.
+- **The portable GLS direct path evaluates `cos`/`sin` once instead of six times** —
+  the base-grid sums for the weights and the weighted data share one angle matrix and
+  the doubled-frequency sums follow from the double-angle identities: ~1.8x on
+  torch:cpu and torch:cuda; the frequency chunk is auto-capped by the light-curve
+  length so device memory stays bounded regardless of `N`.
+- **PDM bins each point once** into `n_bins*n_covers` fine bins and regroups every
+  cover exactly from that histogram (vectorized, CUDA, and numba paths): ~2.8x on the
+  numpy path, one third of the shared-memory atomics in the CUDA kernel.
+- **Opt-in `precision="float32"` now reaches the CUDA `RawKernel`s** (BLS, PDM, CE,
+  TLS): on consumer GPUs, whose float64 throughput is 1/64 of float32, the
+  FLOP-bound searches speed up ~8.6x (BLS full segmented run 610 -> 71 ms; TLS
+  34 -> 4 ms on an RTX Blackwell card). float64 stays the default; PDM keeps float64
+  accumulators and CE counts are exact integers at any precision. The float32 BLS
+  guards empty box windows with an `ivar` floor scaled to the total inverse variance
+  (float32 cumsum noise would otherwise fabricate boxes).
+- **String-Length gains a real CUDA kernel**: one block per period bitonic-sorts the
+  (phase, index) pairs in shared memory — stable, matching the CPU tie order — with
+  no `(P, N)` intermediates (~75x over numpy; curves longer than the shared-memory
+  capacity fall back to the vectorized path). The torch path fuses its sort+gather
+  via `torch.sort(stable=True)`.
+- **Faster scatter shims everywhere**: numpy binning goes through buffered
+  `bincount` instead of unbuffered `np.add.at`, cupy through `cupyx.scatter_add`,
+  and the batch kernels scatter row-wise so torch reads a stride-0 view instead of
+  materializing `(P, N)` broadcast copies and flat indices.
+- **BLS uploads each light curve to the GPU once per run** (cupy and torch) via a
+  per-curve device cache shared by the period segments — previously every segment
+  re-uploaded the arrays and synced on a device-side `t.min()` — and returns all
+  seven per-period outputs in one stacked device-to-host copy. The GLS NUFFT paths
+  batch the base-grid pair (`w`, `w*y`) into a single `n_trans=2` transform, and the
+  one-shot cufinufft path assembles the power on the GPU (194 -> 290 curves/s).
+
 ### Added
 
 - **Multi-vendor GPU support via PyTorch and the Python array API.** All seven

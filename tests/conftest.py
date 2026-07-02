@@ -38,6 +38,12 @@ requires_torch = pytest.mark.skipif(
     reason="torch (the [torch] extra) is not installed",
 )
 
+#: Skip a test unless numba (the ``[fast]`` extra) is importable.
+requires_numba = pytest.mark.skipif(
+    not _importable("numba"),
+    reason="numba (the [fast] extra) is not installed",
+)
+
 
 def _torch_gpu_available() -> bool:
     if not _importable("torch"):
