@@ -50,6 +50,7 @@ Two venvs, because `transitleastsquares` pins an old numba:
 
 ```bash
 python validate_periodograms.py            # -> results/validation_metrics.parquet   (GPU venv)
+python injection_recovery.py               # -> results/injection_recovery.parquet    (GPU venv)
 python benchmark.py                        # -> results/bench_*.parquet               (GPU venv)
 ../.venv-ref/Scripts/python tls_download_ref.py   # -> data/, tls_reference_results.csv
 python tls_cuperiod.py                     # -> results/tls_results.parquet           (GPU venv)

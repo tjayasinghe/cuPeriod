@@ -21,6 +21,7 @@ results/spectra/ for the report's overlay figures.
 
 from __future__ import annotations
 
+import argparse
 import time
 import warnings
 
@@ -32,6 +33,22 @@ import cuperiod as cup  # noqa: E402
 
 import references as R  # noqa: E402
 from _common import RESULTS, exact_match, load_dataset, period_match  # noqa: E402
+from cuperiod.core.backend import torch_available  # noqa: E402
+from cuperiod.core.errors import BackendUnavailableError  # noqa: E402
+from cuperiod.methods.base import get_method  # noqa: E402
+
+
+def supports_torch(method):
+    """Whether ``method`` has the portable torch backend and torch is importable."""
+    return torch_available() and "torch" in get_method(method).all_backends
+
+
+def safe_periodogram(*args, **kwargs):
+    """``cup.periodogram``, but returns ``None`` if the backend is unavailable here."""
+    try:
+        return cup.periodogram(*args, **kwargs)
+    except BackendUnavailableError:
+        return None
 
 SPECTRA = RESULTS / "spectra"
 SPECTRA.mkdir(exist_ok=True)
@@ -102,11 +119,15 @@ def run_freq_method(method, t, y, e, p_true, baseline, save_tag=None):
     p_ref = best_from(ref, agree, sense)
     ok_h, ratio = period_match(p_cpu, p_true)
 
+    # torch backend: same fine grid, parity vs cuPeriod-CPU (mirrors the gpu-parity
+    # check above). Absent gracefully if torch/no device is unavailable for this method.
+    torch_row = torch_parity(method, t, y, e, fc.power, p_cpu, p_true, grid=gf, settings_fn=st)
+
     if save_tag:
         np.savez(SPECTRA / f"{save_tag}_{method}.npz",
                  freq=agree, cup=pc.power, ref=ref, sense=sense,
                  p_true=p_true, p_cpu=p_cpu, p_ref=p_ref)
-    return {
+    row = {
         "parity_max_abs": float(par.max()),
         "parity_max_rel": float((par / scale).max()),
         "cup_ref_max_abs": float(cpu_ref[finite].max()),
@@ -118,6 +139,42 @@ def run_freq_method(method, t, y, e, p_true, baseline, save_tag=None):
         "ref_recover_exact": exact_match(p_ref, p_true),
         "n_grid_fine": fine.size,
     }
+    row.update(torch_row)
+    return row
+
+
+def torch_parity(method, t, y, e, cpu_power, p_cpu, p_true, *, grid=None, settings_fn=None,
+                  settings=None):
+    """CPU-vs-torch parity on the same grid/settings the CPU reference used.
+
+    Returns NaN/False columns if the method has no torch backend, or torch/a
+    usable device is not present on this machine -- mirrors how the GPU
+    columns degrade gracefully without a CUDA device.
+    """
+    cols = {"max_diff_torch": np.nan, "rel_diff_torch": np.nan,
+            "best_period_torch": np.nan, "torch_cpu_same": False,
+            "torch_harmonic": False, "torch_backend": "-"}
+    if not supports_torch(method):
+        return cols
+    kwargs = dict(backend="torch", settings=(settings_fn() if settings_fn else settings))
+    if grid is not None:
+        kwargs["grid"] = grid
+    pt = safe_periodogram((t, y, e), method, **kwargs)
+    if pt is None:
+        return cols
+    diff = np.abs(cpu_power - pt.power)
+    scale = np.maximum(np.abs(cpu_power), 1e-30)
+    p_torch = pt.best_period()
+    ok_h, _ = period_match(p_torch, p_true)
+    cols.update({
+        "max_diff_torch": float(diff.max()),
+        "rel_diff_torch": float((diff / scale).max()),
+        "best_period_torch": p_torch,
+        "torch_cpu_same": bool(abs(p_torch / p_cpu - 1) < 1e-6),
+        "torch_harmonic": ok_h,
+        "torch_backend": pt.backend,
+    })
+    return cols
 
 
 def run_bls(t, y, e, p_true, baseline, save_tag=None):
@@ -131,10 +188,11 @@ def run_bls(t, y, e, p_true, baseline, save_tag=None):
     nr = np.abs(pn.power - pa.power)
     p_n, p_g, p_a = pn.best_period(), pg.best_period(), pa.best_period()
     ok_h, ratio = period_match(p_n, p_true)
+    torch_row = torch_parity("BLS", t, y, e, pn.power, p_n, p_true, settings=st())
     if save_tag:
         np.savez(SPECTRA / f"{save_tag}_BLS.npz", period=pn.period, cup=pn.power,
                  ref=pa.power, sense="max", p_true=p_true, p_cpu=p_n, p_ref=p_a)
-    return {
+    row = {
         "parity_max_abs": float(par.max()), "parity_max_rel": float((par / scale).max()),
         "cup_ref_max_abs": float(nr.max()),
         "cup_ref_corr": float(np.corrcoef(pn.power, pa.power)[0, 1]),
@@ -144,6 +202,8 @@ def run_bls(t, y, e, p_true, baseline, save_tag=None):
         "harmonic_ratio": float(ratio) if np.isfinite(ratio) else np.nan,
         "ref_recover_exact": exact_match(p_a, p_true), "n_grid_fine": pn.power.size,
     }
+    row.update(torch_row)
+    return row
 
 
 def run_tls(t, y, e, p_true, baseline):
@@ -155,7 +215,8 @@ def run_tls(t, y, e, p_true, baseline):
     scale = np.maximum(np.abs(pn.power), 1e-30)
     p_n, p_g = pn.best_period(), pg.best_period()
     ok_h, ratio = period_match(p_n, p_true)
-    return {
+    torch_row = torch_parity("TLS", t, y, e, pn.power, p_n, p_true, settings=st())
+    row = {
         "parity_max_abs": float(par.max()), "parity_max_rel": float((par / scale).max()),
         "cup_ref_max_abs": np.nan, "cup_ref_corr": np.nan,
         "p_cpu": p_n, "p_gpu": p_g, "p_ref": np.nan,
@@ -164,10 +225,19 @@ def run_tls(t, y, e, p_true, baseline):
         "harmonic_ratio": float(ratio) if np.isfinite(ratio) else np.nan,
         "ref_recover_exact": np.nan, "n_grid_fine": pn.power.size,
     }
+    row.update(torch_row)
+    return row
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--limit", type=int, default=None,
+                        help="only process the first N stars (smoke-testing)")
+    args = parser.parse_args()
+
     meta, jd, mag, err = load_dataset()
+    if args.limit is not None:
+        meta = meta.iloc[:args.limit].reset_index(drop=True)
 
     seen_class: set[str] = set()
     rows = []
@@ -209,11 +279,15 @@ def main():
         sub = res[res["method"] == method]
         if sub.empty:
             continue
+        tsub = sub.dropna(subset=["rel_diff_torch"])
+        tstr = (f" | torch max_rel|d|={tsub['rel_diff_torch'].max():.1e} "
+                f"cpu==torch={tsub['torch_cpu_same'].mean()*100:.0f}% (n={len(tsub)})"
+                if len(tsub) else " | torch=—")
         print(f"  {method:12s} n={len(sub):3d} | parity max|d|={sub['parity_max_abs'].max():.1e} "
               f"| cup-ref max|d|={np.nanmax(sub['cup_ref_max_abs']):.1e} "
               f"corr>={np.nanmin(sub['cup_ref_corr']):.4f} "
               f"| recover(harm)={sub['recover_harmonic'].mean()*100:.0f}% "
-              f"cpu==gpu={sub['cpu_gpu_same'].mean()*100:.0f}%")
+              f"cpu==gpu={sub['cpu_gpu_same'].mean()*100:.0f}%{tstr}")
 
 
 if __name__ == "__main__":
