@@ -3,6 +3,10 @@
 **Optimized, GPU-accelerated periodograms for astronomy.**
 
 [![Documentation Status](https://readthedocs.org/projects/cuperiod/badge/?version=latest)](https://cuperiod.readthedocs.io/en/latest/)
+[![PyPI version](https://img.shields.io/pypi/v/cuperiod)](https://pypi.org/project/cuperiod/)
+[![Python versions](https://img.shields.io/pypi/pyversions/cuperiod)](https://pypi.org/project/cuperiod/)
+[![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+[![CI](https://github.com/tjayasinghe/cuPeriod/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tjayasinghe/cuPeriod/actions/workflows/ci.yml)
 
 cuPeriod computes period-search statistics for variable stars and transiting systems with
 fast CPU backends and GPU-accelerated paths that scale from a single light curve to
@@ -14,10 +18,39 @@ N-best-periods utility.
 
 📖 **Documentation:** <https://cuperiod.readthedocs.io> — a [5-minute
 quickstart](https://cuperiod.readthedocs.io/en/latest/quickstart.html), a full user guide,
-and the complete API reference.
+and the complete API reference, including
+[installation](https://cuperiod.readthedocs.io/en/latest/installation.html),
+[backends](https://cuperiod.readthedocs.io/en/latest/guide/backends.html),
+[the GUI](https://cuperiod.readthedocs.io/en/latest/guide/gui.html), and
+[benchmarks](https://cuperiod.readthedocs.io/en/latest/benchmarks.html) pages.
 
 Every implementation is validated against the standard reference (astropy
 `LombScargle` / `BoxLeastSquares`) to floating-point round-off.
+
+## Why cuPeriod
+
+- **Validated, not just fast.** GLS and BLS match astropy to floating-point round-off,
+  and every other method is checked against an independent reference implementation
+  (PyAstronomy, or a direct implementation of the published algorithm) on identical
+  grids. CPU, CUDA, and the portable PyTorch backend agree to round-off and pick the
+  identical best period on 126 real ASAS-SN light curves
+  across six variability classes plus 12 confirmed *Kepler* transits — 88–96%
+  harmonic-aware period recovery on this deliberately heterogeneous sample (a synthetic
+  injection–recovery sweep further characterizes sensitivity vs. signal-to-noise) — see the
+  [full benchmark report](benchmarks/REPORT.md) and the
+  [benchmarks docs page](https://cuperiod.readthedocs.io/en/latest/benchmarks.html).
+- **A fast CPU tier, no GPU required.** The `[fast]` extra's multicore `numba` kernels
+  make `backend="cpu"` 18x faster than astropy's `BoxLeastSquares` and 2106x faster than
+  PyAstronomy's PDM on a representative light curve, while recovering the same periods.
+- **GPU acceleration beyond NVIDIA.** The portable PyTorch backend runs every method on
+  AMD (ROCm), Intel (XPU), and Apple (MPS) GPUs, in addition to the NVIDIA CUDA fast
+  paths — so the accelerated code isn't locked to one vendor.
+- **Built for catalogue scale.** `batch_periodograms` sustains up to 587 light curves/s
+  (>2 million/hour) on a single GPU, with a resumable batch sink for runs spanning
+  millions of curves.
+- **Seven methods, one API.** GLS, BLS, PDM, CE, String-Length, MHAOV, and TLS share one
+  entry point, one CLI, and an optional desktop GUI, with frictionless column handling and
+  multi-band support.
 
 ## Status
 
@@ -158,6 +191,21 @@ synthetic multi-band curve), so there's something to explore on first launch.
 Time may be JD/HJD/BJD/MJD; values may be magnitude or flux; errors are optional. Column
 names are auto-detected (case-insensitive) and can be pinned with `ColumnMap`. Box/transit
 methods (BLS, TLS) work in flux — magnitudes are converted automatically.
+
+## Citing cuPeriod
+
+If you use cuPeriod in your research, please cite it — see [`CITATION.cff`](CITATION.cff)
+for the machine-readable record (also picked up by GitHub's "Cite this repository").
+
+```bibtex
+@software{jayasinghe_cuperiod,
+  author  = {Jayasinghe, Tharindu},
+  title   = {cuPeriod},
+  version = {1.1.0},
+  date    = {2026-07-08},
+  url     = {https://github.com/tjayasinghe/cuPeriod}
+}
+```
 
 ## License
 

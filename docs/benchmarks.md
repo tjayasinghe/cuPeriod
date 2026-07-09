@@ -5,10 +5,12 @@ repository). This page summarizes the headline results; the
 [full report](https://github.com/tjayasinghe/cuPeriod/blob/main/benchmarks/REPORT.md),
 with figures, lives in the repo and regenerates from bundled data with no network access.
 
-**Validation data** — 72 real ASAS-SN *g*-band light curves across six variability classes
+**Validation data** — 126 real ASAS-SN *g*-band light curves across six variability classes
 (eclipsing binaries, RR Lyrae, Cepheids, δ Scuti, long-period and rotational variables),
-each with an established VSX literature period. TLS is validated on confirmed Kepler KOIs.
-The curves and their literature periods ship with the suite, so §1–2 and §4 are fully
+each with an established VSX literature period. The set combines an original 72-star
+curated core with a 54-star extension (`benchmarks/dataset/download_extension.py`) added to
+broaden coverage of harder classes. TLS is validated on 12 confirmed Kepler KOIs. The
+curves and their literature periods ship with the suite, so §1–2 and §4 are fully
 reproducible offline.
 
 ## 1. Numerical validation
@@ -28,43 +30,43 @@ agree to round-off) and cuPeriod↔**reference** (must match an established impl
   - reference
   - ref. agreement
 * - GLS
-  - 72
+  - 126
   - 2.1e-06
   - 100%
   - astropy LS
-  - 3.4e-10
+  - 8.0e-10
 * - BLS
-  - 72
+  - 126
   - 1.2e-11
   - 100%
   - astropy BLS
   - 1.1e-09
 * - PDM
-  - 72
-  - 3.5e-11
+  - 126
+  - 2.0e-10
   - 100%
   - PyAstronomy
-  - r ≥ 0.948
+  - r ≥ 0.929
 * - CE
-  - 72
+  - 126
   - 1.7e-15
   - 100%
   - Graham 2013
-  - 0.0e+00
+  - 3.1e-15
 * - String-Length
-  - 72
-  - 7.7e-16
+  - 126
+  - 6.2e-15
   - 100%
   - Dworetsky 1983
-  - 1.7e+00 †
+  - 4.3e+00 †
 * - MHAOV
-  - 72
-  - 1.5e-07
+  - 126
+  - 1.1e-05
   - 100%
   - Sch.-Czerny
   - 1.4e-04
 * - TLS
-  - 22
+  - 28
   - 9.3e-10
   - 100%
   - —
@@ -78,6 +80,51 @@ now included, via a stable phase sort on every backend — are double). † Stri
 textbook reference breaks ties with an unstable sort. Its correlation stays ≈ 1 (median
 \|Δ\| ≈ 6e-12) and **the recovered period is unaffected** (*same P* = 100%).
 
+**Torch backend.** The portable `backend="torch"` path was validated against cuPeriod's
+own CPU backend on the same grid, on an NVIDIA device (`torch:cuda`):
+
+```{list-table}
+:header-rows: 1
+:widths: 22 14 20 22
+
+* - Method
+  - N
+  - max rel. diff vs CPU
+  - identical peak vs CPU
+* - GLS
+  - 126
+  - 1.4e-06
+  - 100%
+* - BLS
+  - 126
+  - 1.3e-11
+  - 100%
+* - PDM
+  - 126
+  - 2.5e-10
+  - 100%
+* - CE
+  - 126
+  - 1.8e-15
+  - 100%
+* - String-Length
+  - 126
+  - 6.0e-15
+  - 100%
+* - MHAOV
+  - 126
+  - 2.2e-06
+  - 100%
+* - TLS
+  - 28
+  - 1.1e-09
+  - 100%
+```
+
+All seven methods pick the identical best period as the CPU backend on every validated
+star. The same torch code path also runs on Apple (`mps`) and Intel (`xpu`) devices, but
+those were not exercised in this report (see {doc}`guide/backends`).
+
 ## 2. Period recovery on real light curves
 
 ```{list-table}
@@ -88,31 +135,41 @@ textbook reference breaks ties with an unstable sort. Its correlation stays ≈ 
   - harmonic-aware
   - exact (≤ 2%)
 * - GLS
-  - 99%
-  - 75%
+  - 89%
+  - 69%
 * - BLS
-  - 100%
-  - 93%
-* - PDM
-  - 99%
+  - 88%
   - 81%
+* - PDM
+  - 88%
+  - 72%
 * - CE
-  - 99%
-  - 76%
+  - 90%
+  - 72%
 * - String-Length
-  - 99%
-  - 60%
+  - 89%
+  - 51%
 * - MHAOV
-  - 99%
-  - 75%
+  - 88%
+  - 67%
 * - TLS
-  - 100%
-  - 95%
+  - 96%
+  - 86%
 ```
 
 *harmonic-aware* accepts the method-appropriate fold ambiguity (e.g. Fourier methods
 recover P/2 for contact binaries); *exact* requires the VSX literature period itself within
-2%.
+2%. Wilson 95% confidence intervals per method (n=126, or n=28 for TLS) are given in the
+[full report](https://github.com/tjayasinghe/cuPeriod/blob/main/benchmarks/REPORT.md).
+
+**Curated core vs. extension.** Pooled across all frequency methods, harmonic-aware
+recovery is 99% [97–100%] on the original 72-star curated core but 75% [70–80%] on the
+54-star extension. The extension deliberately adds harder classes — spot-evolving rotators
+(BY Dra/RS CVn, whose starspot-driven period drifts between seasons) and semiregular/Mira
+variables (whose pulsation cycle wanders relative to a single catalogue period) — so the
+pooled 126-star rate is a more realistic field estimate than the curated core's rate alone.
+This is a sampling effect, not a code regression: CPU, GPU, and torch backends agree to
+round-off on every star in both groups (§1).
 
 ## 3. Performance
 
@@ -207,7 +264,54 @@ and Apple** GPUs the CUDA paths can't (those share the same code and are CPU-val
 and the numba kernels win there.
 :::
 
-## 4. Batch throughput & transits
+## 4. Injection–recovery sensitivity
+
+§1–2 validate against real, bright, well-established stars — a favourable regime. A
+complementary synthetic sweep (`benchmarks/injection_recovery.py`) injects a signal of
+tunable amplitude onto real ASAS-SN observation cadences (so the irregular sampling and
+seasonal gaps are realistic) and scores recovery with the same harmonic-aware 2% tolerance,
+40 trials per method × signal × SNR cell:
+
+```{list-table}
+:header-rows: 1
+:widths: 20 16 16 16
+
+* - Signal
+  - Method
+  - SNR=1
+  - SNR=6
+* - Sinusoid
+  - GLS / PDM / MHAOV
+  - 95–100%
+  - 98–100%
+* - Sinusoid
+  - CE / String-Length
+  - 42–98%
+  - 100%
+* - Eclipse
+  - BLS
+  - 95%
+  - 100%
+* - Eclipse
+  - PDM / CE / String-Length
+  - 10–72%
+  - 75–100%
+* - Transit
+  - BLS / TLS
+  - 90–92%
+  - 100%
+```
+
+Every method reaches ≥95% recovery by moderate-to-high SNR for the signal it targets;
+isolated cells in the low-to-mid 90s are consistent with one or two alias near-misses at
+40 trials per cell. The one method that plateaus well below 100% even at the highest
+tested SNR is String-Length on the narrow eclipse model (~78%) — a method–signal mismatch,
+not a bug: its rank-based statistic is comparatively insensitive to narrow, low duty-cycle
+dips, and a box-fitting method (BLS) is the appropriate tool for narrow eclipses/transits.
+Full per-SNR grid and figure in the
+[full report](https://github.com/tjayasinghe/cuPeriod/blob/main/benchmarks/REPORT.md#4--injection–recovery-sensitivity).
+
+## 5. Batch throughput & transits
 
 - **Batch:** up to 587 light curves/second on one GPU for GLS on short survey curves
   (>2.1 million/hour) — a *single-batch* rate that includes one-off worker-pool spin-up
@@ -220,7 +324,7 @@ and the numba kernels win there.
   recovers 10/12 within 2% (the `transitleastsquares` reference recovers 11/12); both
   struggle only on the shallowest transits, where a blind search aliases — a shared,
   honest failure mode, not a backend defect. On the CPU-timed subset the GPU is a median
-  **~1.6×** faster at CPU↔GPU agreement ≤ 2.1e-14 (the numba CPU tier narrowed what used
+  **~2×** faster at CPU↔GPU agreement ≤ 2.1e-14 (the numba CPU tier narrowed what used
   to be a much larger single-curve gap).
 
 See the

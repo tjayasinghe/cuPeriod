@@ -6,6 +6,8 @@ All notable changes to cuPeriod are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-07-08
+
 ### Performance
 
 - **Multicore `numba` CPU kernels for PDM, CE, String-Length, MHAOV, and TLS** (BLS
@@ -82,6 +84,22 @@ All notable changes to cuPeriod are documented here. The format is based on
   and toggle a dark/light theme (remembered across launches). Install with the `[gui]`
   extra (`pip install 'cuperiod[gui]'`) and launch with `cuperiod-gui` or
   `python -m cuperiod.gui`. It is a pure presentation layer — the compute core is unchanged.
+- **Torch-backend numerical validation in the benchmark suite.** The validation report
+  (`benchmarks/`) now checks the portable `backend="torch"` path against cuPeriod's CPU
+  backend on every method and validation star, in addition to the existing CPU↔GPU parity
+  and reference-implementation checks.
+- **Synthetic injection–recovery sensitivity suite** (`benchmarks/injection_recovery.py`).
+  Sinusoid, eclipse, and box-transit signals of known period and amplitude are injected onto
+  real ASAS-SN observation cadences and scored across a range of signal-to-noise ratios, per
+  method, with the same harmonic-aware 2% tolerance used elsewhere in the report.
+- **Validation dataset expanded from 72 to 126 ASAS-SN light curves**, via a reproducible
+  download script (`benchmarks/dataset/download_extension.py`) that adds 54 less-curated
+  stars — spot-evolving rotators and long-period semiregular/Mira variables — to give a more
+  realistic, heterogeneous field sample alongside the original curated core.
+- **Wilson 95% confidence intervals and a data-driven "notable failures" breakdown** in the
+  benchmark report, replacing point-estimate recovery rates and a single blanket explanation
+  with per-star-group failure-mode categorization (near-miss, period-wandering, alias/
+  harmonic).
 
 ### Fixed
 
@@ -173,4 +191,5 @@ First public release.
   parity, on 72 real ASAS-SN light curves across six variability classes and on confirmed
   Kepler transits.
 
+[1.1.0]: https://github.com/tjayasinghe/cuPeriod/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/tjayasinghe/cuPeriod/releases/tag/v1.0.0
