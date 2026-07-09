@@ -22,7 +22,7 @@ copyright = "2026, Tharindu Jayasinghe"  # noqa: A001
 try:
     release = importlib.metadata.version("cuperiod")
 except importlib.metadata.PackageNotFoundError:  # not installed (rare)
-    release = "1.0.0"
+    release = "1.1.0"
 version = ".".join(release.split(".")[:2])
 
 # -- General configuration ----------------------------------------------------
