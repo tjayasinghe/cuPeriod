@@ -164,7 +164,7 @@ Every method runs on an identical grid through cuPeriod's CPU and GPU backends a
 
 ## 6 — Performance
 
-**cuPeriod's CPU box search beats astropy.** The default CPU BLS backend is a multicore `numba` port of the CUDA kernel — **18× faster than astropy's compiled `BoxLeastSquares`** (188 ms vs 3.5 s on this light curve), matching it to floating-point — verified on all 72 validation light curves: max\|Δpower\| ≤ 1.1e-09, identical best period on 72/72. The GPU then adds another 2× (38× over astropy).
+**cuPeriod's CPU box search beats astropy.** The default CPU BLS backend is a multicore `numba` port of the CUDA kernel — **18× faster than astropy's compiled `BoxLeastSquares`** (188 ms vs 3.5 s on this light curve), matching it to floating-point — verified on all 126 validation light curves: max\|Δpower\| ≤ 0.0e+00, identical best period on 126/126. The GPU then adds another 2× (38× over astropy).
 
 | method | CPU backend | t_CPU [s] | t_GPU [s] | t_torch [s] | torch device | reference tool | t_ref [s] | CPU vs ref | GPU vs CPU |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |

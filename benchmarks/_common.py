@@ -4,9 +4,11 @@ Dependency-light (numpy/pandas only) so it imports identically in the main GPU
 venv and the isolated reference venv.
 
 The validation light curves ship with the suite as a single self-contained
-Parquet (``dataset/light_curves.parquet``) — 72 real ASAS-SN g-band light
-curves spanning six variability classes, each with its VSX literature period.
-No external catalogue or network access is needed to reproduce the validation.
+Parquet (``dataset/light_curves.parquet``) — 126 real ASAS-SN g-band light
+curves spanning six variability classes, each with its VSX literature period
+(a 72-star curated core plus a 54-star extension; see
+``dataset/download_extension.py``). No external catalogue or network access
+is needed to reproduce the validation.
 """
 
 from __future__ import annotations

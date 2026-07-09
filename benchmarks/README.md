@@ -26,15 +26,19 @@ than failing the sweep.
 
 ## Data
 
-* **`dataset/light_curves.parquet`** — 72 real ASAS-SN g-band light curves
+* **`dataset/light_curves.parquet`** — 126 real ASAS-SN g-band light curves
   spanning six variability classes (eclipsing binaries, RR Lyrae, Cepheids,
-  δ Scuti, long-period and rotational variables), each with its well-established
-  VSX (AAVSO Variable Star Index) literature period. One row per star:
+  δ Scuti, long-period and rotational variables), each with its VSX (AAVSO
+  Variable Star Index) literature period. One row per star:
   `asas_sn_id, band, vsx_type, broad_class, vsx_period, n_det, baseline, jd[],
-  mag[], mag_err[]`. The stars were chosen to have a high-confidence period that
-  ASAS-SN photometry independently confirms against the VSX literature value to
-  within 1%. This file is self-contained — §1, §2 and §4 of the report need no
-  external data or network access.
+  mag[], mag_err[]`. It combines a 72-star curated core — chosen to have a
+  high-confidence period that ASAS-SN photometry independently confirms
+  against the VSX literature value to within 1% — with a 54-star extension
+  (`dataset/download_extension.py`, re-runnable) that deliberately adds harder,
+  less-curated classes (spot-evolving rotators, wandering semiregular/Mira
+  periods) for a more realistic recovery-rate estimate; see REPORT.md §3 for
+  the core-vs-extension breakdown. This file is self-contained — §1, §2 and §4
+  of the report need no external data or network access.
 * **Kepler** confirmed KOIs for TLS, from the Mendeley
   *Dataset_Machine_Learning_Exoplanets_2024* (`wctcv34962`); raw PDCSAP flux is
   fetched from MAST with `lightkurve` into `data/` at run time.
@@ -51,6 +55,7 @@ Two venvs, because `transitleastsquares` pins an old numba:
 ```bash
 python validate_periodograms.py            # -> results/validation_metrics.parquet   (GPU venv)
 python injection_recovery.py               # -> results/injection_recovery.parquet    (GPU venv)
+python bls_numba_parity.py                 # -> results/bls_numba_parity.parquet      (GPU venv)
 python benchmark.py                        # -> results/bench_*.parquet               (GPU venv)
 ../.venv-ref/Scripts/python tls_download_ref.py   # -> data/, tls_reference_results.csv
 python tls_cuperiod.py                     # -> results/tls_results.parquet           (GPU venv)
