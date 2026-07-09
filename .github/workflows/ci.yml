@@ -20,13 +20,13 @@ jobs:
         os: [ubuntu-latest, windows-latest]
         python: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # PySide6 (the GUI tests, run offscreen) needs the EGL/OpenGL system
       # libraries, which the ubuntu-latest image no longer preinstalls.
       - name: Install Qt system libraries (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libegl1 libopengl0 libgl1
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v7
       - name: Create environment
         run: uv venv --python ${{ matrix.python }}
       - name: Install
@@ -38,8 +38,8 @@ jobs:
     name: lint + types
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
       - name: Create environment
         run: uv venv --python 3.12
       - name: Install
@@ -53,8 +53,8 @@ jobs:
     name: docs build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
       - name: Create environment
         run: uv venv --python 3.12
       - name: Install
