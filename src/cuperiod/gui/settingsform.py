@@ -24,7 +24,7 @@ import annotated_types as at
 from pydantic.fields import FieldInfo
 from pydantic_settings import BaseSettings
 
-from cuperiod.gui.qt import Qt, QtWidgets, Signal
+from cuperiod.gui.qt import Qt, QtGui, QtWidgets, Signal
 
 _NONE_TYPE = type(None)
 
@@ -133,6 +133,39 @@ def _float_step(value: Any, decimals: int) -> float:
     return max(10.0 ** (-decimals), magnitude / 10.0)
 
 
+class _GSpinBox(QtWidgets.QDoubleSpinBox):
+    """A ``QDoubleSpinBox`` that renders with ``%g`` instead of a fixed decimal count.
+
+    The stock spinbox always shows :meth:`decimals` places, so a peak-separation
+    default of ``3.0`` renders as ``"3.000000"`` and an eps of ``1e-9`` renders as
+    ``"0.000000001000"``. Overriding ``textFromValue``/``valueFromText`` keeps the
+    underlying value/precision machinery (range, step, decimals-for-precision) intact
+    while displaying a compact, repr-like string (scientific notation for tiny/huge
+    values). ``validate`` is intentionally permissive so typing (e.g. ``"1e-"`` while
+    entering ``"1e-9"``) is never blocked mid-edit.
+    """
+
+    def textFromValue(self, value: float) -> str:  # noqa: N802 - Qt override
+        return f"{value:g}"
+
+    def valueFromText(self, text: str) -> float:  # noqa: N802 - Qt override
+        try:
+            return float(text)
+        except ValueError:
+            return 0.0
+
+    def validate(  # noqa: N802 - Qt override
+        self, text: str, pos: int
+    ) -> tuple[QtGui.QValidator.State, str, int]:
+        if text.strip() in ("", "-", "+"):
+            return QtGui.QValidator.State.Intermediate, text, pos
+        try:
+            float(text)
+        except ValueError:
+            return QtGui.QValidator.State.Intermediate, text, pos
+        return QtGui.QValidator.State.Acceptable, text, pos
+
+
 def _configure_float_spin(
     spin: QtWidgets.QDoubleSpinBox, spec: FieldSpec, effective_default: Any
 ) -> None:
@@ -147,7 +180,7 @@ def _configure_float_spin(
 
 def _configure_int_spin(spin: QtWidgets.QSpinBox, spec: FieldSpec) -> None:
     spin.setRange(
-        int(spec.lo) if spec.lo is not None else 0,
+        int(spec.lo) if spec.lo is not None else -10_000_000,
         int(spec.hi) if spec.hi is not None else 10_000_000,
     )
 
@@ -169,7 +202,7 @@ class _OptionalSpin(QtWidgets.QWidget):
         self._auto = QtWidgets.QCheckBox("auto")
         spin: QtWidgets.QAbstractSpinBox
         if self._is_float:
-            fspin = QtWidgets.QDoubleSpinBox()
+            fspin = _GSpinBox()
             fallback = value if value is not None else spec.lo
             if fallback is None:
                 fallback = 1.0
@@ -290,7 +323,7 @@ class PydanticSettingsForm(QtWidgets.QWidget):
             ispin.valueChanged.connect(self._emit)
             return ispin, ispin.value
         if spec.kind == "float":
-            fspin = QtWidgets.QDoubleSpinBox()
+            fspin = _GSpinBox()
             _configure_float_spin(fspin, spec, value)
             fspin.setValue(float(value))
             fspin.valueChanged.connect(self._emit)

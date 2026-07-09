@@ -75,6 +75,7 @@ class AppController(QObject):
     peaks_ready = Signal(object)  # list[Peak]
     period_changed = Signal(float)  # drives the spectrum line
     fold_changed = Signal(float, float)  # (period, t0) drives the phased view
+    selection_cleared = Signal()  # no peaks -> clear the spectrum band + phased fold
     busy_changed = Signal(bool)
     sources_changed = Signal(object)  # list[str] labels (batch mode)
     source_selected = Signal(int)
@@ -111,15 +112,21 @@ class AppController(QObject):
         if not sources:
             return
         index = max(0, min(index, len(sources) - 1))
-        self.state.current_source_index = index
+        previous_index = self.state.current_source_index
         item = sources[index]
         try:
             lc = item.loader()
         except Exception as exc:  # noqa: BLE001 - surface load failures to the UI
+            # Leave the state on the previously-loaded source and snap the browser
+            # highlight back, so a failed selection doesn't strand the UI showing one
+            # source's plots while a different (failed) source stays highlighted.
+            self.state.current_source_index = previous_index
+            self.source_selected.emit(previous_index)
             self.compute_failed.emit(
-                f"load {item.key}: {type(exc).__name__}: {exc}"
+                f"Could not load {item.label}: {type(exc).__name__}: {exc}"
             )
             return
+        self.state.current_source_index = index
         self.source_selected.emit(index)
         self.set_light_curve(lc, item.key)
 
@@ -175,9 +182,7 @@ class AppController(QObject):
         domain = next(iter(mblc.bands.values())).domain
         return LightCurve.from_arrays(time, value, error, domain=domain)
 
-    def _tune_auto_grid(
-        self, lc: LoadedCurve, settings: BaseSettings
-    ) -> BaseSettings:
+    def _tune_auto_grid(self, lc: LoadedCurve, settings: BaseSettings) -> BaseSettings:
         """Improve the default frequency grid for frequency-grid methods.
 
         (a) Raises an auto max-frequency so sub-day periods aren't missed on sparse data
@@ -214,9 +219,7 @@ class AppController(QObject):
         return np.empty(0, dtype=np.float64)
 
     # -- compute results ---------------------------------------------------------
-    def _on_finished(
-        self, key: ResultKey, pg: Periodogram, elapsed_ms: float
-    ) -> None:
+    def _on_finished(self, key: ResultKey, pg: Periodogram, elapsed_ms: float) -> None:
         # Cache even superseded results so revisiting is instant, but only apply the
         # one the user is currently waiting for.
         self._cache.put(key, pg)
@@ -245,6 +248,7 @@ class AppController(QObject):
         else:
             self.state.selected_peak = None
             self.state.selected_period = None
+            self.selection_cleared.emit()
 
     # -- selection ---------------------------------------------------------------
     def select_peak(self, peak: Peak) -> None:
@@ -266,6 +270,16 @@ class AppController(QObject):
     def current_time(self) -> FloatArray:
         """Time array of the active curve (bands concatenated); empty if none loaded."""
         return self._time_of(self.state.current_lc)
+
+    # -- lifecycle -----------------------------------------------------------------
+    def shutdown(self) -> None:
+        """Cancel any in-flight compute and briefly wait for the pool to drain.
+
+        Called from the window's ``closeEvent`` so a worker thread doesn't outlive
+        the GUI (and so the process can exit promptly).
+        """
+        self._compute.cancel_all()
+        self._compute.wait_for_done(2000)
 
     def _lc_time(self) -> FloatArray:
         """Time array for the active curve (bands concatenated), for the epoch."""

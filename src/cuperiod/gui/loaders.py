@@ -9,6 +9,7 @@ launch even outside a source checkout.
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from functools import lru_cache
@@ -23,25 +24,47 @@ from cuperiod.core.errors import ColumnResolutionError
 from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
 from cuperiod.gui.models import LoadedCurve, SourceItem
 
+_logger = logging.getLogger(__name__)
+
 #: Environment override pointing at a directory of example data.
 _ENV_DATA_DIR = "CUPERIOD_EXAMPLE_DATA"
 
+#: Suffixes read line-by-line for a cheap row count in :func:`preview_file` (text
+#: formats where ``nrows`` lets us avoid parsing the whole file just for a preview).
+_TEXT_SUFFIXES = frozenset({".csv", ".tsv", ".tab"})
 
-def _read_dataframe(path: Path) -> Any:
-    """Read a tabular file into a pandas DataFrame, or None if unreadable."""
+
+def _read_dataframe(path: Path, *, nrows: int | None = None) -> Any:
+    """Read a tabular file into a pandas DataFrame, or None if unreadable.
+
+    ``nrows`` (honored for CSV/TSV) limits how many data rows are parsed — used by
+    :func:`preview_file` so previewing a huge CSV doesn't read the whole thing.
+    Parquet has no cheap partial-read path here, so it is always read in full.
+    """
     import pandas as pd
 
     suffix = path.suffix.lower()
     try:
         if suffix == ".csv":
-            return pd.read_csv(path)
+            return pd.read_csv(path, nrows=nrows)
         if suffix in {".parquet", ".pq"}:
             return pd.read_parquet(path)
         if suffix in {".tsv", ".tab"}:
-            return pd.read_csv(path, sep="\t")
+            return pd.read_csv(path, sep="\t", nrows=nrows)
     except Exception:  # noqa: BLE001 - fall back to single-band loading
+        _logger.debug("failed to read %s as a tabular file", path, exc_info=True)
         return None
     return None
+
+
+def _count_rows(path: Path) -> int | None:
+    """Cheap data-row count for a text-based tabular file (total lines minus header)."""
+    try:
+        with open(path, "rb") as fh:
+            total = sum(1 for _ in fh)
+    except OSError:
+        return None
+    return max(0, total - 1)
 
 
 def load_path(
@@ -93,9 +116,12 @@ def preview_file(
     """First rows of a tabular file plus its auto-detected column mapping.
 
     Returns None for formats not cheaply previewable here (e.g. FITS/ECSV); the caller
-    then simply loads without a preview.
+    then simply loads without a preview. Only ``max_rows`` rows are actually parsed for
+    CSV/TSV (the common huge-file case); the total row count is obtained separately by
+    a cheap line count rather than a full parse.
     """
-    frame = _read_dataframe(Path(path))
+    p = Path(path)
+    frame = _read_dataframe(p, nrows=max_rows)
     if frame is None:
         return None
     names = [str(c) for c in frame.columns]
@@ -117,9 +143,12 @@ def preview_file(
         resolved_domain = resolved.domain.value
     head = frame.head(max_rows)
     rows = [[_fmt_cell(head.iloc[i][c]) for c in names] for i in range(len(head))]
-    return FilePreview(
-        names, rows, int(len(frame)), mapping, resolved_domain, multiband
-    )
+    n_rows = len(frame)
+    if p.suffix.lower() in _TEXT_SUFFIXES:
+        counted = _count_rows(p)
+        if counted is not None:
+            n_rows = counted
+    return FilePreview(names, rows, int(n_rows), mapping, resolved_domain, multiband)
 
 
 def example_data_dir() -> Path | None:

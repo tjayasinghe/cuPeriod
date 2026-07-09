@@ -14,9 +14,11 @@ peaks are minima and the y-axis is labelled accordingly.
 
 from __future__ import annotations
 
+import csv
 from typing import Any
 
 import numpy as np
+from pyqtgraph.exporters import ImageExporter
 
 from cuperiod.core.result import Peak, Periodogram
 from cuperiod.gui.qt import Qt, QtWidgets, Signal, pg
@@ -112,6 +114,8 @@ class SpectrumView(QtWidgets.QWidget):
 
         self._logx = QtWidgets.QCheckBox("log x")
         self._logy = QtWidgets.QCheckBox("log y")
+        self._logx.setToolTip("Plot the x-axis on a logarithmic scale")
+        self._logy.setToolTip("Plot the y-axis on a logarithmic scale")
         self._logx.toggled.connect(self._apply_log)
         self._logy.toggled.connect(self._apply_log)
         row.addWidget(self._logx)
@@ -122,9 +126,22 @@ class SpectrumView(QtWidgets.QWidget):
         self._show_peaks.toggled.connect(self._on_peaks_toggled)
         row.addWidget(self._show_peaks)
 
-        reset = QtWidgets.QPushButton("reset view")
+        reset = QtWidgets.QPushButton("Reset view")
+        reset.setToolTip("Auto-range the plot back to the full spectrum")
         reset.clicked.connect(self._autorange)
         row.addWidget(reset)
+
+        export = QtWidgets.QToolButton()
+        export.setText("Export…")
+        export.setToolTip("Export the spectrum data or a plot image")
+        export.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+        export_menu = QtWidgets.QMenu(export)
+        csv_action = export_menu.addAction("Spectrum as CSV…")
+        csv_action.triggered.connect(self._export_csv)
+        png_action = export_menu.addAction("Image as PNG…")
+        png_action.triggered.connect(self._export_png)
+        export.setMenu(export_menu)
+        row.addWidget(export)
 
         row.addStretch(1)
         self._readout = QtWidgets.QLabel("—")
@@ -157,6 +174,7 @@ class SpectrumView(QtWidgets.QWidget):
         self._sel_period = period
         self._sel_band.setVisible(True)
         self._update_band()
+        self._redraw_markers()  # re-place the selected-peak halo
 
     def clear(self) -> None:
         """Clear the spectrum, peaks, and selection (e.g. when a new curve loads)."""
@@ -168,6 +186,15 @@ class SpectrumView(QtWidgets.QWidget):
         self._sel_band.setVisible(False)
         self._hover_text.setVisible(False)
         self._readout.setText("—")
+
+    def clear_selection(self) -> None:
+        """Hide the selection band (e.g. a compute finished with zero peaks).
+
+        Unlike :meth:`clear`, the spectrum curve/peaks themselves are left alone.
+        """
+        self._sel_period = None
+        self._sel_band.setVisible(False)
+        self._redraw_markers()
 
     # -- drawing -----------------------------------------------------------------
     def _curve_xy(self) -> tuple[np.ndarray, np.ndarray]:
@@ -184,10 +211,21 @@ class SpectrumView(QtWidgets.QWidget):
         self._curve.setData(x, y)
         self._apply_log()
 
+    def _selected_index(self) -> int | None:
+        """Index into :attr:`_peaks` matching the current selection, if any."""
+        if self._sel_period is None or not self._peaks:
+            return None
+        periods = np.array([p.period for p in self._peaks])
+        idx = int(np.argmin(np.abs(periods - self._sel_period)))
+        if np.isclose(periods[idx], self._sel_period, rtol=1e-6, atol=0.0):
+            return idx
+        return None
+
     def _redraw_markers(self) -> None:
         if self._pg is None or not self._show_peaks.isChecked():
             self._markers.clear()
             return
+        sel_idx = self._selected_index()
         spots: list[dict[str, Any]] = []
         if self._peaks:  # a soft glow halo behind the rank-1 peak
             best = self._peaks[0]
@@ -202,17 +240,36 @@ class SpectrumView(QtWidgets.QWidget):
                     "data": None,
                 }
             )
+        if sel_idx is not None and sel_idx != 0:  # halo for the selected peak
+            sel = self._peaks[sel_idx]
+            sx = sel.frequency if self._x_mode == "frequency" else sel.period
+            spots.append(
+                {
+                    "pos": (self._to_plot_x(sx), self._to_plot_y(sel.power)),
+                    "size": 26,
+                    "symbol": "o",
+                    "brush": pg.mkBrush(self._pal.qcolor(self._pal.accent, 60)),
+                    "pen": None,
+                    "data": None,
+                }
+            )
         for i, peak in enumerate(self._peaks):
             x = peak.frequency if self._x_mode == "frequency" else peak.period
             is_best = i == 0
+            is_selected = i == sel_idx
             color = self._pal.best_peak if is_best else self._pal.peak
+            size = 15 if is_best else 9
+            pen = pg.mkPen(self._pal.plot_bg, width=1)
+            if is_selected:
+                size += 4
+                pen = pg.mkPen(self._pal.qcolor(self._pal.accent), width=2)
             spots.append(
                 {
                     "pos": (self._to_plot_x(x), self._to_plot_y(peak.power)),
-                    "size": 15 if is_best else 9,
+                    "size": size,
                     "symbol": "star" if is_best else "o",
                     "brush": pg.mkBrush(color),
-                    "pen": pg.mkPen(self._pal.plot_bg, width=1),
+                    "pen": pen,
                     "data": i,
                 }
             )
@@ -391,6 +448,39 @@ class SpectrumView(QtWidgets.QWidget):
         x = 10.0 ** point.x() if self._logx.isChecked() else point.x()
         y = 10.0 ** point.y() if self._logy.isChecked() else point.y()
         return float(x), float(y)
+
+    # -- export --------------------------------------------------------------
+    def _export_csv(self) -> None:
+        if self._pg is None:
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Export spectrum as CSV", "spectrum.csv", "CSV files (*.csv)"
+        )
+        if path:
+            self.export_csv(path)
+
+    def export_csv(self, path: str) -> None:
+        """Write the full-resolution spectrum (frequency, period, power) to ``path``."""
+        assert self._pg is not None
+        with open(path, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(["frequency", "period", "power"])
+            for freq, period, power in zip(
+                self._pg.frequency, self._pg.period, self._pg.power, strict=True
+            ):
+                writer.writerow([freq, period, power])
+
+    def _export_png(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Export spectrum as PNG", "spectrum.png", "PNG images (*.png)"
+        )
+        if path:
+            self.export_png(path)
+
+    def export_png(self, path: str) -> None:
+        """Render the current plot to ``path`` as a PNG image."""
+        exporter = ImageExporter(self._plot.getPlotItem())
+        exporter.export(path)
 
     # -- theme -------------------------------------------------------------------
     def _crosshair_pen(self) -> object:

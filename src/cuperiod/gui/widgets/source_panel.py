@@ -21,6 +21,7 @@ class SourceBrowser(QtWidgets.QWidget):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
+        self._total = 0
         self._count_label = QtWidgets.QLabel("No sources")
         self._count_label.setObjectName("muted")
         layout.addWidget(self._count_label)
@@ -45,16 +46,19 @@ class SourceBrowser(QtWidgets.QWidget):
 
     def set_sources(self, labels: list[str]) -> None:
         """Populate the list from ``labels`` and select the first (without emitting)."""
+        self._total = len(labels)
         self._list.blockSignals(True)
         self._list.clear()
         for i, label in enumerate(labels):
-            item = QtWidgets.QListWidgetItem(f"{i + 1}. {label}")
+            text = f"{i + 1}. {label}"
+            item = QtWidgets.QListWidgetItem(text)
             item.setData(Qt.ItemDataRole.UserRole, i)
+            item.setToolTip(text)  # full label, in case the row text gets elided
             self._list.addItem(item)
         if labels:
             self._list.setCurrentRow(0)
         self._list.blockSignals(False)
-        self._count_label.setText(f"{len(labels)} sources")
+        self._update_count()
 
     def set_current(self, index: int) -> None:
         """Highlight ``index`` without re-emitting (controller-driven sync)."""
@@ -76,6 +80,21 @@ class SourceBrowser(QtWidgets.QWidget):
             item = self._list.item(row)
             if item is not None:
                 item.setHidden(needle not in item.text().lower())
+        self._update_count()
+
+    def _update_count(self) -> None:
+        if self._total == 0:
+            self._count_label.setText("No sources")
+            return
+        shown = sum(
+            1
+            for row in range(self._list.count())
+            if (item := self._list.item(row)) is not None and not item.isHidden()
+        )
+        if shown == self._total:
+            self._count_label.setText(f"{self._total} sources")
+        else:
+            self._count_label.setText(f"{shown} of {self._total} sources")
 
     def _step(self, delta: int) -> None:
         count = self._list.count()

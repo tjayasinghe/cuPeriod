@@ -34,7 +34,25 @@ from cuperiod.gui.widgets.spectrum_view import SpectrumView
 
 _FILE_FILTER = (
     "Light curves (*.csv *.ecsv *.fits *.fit *.fz *.parquet *.pq "
-    "*.tsv *.tab *.dat *.txt)"
+    "*.tsv *.tab *.dat *.txt);;All files (*)"
+)
+
+#: Extensions recognized as light-curve files, mirroring ``_FILE_FILTER`` above; used to
+#: validate drag-and-drop drops (which bypass the file dialog's own filtering).
+_FILE_EXTENSIONS = frozenset(
+    {
+        ".csv",
+        ".ecsv",
+        ".fits",
+        ".fit",
+        ".fz",
+        ".parquet",
+        ".pq",
+        ".tsv",
+        ".tab",
+        ".dat",
+        ".txt",
+    }
 )
 
 
@@ -52,8 +70,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.setWindowIcon(app_icon())
         self.setWindowTitle("cuPeriod — periodogram explorer")
-        self.resize(1360, 860)
+        self.resize(1360, 860)  # default size; overridden below if a geometry was saved
         self.setMinimumSize(1024, 680)
+        self.setAcceptDrops(True)
 
         self._controller = AppController(self)
         self._controls = ControlsPanel()
@@ -72,12 +91,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_central()
         self._build_peaks_dock()
         self._build_sources_dock()
+        self._build_shortcuts()
         self._connect()
+        self._restore_window_state()
         self._show_status("Open a light curve or load a demo to begin.")
 
     # -- construction ------------------------------------------------------------
     def _build_toolbar(self) -> None:
         toolbar = QtWidgets.QToolBar("Main")
+        toolbar.setObjectName("main_toolbar")  # required for saveState()
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
 
@@ -101,9 +123,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         demo_button = QtWidgets.QToolButton()
         demo_button.setText("Load demo")
-        demo_button.setPopupMode(
-            QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup
+        demo_button.setToolTip(
+            "Load a bundled example light curve, or browse a demo batch"
         )
+        demo_button.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
         demo_button.setMenu(self._build_demo_menu())
         toolbar.addWidget(demo_button)
 
@@ -141,11 +164,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self._center_layout.setSpacing(8)
         self._center_layout.addWidget(self._info)
 
+        self._banner_container = QtWidgets.QWidget()
+        banner_layout = QtWidgets.QHBoxLayout(self._banner_container)
+        banner_layout.setContentsMargins(0, 0, 0, 0)
+        banner_layout.setSpacing(4)
         self._banner = QtWidgets.QLabel("")
         self._banner.setObjectName("error")
         self._banner.setWordWrap(True)
-        self._banner.setVisible(False)
-        self._center_layout.addWidget(self._banner)
+        banner_layout.addWidget(self._banner, 1)
+        self._banner_dismiss = QtWidgets.QToolButton()
+        self._banner_dismiss.setText("✕")
+        self._banner_dismiss.setAutoRaise(True)
+        self._banner_dismiss.setToolTip("Dismiss")
+        self._banner_dismiss.clicked.connect(self._hide_banner)
+        banner_layout.addWidget(self._banner_dismiss, 0, Qt.AlignmentFlag.AlignTop)
+        self._banner_container.setVisible(False)
+        self._center_layout.addWidget(self._banner_container)
 
         self._stack = QtWidgets.QStackedWidget()
         self._placeholder = QtWidgets.QLabel(
@@ -179,6 +213,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _build_peaks_dock(self) -> None:
         dock = QtWidgets.QDockWidget("Peaks", self)
+        dock.setObjectName("peaks_dock")  # required for saveState()
         dock.setWidget(self._peaks_table)
         feature = QtWidgets.QDockWidget.DockWidgetFeature
         dock.setFeatures(
@@ -190,6 +225,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _build_sources_dock(self) -> None:
         self._sources_dock = QtWidgets.QDockWidget("Sources", self)
+        self._sources_dock.setObjectName("sources_dock")  # required for saveState()
         self._sources_dock.setWidget(self._source_browser)
         feature = QtWidgets.QDockWidget.DockWidgetFeature
         self._sources_dock.setFeatures(
@@ -200,12 +236,37 @@ class MainWindow(QtWidgets.QMainWindow):
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self._sources_dock)
         self._sources_dock.setVisible(False)
 
+    def _build_shortcuts(self) -> None:
+        quit_action = QtGui.QAction("Quit", self)
+        quit_action.setShortcut(QtGui.QKeySequence.StandardKey.Quit)
+        if quit_action.shortcut().isEmpty():  # StandardKey.Quit is empty on Windows
+            quit_action.setShortcut(QtGui.QKeySequence("Ctrl+Q"))
+        quit_action.setToolTip("Quit cuPeriod  (Ctrl+Q)")
+        quit_action.triggered.connect(self.close)
+        self.addAction(quit_action)
+
+        # Ctrl+Return and Ctrl+Enter (main keyboard vs. numpad) both trigger Compute.
+        for sequence in ("Ctrl+Return", "Ctrl+Enter"):
+            shortcut = QtGui.QShortcut(QtGui.QKeySequence(sequence), self)
+            shortcut.activated.connect(self._compute_via_shortcut)
+
+    def _restore_window_state(self) -> None:
+        """Restore the previous session's window geometry/layout, if any was saved."""
+        settings = QtCore.QSettings()
+        geometry = settings.value("geometry")
+        if geometry is not None:
+            self.restoreGeometry(geometry)
+        window_state = settings.value("windowState")
+        if window_state is not None:
+            self.restoreState(window_state)
+
     def _connect(self) -> None:
         self._controls.run_requested.connect(self._on_run_requested)
         ctl = self._controller
         ctl.lc_loaded.connect(self._on_lc_loaded)
         ctl.compute_started.connect(self._on_compute_started)
         ctl.busy_changed.connect(self._info.set_busy)
+        ctl.busy_changed.connect(self._controls.set_busy)
         ctl.periodogram_ready.connect(self._on_periodogram_ready)
         ctl.periodogram_ready.connect(self._spectrum.set_periodogram)
         ctl.peaks_ready.connect(self._spectrum.set_peaks)
@@ -221,15 +282,24 @@ class MainWindow(QtWidgets.QMainWindow):
         ctl.sources_changed.connect(self._on_sources_changed)
         ctl.source_selected.connect(self._source_browser.set_current)
         ctl.compute_failed.connect(self._on_compute_failed)
+        ctl.selection_cleared.connect(self._spectrum.clear_selection)
+        ctl.selection_cleared.connect(self._phased.clear_fold)
 
     # -- actions -----------------------------------------------------------------
     def _open_file(self) -> None:
+        settings = QtCore.QSettings()
+        start_dir = str(settings.value("last_dir", ""))
         path_str, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Open light curve", "", _FILE_FILTER
+            self, "Open light curve", start_dir, _FILE_FILTER
         )
         if not path_str:
             return
         path = Path(path_str)
+        settings.setValue("last_dir", str(path.parent))
+        self._load_file(path)
+
+    def _load_file(self, path: Path) -> None:
+        """Preview (if possible) and load a single light-curve file at ``path``."""
         preview = preview_file(path)
         if preview is not None:
             dialog = PreviewDialog(path.name, preview, self)
@@ -255,13 +325,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle(f"cuPeriod — {item.label}")
 
     def _open_folder(self) -> None:
+        settings = QtCore.QSettings()
+        start_dir = str(settings.value("last_dir", ""))
         directory = QtWidgets.QFileDialog.getExistingDirectory(
-            self, "Open a folder of light curves"
+            self, "Open a folder of light curves", start_dir
         )
         if not directory:
             return
+        settings.setValue("last_dir", directory)
+        self._load_folder(directory)
+
+    def _load_folder(self, directory: str | Path) -> None:
+        """Enumerate and batch-load every light curve under ``directory``."""
         try:
-            items = enumerate_sources(directory)
+            items = enumerate_sources(str(directory))
         except Exception as exc:  # noqa: BLE001 - surface any enumeration error
             self._warn(f"Could not read folder:\n{type(exc).__name__}: {exc}")
             return
@@ -269,7 +346,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._warn("No light-curve files found in that folder.")
             return
         self._controller.load_sources(items)
-        self.setWindowTitle(f"cuPeriod — {directory} ({len(items)} sources)")
+        name = Path(directory).name or str(directory)
+        self.setWindowTitle(f"cuPeriod — {name} ({len(items)} sources)")
 
     def _load_demo_batch(self) -> None:
         self._controller.load_sources(demo_sources())
@@ -327,7 +405,7 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             return
         self._placeholder.setText(
-            f"{detail}\n\nPress “Compute periodogram” to see the spectrum."
+            f'{detail}\n\nPress "Compute periodogram" to see the spectrum.'
         )
         self._show_status(note)
         if self._controller.state.mode == "batch":
@@ -376,13 +454,14 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.warning(self, "cuPeriod", message)
 
     def _show_banner(self, message: str) -> None:
-        """Show a non-blocking error banner (auto-hides after a few seconds)."""
+        """Show a dismissable error banner (also auto-hides after a while)."""
         self._banner.setText(f"⚠  {message}")
-        self._banner.setVisible(True)
-        self._banner_timer.start(7000)
+        self._banner_container.setVisible(True)
+        self._banner_timer.start(12000)
 
     def _hide_banner(self) -> None:
-        self._banner.setVisible(False)
+        self._banner_timer.stop()
+        self._banner_container.setVisible(False)
 
     def _toggle_theme(self) -> None:
         self._theme = "light" if self._theme == "dark" else "dark"
@@ -392,6 +471,80 @@ class MainWindow(QtWidgets.QMainWindow):
         self._phased.apply_theme(pal)
         self._raw.apply_theme(pal)
         QtCore.QSettings().setValue("theme", self._theme)
+
+    def _compute_via_shortcut(self) -> None:
+        """Ctrl+Return/Ctrl+Enter: request a compute if one would currently run."""
+        if self._controls.can_compute():
+            self._controls.request_compute()
+
+    # -- lifecycle -----------------------------------------------------------------
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        """Cancel any in-flight compute and persist the window geometry/layout."""
+        self._controller.shutdown()
+        settings = QtCore.QSettings()
+        settings.setValue("geometry", self.saveGeometry())
+        settings.setValue("windowState", self.saveState())
+        super().closeEvent(event)
+
+    # -- drag and drop -------------------------------------------------------------
+    def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:
+        if self._is_acceptable_drop(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event: QtGui.QDropEvent) -> None:
+        mime = event.mimeData()
+        if not self._is_acceptable_drop(mime):
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        paths = [Path(url.toLocalFile()) for url in mime.urls()]
+        self._handle_dropped_paths(paths)
+
+    @staticmethod
+    def _is_acceptable_drop(mime: QtCore.QMimeData) -> bool:
+        if not mime.hasUrls():
+            return False
+        urls = mime.urls()
+        if not all(url.isLocalFile() for url in urls):
+            return False
+        paths = [Path(url.toLocalFile()) for url in urls]
+        if len(paths) == 1 and paths[0].is_dir():
+            return True
+        return all(p.suffix.lower() in _FILE_EXTENSIONS for p in paths)
+
+    def _handle_dropped_paths(self, paths: list[Path]) -> None:
+        """Load dropped files/folders the same way as the toolbar's Open actions.
+
+        A single directory is browsed like "Open folder…"; a single file is opened
+        (with the usual preview) like "Open…"; multiple files are loaded as a batch.
+        """
+        if not paths:
+            return
+        if len(paths) == 1 and paths[0].is_dir():
+            self._load_folder(paths[0])
+            return
+        if len(paths) == 1:
+            self._load_file(paths[0])
+            return
+        valid = [p for p in paths if p.suffix.lower() in _FILE_EXTENSIONS]
+        if not valid:
+            self._warn("None of the dropped files are recognized light-curve files.")
+            return
+        if len(valid) == 1:
+            self._load_file(valid[0])
+            return
+        try:
+            items = enumerate_sources([str(p) for p in valid])
+        except Exception as exc:  # noqa: BLE001 - surface any enumeration error
+            self._warn(f"Could not load dropped files:\n{type(exc).__name__}: {exc}")
+            return
+        if not items:
+            self._warn("No light-curve files found among the dropped files.")
+            return
+        self._controller.load_sources(items)
+        self.setWindowTitle(f"cuPeriod — dropped batch ({len(items)} sources)")
 
 
 __all__ = ["MainWindow"]

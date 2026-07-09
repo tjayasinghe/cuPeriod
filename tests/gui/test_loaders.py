@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -10,6 +11,7 @@ import pytest
 
 from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
 from cuperiod.gui.loaders import (
+    _read_dataframe,
     asassn_sources,
     enumerate_sources,
     example_data_dir,
@@ -89,6 +91,39 @@ def test_preview_file_detects_mapping(tmp_path: Path) -> None:
     assert preview.mapping["error"] == "mag_err"
     assert preview.n_rows == 50
     assert 0 < len(preview.rows) <= 12
+
+
+def test_preview_file_only_reads_head_rows_for_csv(tmp_path: Path) -> None:
+    path = tmp_path / "big.csv"
+    _write_single(path, 2.0, n=5000)
+    preview = preview_file(path, max_rows=12)
+    assert preview is not None
+    # the true row count is still reported accurately...
+    assert preview.n_rows == 5000
+    # ...even though only a small head was actually parsed
+    assert len(preview.rows) == 12
+
+
+def test_read_dataframe_nrows_limits_csv_parse(tmp_path: Path) -> None:
+    path = tmp_path / "p.csv"
+    _write_single(path, 2.0, n=200)
+    frame = _read_dataframe(path, nrows=10)
+    assert frame is not None
+    assert len(frame) == 10
+    full = _read_dataframe(path)
+    assert len(full) == 200
+
+
+def test_read_dataframe_logs_parse_failure(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    bad = tmp_path / "bad.csv"
+    # a ragged row count reliably makes pandas' C parser raise ParserError
+    bad.write_text("a,b,c\n1,2\n3,4,5,6,7\n", encoding="utf-8")
+    with caplog.at_level(logging.DEBUG, logger="cuperiod.gui.loaders"):
+        result = _read_dataframe(bad)
+    assert result is None
+    assert "bad.csv" in caplog.text
 
 
 def test_asassn_adapter_when_available() -> None:

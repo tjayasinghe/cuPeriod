@@ -31,6 +31,11 @@ from cuperiod.gui.settingsform import PydanticSettingsForm
 
 _DEFAULT_METHOD = "GLS"
 
+#: Item-data sentinels for the synthetic "all bands" combo entries, distinguishing them
+#: from a real band that happens to be named "combined" or "stacked".
+_COMBINED_SENTINEL = "__combined__"
+_STACKED_SENTINEL = "__stacked__"
+
 
 def _first_error_message(exc: ValidationError) -> str:
     """A compact ``loc: msg`` summary of the first validation error."""
@@ -55,6 +60,8 @@ class ControlsPanel(QtWidgets.QWidget):
         self._current_method: str | None = None
         self._form: PydanticSettingsForm | None = None
         self._curve_time: FloatArray | None = None
+        self._has_curve = False
+        self._busy = False
 
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -121,6 +128,7 @@ class ControlsPanel(QtWidgets.QWidget):
 
         self._compute_btn = QtWidgets.QPushButton("Compute periodogram")
         self._compute_btn.setProperty("primary", True)
+        self._compute_btn.setToolTip("Compute the periodogram  (Ctrl+Enter)")
         self._compute_btn.clicked.connect(self._on_compute)
         root.addWidget(self._compute_btn)
 
@@ -134,11 +142,28 @@ class ControlsPanel(QtWidgets.QWidget):
     # -- public ------------------------------------------------------------------
     def set_enabled(self, enabled: bool) -> None:
         """Enable/disable the Compute action (a light curve must be loaded first)."""
-        self._compute_btn.setEnabled(enabled)
+        self._has_curve = enabled
+        self._update_compute_enabled()
+
+    def set_busy(self, busy: bool) -> None:
+        """Disable just the Compute button while a run is in flight.
+
+        The rest of the form (method/backend/options) stays interactive so the user
+        can prepare the next run while the current one finishes.
+        """
+        self._busy = busy
+        self._update_compute_enabled()
+
+    def can_compute(self) -> bool:
+        """Whether Compute would currently do anything (curve loaded, not busy)."""
+        return self._compute_btn.isEnabled()
 
     def request_compute(self) -> None:
         """Trigger a compute programmatically (batch auto-run on source change)."""
         self._on_compute()
+
+    def _update_compute_enabled(self) -> None:
+        self._compute_btn.setEnabled(self._has_curve and not self._busy)
 
     def set_multiband(self, is_multiband: bool) -> None:
         """Restrict the method list to multiband-capable methods for multiband data."""
@@ -168,12 +193,12 @@ class ControlsPanel(QtWidgets.QWidget):
         """The selected band: a band name, ``"stacked"``, ``"combined"``, or ``""``."""
         if self._band_names is None:
             return ""
-        text = self._band_combo.currentText()
-        if text.startswith("combined"):
+        data = self._band_combo.currentData()
+        if data == _COMBINED_SENTINEL:
             return "combined"
-        if text.startswith("stacked"):
+        if data == _STACKED_SENTINEL:
             return "stacked"
-        return text
+        return self._band_combo.currentText()
 
     # -- method switching --------------------------------------------------------
     def _on_method_changed(self, method: str) -> None:
@@ -198,12 +223,14 @@ class ControlsPanel(QtWidgets.QWidget):
         self._band_combo.clear()
         if supports_multiband(method):
             # combined multiband analysis is the default for capable methods
-            self._band_combo.addItem("combined (all bands)")
-            self._band_combo.addItems(self._band_names)
+            self._band_combo.addItem("combined (all bands)", _COMBINED_SENTINEL)
+            for name in self._band_names:
+                self._band_combo.addItem(name, name)
         else:
             # single-band methods analyse one band (safest) or a stacked merge
-            self._band_combo.addItems(self._band_names)
-            self._band_combo.addItem("stacked (all bands)")
+            for name in self._band_names:
+                self._band_combo.addItem(name, name)
+            self._band_combo.addItem("stacked (all bands)", _STACKED_SENTINEL)
         self._band_combo.setCurrentIndex(0)
         self._band_combo.blockSignals(False)
 

@@ -9,9 +9,10 @@ from cuperiod.core.config import BLSSettings, GLSSettings
 from cuperiod.core.lightcurve import LightCurve
 from cuperiod.core.result import Periodogram
 from cuperiod.gui.compute import ComputeManager
-from cuperiod.gui.models import ResultKey, settings_hash
+from cuperiod.gui.models import LoadedCurve, ResultKey, SourceItem, settings_hash
 from cuperiod.gui.settingsform import PydanticSettingsForm
 from cuperiod.gui.state import AppController
+from cuperiod.gui.widgets.phased_view import PhasedView
 from cuperiod.gui.widgets.spectrum_view import SpectrumView
 
 
@@ -132,6 +133,98 @@ def test_spectrum_markers_follow_log_mode(qtbot: QtBot) -> None:
             continue
         expected = np.log10(view._peaks[int(idx)].period)
         assert abs(spot.pos().x() - expected) < 1e-6
+
+
+def test_select_source_load_failure_reverts_index_and_names_source(
+    qtbot: QtBot,
+) -> None:
+    controller = AppController()
+    good = SourceItem(key="good", label="Good Star", loader=_light_curve)
+
+    def _boom() -> LoadedCurve:
+        raise ValueError("bad file")
+
+    bad = SourceItem(key="bad", label="Bad Star", loader=_boom)
+    controller.load_sources([good, bad])
+    controller.select_source(0)
+    assert controller.state.current_source_index == 0
+
+    failures: list[str] = []
+    controller.compute_failed.connect(failures.append)
+    reverted: list[int] = []
+    controller.source_selected.connect(reverted.append)
+    controller.select_source(1)
+
+    # index/state stayed on the previously-loaded (good) source, not the failed one
+    assert controller.state.current_source_index == 0
+    assert reverted[-1] == 0  # browser highlight snaps back to the previous source
+    assert len(failures) == 1
+    assert "Bad Star" in failures[0]  # failure message names the failed source
+
+
+def test_select_source_success_after_prior_failure(qtbot: QtBot) -> None:
+    controller = AppController()
+    good = SourceItem(key="good", label="Good Star", loader=_light_curve)
+
+    def _boom() -> LoadedCurve:
+        raise ValueError("bad file")
+
+    bad = SourceItem(key="bad", label="Bad Star", loader=_boom)
+    controller.load_sources([bad, good])
+    controller.select_source(0)  # fails; index stays at the default 0
+    assert controller.state.current_source_index == 0
+
+    controller.select_source(1)  # succeeds
+    assert controller.state.current_source_index == 1
+    assert controller.state.current_lc is not None
+
+
+def test_zero_peaks_clears_stale_spectrum_and_phased_selection(qtbot: QtBot) -> None:
+    controller = AppController()
+    lc = _light_curve()
+    controller.set_light_curve(lc, "src")
+
+    spectrum = SpectrumView("dark")
+    qtbot.addWidget(spectrum)
+    phased = PhasedView("dark")
+    qtbot.addWidget(phased)
+    controller.periodogram_ready.connect(spectrum.set_periodogram)
+    controller.peaks_ready.connect(spectrum.set_peaks)
+    controller.period_changed.connect(spectrum.set_selected_period)
+    controller.selection_cleared.connect(spectrum.clear_selection)
+    controller.fold_changed.connect(phased.set_fold)
+    controller.selection_cleared.connect(phased.clear_fold)
+    phased.set_light_curve(lc)
+
+    # first, a normal run with a real peak selects something in both views
+    with qtbot.waitSignal(controller.periodogram_ready, timeout=30000):
+        controller.run("GLS", "auto", GLSSettings(), 5)
+    assert spectrum._sel_period is not None
+    assert phased._period is not None
+
+    # a compute that yields zero peaks must clear both stale selections
+    empty_pg = Periodogram.from_spectrum(
+        method="GLS",
+        backend="numpy",
+        frequency=np.array([]),
+        power=np.array([]),
+        objective_sense="max",
+        n_samples=100,
+        baseline=90.0,
+    )
+    assert empty_pg.best_periods(5) == []  # sanity: this really yields zero peaks
+    cleared: list[None] = []
+    controller.selection_cleared.connect(lambda: cleared.append(None))
+    key = ResultKey("src", "GLS", settings_hash(GLSSettings(nyquist_factor=6)), "auto")
+    controller._pending_key = key
+    controller._on_finished(key, empty_pg, 1.0)
+
+    assert cleared  # signal fired
+    assert controller.state.selected_peak is None
+    assert controller.state.selected_period is None
+    assert spectrum._sel_period is None
+    assert not spectrum._sel_band.isVisible()
+    assert phased._period is None
 
 
 def test_spectrum_marker_click_selects_period(qtbot: QtBot) -> None:

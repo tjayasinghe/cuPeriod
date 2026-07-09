@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from pyqtgraph.exporters import ImageExporter
+
 from cuperiod.core.columns import Domain
 from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
 from cuperiod.gui.fold import fold_series
@@ -66,6 +68,10 @@ class PhasedView(QtWidgets.QWidget):
         self._two_cycles.setChecked(True)  # two cycles is the default view
         self._two_cycles.toggled.connect(self.refold)
         row.addWidget(self._two_cycles)
+        export_btn = QtWidgets.QPushButton("Image as PNG…")
+        export_btn.setToolTip("Save the phased plot as a PNG image")
+        export_btn.clicked.connect(self._export_png)
+        row.addWidget(export_btn)
         layout.addWidget(bar)
 
         self._plot = pg.PlotWidget()
@@ -138,6 +144,19 @@ class PhasedView(QtWidgets.QWidget):
             "left", brightness_label(domain), **plot_label_style(self._pal)
         )
 
+    # -- export ----------------------------------------------------------------
+    def _export_png(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Export phased plot as PNG", "phased.png", "PNG images (*.png)"
+        )
+        if path:
+            self.export_png(path)
+
+    def export_png(self, path: str) -> None:
+        """Render the current phased plot to ``path`` as a PNG image."""
+        exporter = ImageExporter(self._plot.getPlotItem())
+        exporter.export(path)
+
     def _domain(self) -> Domain:
         bands = self._bands()
         if not bands:
@@ -149,6 +168,17 @@ class PhasedView(QtWidgets.QWidget):
         self._lc = None
         self._period = None
         self._rebuild_scatters()
+        self._period_label.setText("")
+
+    def clear_fold(self) -> None:
+        """Clear the current fold display (e.g. a compute finished with zero peaks).
+
+        Unlike :meth:`clear`, the loaded light curve itself is left alone.
+        """
+        self._period = None
+        self._t0 = 0.0
+        for scatter in self._scatters.values():
+            scatter.setData([], [])
         self._period_label.setText("")
 
     # -- theme -------------------------------------------------------------------
