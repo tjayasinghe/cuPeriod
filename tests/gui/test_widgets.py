@@ -5,7 +5,13 @@ from __future__ import annotations
 import numpy as np
 from pytestqt.qtbot import QtBot
 
-from cuperiod.core.config import BLSSettings, GLSSettings
+from cuperiod.core.config import (
+    BLSSettings,
+    GLSSettings,
+    MHAOVSettings,
+    PDMSettings,
+    PreWhitenSettings,
+)
 from cuperiod.core.lightcurve import LightCurve
 from cuperiod.core.result import Periodogram
 from cuperiod.gui.compute import ComputeManager
@@ -94,10 +100,20 @@ def test_auto_grid_tuning_for_sparse_data(qtbot: QtBot) -> None:
     time = np.sort(np.random.default_rng(0).uniform(0.0, 2000.0, 200))
     lc = LightCurve.from_arrays(time, np.sin(time), np.full(200, 0.01))
 
-    tuned = controller._tune_auto_grid(lc, GLSSettings())
-    assert tuned.maximum_frequency is not None
-    assert tuned.maximum_frequency >= 10.0  # reaches at least P = 0.1 d
-    assert tuned.samples_per_peak >= 10  # densified default grid
+    # The frequency-domain analyses share the delta Scuti / HADS floor (50 c/d): a
+    # trial frequency costs them a trig sum, and the 10 c/d ceiling put the bundled
+    # HADS demo (f = 11.14 c/d) out of band, aliasing it to a wrong period.
+    for settings in (GLSSettings(), MHAOVSettings(), PreWhitenSettings()):
+        tuned = controller._tune_auto_grid(lc, settings)
+        assert tuned.maximum_frequency is not None
+        assert tuned.maximum_frequency >= 50.0, type(settings).__name__
+    assert controller._tune_auto_grid(lc, GLSSettings()).samples_per_peak >= 10
+
+    # Fold-based methods pay a full fold per trial frequency and keep the 10 c/d
+    # floor; their sub-day coverage is unchanged.
+    pdm = controller._tune_auto_grid(lc, PDMSettings())
+    assert pdm.maximum_frequency is not None
+    assert pdm.maximum_frequency == 10.0
 
     # a method without frequency-grid fields (BLS) is returned unchanged
     bls = BLSSettings()

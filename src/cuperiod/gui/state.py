@@ -30,6 +30,7 @@ from cuperiod.gui.fold import epoch_for_peak
 from cuperiod.gui.meta import (
     alias_diverse_default,
     auto_max_frequency,
+    reaches_short_periods,
     supports_multiband,
 )
 from cuperiod.gui.models import (
@@ -278,9 +279,10 @@ class AppController(QObject):
         """Improve the default frequency grid for frequency-grid methods.
 
         (a) Raises an auto max-frequency so sub-day periods aren't missed on sparse data
-        (see :func:`cuperiod.gui.meta.auto_max_frequency`; pre-whitening uses the
-        engine's own :func:`~cuperiod.prewhiten.default_maximum_frequency`, whose higher
-        floor keeps δ Scuti / HADS frequencies in band) and (b) densifies the default
+        (see :func:`cuperiod.gui.meta.auto_max_frequency`; the frequency-domain
+        analyses — GLS, MHAOV, pre-whitening — use the engine's
+        :func:`~cuperiod.prewhiten.default_maximum_frequency`, whose higher floor keeps
+        δ Scuti / HADS frequencies in band) and (b) densifies the default
         ``samples_per_peak`` for smoother, better-resolved periodograms (notably at long
         periods). Explicitly-changed values are left as-is.
         """
@@ -295,7 +297,7 @@ class AppController(QObject):
             nyquist_factor = int(getattr(settings, "nyquist_factor", 5))
             auto = (
                 default_maximum_frequency(time, nyquist_factor)
-                if isinstance(settings, PreWhitenSettings)
+                if reaches_short_periods(settings)
                 else auto_max_frequency(time, nyquist_factor)
             )
             updates["maximum_frequency"] = auto

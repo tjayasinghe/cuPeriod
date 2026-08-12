@@ -87,7 +87,11 @@ All notable changes to cuPeriod are documented here. The format is based on
   {func}`cuperiod.prewhiten.default_maximum_frequency`, and the GUI's auto value uses
   the same helper. The demo star now yields P = 0.089757 d — the VSX period to the
   last digit — with its 2f, 3f, 4f harmonics extracted and combination-labelled
-  (residual rms 0.073).
+  (residual rms 0.073). The GUI applies the same floor to the **GLS and MHAOV**
+  periodograms — a trial frequency costs them a trig sum, so the wider band is free —
+  and GLS now also recovers the demo star's period; the fold-based methods (PDM, CE,
+  string-length), which pay a full fold per trial frequency, keep their 10 c/d auto
+  ceiling.
 - **Bootstrap frequency errors were exactly zero for every component but the newest.**
   The engine handed its per-iteration refinement policy (default `"last"`, which pins
   all established frequencies) to the bootstrap's replicate fits, so their scatter

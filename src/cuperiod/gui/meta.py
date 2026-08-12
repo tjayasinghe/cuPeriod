@@ -12,6 +12,7 @@ from pydantic_settings import BaseSettings
 
 from cuperiod.core._typing import FloatArray
 from cuperiod.core.columns import Domain
+from cuperiod.core.config import GLSSettings, MHAOVSettings, PreWhitenSettings
 from cuperiod.core.errors import BackendUnavailableError
 from cuperiod.core.grid import pseudo_nyquist_frequency
 from cuperiod.methods.base import get_method, method_names
@@ -19,8 +20,27 @@ from cuperiod.methods.base import get_method, method_names
 #: Box/transit methods where alias-diverse peak selection is the sensible default.
 _ALIAS_DIVERSE_METHODS = frozenset({"BLS", "TLS"})
 
-#: The GUI's auto grid reaches at least this short a period (days) for freq methods.
+#: The GUI's auto grid reaches at least this short a period (days) for the fold-based
+#: methods (PDM, CE, string-length), which pay a full fold of the light curve per
+#: trial frequency. The frequency-domain analyses reach shorter periods — see
+#: :func:`reaches_short_periods`.
 MIN_PERIOD_FLOOR_DAYS = 0.1
+
+#: Analyses whose cost per trial frequency is a trig sum / one NUFFT, so a wide band
+#: is cheap and the auto grid can afford the same δ Scuti / HADS floor pre-whitening
+#: uses (50 cycles/day — the bundled ASAS-SN HADS at P = 0.0898 d is the star the old
+#: 10 c/d ceiling silently aliased).
+_SHORT_PERIOD_SETTINGS: tuple[type[BaseSettings], ...] = (
+    GLSSettings,
+    MHAOVSettings,
+    PreWhitenSettings,
+)
+
+
+def reaches_short_periods(settings: BaseSettings | type[BaseSettings]) -> bool:
+    """Whether this analysis' auto band uses the short-period (50 c/d) floor."""
+    cls = settings if isinstance(settings, type) else type(settings)
+    return issubclass(cls, _SHORT_PERIOD_SETTINGS)
 
 
 def method_display_names() -> list[str]:
@@ -149,6 +169,7 @@ __all__ = [
     "natural_domain",
     "objective_sense",
     "prewhiten_backend_options",
+    "reaches_short_periods",
     "resolved_backend",
     "resolved_prewhiten_backend",
     "settings_class",

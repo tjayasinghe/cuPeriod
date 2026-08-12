@@ -30,6 +30,7 @@ from cuperiod.gui.meta import (
     natural_domain,
     objective_sense,
     prewhiten_backend_options,
+    reaches_short_periods,
     resolved_backend,
     resolved_prewhiten_backend,
     settings_class,
@@ -384,11 +385,12 @@ class ControlsPanel(QtWidgets.QWidget):
         baseline = float(time.max() - time.min())
         nyquist_factor = int(self._form.value_of("nyquist_factor") or 5)
         auto_min = 1.0 / baseline if baseline > 0.0 else 0.0
-        # Pre-whitening floors its auto band higher (delta Scuti / HADS coverage);
-        # mirror the engine exactly so the greyed value is the one that will run.
+        # Frequency-domain analyses floor their auto band higher (delta Scuti / HADS
+        # coverage); mirror the controller exactly so the greyed value is the one
+        # that will run.
         auto_max = (
             default_maximum_frequency(time, nyquist_factor)
-            if self._prewhiten
+            if reaches_short_periods(self._settings_model())
             else auto_max_frequency(time, nyquist_factor)
         )
         # fill the greyed 'auto' spin boxes with the values that will actually be used
