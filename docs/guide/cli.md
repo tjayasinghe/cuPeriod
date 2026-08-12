@@ -127,7 +127,7 @@ stopped.
   - `auto` | `cpu` | `gpu` | a concrete backend name.
 * - `--out` / `--csv` / `--save-spectrum`
   - Write the full solution as JSON, the component table as CSV, and/or the
-    amplitude spectra as `.npz`.
+    amplitude spectra as `.npz` (data, residual, and the spectral window).
 ```
 
 ## `batch-prewhiten` — many pulsators

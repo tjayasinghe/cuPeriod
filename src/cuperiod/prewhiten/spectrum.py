@@ -534,6 +534,7 @@ class SpectrumEngine:
         self._torch_dtype: Any = None
         self._device = "cpu"
         self._precision = "float64"
+        self._window_sums: tuple[FloatArray, FloatArray] | None = None
         self._setup(device, precision)
         # The weights sum to 1, so a well-conditioned frequency has det ~ 0.25 and
         # rounding noise ~eps. Anything far below that is a degenerate design (a zero
@@ -657,6 +658,7 @@ class SpectrumEngine:
             zero = np.zeros(nf, dtype=np.float64)
             return zero, zero, zero, zero
         c, s = self._base_sums(self._weight)
+        self._window_sums = (c, s)  # exactly the spectral window; see :meth:`window`
         c2, s2 = self._doubled_sums(self._weight)
         cc = 0.5 * (1.0 + c2) - c * c
         ss = 0.5 * (1.0 - c2) - s * s
@@ -723,6 +725,44 @@ class SpectrumEngine:
             baseline=self.baseline,
         )
 
+    def window(self) -> AmplitudeSpectrum:
+        """The spectral window ``|W(f)|`` of this sampling, on the engine's grid.
+
+        The window function :math:`W(f) = \\sum_j w_j e^{2\\pi i f \\Delta t_j}`
+        is what convolves the true spectrum when the sampling is irregular: every real
+        peak is dressed with the window's sidelobes, so a candidate frequency sitting
+        where a stronger component's window has a lobe (classically at ±1 cycle/day for
+        single-site ground-based data) is suspect. Period04 displays it for exactly
+        this reason, and comparing a doubtful peak against the window is the standard
+        alias check before believing a close pair.
+
+        The returned object reuses :class:`AmplitudeSpectrum`: ``amplitude`` is
+        ``|W(f)|`` (dimensionless, ``|W| <= 1``, and ``|W| -> 1`` as ``f -> 0``),
+        ``phase`` is ``arg W(f)``, and ``power`` is ``|W(f)|^2``. Costs nothing beyond
+        construction for the default ``"lsq"`` normalization — the sums are already
+        part of the cached normal equations; ``"dft"`` engines compute them on first
+        call (one transform, then cached).
+
+        Returns
+        -------
+        AmplitudeSpectrum
+        """
+        if self._window_sums is None:
+            self._window_sums = self._base_sums(self._weight)
+        c, s = self._window_sums
+        amplitude = np.hypot(c, s)
+        return AmplitudeSpectrum(
+            frequency=self.frequency,
+            amplitude=amplitude,
+            phase=np.mod(np.arctan2(s, c), 2.0 * np.pi),
+            power=amplitude * amplitude,
+            t_ref=self.t_ref,
+            backend=self.backend,
+            normalization=self.normalization,
+            n_samples=self.n_samples,
+            baseline=self.baseline,
+        )
+
 
 def amplitude_spectrum(
     time: FloatArray,
@@ -773,6 +813,60 @@ def amplitude_spectrum(
     return engine.spectrum(value)
 
 
+def spectral_window(
+    time: FloatArray,
+    error: FloatArray | None = None,
+    *,
+    grid: GridSpec,
+    backend: str = "auto",
+    device: str = "auto",
+    precision: str = "auto",
+    eps: float = DEFAULT_EPS,
+    freq_batch: int = 4096,
+    t_ref: float | None = None,
+) -> AmplitudeSpectrum:
+    """One-shot spectral window of a sampling (see :meth:`SpectrumEngine.window`).
+
+    The window depends only on the observation times and weights — no brightness
+    values enter — so this is the diagnostic to run when deciding whether a peak in an
+    amplitude spectrum is real or an alias of a stronger one.
+
+    Parameters
+    ----------
+    time : numpy.ndarray
+        Observation times in days (finite points only).
+    error : numpy.ndarray, optional
+        1-sigma uncertainties; the window is weighted exactly as the spectrum is.
+    grid : GridSpec
+        A uniform frequency grid.
+    backend, device, precision, eps, freq_batch, t_ref
+        See :class:`SpectrumEngine`.
+
+    Returns
+    -------
+    AmplitudeSpectrum
+        ``amplitude`` holds ``|W(f)| <= 1``.
+
+    Examples
+    --------
+    >>> grid = cup.uniform_frequency_grid(t.max() - t.min(),    # doctest: +SKIP
+    ...                                   maximum_frequency=5.0)
+    >>> window = cup.spectral_window(t, dy, grid=grid)          # doctest: +SKIP
+    """
+    engine = SpectrumEngine(
+        time,
+        error,
+        grid=grid,
+        backend=backend,
+        device=device,
+        precision=precision,
+        eps=eps,
+        freq_batch=freq_batch,
+        t_ref=t_ref,
+    )
+    return engine.window()
+
+
 __all__ = [
     "DEFAULT_EPS",
     "SPECTRUM_BACKENDS",
@@ -783,5 +877,6 @@ __all__ = [
     "amplitude_spectrum",
     "noise_level",
     "resolve_spectrum_backend",
+    "spectral_window",
     "weighted_epoch",
 ]

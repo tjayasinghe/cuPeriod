@@ -43,6 +43,7 @@ from __future__ import annotations
 from cuperiod.prewhiten.batch import batch_prewhiten
 from cuperiod.prewhiten.combinations import Combination, identify_combinations
 from cuperiod.prewhiten.engine import default_prewhiten_grid, prewhiten
+from cuperiod.prewhiten.fap import baluev_fap
 from cuperiod.prewhiten.fit import MultiSineFit, fit_multisine
 from cuperiod.prewhiten.result import PreWhitenResult, Sinusoid
 from cuperiod.prewhiten.spacing import (
@@ -58,6 +59,7 @@ from cuperiod.prewhiten.spectrum import (
     SpectrumEngine,
     amplitude_spectrum,
     noise_level,
+    spectral_window,
 )
 from cuperiod.prewhiten.uncertainty import (
     Uncertainties,
@@ -79,6 +81,7 @@ __all__ = [
     "Uncertainties",
     "amplitude_spectrum",
     "analytic_uncertainties",
+    "baluev_fap",
     "batch_prewhiten",
     "bootstrap_uncertainties",
     "buoyancy_radius",
@@ -92,4 +95,5 @@ __all__ = [
     "noise_level",
     "prewhiten",
     "spacing_spectrum",
+    "spectral_window",
 ]

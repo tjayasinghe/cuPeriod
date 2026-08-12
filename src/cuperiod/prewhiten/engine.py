@@ -35,6 +35,7 @@ from cuperiod.core.grid import (
 )
 from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
 from cuperiod.prewhiten.combinations import Combination, identify_combinations
+from cuperiod.prewhiten.fap import baluev_fap
 from cuperiod.prewhiten.fit import MultiSineFit, fit_multisine
 from cuperiod.prewhiten.result import PreWhitenResult, Sinusoid
 from cuperiod.prewhiten.spectrum import AmplitudeSpectrum, SpectrumEngine
@@ -94,36 +95,23 @@ def default_prewhiten_grid(
 
 def _peak_fap(
     time: FloatArray,
-    residuals: FloatArray,
     error: FloatArray | None,
     power: float,
     *,
-    f_min: float,
     f_max: float,
-    fit_mean: bool,
 ) -> float:
     """Baluev false-alarm probability of a peak of normalized power ``power``.
 
     The amplitude spectrum's ``power`` is the standard-normalized generalized
-    Lomb-Scargle power by construction, so astropy's analytic false-alarm machinery
-    applies directly. Any failure (a degenerate spectrum, a missing optional dependency)
-    yields NaN rather than aborting the extraction.
+    Lomb-Scargle power by construction, so :func:`baluev_fap` applies directly. An
+    undefined statistic (a degenerate spectrum, too few points) yields NaN rather than
+    aborting the extraction.
     """
     if not np.isfinite(power) or power <= 0.0:
         return float("nan")
-    try:
-        from astropy.timeseries import LombScargle
-
-        ls = LombScargle(time, residuals, error, fit_mean=fit_mean)
-        value = ls.false_alarm_probability(
-            min(power, 1.0 - 1e-15),
-            method="baluev",
-            minimum_frequency=f_min,
-            maximum_frequency=f_max,
-        )
-        return float(np.asarray(value, dtype=np.float64).reshape(-1)[0])
-    except Exception:  # noqa: BLE001 - FAP is informational, never fatal
-        return float("nan")
+    return float(
+        baluev_fap(min(power, 1.0 - 1e-15), time, error, maximum_frequency=f_max)
+    )
 
 
 def _accept(
@@ -329,11 +317,10 @@ def prewhiten(
             # down the spectrum rather than abandoning the run.
             blocked.append(f_guess)
             continue
-        # Deferred until the candidate survives the collision guard: the false-alarm
-        # probability costs a pass over the data; a discarded candidate never uses it.
+        # Deferred until the candidate survives the collision guard: a discarded
+        # candidate never uses its false-alarm probability.
         fap = _peak_fap(
-            time, fit.residuals, error, float(spectrum.power[index]),
-            f_min=f_min, f_max=f_max, fit_mean=cfg.fit_mean,
+            time, error, float(spectrum.power[index]), f_max=f_max
         )
         trial_spectrum = engine.spectrum(trial.residuals)
         amplitude = float(trial.amplitude[-1])
@@ -429,6 +416,7 @@ def prewhiten(
         seed=cfg.seed,
         refine=cfg.refine,
         sweeps=cfg.sweeps,
+        frequency_bounds=refine_bounds(fit.frequency),
     )
     snr_final = _component_snr(spectrum, fit, cfg)
     labels = tuple(f"F{i + 1}" for i in range(fit.n_components))
@@ -489,6 +477,7 @@ def prewhiten(
         backend=engine.backend,
         spectrum=initial_spectrum if keep else None,
         residual_spectrum=spectrum if keep else None,
+        window=engine.window() if keep else None,
         meta=dict(lc.meta),
     )
 

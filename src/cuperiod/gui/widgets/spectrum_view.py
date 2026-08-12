@@ -15,6 +15,8 @@ The same view serves pre-whitening: the main curve becomes the amplitude spectru
 the data, an optional **overlay** curve shows the spectrum of the residuals once every
 extracted component has been subtracted, and the peak markers become the components.
 That side-by-side is the whole point of the method — what was there, and what is left.
+A third, dashed trace can show the **spectral window** of the sampling (scaled to the
+tallest peak, Period04-style) so an alias lobe is recognisable at a glance.
 """
 
 from __future__ import annotations
@@ -96,6 +98,15 @@ class SpectrumView(QtWidgets.QWidget):
         self._overlay.setVisible(False)
         self._overlay_xy: tuple[np.ndarray, np.ndarray] | None = None
 
+        # The spectral window of the sampling (dashed, behind the data curve): the
+        # alias-lobe pattern every real peak is convolved with.
+        self._window_curve = self._plot.plot([], [], pen=self._window_pen())
+        self._window_curve.setDownsampling(auto=True, method="peak")
+        self._window_curve.setClipToView(True)
+        self._window_curve.setZValue(-5)
+        self._window_curve.setVisible(False)
+        self._window_xy: tuple[np.ndarray, np.ndarray] | None = None
+
         self._markers = pg.ScatterPlotItem(hoverable=True, pxMode=True)
         self._markers.setZValue(5)
         self._markers.sigClicked.connect(self._on_peak_clicked)
@@ -122,12 +133,21 @@ class SpectrumView(QtWidgets.QWidget):
         bar = QtWidgets.QWidget()
         row = QtWidgets.QHBoxLayout(bar)
         row.setContentsMargins(6, 2, 6, 2)
-        row.setSpacing(8)
+        # Tight spacing: with the pre-whitening toggles shown the row is the widest
+        # thing in the dock, and buttons must not get squeezed into ellipses.
+        row.setSpacing(6)
 
         row.addWidget(QtWidgets.QLabel("x:"))
         self._xaxis_combo = QtWidgets.QComboBox()
         self._xaxis_combo.addItems(["frequency", "period"])
         self._xaxis_combo.setToolTip("Plot the x-axis as frequency or period")
+        # Never squeeze the combo into an elided "frequen…" when the row gets tight;
+        # shortage lands on the stretchable readout instead. The explicit minimum is
+        # needed because a combo's minimum size ignores its contents by default.
+        self._xaxis_combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents
+        )
+        self._xaxis_combo.setMinimumWidth(self._xaxis_combo.sizeHint().width())
         self._xaxis_combo.currentTextChanged.connect(self._on_xaxis_changed)
         row.addWidget(self._xaxis_combo)
 
@@ -154,7 +174,17 @@ class SpectrumView(QtWidgets.QWidget):
         self._show_residual.toggled.connect(self._redraw_overlay)
         row.addWidget(self._show_residual)
 
-        reset = QtWidgets.QPushButton("Reset view")
+        self._show_window = QtWidgets.QCheckBox("window")
+        self._show_window.setChecked(False)
+        self._show_window.setToolTip(
+            "Overlay the spectral window of the sampling (scaled to the tallest "
+            "peak): a peak sitting on another's window lobe is likely an alias"
+        )
+        self._show_window.setVisible(False)
+        self._show_window.toggled.connect(self._redraw_window)
+        row.addWidget(self._show_window)
+
+        reset = QtWidgets.QPushButton("Reset")
         reset.setToolTip("Auto-range the plot back to the full spectrum")
         reset.clicked.connect(self._autorange)
         row.addWidget(reset)
@@ -187,6 +217,9 @@ class SpectrumView(QtWidgets.QWidget):
         self._sel_band.setVisible(False)
         self._overlay_xy = None
         self._show_residual.setVisible(False)
+        self._window_xy = None
+        self._show_window.setVisible(False)
+        self._window_curve.setVisible(False)
         self._default_axis_for(pg_result)
         self._redraw_curve()
         self._update_y_label()
@@ -207,6 +240,30 @@ class SpectrumView(QtWidgets.QWidget):
         self._show_residual.setVisible(False)
         self._overlay.setVisible(False)
         self._overlay.setData([], [])
+
+    def set_window(
+        self, frequency: np.ndarray, amplitude: np.ndarray, *, scale: float = 1.0
+    ) -> None:
+        """Provide the sampling's spectral window ``|W(f)|``, scaled by ``scale``.
+
+        ``|W|`` is dimensionless (1 at zero frequency); ``scale`` is normally the
+        tallest amplitude of the displayed spectrum, which is how Period04 overlays the
+        two. The trace stays hidden until the ``window`` toggle is checked.
+        """
+        factor = float(scale) if np.isfinite(scale) and scale > 0.0 else 1.0
+        self._window_xy = (
+            np.asarray(frequency, dtype=np.float64),
+            np.asarray(amplitude, dtype=np.float64) * factor,
+        )
+        self._show_window.setVisible(True)
+        self._redraw_window()
+
+    def clear_window(self) -> None:
+        """Remove the spectral-window trace and hide its toggle."""
+        self._window_xy = None
+        self._show_window.setVisible(False)
+        self._window_curve.setVisible(False)
+        self._window_curve.setData([], [])
 
     def set_peaks(self, peaks: list[Peak]) -> None:
         """Overlay the significant peaks as markers."""
@@ -233,6 +290,7 @@ class SpectrumView(QtWidgets.QWidget):
         self._hover_text.setVisible(False)
         self._readout.setText("—")
         self.clear_overlay()
+        self.clear_window()
 
     def clear_selection(self) -> None:
         """Hide the selection band (e.g. a compute finished with zero peaks).
@@ -257,22 +315,36 @@ class SpectrumView(QtWidgets.QWidget):
         x, y = self._curve_xy()
         self._curve.setData(x, y)
         self._redraw_overlay()
+        self._redraw_window()
         self._apply_log()
+
+    def _trace_xy(
+        self, data: tuple[np.ndarray, np.ndarray]
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """An auxiliary trace re-oriented for the current x mode."""
+        frequency, values = data
+        if self._x_mode == "period":
+            with np.errstate(divide="ignore"):
+                return (1.0 / frequency)[::-1], values[::-1]
+        return frequency, values
 
     def _redraw_overlay(self) -> None:
         """Re-place the second trace for the current x mode, or hide it."""
         if self._overlay_xy is None or not self._show_residual.isChecked():
             self._overlay.setVisible(False)
             return
-        frequency, values = self._overlay_xy
-        if self._x_mode == "period":
-            with np.errstate(divide="ignore"):
-                x = (1.0 / frequency)[::-1]
-            y = values[::-1]
-        else:
-            x, y = frequency, values
+        x, y = self._trace_xy(self._overlay_xy)
         self._overlay.setData(x, y)
         self._overlay.setVisible(True)
+
+    def _redraw_window(self) -> None:
+        """Re-place the spectral-window trace for the current x mode, or hide it."""
+        if self._window_xy is None or not self._show_window.isChecked():
+            self._window_curve.setVisible(False)
+            return
+        x, y = self._trace_xy(self._window_xy)
+        self._window_curve.setData(x, y)
+        self._window_curve.setVisible(True)
 
     def _selected_index(self) -> int | None:
         """Index into :attr:`_peaks` matching the current selection, if any."""
@@ -551,6 +623,12 @@ class SpectrumView(QtWidgets.QWidget):
     def _crosshair_pen(self) -> object:
         return pg.mkPen(self._pal.muted, width=1, style=Qt.PenStyle.DashLine)
 
+    def _window_pen(self) -> object:
+        return pg.mkPen(
+            self._pal.qcolor(self._pal.muted, 200), width=1,
+            style=Qt.PenStyle.DashLine,
+        )
+
     def apply_theme(self, theme_palette: ThemePalette) -> None:
         """Re-pen the plot items for a new theme (live re-skin)."""
         self._pal = theme_palette
@@ -558,6 +636,7 @@ class SpectrumView(QtWidgets.QWidget):
         self._overlay.setPen(
             pg.mkPen(theme_palette.qcolor(theme_palette.accent, 220), width=1)
         )
+        self._window_curve.setPen(self._window_pen())
         band_brush = pg.mkBrush(theme_palette.qcolor(theme_palette.accent, 45))
         self._sel_band.setBrush(band_brush)
         band_pen = pg.mkPen(theme_palette.qcolor(theme_palette.accent, 170), width=1)

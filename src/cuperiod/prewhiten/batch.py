@@ -166,8 +166,9 @@ def batch_prewhiten(
         curves or ``(key, lc)`` pairs, a glob string, a directory, or a
         ``(DataFrame, group_column)`` tuple.
     settings : PreWhitenSettings, optional
-        Extraction settings applied to every light curve. Batch runs usually want
-        ``store_spectra=False`` (the default keeps full spectra, which are large).
+        Extraction settings applied to every light curve. ``store_spectra`` is forced
+        off — catalogue rows never carry spectra, so keeping them would only waste
+        worker memory.
     backend : str, default "auto"
         Amplitude-spectrum backend.
     device : {"cpu", "gpu"}, default "cpu"
@@ -197,8 +198,12 @@ def batch_prewhiten(
     """
     if device not in {"cpu", "gpu"}:
         raise ValueError("device must be 'cpu' or 'gpu'")
+    # Catalogue rows never carry spectra, so keeping them would only make each worker
+    # hold (and ship nothing from) megabytes of grid arrays per star: force them off.
     cfg = _ChunkConfig(
-        settings=settings or PreWhitenSettings(store_spectra=False),
+        settings=(settings or PreWhitenSettings()).model_copy(
+            update={"store_spectra": False}
+        ),
         backend="gpu" if device == "gpu" else backend,
         columns=columns,
         domain=domain,

@@ -25,7 +25,7 @@ unresolved modes), so the *effective* number of independent samples is smaller t
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 
@@ -142,6 +142,7 @@ def bootstrap_uncertainties(
     seed: int = 0,
     refine: Refinement = "cyclic",
     sweeps: int = 1,
+    frequency_bounds: tuple[Any, Any] | None = None,
 ) -> tuple[FloatArray, FloatArray, FloatArray]:
     """Residual-resampling bootstrap errors for a fitted solution.
 
@@ -167,7 +168,14 @@ def bootstrap_uncertainties(
     seed : int, default 0
         Seed for the resampling RNG (results are reproducible).
     refine, sweeps
-        Refinement policy for the replicate fits.
+        Refinement policy for the replicate fits. ``"none"`` and ``"last"`` are
+        extraction-loop policies that pin some or all frequencies, which would report
+        exactly zero frequency scatter for the pinned components — they are promoted to
+        a full ``"cyclic"`` sweep here.
+    frequency_bounds : (lower, upper), optional
+        Per-frequency refinement boxes for the replicate fits (see
+        :func:`~cuperiod.prewhiten.fit.fit_multisine`). Keeps a replicate from sliding
+        onto a close neighbour, exactly as in the fit being characterised.
 
     Returns
     -------
@@ -178,6 +186,7 @@ def bootstrap_uncertainties(
     if k == 0 or n_resamples < 2:
         empty = np.full(k, np.nan, dtype=np.float64)
         return empty, empty.copy(), empty.copy()
+    policy: Refinement = "cyclic" if refine in {"none", "last"} else refine
     t = np.asarray(time, dtype=np.float64)
     model = fit.model(t)
     residuals = np.asarray(fit.residuals, dtype=np.float64)
@@ -194,8 +203,9 @@ def bootstrap_uncertainties(
             fit.frequency,
             fit_mean=fit.fit_mean,
             t_ref=fit.t_ref,
-            refine=refine,
+            refine=policy,
             sweeps=sweeps,
+            frequency_bounds=frequency_bounds,
             covariance=False,
         )
         freqs[i] = replicate.frequency
@@ -220,6 +230,7 @@ def component_uncertainties(
     seed: int = 0,
     refine: Refinement = "cyclic",
     sweeps: int = 1,
+    frequency_bounds: tuple[Any, Any] | None = None,
 ) -> Uncertainties:
     """Per-component 1-sigma errors by the requested estimator.
 
@@ -236,8 +247,8 @@ def component_uncertainties(
     correlation_correction : bool, default True
         Multiply the errors by ``sqrt(D)`` with ``D`` from :func:`correlation_factor`.
         Never applied to the bootstrap, which already samples the residuals as they are.
-    n_resamples, seed, refine, sweeps
-        Bootstrap controls.
+    n_resamples, seed, refine, sweeps, frequency_bounds
+        Bootstrap controls (see :func:`bootstrap_uncertainties`).
 
     Returns
     -------
@@ -254,6 +265,7 @@ def component_uncertainties(
         sigma_f, sigma_a, sigma_phase = bootstrap_uncertainties(
             time, error, fit,
             n_resamples=n_resamples, seed=seed, refine=refine, sweeps=sweeps,
+            frequency_bounds=frequency_bounds,
         )
     else:
         sigma_f = fit.frequency_error

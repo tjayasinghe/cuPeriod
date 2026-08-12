@@ -74,6 +74,11 @@ still admits roughly 0.2 spurious frequencies per light curve. For catalogue wor
 to `stop_criteria`, which control the false-alarm rate directly.
 :::
 
+The false-alarm probability is evaluated natively from Baluev's (2008) closed form —
+matching astropy's `false_alarm_probability(method="baluev")` while staying accurate for
+raw Julian dates — and every component's value is reported whether or not `"fap"` is a
+stopping criterion. It is also available directly as {func}`~cuperiod.baluev_fap`.
+
 After the loop, the accepted solution is polished with one simultaneous fit of all
 frequencies and then **re-checked**: the joint fit redistributes power between close
 components, so a frequency that cleared the threshold when it was extracted can end up
@@ -95,7 +100,8 @@ Reported errors are 1-sigma and come from one of three estimators, set by `uncer
 
 `"bootstrap"`
 : Resample the residuals, re-fit `n_resamples` times, take the scatter. No linearity
-  assumption, at the price of that many extra fits.
+  assumption, at the price of that many extra fits. Every replicate re-optimises *all*
+  frequencies, boxed by the same per-frequency bounds as the fit it characterises.
 
 All three are inflated by `sqrt(D)` with `D` the Schwarzenberg-Czerny (1991) correlation
 factor (`correlation_correction`, on by default), because real photometry has residuals
@@ -129,6 +135,30 @@ fall inside `max(3σ, 0.25/T)` where σ is the **propagated** uncertainty of the
 combination. Each identification also carries `expected_false`, the number of chance
 matches expected for the coefficient vectors that were searched — if that approaches 1,
 the identification means nothing, and you should know that without having to work it out.
+
+## The spectral window
+
+Irregular sampling convolves every real peak with the **spectral window**
+`W(f) = Σ wⱼ exp(2πi f tⱼ)` of the observation times, so a candidate sitting where a
+stronger component's window has a lobe — classically at ±1 c/d for single-site
+ground-based data — deserves suspicion before it is called a mode.
+
+```python
+solution.window                 # AmplitudeSpectrum of |W(f)|, kept with the spectra
+
+grid = cup.uniform_frequency_grid(t.max() - t.min(), maximum_frequency=5.0)
+window = cup.spectral_window(t, dy, grid=grid)   # standalone, no brightness needed
+```
+
+`|W(f)|` is dimensionless with `|W| → 1` towards zero frequency. To vet a doubtful pair,
+compare the residual spectrum around the weaker peak with the window displaced to the
+stronger frequency: if the peak reproduces a window lobe in position *and* relative
+height, it is the sampling talking. The GUI's spectrum view has a *window* toggle that
+overlays it scaled to the tallest peak (the Period04 convention), and
+`cuperiod prewhiten --save-spectrum` writes it into the `.npz` alongside the spectra.
+
+Keeping the window costs nothing: its sums are already part of the cached normal
+equations that make each pre-whitening iteration a single NUFFT.
 
 ## g-mode period spacings
 
@@ -212,6 +242,7 @@ Every field of {class}`~cuperiod.PreWhitenSettings` is documented in the
 ## References
 
 - Breger, M., et al. 1993, A&A 271, 482 — the S/N ≥ 4 criterion.
+- Baluev, R. V. 2008, MNRAS 385, 1279 — the false-alarm probability bound.
 - Loumos, G. L., & Deeming, T. J. 1978, Ap&SS 56, 285 — frequency resolution.
 - Schwarzenberg-Czerny, A. 1991, MNRAS 253, 198 — correlated residuals.
 - Montgomery, M. H., & O'Donoghue, D. 1999, DSSN 13, 28 — analytic uncertainties.

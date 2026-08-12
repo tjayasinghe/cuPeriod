@@ -56,6 +56,7 @@ from cuperiod.prewhiten import (
     SpacingSpectrum,
     SpectrumEngine,
     amplitude_spectrum,
+    baluev_fap,
     batch_prewhiten,
     buoyancy_radius,
     echelle,
@@ -64,6 +65,7 @@ from cuperiod.prewhiten import (
     identify_combinations,
     prewhiten,
     spacing_spectrum,
+    spectral_window,
 )
 
 try:
@@ -108,6 +110,7 @@ __all__ = [
     "UnknownMethodError",
     "__version__",
     "amplitude_spectrum",
+    "baluev_fap",
     "batch_periodograms",
     "batch_prewhiten",
     "best_periods",
@@ -125,6 +128,7 @@ __all__ = [
     "periodogram",
     "prewhiten",
     "spacing_spectrum",
+    "spectral_window",
     "suggest_gpu_workers",
     "to_input",
     "uniform_frequency_grid",

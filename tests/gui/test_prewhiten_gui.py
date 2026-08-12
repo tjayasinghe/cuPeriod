@@ -269,6 +269,38 @@ def test_spectrum_view_overlays_the_residual_spectrum(qtbot: QtBot) -> None:
     assert view._overlay_xy is None
 
 
+def test_spectrum_view_offers_the_spectral_window(qtbot: QtBot) -> None:
+    from cuperiod.core.result import Periodogram
+
+    view = SpectrumView()
+    qtbot.addWidget(view)
+    solution = _solution()
+    assert solution.spectrum is not None and solution.window is not None
+    wrapped = Periodogram.from_spectrum(
+        method=PREWHITEN_METHOD,
+        backend=solution.backend,
+        frequency=solution.spectrum.frequency,
+        power=solution.spectrum.amplitude,
+        objective_sense="max",
+        n_samples=solution.n_samples,
+        baseline=solution.baseline,
+    )
+    view.set_periodogram(wrapped)
+    scale = float(np.max(solution.spectrum.amplitude))
+    view.set_window(
+        solution.window.frequency, solution.window.amplitude, scale=scale
+    )
+    # Off by default: the window is a diagnostic the user opts into.
+    assert not view._window_curve.isVisible()
+    view._show_window.setChecked(True)
+    assert view._window_curve.isVisible()
+    assert view._window_xy is not None
+    # Scaled to the tallest peak, so it shares the spectrum's amplitude axis.
+    assert np.max(view._window_xy[1]) <= scale * (1.0 + 1e-9)
+    view.set_periodogram(wrapped)  # a new result drops the stale window
+    assert view._window_xy is None and not view._window_curve.isVisible()
+
+
 # --- regressions -------------------------------------------------------------
 
 

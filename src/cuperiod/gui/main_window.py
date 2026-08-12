@@ -524,7 +524,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _show_solution_spectrum(self, result: PreWhitenResult) -> None:
-        """Draw the amplitude spectrum, the residual overlay, and the components.
+        """Draw the amplitude spectrum, its overlays, and the components.
 
         The pre-whitening result is wrapped in a :class:`Periodogram` so it flows
         through the existing spectrum view unchanged — full-resolution rendering, the
@@ -549,6 +549,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if result.residual_spectrum is not None:
             self._spectrum.set_overlay(
                 result.residual_spectrum.frequency, result.residual_spectrum.amplitude
+            )
+        if result.window is not None:
+            # Scaled to the tallest peak, Period04-style: |W| itself tops out at 1.
+            scale = (
+                float(spectrum.amplitude.max()) if spectrum.amplitude.size else 1.0
+            )
+            self._spectrum.set_window(
+                result.window.frequency, result.window.amplitude, scale=scale
             )
         peaks = [
             Peak(

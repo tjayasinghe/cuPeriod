@@ -179,11 +179,13 @@ def test_spectrum_export_csv_writes_expected_columns(qtbot: QtBot, tmp_path) -> 
 
 
 def test_spectrum_reset_button_label(qtbot: QtBot) -> None:
+    # "Reset", not "Reset view": with the pre-whitening overlay toggles shown the
+    # longer label pushed the toolbar past the dock width and Qt squeezed the buttons.
     view = SpectrumView("dark")
     qtbot.addWidget(view)
     buttons = view.findChildren(QtWidgets.QPushButton)
     labels = [b.text() for b in buttons]
-    assert "Reset view" in labels
+    assert "Reset" in labels
 
 
 def test_spectrum_selected_marker_is_highlighted(qtbot: QtBot) -> None:

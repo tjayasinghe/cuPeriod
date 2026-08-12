@@ -177,6 +177,21 @@ def test_bootstrap_errors_agree_with_the_covariance() -> None:
     assert np.all(sigma_phase > 0.0)
 
 
+def test_bootstrap_promotes_frequency_pinning_policies_to_a_full_sweep() -> None:
+    # Regression: "none" pins every frequency and "last" pins all but the newest, so a
+    # replicate fit under either policy returns the start frequencies verbatim and the
+    # bootstrap scatter collapses to exactly zero for the pinned components.
+    time, value, error = _two_mode(n=600, noise=0.002)
+    fit = fit_multisine(
+        time, value, error, np.array([12.34, 17.81]), refine="simultaneous"
+    )
+    for policy in ("none", "last"):
+        sigma_f, _, _ = bootstrap_uncertainties(
+            time, error, fit, n_resamples=24, seed=3, refine=policy
+        )
+        assert np.all(sigma_f > 0.1 * fit.frequency_error), policy
+
+
 def test_component_uncertainties_apply_the_correlation_correction() -> None:
     time, value, error = _two_mode()
     fit = fit_multisine(time, value, error, np.array([12.34, 17.81]))

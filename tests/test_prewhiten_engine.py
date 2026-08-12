@@ -218,6 +218,19 @@ def test_store_spectra_false_drops_the_big_arrays() -> None:
         (time, value, error), settings=_settings(store_spectra=False, max_frequencies=1)
     )
     assert solution.spectrum is None and solution.residual_spectrum is None
+    assert solution.window is None
+
+
+def test_solution_carries_the_spectral_window() -> None:
+    time, value, error = synthetic_pulsator(n=400)
+    solution = prewhiten((time, value, error), settings=_settings(max_frequencies=1))
+    assert solution.window is not None
+    assert solution.spectrum is not None
+    assert np.array_equal(solution.window.frequency, solution.spectrum.frequency)
+    assert np.all(solution.window.amplitude <= 1.0 + 1e-12)
+    # |W| -> 1 towards zero frequency; the grid starts at 1/T where it is already low,
+    # but it must never exceed 1 and must peak below the lowest trial frequency's lobe.
+    assert float(solution.window.amplitude.max()) <= 1.0 + 1e-12
 
 
 def test_backend_argument_overrides_the_setting() -> None:
@@ -239,6 +252,22 @@ def test_uncertainty_estimators_are_all_selectable() -> None:
         )
         assert solution.uncertainty_method == method
         assert solution.components[0].frequency_error > 0.0
+
+
+def test_bootstrap_errors_are_nonzero_for_every_component() -> None:
+    # Regression: the engine hands its per-iteration policy (default "last") to the
+    # bootstrap; the replicate fits then pinned every frequency except the newest, so
+    # all established components reported sigma_f == 0 exactly. The bootstrap must
+    # scatter *every* frequency, and roughly as much as the covariance says.
+    time, value, error = synthetic_pulsator(n=800, span=25.0)
+    boot = prewhiten(
+        (time, value, error),
+        settings=_settings(uncertainty="bootstrap", n_resamples=24),
+    )
+    cova = prewhiten((time, value, error), settings=_settings())
+    assert boot.n_components == cova.n_components >= 2
+    assert np.all(boot.frequency_error > 0.1 * cova.frequency_error)
+    assert np.all(boot.frequency_error < 10.0 * cova.frequency_error)
 
 
 def test_harmonic_is_flagged_as_a_combination() -> None:

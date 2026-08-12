@@ -13,6 +13,7 @@ from cuperiod.prewhiten.spectrum import (
     amplitude_spectrum,
     noise_level,
     resolve_spectrum_backend,
+    spectral_window,
     weighted_epoch,
 )
 from synth import synthetic_pulsator
@@ -143,6 +144,78 @@ def test_noise_level_widens_a_box_that_is_too_narrow() -> None:
     value = noise_level(frequency, amplitude, 5.0, window=0.01, min_samples=25)
     assert np.isfinite(value)
     assert value == pytest.approx(np.mean(amplitude[38:63]), rel=1e-9)
+
+
+# --- the spectral window -------------------------------------------------------
+
+
+def test_window_matches_the_direct_sum_definition() -> None:
+    time, _, error = _curve()
+    grid = _grid(time)
+    engine = SpectrumEngine(time, error, grid=grid, backend="numpy")
+    window = engine.window()
+    weight = 1.0 / error**2
+    weight = weight / weight.sum()
+    dt = time - engine.t_ref
+    for index in range(0, grid.size, 29):
+        w_f = np.sum(weight * np.exp(2j * np.pi * grid.values[index] * dt))
+        assert window.amplitude[index] == pytest.approx(abs(w_f), abs=1e-12)
+    assert np.all(window.amplitude <= 1.0 + 1e-12)
+    assert np.array_equal(window.power, window.amplitude**2)
+
+
+def test_window_peaks_at_the_sampling_alias() -> None:
+    # Perfectly regular sampling at dt = 0.05 d puts an exact alias at 20 c/d: the
+    # window there is 1, and it is small away from the aliases.
+    time = 0.05 * np.arange(400)
+    grid = uniform_frequency_grid(
+        float(time.max()), maximum_frequency=22.0, minimum_frequency=0.5,
+        samples_per_peak=5,
+    )
+    window = spectral_window(time, grid=grid)
+    alias = int(np.argmin(np.abs(window.frequency - 20.0)))
+    # The nearest grid sample sits a fraction of a Rayleigh width off the exact alias.
+    assert window.amplitude[alias] > 0.99
+    assert window.refine_peak(alias)[1] == pytest.approx(1.0, abs=1e-3)
+    midway = int(np.argmin(np.abs(window.frequency - 10.0)))
+    assert window.amplitude[midway] < 0.05
+
+
+def test_nightly_gaps_put_sidelobes_at_one_cycle_per_day() -> None:
+    # Single-site ground-based sampling: observations only during a fraction of each
+    # night alias every peak at +/- 1 c/d, which is the classic reason to look at the
+    # window before believing a close pair.
+    rng = np.random.default_rng(3)
+    time = np.sort(
+        np.concatenate([day + rng.uniform(0.0, 0.3, 12) for day in range(25)])
+    )
+    grid = uniform_frequency_grid(
+        float(time.max() - time.min()), maximum_frequency=3.0,
+        minimum_frequency=0.05, samples_per_peak=10,
+    )
+    window = spectral_window(time, grid=grid)
+    lobe = int(np.argmin(np.abs(window.frequency - 1.0)))
+    assert window.amplitude[lobe] > 0.5
+    assert np.all(window.amplitude <= 1.0 + 1e-12)
+
+
+def test_window_is_identical_for_lsq_and_dft_engines() -> None:
+    # The window is a property of sampling and weights alone; the amplitude
+    # normalization must not touch it (the dft engine just computes it lazily).
+    time, _, error = _curve()
+    grid = _grid(time)
+    lsq = SpectrumEngine(time, error, grid=grid, backend="numpy")
+    dft = SpectrumEngine(time, error, grid=grid, backend="numpy",
+                         normalization="dft")
+    assert np.allclose(lsq.window().amplitude, dft.window().amplitude, atol=1e-14)
+
+
+def test_window_backends_agree() -> None:
+    time, _, error = _curve()
+    grid = _grid(time)
+    direct = spectral_window(time, error, grid=grid, backend="numpy")
+    nufft = spectral_window(time, error, grid=grid, backend="finufft")
+    assert np.max(np.abs(direct.amplitude - nufft.amplitude)) < 1e-9
 
 
 def test_weighted_epoch_decorrelates_phase_from_frequency() -> None:

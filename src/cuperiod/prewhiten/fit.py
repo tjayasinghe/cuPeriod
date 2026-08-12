@@ -159,8 +159,11 @@ def _split_linear(
 class _VarPro:
     """Variable-projection residual/Jacobian for the frequencies of a multi-sine fit.
 
-    ``fun`` and ``jac`` share one evaluation per parameter vector, so a Jacobian costs
-    nothing extra once the residual has been formed at the same frequencies.
+    The residual and the Jacobian are cached per parameter vector, and the Jacobian is
+    built *lazily*: the residual costs one multi-column least-squares solve, the
+    Jacobian projection a second, ``K``-column one, and a trust-region step the
+    optimiser rejects only ever asks for the residual — so rejected steps (frequent in
+    tightly bounded fits near close pairs) never pay for derivatives.
     """
 
     def __init__(
@@ -171,6 +174,10 @@ class _VarPro:
         self._sw = sw
         self._fit_mean = fit_mean
         self._key: bytes | None = None
+        self._jac_key: bytes | None = None
+        self._design: FloatArray = np.zeros((0, 0), dtype=np.float64)
+        self._design_w: FloatArray = np.zeros((0, 0), dtype=np.float64)
+        self._beta: FloatArray = np.zeros(0, dtype=np.float64)
         self._residual: FloatArray = np.zeros(0, dtype=np.float64)
         self._jacobian: FloatArray = np.zeros((0, 0), dtype=np.float64)
 
@@ -178,21 +185,11 @@ class _VarPro:
         key = np.ascontiguousarray(freqs, dtype=np.float64).tobytes()
         if key == self._key:
             return
-        k = int(freqs.size)
-        n = int(self._dt.size)
         design = _design(self._dt, freqs, self._fit_mean)
         design_w = design * self._sw[:, None]
         beta = _solve(design_w, self._yw)
         self._residual = self._yw - design_w @ beta
-        a, b, _ = _split_linear(beta, k, self._fit_mean)
-        # d/df_k of the k-th component: 2*pi*dt * (b_k cos - a_k sin).
-        deriv = np.empty((n, k), dtype=np.float64)
-        scaled_dt = (_TWO_PI * self._dt) * self._sw
-        for j in range(k):
-            deriv[:, j] = scaled_dt * (
-                b[j] * design[:, 2 * j] - a[j] * design[:, 2 * j + 1]
-            )
-        self._jacobian = -(deriv - design_w @ _solve(design_w, deriv))
+        self._design, self._design_w, self._beta = design, design_w, beta
         self._key = key
 
     def fun(self, freqs: FloatArray) -> FloatArray:
@@ -203,6 +200,21 @@ class _VarPro:
     def jac(self, freqs: FloatArray) -> FloatArray:
         """Kaufman variable-projection Jacobian at ``freqs``."""
         self._evaluate(freqs)
+        if self._jac_key != self._key:
+            k = (self._design.shape[1] - (1 if self._fit_mean else 0)) // 2
+            n = int(self._dt.size)
+            a, b, _ = _split_linear(self._beta, k, self._fit_mean)
+            # d/df_k of the k-th component: 2*pi*dt * (b_k cos - a_k sin).
+            deriv = np.empty((n, k), dtype=np.float64)
+            scaled_dt = (_TWO_PI * self._dt) * self._sw
+            for j in range(k):
+                deriv[:, j] = scaled_dt * (
+                    b[j] * self._design[:, 2 * j] - a[j] * self._design[:, 2 * j + 1]
+                )
+            self._jacobian = -(
+                deriv - self._design_w @ _solve(self._design_w, deriv)
+            )
+            self._jac_key = self._key
         return self._jacobian
 
 

@@ -135,6 +135,9 @@ class PreWhitenResult:
     spectrum, residual_spectrum : AmplitudeSpectrum or None
         Amplitude spectra of the original data and of the residuals (``None`` when the
         run was told not to keep them, as in batch mode).
+    window : AmplitudeSpectrum or None
+        The spectral window ``|W(f)|`` of the sampling, for alias diagnosis (``None``
+        when spectra are not kept).
     meta : Mapping
         Free-form metadata carried from the light curve.
     """
@@ -160,6 +163,7 @@ class PreWhitenResult:
     backend: str
     spectrum: AmplitudeSpectrum | None = None
     residual_spectrum: AmplitudeSpectrum | None = None
+    window: AmplitudeSpectrum | None = None
     meta: Mapping[str, Any] = field(default_factory=dict)
 
     # -- convenience views -------------------------------------------------------

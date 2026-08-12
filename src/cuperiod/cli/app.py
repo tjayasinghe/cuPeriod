@@ -295,6 +295,8 @@ def prewhiten(
             arrays["amplitude"] = result.spectrum.amplitude
         if result.residual_spectrum is not None:
             arrays["residual_amplitude"] = result.residual_spectrum.amplitude
+        if result.window is not None:
+            arrays["window_amplitude"] = result.window.amplitude
         np.savez_compressed(save_spectrum, **arrays)  # type: ignore[arg-type]
         typer.echo(f"Wrote {save_spectrum}")
 

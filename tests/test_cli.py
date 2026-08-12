@@ -136,7 +136,10 @@ def test_prewhiten_command_saves_spectra(tmp_path: Path) -> None:
     )
     assert result.exit_code == 0, result.output
     with np.load(npz) as data:
-        assert {"frequency", "amplitude", "residual_amplitude"} <= set(data)
+        assert {
+            "frequency", "amplitude", "residual_amplitude", "window_amplitude"
+        } <= set(data)
+        assert np.all(data["window_amplitude"] <= 1.0 + 1e-12)
 
 
 def test_prewhiten_command_reports_a_period_spacing(tmp_path: Path) -> None:

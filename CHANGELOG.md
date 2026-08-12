@@ -52,6 +52,17 @@ All notable changes to cuPeriod are documented here. The format is based on
   directory sinks.
 - **CLI**: `cuperiod prewhiten` (with `--spacing`, JSON/CSV/npz output) and
   `cuperiod batch-prewhiten`.
+- **The spectral window as a first-class diagnostic**: `SpectrumEngine.window()`,
+  {func}`cuperiod.spectral_window`, and `PreWhitenResult.window` expose `|W(f)|` of the
+  sampling — the alias-lobe pattern every real peak is convolved with — at zero extra
+  transforms (its sums are already part of the cached normal equations). The GUI
+  spectrum view gains a *window* overlay toggle (scaled to the tallest peak,
+  Period04-style) and `cuperiod prewhiten --save-spectrum` writes it into the `.npz`.
+- **A native Baluev (2008) false-alarm probability** ({func}`cuperiod.baluev_fap`)
+  matching astropy's `false_alarm_probability(method="baluev")` to machine precision on
+  centred times — and staying accurate on raw Julian dates, where the one-pass time
+  variance loses ~11 digits. Pre-whitening no longer imports `astropy.timeseries`,
+  which was ~1 s of first-solution latency in the CLI/GUI and per batch worker.
 - **GUI**: an **Analysis** picker switches the desktop app between *Periodogram* and
   *Pre-whitening* without disturbing anything else — same inputs, same spectrum, phased
   and raw views, same source browser, same off-thread compute and result caching. In
@@ -66,6 +77,13 @@ All notable changes to cuPeriod are documented here. The format is based on
 
 - `cuperiod.gui.models.ResultCache` is now generic over its value type, so the app keeps
   one cache per analysis and switching back and forth is instant.
+- **Bootstrap frequency errors were exactly zero for every component but the newest.**
+  The engine handed its per-iteration refinement policy (default `"last"`, which pins
+  all established frequencies) to the bootstrap's replicate fits, so their scatter
+  collapsed. Replicates now always sweep every frequency, boxed by the same
+  per-frequency bounds as the fit they characterise.
+- `batch_prewhiten` forces `store_spectra=False`: catalogue rows never carry spectra,
+  so keeping them only made each worker hold megabytes of grid arrays per star.
 
 ## [1.1.0] - 2026-07-08
 

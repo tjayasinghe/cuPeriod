@@ -49,8 +49,10 @@ required.
 5. **Switch **Analysis** to *Pre-whitening*** and press **Run pre-whitening**. The
    spectrum becomes the amplitude spectrum with the residual spectrum overlaid and every
    extracted component marked; the **Frequencies** dock lists them with uncertainties and
-   S/N. Click a row to fold on it. For a g-mode star, the **Period spacing** tab scans for
-   a regular spacing and draws the échelle diagram.
+   S/N. Click a row to fold on it. The **window** checkbox overlays the sampling's
+   spectral window (scaled to the tallest peak) — a component sitting on another's window
+   lobe is likely an alias. For a g-mode star, the **Period spacing** tab scans for a
+   regular spacing and draws the échelle diagram.
 6. **Toggle the theme** (dark ↔ light — remembered next launch). With `[gpu]`/`[torch]`
    installed, the info bar names the backend and device actually used.
 

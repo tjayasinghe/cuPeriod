@@ -46,6 +46,8 @@ follow it (see {doc}`../guide/prewhitening`).
    fit_multisine
    MultiSineFit
    amplitude_spectrum
+   spectral_window
+   baluev_fap
    AmplitudeSpectrum
    SpectrumEngine
    find_period_spacing
