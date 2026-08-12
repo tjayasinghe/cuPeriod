@@ -137,6 +137,20 @@ The result is identical to floating-point round-off; the GPU just computes it fa
 large grids and big catalogs. On a non-NVIDIA GPU (AMD, Intel, or Apple), install the
 `[torch]` extra and use `backend="torch"` instead. See {doc}`guide/backends`.
 
+## Analysing a pulsator
+
+A multiperiodic star needs the whole frequency solution, not one best period:
+
+```python
+solution = cup.prewhiten((t, mag, err))
+print(solution.summary())
+print(solution.frequency, solution.frequency_error)
+```
+
+The extraction stops on a stated criterion (`solution.stop_reason`), reports 1-sigma
+uncertainties on every frequency, amplitude and phase, and flags components that are
+combinations of stronger ones. See {doc}`guide/prewhitening`.
+
 ## From the command line
 
 The same machinery is a CLI. Given a file `star.csv`:

@@ -27,6 +27,35 @@ The two functions most users need, plus their helpers.
    to_input
 ```
 
+## Pre-whitening
+
+Automated frequency extraction for pulsators, and the g-mode period-spacing tools that
+follow it (see {doc}`../guide/prewhitening`).
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   prewhiten
+   batch_prewhiten
+   PreWhitenResult
+   Sinusoid
+   Combination
+   identify_combinations
+   fit_multisine
+   MultiSineFit
+   amplitude_spectrum
+   AmplitudeSpectrum
+   SpectrumEngine
+   find_period_spacing
+   PeriodSpacingSeries
+   spacing_spectrum
+   SpacingSpectrum
+   echelle
+   buoyancy_radius
+```
+
 ## Light curves & inputs
 
 Containers for the data, and the column/domain mapping that ingests heterogeneous tables.
@@ -72,6 +101,8 @@ Per-method tuning models (see {doc}`../guide/tuning`).
    MHAOVSettings
    StringLengthSettings
    TLSSettings
+   PreWhitenSettings
+   SpacingSettings
    BatchSettings
 ```
 

@@ -51,6 +51,11 @@ tuning, multi-band, batch, and the CLI.
 resumable across runs.
 :::
 
+:::{grid-item-card} 🎵 Analyse a pulsator
+{doc}`Automated pre-whitening <guide/prewhitening>` extracts a δ Scuti or γ Dor
+frequency solution with uncertainties, combination frequencies, and period spacings.
+:::
+
 :::{grid-item-card} 🔬 Trust the numbers
 The {doc}`benchmarks` page shows parity, period recovery, and speedups on real
 survey data.
@@ -77,6 +82,12 @@ you drag across peaks — `pip install "cuperiod[gui]"`, then `cuperiod-gui`.
 
 All seven share one API, one CLI, and the full single/batch machinery. See
 {doc}`guide/methods` for a decision guide.
+
+Multiperiodic pulsators need more than a single best period. {func}`cuperiod.prewhiten`
+extracts the whole frequency solution — iterative sinusoid fitting with principled
+stopping criteria, propagated uncertainties, combination-frequency identification, and
+g-mode period-spacing tools — over the same inputs and backends. See
+{doc}`guide/prewhitening`.
 
 ## Install
 
@@ -108,6 +119,7 @@ guide/methods
 guide/results
 guide/backends
 guide/tuning
+guide/prewhitening
 guide/multiband
 guide/batch
 guide/cli

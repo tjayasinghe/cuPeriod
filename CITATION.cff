@@ -8,7 +8,9 @@ abstract: >-
   acceleration beyond NVIDIA to AMD (ROCm), Intel (XPU), and Apple (MPS) hardware, and a
   multi-threaded numba CPU tier gives every method a fast backend even without a GPU. An
   optional PySide6 desktop GUI provides an interactive periodogram explorer over the same
-  API.
+  API. For classical pulsators it also performs automated, uncertainty-aware
+  pre-whitening: iterative sinusoid extraction with principled stopping criteria, error
+  propagation, combination-frequency identification, and g-mode period-spacing tools.
 type: software
 authors:
   - given-names: Tharindu

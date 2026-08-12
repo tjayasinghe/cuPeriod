@@ -5,12 +5,14 @@ Python API, so the CLI and library share one code path and give identical result
 `cuperiod --help` (or `cuperiod <command> --help`) for the full option list.
 
 ```text
-cuperiod run         one light curve, one or more methods → prints the best periods
-cuperiod batch       many light curves with CPU or GPU workers → Parquet/CSV
-cuperiod methods     list registered methods and their backends
-cuperiod gpu-info    show the CUDA GPU and suggested worker counts
-cuperiod doctor      diagnose backends, torch devices, and the precision each uses
-cuperiod grid-info   show a method's trial grid for a light curve (no compute)
+cuperiod run              one light curve, one or more methods → best periods
+cuperiod batch            many light curves with CPU or GPU workers → Parquet/CSV
+cuperiod prewhiten        extract a pulsator's frequency solution
+cuperiod batch-prewhiten  the same over many light curves → Parquet/CSV
+cuperiod methods          list registered methods and their backends
+cuperiod gpu-info         show the CUDA GPU and suggested worker counts
+cuperiod doctor           diagnose backends, torch devices, and precision
+cuperiod grid-info        show a method's trial grid for a light curve (no compute)
 ```
 
 :::{tip}
@@ -90,6 +92,54 @@ row per light curve. Key options:
 ```
 
 A directory sink is resumable — re-running skips finished chunks. See {doc}`batch`.
+
+## `prewhiten` — a pulsator's frequency solution
+
+```bash
+cuperiod prewhiten star.csv --snr 4.6 -n 30 --spacing --csv modes.csv
+```
+
+Runs the automated extraction loop of {doc}`prewhitening` and prints the ranked
+components with their uncertainties and signal-to-noise, followed by the reason the run
+stopped.
+
+```{list-table}
+:header-rows: 1
+:widths: 30 70
+
+* - Option
+  - Meaning
+* - `--max-frequencies`, `-n`
+  - Cap on extracted components (default 30).
+* - `--snr`
+  - Breger signal-to-noise threshold (default 4.0).
+* - `--stop`
+  - Comma-separated criteria: `snr`, `fap`, `bic`, `amplitude`.
+* - `--fmin` / `--fmax`
+  - Search band in cycles/day (default `1/T` to pseudo-Nyquist).
+* - `--uncertainty`
+  - `covariance` | `analytic` | `bootstrap`.
+* - `--combinations / --no-combinations`
+  - Identify harmonics and combination frequencies (default on).
+* - `--spacing`
+  - Also search the independent modes for a g-mode period-spacing pattern.
+* - `--backend`
+  - `auto` | `cpu` | `gpu` | a concrete backend name.
+* - `--out` / `--csv` / `--save-spectrum`
+  - Write the full solution as JSON, the component table as CSV, and/or the
+    amplitude spectra as `.npz`.
+```
+
+## `batch-prewhiten` — many pulsators
+
+```bash
+cuperiod batch-prewhiten "lcs/*.csv" --out modes.parquet --workers 8 -n 20
+```
+
+Takes the same inputs and worker options as `batch`, and the same extraction options as
+`prewhiten`. The output has **one row per extracted component**, each carrying the
+per-star summary (sample count, baseline, stop reason, fit statistics) so a single table
+is self-describing.
 
 ## `methods` — what's available
 

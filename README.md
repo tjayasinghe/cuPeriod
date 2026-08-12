@@ -51,6 +51,11 @@ Every implementation is validated against the standard reference (astropy
 - **Seven methods, one API.** GLS, BLS, PDM, CE, String-Length, MHAOV, and TLS share one
   entry point, one CLI, and an optional desktop GUI, with frictionless column handling and
   multi-band support.
+- **Pulsators get a frequency solution, not just a period.** `prewhiten` automates the
+  whole Period04-style loop — GPU/NUFFT amplitude spectrum, iterative sinusoid extraction,
+  simultaneous re-fitting, principled stopping criteria, propagated uncertainties,
+  combination-frequency identification, and g-mode period-spacing tools — for one star or
+  a million.
 
 ## Status
 
@@ -141,6 +146,25 @@ device: `backend="torch"` (best device present) or `"torch:cpu"` / `"torch:cuda"
 `"torch:mps"` / `"torch:xpu"`. On Apple MPS (no float64) it uses float32; `precision="auto"`
 keeps float64 everywhere else.
 
+## Pre-whitening a pulsator
+
+```python
+solution = cup.prewhiten((time, mag, mag_err))
+print(solution.summary())        # ranked frequencies with 1-sigma uncertainties and S/N
+
+for c in solution.components:
+    print(c.label, c.frequency, c.frequency_error, c.snr, c.combination)
+
+series = cup.find_period_spacing(  # gamma Dor / SPB g-mode pattern
+    [c.period for c in solution.independent()],
+    [c.amplitude for c in solution.independent()],
+)
+```
+
+Every judgement call an interactive session leaves to the operator is an explicit setting,
+and the result records **why the extraction stopped**. See the
+[pre-whitening guide](https://cuperiod.readthedocs.io/en/latest/guide/prewhitening.html).
+
 ## Batch processing (millions of light curves)
 
 ```python
@@ -162,6 +186,8 @@ written. `suggest_gpu_workers` sizes the GPU pool from probed device memory.
 ```bash
 cuperiod run star.csv --method GLS,BLS --n-best 10
 cuperiod batch "lcs/*.csv" --method GLS --device gpu --out results/
+cuperiod prewhiten star.csv --snr 4.6 -n 30 --spacing
+cuperiod batch-prewhiten "lcs/*.csv" --out modes.parquet
 cuperiod methods                 # list methods and backends
 cuperiod gpu-info                # device + suggested worker counts
 cuperiod doctor                  # backends, torch devices, precision, auto-resolution
@@ -173,10 +199,12 @@ can write JSON (`--out`) and the raw spectrum (`--save-periodogram`).
 
 ## Desktop GUI
 
-An interactive periodogram explorer ships with the `[gui]` extra — run any method with all
-of its options, explore the full-resolution spectrum, and watch the phased light curve
-update live as you drag across peaks. Single curves or a whole folder in batch mode,
-multi-band overlays, and a dark/light theme remembered across launches.
+An interactive explorer ships with the `[gui]` extra — run any method with all of its
+options, explore the full-resolution spectrum, and watch the phased light curve update
+live as you drag across peaks. Single curves or a whole folder in batch mode, multi-band
+overlays, and a dark/light theme remembered across launches. An **Analysis** picker
+switches the same window to pre-whitening: the amplitude spectrum with the residual
+overlaid, a frequency table with uncertainties, and a g-mode period-spacing explorer.
 
 ```bash
 pip install "cuperiod[gui]"      # add [gpu] or [torch] for accelerated backends

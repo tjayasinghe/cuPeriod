@@ -46,18 +46,26 @@ required.
    band.
 4. **Load demo → a folder in batch mode.** Scroll the **Sources** dock (arrow keys or
    Prev/Next); each source computes on demand and revisits are instant (cached).
-5. **Toggle the theme** (dark ↔ light — remembered next launch). With `[gpu]`/`[torch]`
+5. **Switch **Analysis** to *Pre-whitening*** and press **Run pre-whitening**. The
+   spectrum becomes the amplitude spectrum with the residual spectrum overlaid and every
+   extracted component marked; the **Frequencies** dock lists them with uncertainties and
+   S/N. Click a row to fold on it. For a g-mode star, the **Period spacing** tab scans for
+   a regular spacing and draws the échelle diagram.
+6. **Toggle the theme** (dark ↔ light — remembered next launch). With `[gpu]`/`[torch]`
    installed, the info bar names the backend and device actually used.
 
 ## The interface
 
 | Area | What it does |
 | --- | --- |
+| **Analysis** (top left) | Switch between **Periodogram** — one method over a trial grid — and **Pre-whitening**, the automated frequency extraction of {doc}`prewhitening`. The rest of the window is shared: same inputs, same spectrum/phased views, same source browser; only the result docks change. |
 | **Controls** (left) | Choose the method and edit its settings. The form is built automatically from each method's settings model ({doc}`tuning`), so every knob — grid bounds, `n_harmonics`, transit-duration fractions, backend/device/precision — is exposed with the right type and defaults. Press **Compute** to run. |
 | **Spectrum** (centre) | The full-resolution periodogram, rendered at interactive speed. Drag the marker to select a trial period; toggle the **x-axis** between frequency and period and switch either axis to **log**. |
 | **Phased** | The light curve folded on the selected period, updating live as you move the marker. **2 cycles** repeats the fold; for multi-band data a **Band** selector overlays all bands or isolates one. |
 | **Raw light curve** | The unfolded time series for the loaded source. |
 | **Peaks** (dock) | The ranked N-best periods ({doc}`results`). Click a row to jump the marker (and the fold) to that peak. |
+| **Frequencies** (dock) | In pre-whitening mode, the extracted components with their 1-sigma uncertainties, S/N, false-alarm probability, and any combination-frequency identification, plus the stopping reason and fit statistics. Click a row to fold on that component; right-click to copy or export CSV. |
+| **Period spacing** (dock) | In pre-whitening mode, the comb scan over trial spacings and the échelle diagram of the modes that belong to the series, with the mean spacing, its tilt, and the buoyancy radius Π₀. Runs on the *independent* components, so identified combinations cannot pollute the pattern. |
 | **Sources** (dock) | In batch mode, the list of light curves; navigate with Prev/Next or the arrow keys. |
 | **Info bar** | The backend and device actually used for the last run, plus timing — handy for confirming that `auto` reached your GPU. |
 

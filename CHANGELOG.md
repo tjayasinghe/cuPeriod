@@ -6,6 +6,67 @@ All notable changes to cuPeriod are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Automated, uncertainty-aware pre-whitening for classical pulsators**
+  ({func}`cuperiod.prewhiten`). Frequency analysis of δ Scuti, γ Doradus and SPB stars
+  has funnelled through interactive Period04-style sessions one star at a time; this
+  runs the whole loop — amplitude spectrum, peak selection, simultaneous non-linear
+  re-fit of every component, significance test — end to end, and makes every judgement
+  call an explicit, recorded setting. A `PreWhitenResult` carries the ranked components
+  with their uncertainties, the residuals and their spectrum, the fit statistics, and
+  the reason the run stopped.
+- **A batch-capable GPU/NUFFT amplitude spectrum** (`cuperiod.amplitude_spectrum`,
+  `SpectrumEngine`) on the cufinufft / finufft / torch / numpy backends. The terms of
+  the least-squares normal equations that depend only on the observation times are
+  computed once and cached, so each pre-whitening iteration costs a *single* transform:
+  a 50-frequency solution needs ~52 transforms rather than ~150. A 20 000-point TESS
+  sector with 15 modes takes about a second on a laptop CPU.
+- **Principled stopping criteria**, combinable and always reported in `stop_reason`:
+  the Breger et al. (1993) signal-to-noise ratio, the Baluev false-alarm probability,
+  a ΔBIC improvement threshold, and an absolute amplitude floor. After the final
+  simultaneous polish the solution is re-checked and components that no longer pass are
+  pruned, so every reported frequency satisfies the criterion it was admitted by.
+- **Error propagation** with three estimators (`uncertainty=`): the linearised
+  least-squares covariance of the joint fit (the default, and the only one that accounts
+  for correlations between close frequencies), the classical Montgomery & O'Donoghue
+  (1999) formulae, and a residual bootstrap. All optionally inflated by the
+  Schwarzenberg-Czerny (1991) correlation factor. Phases are referenced to the weighted
+  mean epoch, at which a phase is uncorrelated with its own frequency — validated
+  against Monte Carlo: reported 1-sigma errors match the realised scatter to within
+  ~5% in frequency, amplitude, and phase.
+- **Combination-frequency identification**
+  ({func}`cuperiod.identify_combinations`) with uncertainty-aware tolerances — a match
+  must fall within `max(3σ, 0.25/T)` of the *propagated* prediction — and a
+  chance-coincidence rate reported per identification, so a spurious match is visible as
+  such. `PreWhitenResult.independent()` returns the candidate independent-mode list.
+- **g-mode period-spacing tools**: a comb scan over trial spacings
+  ({func}`cuperiod.spacing_spectrum`, unaffected by missing radial orders, and immune to
+  the sub-multiple ambiguity that makes a naive scan report ΔΠ/2), extraction of the
+  longest *tilted* series `ΔP(P) = a + bP` bridging missing orders
+  ({func}`cuperiod.find_period_spacing`), échelle coordinates
+  ({func}`cuperiod.echelle`), and the buoyancy radius Π₀
+  ({func}`cuperiod.buoyancy_radius`).
+- **Batch pre-whitening** ({func}`cuperiod.batch_prewhiten`) over the existing CPU/GPU
+  worker pools, writing one row per extracted component to Parquet/CSV with resumable
+  directory sinks.
+- **CLI**: `cuperiod prewhiten` (with `--spacing`, JSON/CSV/npz output) and
+  `cuperiod batch-prewhiten`.
+- **GUI**: an **Analysis** picker switches the desktop app between *Periodogram* and
+  *Pre-whitening* without disturbing anything else — same inputs, same spectrum, phased
+  and raw views, same source browser, same off-thread compute and result caching. In
+  pre-whitening mode the spectrum shows the amplitude spectrum with the residual
+  spectrum overlaid and the components marked, a **Frequencies** dock lists them with
+  uncertainties and S/N (click to fold, right-click to export), and a **Period spacing**
+  dock scans for a regular spacing and draws the échelle diagram. The settings form is
+  generated from `PreWhitenSettings` by the existing machinery, so every knob is exposed
+  with no bespoke widgets.
+
+### Fixed
+
+- `cuperiod.gui.models.ResultCache` is now generic over its value type, so the app keeps
+  one cache per analysis and switching back and forth is instant.
+
 ## [1.1.0] - 2026-07-08
 
 ### Performance

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cuperiod"
-version = "1.1.0"
+version = "1.2.0.dev0"
 description = "Optimized, GPU-accelerated periodograms for astronomy"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -16,6 +16,9 @@ keywords = [
     "lomb-scargle",
     "box-least-squares",
     "variable-stars",
+    "asteroseismology",
+    "pulsations",
+    "pre-whitening",
     "time-series",
     "gpu",
     "cuda",

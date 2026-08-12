@@ -32,6 +32,11 @@ Per-method settings models, environment-variable overrides, and custom frequency
 grids.
 :::
 
+:::{grid-item-card} {doc}`prewhitening`
+Automated, uncertainty-aware frequency extraction for δ Scuti, γ Dor, and SPB
+pulsators — with combination frequencies and g-mode period spacings.
+:::
+
 :::{grid-item-card} {doc}`multiband`
 Jointly model several filters of the same star with GLS, BLS, and MHAOV.
 :::
@@ -42,7 +47,8 @@ output.
 :::
 
 :::{grid-item-card} {doc}`cli`
-The `cuperiod` command line: `run`, `batch`, `methods`, `gpu-info`, `doctor`, `grid-info`.
+The `cuperiod` command line: `run`, `batch`, `prewhiten`, `batch-prewhiten`, `methods`,
+`doctor`, and more.
 :::
 
 :::{grid-item-card} {doc}`gui`
@@ -65,3 +71,7 @@ A run is always the same three steps, whether you call the function or the CLI:
 
 The single entry point {func}`cuperiod.periodogram` ties these together; its batch
 sibling {func}`cuperiod.batch_periodograms` does the same for many light curves at once.
+
+A multiperiodic pulsator needs more than the best period, so {func}`cuperiod.prewhiten`
+runs that same three-step machinery in a loop — extract, fit, subtract, repeat — with
+principled stopping criteria and propagated uncertainties ({doc}`prewhitening`).
