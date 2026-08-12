@@ -22,6 +22,20 @@ from cuperiod.prewhiten.spectrum import AmplitudeSpectrum
 _TWO_PI = 2.0 * np.pi
 
 
+def amplitude_ratio(amplitude: float, spectrum_amplitude: float) -> float:
+    """Fitted amplitude over the spectrum's own reading at the same frequency.
+
+    See :attr:`Sinusoid.amplitude_ratio` for what the number means. Returns ``inf``
+    when the spectrum is flat there but the fit still claims amplitude, and NaN when
+    neither is measurable.
+    """
+    if not (np.isfinite(amplitude) and np.isfinite(spectrum_amplitude)):
+        return float("nan")
+    if spectrum_amplitude > 0.0:
+        return amplitude / spectrum_amplitude
+    return float("inf") if amplitude > 0.0 else float("nan")
+
+
 @dataclass(frozen=True)
 class Sinusoid:
     """One extracted sinusoidal component.
@@ -50,6 +64,12 @@ class Sinusoid:
         Negative means the component improved the model.
     combination : str or None
         Identification as a combination of stronger components, if any.
+    spectrum_amplitude : float
+        The amplitude spectrum of the *input data* read directly at this frequency —
+        the single-frequency measurement, independent of the joint fit.
+    blended : bool
+        Whether :attr:`amplitude_ratio` falls outside the run's
+        :attr:`~cuperiod.PreWhitenSettings.blend_tolerance`.
     """
 
     rank: int
@@ -64,6 +84,8 @@ class Sinusoid:
     fap: float = float("nan")
     delta_bic: float = float("nan")
     combination: str | None = None
+    spectrum_amplitude: float = float("nan")
+    blended: bool = False
 
     @property
     def period(self) -> float:
@@ -77,6 +99,25 @@ class Sinusoid:
             return float("nan")
         return self.frequency_error / (self.frequency * self.frequency)
 
+    @property
+    def amplitude_ratio(self) -> float:
+        """Fitted :attr:`amplitude` over :attr:`spectrum_amplitude` (1.0 = agreement).
+
+        The fitted amplitude comes from the *joint* solution of every component at
+        once; the spectrum's reading treats this frequency as if it were alone. They
+        agree for a mode that is resolved from its neighbours and free of window
+        leakage, so a ratio far from 1 says this component's amplitude is not an
+        independent measurement — it is entangled with the components it is correlated
+        with, and moving one moves the other. That happens for genuinely close pairs
+        and, very commonly in ground-based data, for a mode and its own alias
+        sidelobes.
+
+        A discrepancy is **not** a significance test: a blended component can be
+        perfectly real (an alias sidelobe *is* in the data). It means the amplitude
+        should be quoted with its partners, not on its own.
+        """
+        return amplitude_ratio(self.amplitude, self.spectrum_amplitude)
+
     def to_dict(self) -> dict[str, Any]:
         """Flatten to a plain dict (also the batch/CSV row layout)."""
         return {
@@ -88,6 +129,9 @@ class Sinusoid:
             "period_error": self.period_error,
             "amplitude": self.amplitude,
             "amplitude_error": self.amplitude_error,
+            "spectrum_amplitude": self.spectrum_amplitude,
+            "amplitude_ratio": self.amplitude_ratio,
+            "blended": self.blended,
             "phase": self.phase,
             "phase_error": self.phase_error,
             "snr": self.snr,
@@ -186,6 +230,15 @@ class PreWhitenResult:
         """Rayleigh frequency resolution ``1/baseline`` (cycles/day)."""
         return 1.0 / self.baseline if self.baseline > 0.0 else float("inf")
 
+    @property
+    def n_blended(self) -> int:
+        """How many components' amplitudes disagree with the spectrum's own reading.
+
+        See :attr:`Sinusoid.amplitude_ratio`. A non-zero count is a reliability
+        warning about individual amplitudes, not about the solution's significance.
+        """
+        return sum(1 for c in self.components if c.blended)
+
     def _column(self, name: str) -> FloatArray:
         return np.asarray(
             [getattr(c, name) for c in self.components], dtype=np.float64
@@ -268,6 +321,7 @@ class PreWhitenResult:
             "stop_reason": self.stop_reason,
             "n_iterations": self.n_iterations,
             "n_pruned": self.n_pruned,
+            "n_blended": self.n_blended,
             "rms": self.rms,
             "chi2": self.chi2,
             "reduced_chi2": self.reduced_chi2,
@@ -297,18 +351,28 @@ class PreWhitenResult:
         )
         header = (
             f"  {'ID':<4} {'frequency (1/d)':>17} {'+/-':>11} "
-            f"{'amplitude':>13} {'+/-':>11} {'phase':>8} {'S/N':>7}  note"
+            f"{'amplitude':>13} {'+/-':>11} {'phase':>8} {'S/N':>7} {'A/Asp':>7}  note"
         )
         lines = [head, stop, stats, "", header]
         for c in self.components[:max_rows]:
             note = c.combination or ""
+            ratio = c.amplitude_ratio
+            shown = f"{ratio:.2f}" if np.isfinite(ratio) else "—"
             lines.append(
                 f"  {c.label:<4} {c.frequency:>17.9g} {c.frequency_error:>11.3g} "
                 f"{c.amplitude:>13.6g} {c.amplitude_error:>11.3g} "
-                f"{c.phase:>8.4f} {c.snr:>7.2f}  {note}"
+                f"{c.phase:>8.4f} {c.snr:>7.2f} "
+                f"{shown + ('*' if c.blended else ''):>7}  {note}"
             )
         if self.n_components > max_rows:
             lines.append(f"  ... {self.n_components - max_rows} more")
+        if self.n_blended:
+            lines.append(
+                f"  * {self.n_blended} amplitude"
+                f"{'' if self.n_blended == 1 else 's'} disagree with the spectrum "
+                "(A/Asp): blended with a correlated neighbour, so quote them together "
+                "rather than alone."
+            )
         return "\n".join(lines)
 
     def __repr__(self) -> str:
@@ -318,4 +382,4 @@ class PreWhitenResult:
         )
 
 
-__all__ = ["PreWhitenResult", "Sinusoid"]
+__all__ = ["PreWhitenResult", "Sinusoid", "amplitude_ratio"]

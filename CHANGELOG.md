@@ -58,6 +58,20 @@ All notable changes to cuPeriod are documented here. The format is based on
   transforms (its sums are already part of the cached normal equations). The GUI
   spectrum view gains a *window* overlay toggle (scaled to the tallest peak,
   Period04-style) and `cuperiod prewhiten --save-spectrum` writes it into the `.npz`.
+- **GUI: the data curve has its own toggle**, so the residual and window traces it
+  draws over can be read on their own, and **double-clicking the spectrum restores the
+  default view** (what the *Reset* button does).
+- **An amplitude-reliability flag.** Every component now records
+  `spectrum_amplitude` — the amplitude spectrum read directly at its frequency, a
+  single-frequency measurement independent of the joint fit — alongside the derived
+  `amplitude_ratio` and a `blended` flag (`blend_tolerance`, default 2×). A ratio far
+  from 1 says the amplitude is entangled with a component it is correlated with, which
+  in ground-based data usually means the mode's own alias sidelobe: on the bundled
+  ASAS-SN HADS demo the 3f harmonic is fitted at nearly twice what the data holds
+  there. It is explicitly *not* a significance test — a blended component can be real —
+  and nothing is dropped because of it. `PreWhitenResult.n_blended` counts them,
+  `summary()` gains an `A/Asp` column, the batch catalogue gains both floats, and the
+  GUI's Frequencies dock marks the affected rows.
 - **A native Baluev (2008) false-alarm probability** ({func}`cuperiod.baluev_fap`)
   matching astropy's `false_alarm_probability(method="baluev")` to machine precision on
   centred times — and staying accurate on raw Julian dates, where the one-pass time
@@ -92,6 +106,11 @@ All notable changes to cuPeriod are documented here. The format is based on
   and GLS now also recovers the demo star's period; the fold-based methods (PDM, CE,
   string-length), which pay a full fold per trial frequency, keep their 10 c/d auto
   ceiling.
+- **GUI: the Frequencies table ignored its own number formats.** The sort key was
+  written to `EditRole`, which `QTableWidgetItem` stores in the same slot as
+  `DisplayRole`, so every numeric column silently rendered Qt's six-significant-digit
+  default — too few digits for a frequency (`11.1412` where the solution knows
+  `11.1412066`) and too many for an uncertainty. The sort key now lives on the item.
 - **GUI: component markers floated above the amplitude spectrum.** They were drawn at
   each component's *fitted* amplitude while the curve shows the single-frequency
   amplitude spectrum. Those agree for a well-separated mode but diverge as soon as

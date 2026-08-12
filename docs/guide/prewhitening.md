@@ -136,6 +136,40 @@ combination. Each identification also carries `expected_false`, the number of ch
 matches expected for the coefficient vectors that were searched — if that approaches 1,
 the identification means nothing, and you should know that without having to work it out.
 
+## Is an amplitude trustworthy on its own?
+
+Every fitted amplitude comes from the *joint* solution of all components at once, while
+the amplitude spectrum reads each frequency as if it were alone. For a mode resolved
+from its neighbours the two agree, and each component records both so you can check:
+
+```python
+for c in solution.components:
+    print(c.label, c.amplitude, c.spectrum_amplitude, c.amplitude_ratio, c.blended)
+
+solution.n_blended            # how many disagree beyond blend_tolerance (default 2x)
+```
+
+A ratio far from 1 means the amplitude is **entangled** with a component it is
+correlated with: change one and the other moves. Close pairs do this, and so — far more
+often in ground-based data — does a mode sitting beside its own alias sidelobe. On the
+bundled ASAS-SN HADS demo every harmonic carries yearly aliases at
+Δf = 1/365.25 d, and the 3f component is fitted at nearly twice what the data holds
+there.
+
+:::{admonition} A blend flag is not a significance test
+:class: caution
+A blended component can be perfectly real — an alias sidelobe *is* present in the data,
+and the flag never removes anything from the solution. It says the amplitude means
+something only alongside the components it is correlated with, so quote them together
+rather than treating the number as an independent measurement. Use `snr`, `fap` and
+`delta_bic` to decide whether a component is real; use `amplitude_ratio` to decide
+whether to trust its amplitude.
+:::
+
+`blend_tolerance` (default 2.0) sets the factor. Two is deliberately loose: the ratio
+carries the noise of both measurements, roughly `sqrt(2)/(S/N)` in relative terms, so a
+factor of two is a ≳3σ statement even for a component that only just cleared S/N ≥ 4.
+
 ## The spectral window
 
 Irregular sampling convolves every real peak with the **spectral window**
@@ -235,6 +269,7 @@ Every field of {class}`~cuperiod.PreWhitenSettings` is documented in the
 | `samples_per_peak` | 10 | Frequency oversampling of the search grid. |
 | `maximum_frequency` | max(pseudo-Nyquist, 50 /d) | Top of the search band. The floor matters: the median-gap pseudo-Nyquist of nightly ground-based sampling is a few c/d, and a band capped there sees only the *daily aliases* of a δ Scuti or HADS star. |
 | `uncertainty` | `"covariance"` | Error estimator. |
+| `blend_tolerance` | 2.0 | Factor beyond which a fitted amplitude is flagged as blended. |
 | `refine` | `"last"` | Per-iteration refinement; the final polish is simultaneous. |
 | `combination_max_order` | 2 | Largest `Σ|nᵢ|` in the combination search. |
 | `backend` | `"auto"` | GPU when available (see {doc}`backends`). |

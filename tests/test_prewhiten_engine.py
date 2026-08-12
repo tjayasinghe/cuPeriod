@@ -325,6 +325,90 @@ def test_bootstrap_errors_are_nonzero_for_every_component() -> None:
     assert np.all(boot.frequency_error < 10.0 * cova.frequency_error)
 
 
+def test_clean_components_agree_with_the_spectrum_and_are_not_blended() -> None:
+    time, value, error = synthetic_pulsator()
+    solution = prewhiten((time, value, error), settings=_settings())
+    assert solution.n_components == 3
+    for component in solution.components:
+        # Well-separated modes: the joint fit and the spectrum's own reading agree.
+        assert component.spectrum_amplitude > 0.0
+        assert component.amplitude_ratio == pytest.approx(1.0, abs=0.25)
+        assert not component.blended
+    assert solution.n_blended == 0
+    assert "*" not in solution.summary()
+
+
+def test_a_correlated_pair_is_flagged_as_blended() -> None:
+    # Two modes a third of a Rayleigh width apart are hopelessly correlated: the joint
+    # fit gives them large, mutually cancelling amplitudes while the spectrum sees one
+    # blended bump. That is precisely what the flag exists to say out loud.
+    rng = np.random.default_rng(3)
+    n, span = 1500, 30.0
+    time = np.sort(rng.uniform(0.0, span, n))
+    rayleigh = 1.0 / span
+    pair = (9.0, 9.0 + rayleigh / 3.0)
+    value = (
+        10.0
+        + 0.05 * np.sin(2 * np.pi * pair[0] * time + 0.3)
+        + 0.05 * np.sin(2 * np.pi * pair[1] * time + 2.6)
+        + rng.normal(0.0, 0.002, n)
+    )
+    error = np.full(n, 0.002)
+    solution = prewhiten(
+        (time, value, error),
+        settings=_settings(
+            max_frequencies=4, min_separation_rayleigh=0.2, refine_bound_rayleigh=0.5
+        ),
+    )
+    assert solution.n_blended >= 1
+    flagged = [c for c in solution.components if c.blended]
+    assert all(
+        c.amplitude_ratio > 2.0 or c.amplitude_ratio < 0.5 for c in flagged
+    )
+    assert "*" in solution.summary()
+    assert "disagree with the spectrum" in solution.summary()
+
+
+def test_blend_tolerance_controls_the_flag() -> None:
+    time, value, error = synthetic_pulsator()
+    strict = prewhiten(
+        (time, value, error), settings=_settings(blend_tolerance=1.001)
+    )
+    assert strict.n_blended == strict.n_components  # nothing agrees to 0.1%
+    lenient = prewhiten(
+        (time, value, error), settings=_settings(blend_tolerance=100.0)
+    )
+    assert lenient.n_blended == 0
+
+
+def test_spectrum_amplitude_is_the_spectrum_read_at_the_component() -> None:
+    time, value, error = synthetic_pulsator()
+    solution = prewhiten((time, value, error), settings=_settings())
+    spectrum = solution.spectrum
+    assert spectrum is not None
+    for component in solution.components:
+        nearest = int(np.argmin(np.abs(spectrum.frequency - component.frequency)))
+        assert component.spectrum_amplitude == pytest.approx(
+            float(spectrum.amplitude[nearest])
+        )
+        assert component.amplitude_ratio == pytest.approx(
+            component.amplitude / component.spectrum_amplitude
+        )
+    # Still computed when the spectra themselves are not kept (batch mode).
+    lean = prewhiten((time, value, error), settings=_settings(store_spectra=False))
+    assert lean.spectrum is None
+    assert all(np.isfinite(c.spectrum_amplitude) for c in lean.components)
+
+
+def test_amplitude_ratio_edge_cases() -> None:
+    from cuperiod.prewhiten.result import amplitude_ratio
+
+    assert amplitude_ratio(0.5, 0.25) == pytest.approx(2.0)
+    assert amplitude_ratio(0.5, 0.0) == float("inf")  # fit claims what data lacks
+    assert np.isnan(amplitude_ratio(0.0, 0.0))
+    assert np.isnan(amplitude_ratio(float("nan"), 0.25))
+
+
 def test_harmonic_is_flagged_as_a_combination() -> None:
     # The default synthetic pulsator plants 24.68 = 2 x 12.34 exactly.
     time, value, error = synthetic_pulsator()

@@ -98,9 +98,13 @@ def prewhiten_to_rows(
 #: rather than ``None`` so every chunk of a directory sink infers the *same* Arrow type:
 #: a part in which no star had a combination would otherwise type that column null,
 #: making the whole dataset unreadable.
+#: ``blended`` is deliberately absent: a boolean has no missing value to fill for a
+#: light curve that yielded nothing, and ``amplitude_ratio`` carries the same
+#: information with a threshold the catalogue's consumer picks.
 _NUMERIC_FIELDS: tuple[str, ...] = (
     "rank", "frequency", "frequency_error", "period", "period_error",
-    "amplitude", "amplitude_error", "phase", "phase_error", "snr", "fap", "delta_bic",
+    "amplitude", "amplitude_error", "spectrum_amplitude", "amplitude_ratio",
+    "phase", "phase_error", "snr", "fap", "delta_bic",
 )
 
 #: String component fields, empty-string-filled for the same reason.

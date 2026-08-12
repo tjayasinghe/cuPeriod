@@ -5,6 +5,10 @@ with its uncertainty, signal-to-noise, false-alarm probability, and — where on
 identified — the combination that explains it. Selecting a row makes that component the
 active period, so the phased view folds on it exactly as it does for a periodogram peak.
 
+The ``A/Asp`` column is the reliability check the plot cannot show: the fitted amplitude
+against the spectrum's own reading at that frequency. A row marked ✱ has an amplitude
+entangled with a correlated neighbour, so it means something only alongside it.
+
 The header line carries the part of the result that is easy to lose in a table: *why the
 extraction stopped*, the residual scatter, and which uncertainty estimator produced the
 error bars.
@@ -27,6 +31,12 @@ _COLUMNS: tuple[tuple[str, str, str, str], ...] = (
     ("period (d)", "Period in days", "period", "g"),
     ("amplitude", "Amplitude in the light curve's units", "amplitude", "g"),
     ("± A", "1-sigma amplitude uncertainty", "amplitude_error", "e"),
+    ("A/Asp",
+     "Fitted amplitude over the spectrum's own reading at this frequency. 1.0 means "
+     "they agree. Far from 1 (marked ✱) means this amplitude is entangled with a "
+     "correlated neighbour — often the mode's own alias sidelobe — and should be "
+     "quoted together with it, not alone. It is not a significance test.",
+     "amplitude_ratio", "f"),
     ("phase", "Phase in radians at the solution's reference epoch", "phase", "f"),
     ("± ph", "1-sigma phase uncertainty (radians)", "phase_error", "e"),
     ("S/N", "Amplitude over the local noise of the residual spectrum (Breger)",
@@ -54,11 +64,23 @@ def _format(value: object, kind: str) -> str:
 
 
 class _NumericItem(QtWidgets.QTableWidgetItem):
-    """A table item that sorts by its numeric value rather than its display text."""
+    """A table item that sorts by its numeric value rather than its display text.
+
+    The sort key is kept on the instance rather than written to ``EditRole``:
+    :class:`QTableWidgetItem` stores ``EditRole`` and ``DisplayRole`` in the same slot,
+    so a float written there silently replaces the formatted text with Qt's own
+    six-significant-digit rendering — which is not enough digits for a frequency and
+    too many for an uncertainty.
+    """
 
     def __init__(self, value: float, text: str) -> None:
         super().__init__(text)
-        self.setData(Qt.ItemDataRole.EditRole, float(value))
+        self._value = float(value)
+
+    def __lt__(self, other: QtWidgets.QTableWidgetItem) -> bool:
+        if isinstance(other, _NumericItem):
+            return self._value < other._value
+        return super().__lt__(other)
 
 
 class SolutionPanel(QtWidgets.QWidget):
@@ -127,8 +149,12 @@ class SolutionPanel(QtWidgets.QWidget):
             if result.combinations
             else ""
         )
+        blended = (
+            f"  ·  <b>{result.n_blended}</b> blended ✱" if result.n_blended else ""
+        )
         return (
-            f"<b>{result.n_components}</b> components{pruned}{combinations}<br>"
+            f"<b>{result.n_components}</b> components{pruned}{combinations}"
+            f"{blended}<br>"
             f"stopped: {result.stop_reason}<br>"
             f"residual rms {result.rms:.4g}  ·  reduced χ² {result.reduced_chi2:.3g}"
             f"  ·  D = {result.correlation_factor:.2f}"
@@ -143,9 +169,11 @@ class SolutionPanel(QtWidgets.QWidget):
         self._table.setHorizontalHeaderLabels([c[0] for c in _COLUMNS])
         self._table.setRowCount(len(self._components))
         for row, component in enumerate(self._components):
-            for column, (_, _, attribute, kind) in enumerate(_COLUMNS):
+            for column, (_, tooltip, attribute, kind) in enumerate(_COLUMNS):
                 value = getattr(component, attribute)
                 text = _format(value, kind)
+                if attribute == "amplitude_ratio" and component.blended:
+                    text = f"{text} ✱"
                 if kind == "s":
                     item: QtWidgets.QTableWidgetItem = QtWidgets.QTableWidgetItem(text)
                     if attribute == "label":
@@ -155,6 +183,8 @@ class SolutionPanel(QtWidgets.QWidget):
                     item = _NumericItem(
                         numeric if math.isfinite(numeric) else float("inf"), text
                     )
+                if component.blended and attribute in {"amplitude", "amplitude_ratio"}:
+                    item.setToolTip(tooltip)
                 self._table.setItem(row, column, item)
         h_header = self._table.horizontalHeader()
         if h_header is not None:

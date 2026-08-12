@@ -186,6 +186,72 @@ def test_result_cache_is_generic_over_its_value_type() -> None:
 # --- panels ------------------------------------------------------------------
 
 
+def test_solution_table_shows_formatted_numbers_and_still_sorts_numerically(
+    qtbot: QtBot,
+) -> None:
+    # Regression: the sort key was written to EditRole, which QTableWidgetItem stores
+    # in the same slot as DisplayRole — so every numeric column silently rendered Qt's
+    # 6-significant-digit default instead of the per-column format (a frequency needs
+    # more digits than that, an uncertainty fewer).
+    panel = SolutionPanel()
+    qtbot.addWidget(panel)
+    panel.set_solution(_solution())
+    headers = [
+        panel._table.horizontalHeaderItem(i).text()
+        for i in range(panel._table.columnCount())
+    ]
+    row_of = {panel._table.item(r, 0).text(): r for r in range(panel._table.rowCount())}
+    component = next(c for c in panel._components if c.label in row_of)
+    row = row_of[component.label]
+
+    shown = panel._table.item(row, headers.index("frequency")).text()
+    assert shown == f"{component.frequency:.9g}"
+    assert panel._table.item(row, headers.index("± f")).text() == (
+        f"{component.frequency_error:.3g}"
+    )
+    # And sorting still orders by value, not by the string.
+    panel._table.sortItems(headers.index("frequency"))
+    ordered = [
+        float(panel._table.item(r, headers.index("frequency")).text())
+        for r in range(panel._table.rowCount())
+    ]
+    assert ordered == sorted(ordered)
+
+
+def test_blended_components_are_marked_in_the_table(qtbot: QtBot) -> None:
+    from dataclasses import replace
+
+    panel = SolutionPanel()
+    qtbot.addWidget(panel)
+    solution = _solution()
+    components = list(solution.components)
+    components[0] = replace(
+        components[0], spectrum_amplitude=components[0].amplitude / 5.0, blended=True
+    )
+    solution = replace(solution, components=tuple(components))
+    panel.set_solution(solution)
+
+    headers = [
+        panel._table.horizontalHeaderItem(i).text()
+        for i in range(panel._table.columnCount())
+    ]
+    column = headers.index("A/Asp")
+    marked = [
+        panel._table.item(r, column).text()
+        for r in range(panel._table.rowCount())
+        if "✱" in panel._table.item(r, column).text()
+    ]
+    assert len(marked) == 1 and marked[0].startswith("5.0")
+    assert "blended" in panel._summary.text()
+    # The mark must not be there when nothing is blended.
+    panel.set_solution(_solution())
+    assert all(
+        "✱" not in panel._table.item(r, column).text()
+        for r in range(panel._table.rowCount())
+    )
+    assert "blended" not in panel._summary.text()
+
+
 def test_solution_panel_lists_components_and_emits_selection(qtbot: QtBot) -> None:
     panel = SolutionPanel()
     qtbot.addWidget(panel)
@@ -301,6 +367,83 @@ def test_spectrum_view_offers_the_spectral_window(qtbot: QtBot) -> None:
     assert view._window_xy is None and not view._window_curve.isVisible()
 
 
+def test_data_curve_can_be_hidden_to_read_the_overlays(qtbot: QtBot) -> None:
+    from cuperiod.core.result import Periodogram
+
+    view = SpectrumView()
+    qtbot.addWidget(view)
+    solution = _solution()
+    assert solution.spectrum is not None and solution.residual_spectrum is not None
+    wrapped = Periodogram.from_spectrum(
+        method=PREWHITEN_METHOD,
+        backend=solution.backend,
+        frequency=solution.spectrum.frequency,
+        power=solution.spectrum.amplitude,
+        objective_sense="max",
+        n_samples=solution.n_samples,
+        baseline=solution.baseline,
+    )
+    view.set_periodogram(wrapped)
+    # A plain periodogram has nothing underneath, so the toggle is not offered.
+    assert not view._show_data.isVisibleTo(view)
+    view.set_overlay(
+        solution.residual_spectrum.frequency, solution.residual_spectrum.amplitude
+    )
+    assert view._show_data.isVisibleTo(view) and view._show_data.isChecked()
+    assert view._curve.isVisible()
+
+    view._show_data.setChecked(False)
+    assert not view._curve.isVisible()
+    assert view._overlay.isVisible()  # the point of hiding it
+
+    # Dropping the overlays must restore the curve rather than leave an empty plot.
+    view.clear_overlay()
+    assert view._show_data.isChecked() and not view._show_data.isVisibleTo(view)
+    view._redraw_curve()
+    assert view._curve.isVisible()
+
+
+def test_double_click_restores_the_default_view(qtbot: QtBot) -> None:
+    from cuperiod.core.result import Periodogram
+
+    view = SpectrumView()
+    qtbot.addWidget(view)
+    frequency = np.linspace(0.5, 20.0, 4000)
+    power = np.exp(-((frequency - 7.0) ** 2) / 0.01)
+    view.set_periodogram(
+        Periodogram.from_spectrum(
+            method="GLS", backend="numpy", frequency=frequency, power=power,
+            objective_sense="max", n_samples=400, baseline=30.0,
+        )
+    )
+    box = view._plot.getPlotItem().vb
+    box.setXRange(6.9, 7.1, padding=0.0)
+    zoomed = box.viewRange()[0]
+    assert zoomed[1] - zoomed[0] < 1.0
+
+    class _DoubleClick:
+        def __init__(self) -> None:
+            self.accepted = False
+
+        def double(self) -> bool:
+            return True
+
+        def accept(self) -> None:
+            self.accepted = True
+
+    event = _DoubleClick()
+    view._on_scene_clicked(event)
+    assert event.accepted
+    restored = box.viewRange()[0]
+    assert restored[1] - restored[0] > 15.0  # back to the full spectrum
+
+    # A single click must not steal the user's zoom.
+    box.setXRange(6.9, 7.1, padding=0.0)
+    view._on_scene_clicked(type("_Single", (), {"double": lambda self: False})())
+    held = box.viewRange()[0]
+    assert held[1] - held[0] < 1.0
+
+
 def test_marker_hover_reports_the_fitted_amplitude(qtbot: QtBot) -> None:
     # The marker sits at the height of the *curve*, so the component's fitted
     # amplitude has to be readable from the hover text instead of its position.
@@ -313,6 +456,13 @@ def test_marker_hover_reports_the_fitted_amplitude(qtbot: QtBot) -> None:
     detail = SpectrumView._peak_detail(component)
     assert "0.0855" in detail and "20.9" in detail
     assert "0.046" not in detail  # that is where the marker sits, not what it is
+    assert "blended" not in detail
+    # A blended component says so, since its marker height is not its amplitude.
+    flagged = Peak(
+        period=0.08, frequency=12.5, power=0.046, rank=1,
+        extra={"amplitude": 0.0855, "snr": 20.9, "blended": 1.0},
+    )
+    assert "blended" in SpectrumView._peak_detail(flagged)
     # A plain periodogram peak has no amplitude and keeps reporting its power.
     plain = Peak(period=2.0, frequency=0.5, power=0.83, rank=1)
     assert SpectrumView._peak_detail(plain) == "power=0.83"

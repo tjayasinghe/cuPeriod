@@ -8,15 +8,18 @@ grid sample). A crosshair reads out frequency/period/power under the cursor.
 
 The x-axis toggles frequency/period (arrays are reversed in period mode so x stays
 ascending, as pyqtgraph's clip/downsample require) and each axis toggles linear/log.
-Display adapts to the objective sense: for minimise methods (PDM/CE/string-length) the
-peaks are minima and the y-axis is labelled accordingly.
+Double-clicking anywhere restores the default, auto-ranged view. Display adapts to the
+objective sense: for minimise methods (PDM/CE/string-length) the peaks are minima and
+the y-axis is labelled accordingly.
 
 The same view serves pre-whitening: the main curve becomes the amplitude spectrum of
 the data, an optional **overlay** curve shows the spectrum of the residuals once every
 extracted component has been subtracted, and the peak markers become the components.
 That side-by-side is the whole point of the method — what was there, and what is left.
 A third, dashed trace can show the **spectral window** of the sampling (scaled to the
-tallest peak, Period04-style) so an alias lobe is recognisable at a glance.
+tallest peak, Period04-style) so an alias lobe is recognisable at a glance. The dense
+data curve draws over both, so it has its own toggle: hide it and the residual and
+window become readable on their own.
 """
 
 from __future__ import annotations
@@ -125,6 +128,9 @@ class SpectrumView(QtWidgets.QWidget):
         self._proxy = pg.SignalProxy(
             self._plot.scene().sigMouseMoved, rateLimit=60, slot=self._on_mouse_moved
         )
+        # Double-click anywhere in the plot restores the default view, the shortcut
+        # every plotting tool has and pyqtgraph leaves unbound.
+        self._plot.scene().sigMouseClicked.connect(self._on_scene_clicked)
         self._plot.getPlotItem().vb.sigXRangeChanged.connect(self._on_xrange_changed)
         apply_plot_theme(self._plot, self._pal)
 
@@ -165,6 +171,18 @@ class SpectrumView(QtWidgets.QWidget):
         self._show_peaks.toggled.connect(self._on_peaks_toggled)
         row.addWidget(self._show_peaks)
 
+        # Only offered once there is an overlay to read: hiding the data curve of a
+        # plain periodogram would just leave an empty plot.
+        self._show_data = QtWidgets.QCheckBox("data")
+        self._show_data.setChecked(True)
+        self._show_data.setToolTip(
+            "Show the amplitude spectrum of the data. Turn it off to read the "
+            "residual and window traces, which it otherwise draws over"
+        )
+        self._show_data.setVisible(False)
+        self._show_data.toggled.connect(self._redraw_curve)
+        row.addWidget(self._show_data)
+
         self._show_residual = QtWidgets.QCheckBox("residual")
         self._show_residual.setChecked(True)
         self._show_residual.setToolTip(
@@ -185,7 +203,10 @@ class SpectrumView(QtWidgets.QWidget):
         row.addWidget(self._show_window)
 
         reset = QtWidgets.QPushButton("Reset")
-        reset.setToolTip("Auto-range the plot back to the full spectrum")
+        reset.setToolTip(
+            "Auto-range the plot back to the full spectrum "
+            "(or just double-click the plot)"
+        )
         reset.clicked.connect(self._autorange)
         row.addWidget(reset)
 
@@ -220,6 +241,8 @@ class SpectrumView(QtWidgets.QWidget):
         self._window_xy = None
         self._show_window.setVisible(False)
         self._window_curve.setVisible(False)
+        self._show_data.setVisible(False)
+        self._show_data.setChecked(True)
         self._default_axis_for(pg_result)
         self._redraw_curve()
         self._update_y_label()
@@ -232,6 +255,7 @@ class SpectrumView(QtWidgets.QWidget):
             np.asarray(values, dtype=np.float64),
         )
         self._show_residual.setVisible(True)
+        self._show_data.setVisible(True)
         self._redraw_overlay()
 
     def clear_overlay(self) -> None:
@@ -240,6 +264,7 @@ class SpectrumView(QtWidgets.QWidget):
         self._show_residual.setVisible(False)
         self._overlay.setVisible(False)
         self._overlay.setData([], [])
+        self._sync_data_toggle()
 
     def set_window(
         self, frequency: np.ndarray, amplitude: np.ndarray, *, scale: float = 1.0
@@ -256,6 +281,7 @@ class SpectrumView(QtWidgets.QWidget):
             np.asarray(amplitude, dtype=np.float64) * factor,
         )
         self._show_window.setVisible(True)
+        self._show_data.setVisible(True)
         self._redraw_window()
 
     def clear_window(self) -> None:
@@ -264,6 +290,13 @@ class SpectrumView(QtWidgets.QWidget):
         self._show_window.setVisible(False)
         self._window_curve.setVisible(False)
         self._window_curve.setData([], [])
+        self._sync_data_toggle()
+
+    def _sync_data_toggle(self) -> None:
+        """Offer the data toggle only while an overlay could be read underneath it."""
+        if self._overlay_xy is None and self._window_xy is None:
+            self._show_data.setVisible(False)
+            self._show_data.setChecked(True)  # never leave the plot empty
 
     def set_peaks(self, peaks: list[Peak]) -> None:
         """Overlay the significant peaks as markers."""
@@ -314,6 +347,7 @@ class SpectrumView(QtWidgets.QWidget):
             return
         x, y = self._curve_xy()
         self._curve.setData(x, y)
+        self._curve.setVisible(self._show_data.isChecked())
         self._redraw_overlay()
         self._redraw_window()
         self._apply_log()
@@ -466,11 +500,15 @@ class SpectrumView(QtWidgets.QWidget):
     def _autorange(self) -> None:
         # Disable clip-to-view first: with it on, auto-ranging after a data-range change
         # fits only the previously-visible slice, so the view sticks (e.g. a BLS peak
-        # ends up off-screen). Re-enable it once the view spans the full data.
-        self._curve.setClipToView(False)
+        # ends up off-screen). Re-enable it once the view spans the full data. All three
+        # traces need it — with the data curve hidden, the overlays set the range.
+        traces = (self._curve, self._overlay, self._window_curve)
+        for trace in traces:
+            trace.setClipToView(False)
         self._plot.enableAutoRange()
         self._plot.autoRange()
-        self._curve.setClipToView(True)
+        for trace in traces:
+            trace.setClipToView(True)
 
     # -- selection band ----------------------------------------------------------
     def _update_band(self) -> None:
@@ -495,6 +533,12 @@ class SpectrumView(QtWidgets.QWidget):
 
     def _on_xrange_changed(self, *_: Any) -> None:
         self._update_band()
+
+    def _on_scene_clicked(self, event: Any) -> None:
+        """Restore the default view on a double-click (same as the Reset button)."""
+        if event.double():
+            self._autorange()
+            event.accept()
 
     # -- conversions -------------------------------------------------------------
     def _x_for_period(self, period: float) -> float:
@@ -574,6 +618,8 @@ class SpectrumView(QtWidgets.QWidget):
         snr = peak.extra.get("snr")
         if snr is not None and np.isfinite(snr):
             detail += f"   S/N={snr:.1f}"
+        if peak.extra.get("blended"):
+            detail += "\nblended — amplitude disagrees with the spectrum"
         return detail
 
     def _on_mouse_moved(self, event: Any) -> None:

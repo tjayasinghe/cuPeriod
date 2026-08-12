@@ -375,6 +375,35 @@ class AmplitudeSpectrum:
         apex = y1 - 0.25 * (y0 - y2) * shift
         return f + shift * step, max(apex, a)
 
+    def amplitude_at(self, frequency: FloatArray | float) -> Any:
+        """Amplitude at the grid sample(s) nearest ``frequency``.
+
+        The direct, single-frequency reading of the spectrum — what a marker drawn on
+        this curve sits at, and the reference the extraction compares each fitted
+        amplitude against (see :attr:`~cuperiod.Sinusoid.amplitude_ratio`).
+
+        Parameters
+        ----------
+        frequency : float or numpy.ndarray
+            Frequencies in cycles/day. Values outside the grid clamp to its ends.
+
+        Returns
+        -------
+        float or numpy.ndarray
+            Matching the input's scalar-or-array shape.
+        """
+        wanted = np.asarray(frequency, dtype=np.float64)
+        if self.size == 0:
+            empty = np.full(wanted.shape, np.nan)
+            return empty if np.ndim(frequency) else float("nan")
+        right = np.clip(np.searchsorted(self.frequency, wanted), 0, self.size - 1)
+        left = np.clip(right - 1, 0, self.size - 1)
+        nearer_left = np.abs(self.frequency[left] - wanted) <= np.abs(
+            self.frequency[right] - wanted
+        )
+        out = self.amplitude[np.where(nearer_left, left, right)]
+        return out if np.ndim(frequency) else float(out)
+
     def noise_at(
         self,
         frequency: float,

@@ -37,7 +37,7 @@ from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
 from cuperiod.prewhiten.combinations import Combination, identify_combinations
 from cuperiod.prewhiten.fap import baluev_fap
 from cuperiod.prewhiten.fit import MultiSineFit, fit_multisine
-from cuperiod.prewhiten.result import PreWhitenResult, Sinusoid
+from cuperiod.prewhiten.result import PreWhitenResult, Sinusoid, amplitude_ratio
 from cuperiod.prewhiten.spectrum import AmplitudeSpectrum, SpectrumEngine
 from cuperiod.prewhiten.uncertainty import component_uncertainties, correlation_factor
 
@@ -470,6 +470,16 @@ def prewhiten(
         )
     by_index = {c.index: c.label for c in matches}
 
+    # The spectrum's own reading at each reported frequency: a single-frequency
+    # measurement of the data, independent of the joint fit. Where the two disagree the
+    # component's amplitude is entangled with a correlated neighbour (a close pair, or
+    # far more often an alias sidelobe of the same mode) and means little on its own.
+    direct = initial_spectrum.amplitude_at(fit.frequency)
+    ratios = [
+        amplitude_ratio(float(fit.amplitude[k]), float(direct[k]))
+        for k in range(fit.n_components)
+    ]
+
     components = tuple(
         Sinusoid(
             rank=k + 1,
@@ -484,6 +494,11 @@ def prewhiten(
             fap=faps[kept[k]] if kept[k] < len(faps) else float("nan"),
             delta_bic=deltas[kept[k]] if kept[k] < len(deltas) else float("nan"),
             combination=by_index.get(k),
+            spectrum_amplitude=float(direct[k]),
+            blended=bool(
+                ratios[k] > cfg.blend_tolerance
+                or ratios[k] < 1.0 / cfg.blend_tolerance
+            ),
         )
         for k in range(fit.n_components)
     )

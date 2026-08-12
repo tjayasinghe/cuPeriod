@@ -533,6 +533,14 @@ class PreWhitenSettings(_DeviceSettings):
         default=True,
         description="Re-check significance after the final fit and drop failures.",
     )
+    blend_tolerance: float = Field(
+        default=2.0,
+        gt=1.0,
+        description=(
+            "Flag a component as blended when its fitted amplitude and the spectrum's "
+            "own reading differ by more than this factor either way."
+        ),
+    )
 
     # -- fitting -----------------------------------------------------------------
     refine: Literal["none", "last", "cyclic", "simultaneous"] = Field(

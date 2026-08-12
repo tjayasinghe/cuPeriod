@@ -13,7 +13,6 @@ never changes the window layout the user has arranged.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
@@ -66,23 +65,6 @@ _FILE_EXTENSIONS = frozenset(
         ".txt",
     }
 )
-
-
-def _spectrum_heights(
-    grid: np.ndarray, values: np.ndarray, at: Sequence[float]
-) -> np.ndarray:
-    """``values`` sampled at the grid points nearest each frequency in ``at``.
-
-    Vectorized rather than a per-frequency ``argmin``: the pre-whitening grid runs to
-    over a million samples and this is on the UI thread.
-    """
-    wanted = np.asarray(at, dtype=np.float64)
-    if grid.size == 0 or wanted.size == 0:
-        return np.zeros(wanted.size, dtype=np.float64)
-    right = np.searchsorted(grid, wanted).clip(0, grid.size - 1)
-    left = (right - 1).clip(0, grid.size - 1)
-    nearer_left = np.abs(grid[left] - wanted) <= np.abs(grid[right] - wanted)
-    return np.asarray(values[np.where(nearer_left, left, right)], dtype=np.float64)
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -582,11 +564,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # well-separated mode but diverge whenever components are correlated (a HADS
         # harmonic and its yearly alias sidelobes trade amplitude in the joint fit),
         # and a marker floating above the curve claims a peak that is not there. The
-        # fitted amplitude stays on the hover readout and in the Frequencies dock.
-        heights = _spectrum_heights(
-            spectrum.frequency,
-            spectrum.amplitude,
-            [component.frequency for component in result.components],
+        # fitted amplitude stays on the hover readout and in the Frequencies dock,
+        # where their disagreement is reported as the blend ratio.
+        heights = spectrum.amplitude_at(
+            np.asarray([c.frequency for c in result.components], dtype=np.float64)
         )
         peaks = [
             Peak(
@@ -594,7 +575,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 frequency=component.frequency,
                 power=float(heights[i]),
                 rank=component.rank,
-                extra={"snr": component.snr, "amplitude": component.amplitude},
+                extra={
+                    "snr": component.snr,
+                    "amplitude": component.amplitude,
+                    "blended": float(component.blended),
+                },
             )
             for i, component in enumerate(result.components)
         ]
