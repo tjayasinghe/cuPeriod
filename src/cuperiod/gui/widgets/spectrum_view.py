@@ -391,6 +391,12 @@ class SpectrumView(QtWidgets.QWidget):
         return None
 
     def _redraw_markers(self) -> None:
+        # The hover label is anchored to a marker in plot coordinates, so any redraw
+        # invalidates it: hiding the peaks would stranded it over an empty plot, a new
+        # result would leave the old one's numbers floating, and a log/axis switch
+        # would park it at coordinates that no longer mean anything. It reappears on
+        # the next hover event, which fires on every mouse move over a marker.
+        self._hover_text.setVisible(False)
         if self._pg is None or not self._show_peaks.isChecked():
             self._markers.clear()
             return
@@ -594,6 +600,9 @@ class SpectrumView(QtWidgets.QWidget):
             return
         idx = pts[0].data()
         if idx is None or idx >= len(self._peaks):
+            # A glow halo carries no index; keeping the previous peak's label up while
+            # the cursor sits on a different one would simply be wrong.
+            self._hover_text.setVisible(False)
             return
         peak = self._peaks[int(idx)]
         x = peak.frequency if self._x_mode == "frequency" else peak.period

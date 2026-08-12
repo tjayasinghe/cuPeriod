@@ -106,6 +106,12 @@ All notable changes to cuPeriod are documented here. The format is based on
   and GLS now also recovers the demo star's period; the fold-based methods (PDM, CE,
   string-length), which pay a full fold per trial frequency, keep their 10 c/d auto
   ceiling.
+- **GUI: hiding the peaks left their hover label behind.** The label is anchored to a
+  marker, but nothing dismissed it when the markers went away — so unchecking *peaks*
+  right after hovering one to read it (the natural order) stranded the numbers over an
+  empty plot, and the same label survived a new result and axis/log switches that moved
+  its anchor. It is now dismissed whenever the markers are redrawn, and reappears on
+  the next hover.
 - **GUI: the Frequencies table ignored its own number formats.** The sort key was
   written to `EditRole`, which `QTableWidgetItem` stores in the same slot as
   `DisplayRole`, so every numeric column silently rendered Qt's six-significant-digit

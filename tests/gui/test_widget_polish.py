@@ -178,6 +178,86 @@ def test_spectrum_export_csv_writes_expected_columns(qtbot: QtBot, tmp_path) -> 
     assert len(rows) == 1 + view._pg.size
 
 
+class _HoveredPoint:
+    """Stand-in for the pyqtgraph spot under the cursor."""
+
+    def __init__(self, index: int | None) -> None:
+        self._index = index
+
+    def data(self) -> int | None:
+        return self._index
+
+
+def test_hiding_the_peaks_takes_their_hover_label_with_them(qtbot: QtBot) -> None:
+    # Regression: the hover label is anchored to a marker, but nothing hid it when the
+    # markers went away — so unchecking "peaks" (the natural move right after hovering
+    # one to read it) left the label stranded over an empty plot.
+    view = SpectrumView("dark")
+    qtbot.addWidget(view)
+    pg_result = _bump_periodogram()
+    view.set_periodogram(pg_result)
+    view.set_peaks(pg_result.best_periods(3))
+
+    view._on_peak_hovered(view._markers, [_HoveredPoint(0)])
+    assert view._hover_text.isVisible()
+
+    view._show_peaks.setChecked(False)
+    assert not view._hover_text.isVisible()
+    assert len(view._markers.data) == 0
+
+    # Same for a new result, and for an axis switch that moves the anchor.
+    view._show_peaks.setChecked(True)
+    view.set_peaks(pg_result.best_periods(3))
+    view._on_peak_hovered(view._markers, [_HoveredPoint(0)])
+    assert view._hover_text.isVisible()
+    view.set_periodogram(pg_result)
+    assert not view._hover_text.isVisible()
+
+    view.set_peaks(pg_result.best_periods(3))
+    view._on_peak_hovered(view._markers, [_HoveredPoint(0)])
+    assert view._hover_text.isVisible()
+    view._xaxis_combo.setCurrentText("period")
+    assert not view._hover_text.isVisible()
+
+    # A glow halo carries no index and must not leave another peak's label up.
+    view._on_peak_hovered(view._markers, [_HoveredPoint(0)])
+    assert view._hover_text.isVisible()
+    view._on_peak_hovered(view._markers, [_HoveredPoint(None)])
+    assert not view._hover_text.isVisible()
+
+
+def test_peaks_toggle_hides_and_restores_every_marker(qtbot: QtBot) -> None:
+    view = SpectrumView("dark")
+    qtbot.addWidget(view)
+    frequency = np.linspace(0.2, 20.0, 6000)
+    power = sum(
+        a * np.exp(-((frequency - f) ** 2) / 0.002)
+        for f, a in ((3.0, 1.0), (7.0, 0.6), (11.0, 0.35))
+    )
+    pg_result = Periodogram.from_spectrum(
+        method="GLS", backend="numpy", frequency=frequency, power=power,
+        objective_sense="max", n_samples=500, baseline=40.0,
+    )
+    peaks = pg_result.best_periods(3)
+    assert len(peaks) == 3
+    view.set_periodogram(pg_result)
+    view.set_peaks(peaks)
+    view.set_selected_period(peaks[1].period)
+    populated = len(view._markers.data)
+    assert populated == 5  # three peaks plus the best-peak and selected halos
+
+    view._show_peaks.setChecked(False)
+    assert len(view._markers.data) == 0
+    # Nothing that happens while it is off may bring them back.
+    view.set_selected_period(peaks[2].period)
+    view.set_peaks(peaks)
+    view._logy.setChecked(True)
+    assert len(view._markers.data) == 0
+
+    view._show_peaks.setChecked(True)
+    assert len(view._markers.data) == populated
+
+
 def test_spectrum_reset_button_label(qtbot: QtBot) -> None:
     # "Reset", not "Reset view": with the pre-whitening overlay toggles shown the
     # longer label pushed the toolbar past the dock width and Qt squeezed the buttons.
