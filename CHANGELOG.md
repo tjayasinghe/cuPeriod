@@ -60,7 +60,9 @@ All notable changes to cuPeriod are documented here. The format is based on
   Period04-style) and `cuperiod prewhiten --save-spectrum` writes it into the `.npz`.
 - **GUI: the data curve has its own toggle**, so the residual and window traces it
   draws over can be read on their own, and **double-clicking the spectrum restores the
-  default view** (what the *Reset* button does).
+  default view** (what the *Reset* button does). The *peaks* toggle now also hides the
+  shaded selection band — it marks a peak, so it belongs to the same layer — while
+  keeping the selection itself, so the folded period does not change underneath you.
 - **An amplitude-reliability flag.** Every component now records
   `spectrum_amplitude` — the amplitude spectrum read directly at its frequency, a
   single-frequency measurement independent of the joint fit — alongside the derived

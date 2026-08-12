@@ -4,7 +4,9 @@ Renders the **full-resolution** spectrum (auto peak-preserving downsampling keep
 pan/zoom smooth on 10^5-10^6 points), overlays the significant peaks, and marks the
 selection with a **translucent shaded band** drawn behind the curve — so the peak stays
 visible — that is draggable and emits :attr:`period_selected` (snapped to the nearest
-grid sample). A crosshair reads out frequency/period/power under the cursor.
+grid sample). Markers and band form one layer that the *peaks* toggle shows or hides
+together; the selection itself survives being hidden. A crosshair reads out
+frequency/period/power under the cursor.
 
 The x-axis toggles frequency/period (arrays are reversed in period mode so x stays
 ascending, as pyqtgraph's clip/downsample require) and each axis toggles linear/log.
@@ -168,6 +170,10 @@ class SpectrumView(QtWidgets.QWidget):
 
         self._show_peaks = QtWidgets.QCheckBox("peaks")
         self._show_peaks.setChecked(True)
+        self._show_peaks.setToolTip(
+            "Mark the significant peaks, and shade the selected one. Turn it off for "
+            "an unobstructed view of the spectrum itself"
+        )
         self._show_peaks.toggled.connect(self._on_peaks_toggled)
         row.addWidget(self._show_peaks)
 
@@ -235,7 +241,7 @@ class SpectrumView(QtWidgets.QWidget):
         self._peaks = []
         self._sel_period = None
         self._markers.clear()
-        self._sel_band.setVisible(False)
+        self._sync_band()
         self._overlay_xy = None
         self._show_residual.setVisible(False)
         self._window_xy = None
@@ -308,9 +314,21 @@ class SpectrumView(QtWidgets.QWidget):
         if self._pg is None or not np.isfinite(period) or period <= 0.0:
             return
         self._sel_period = period
-        self._sel_band.setVisible(True)
+        self._sync_band()
         self._update_band()
         self._redraw_markers()  # re-place the selected-peak halo
+
+    def _sync_band(self) -> None:
+        """The band is shown iff something is selected *and* peaks are being marked.
+
+        It shades a peak, so it belongs to the peak layer: leaving it behind when the
+        markers are hidden would keep the one piece of clutter the toggle is usually
+        turned off to be rid of. The selection itself survives, band and all, and
+        comes back with the markers.
+        """
+        self._sel_band.setVisible(
+            self._sel_period is not None and self._show_peaks.isChecked()
+        )
 
     def clear(self) -> None:
         """Clear the spectrum, peaks, and selection (e.g. when a new curve loads)."""
@@ -319,7 +337,7 @@ class SpectrumView(QtWidgets.QWidget):
         self._sel_period = None
         self._curve.setData([], [])
         self._markers.clear()
-        self._sel_band.setVisible(False)
+        self._sync_band()
         self._hover_text.setVisible(False)
         self._readout.setText("—")
         self.clear_overlay()
@@ -331,7 +349,7 @@ class SpectrumView(QtWidgets.QWidget):
         Unlike :meth:`clear`, the spectrum curve/peaks themselves are left alone.
         """
         self._sel_period = None
-        self._sel_band.setVisible(False)
+        self._sync_band()
         self._redraw_markers()
 
     # -- drawing -----------------------------------------------------------------
@@ -502,6 +520,7 @@ class SpectrumView(QtWidgets.QWidget):
 
     def _on_peaks_toggled(self, _checked: bool) -> None:
         self._redraw_markers()
+        self._sync_band()
 
     def _autorange(self) -> None:
         # Disable clip-to-view first: with it on, auto-ranging after a data-range change

@@ -258,6 +258,37 @@ def test_peaks_toggle_hides_and_restores_every_marker(qtbot: QtBot) -> None:
     assert len(view._markers.data) == populated
 
 
+def test_selection_band_follows_the_peaks_toggle(qtbot: QtBot) -> None:
+    # The band shades a peak, so it belongs to the peak layer: leaving it behind was
+    # the one bit of clutter the toggle is usually turned off to be rid of.
+    view = SpectrumView("dark")
+    qtbot.addWidget(view)
+    pg_result = _bump_periodogram()
+    view.set_periodogram(pg_result)
+    peak = pg_result.best_periods(1)[0]
+    view.set_peaks([peak])
+    view.set_selected_period(peak.period)
+    assert view._sel_band.isVisible()
+
+    view._show_peaks.setChecked(False)
+    assert not view._sel_band.isVisible()
+    # The selection itself is not lost, so the fold does not change under the user.
+    assert view._sel_period == peak.period
+    # Nor does re-selecting while hidden bring the band back.
+    view.set_selected_period(peak.period)
+    assert not view._sel_band.isVisible()
+
+    view._show_peaks.setChecked(True)
+    assert view._sel_band.isVisible()
+
+    # With peaks shown but nothing selected there is still no band.
+    view.clear_selection()
+    assert not view._sel_band.isVisible()
+    view._show_peaks.setChecked(False)
+    view._show_peaks.setChecked(True)
+    assert not view._sel_band.isVisible()
+
+
 def test_spectrum_reset_button_label(qtbot: QtBot) -> None:
     # "Reset", not "Reset view": with the pre-whitening overlay toggles shown the
     # longer label pushed the toolbar past the dock width and Qt squeezed the buttons.

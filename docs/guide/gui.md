@@ -65,7 +65,7 @@ required.
 | --- | --- |
 | **Analysis** (top left) | Switch between **Periodogram** — one method over a trial grid — and **Pre-whitening**, the automated frequency extraction of {doc}`prewhitening`. The rest of the window is shared: same inputs, same spectrum/phased views, same source browser; only the result docks change. |
 | **Controls** (left) | Choose the method and edit its settings. The form is built automatically from each method's settings model ({doc}`tuning`), so every knob — grid bounds, `n_harmonics`, transit-duration fractions, backend/device/precision — is exposed with the right type and defaults. Press **Compute** to run. |
-| **Spectrum** (centre) | The full-resolution periodogram, rendered at interactive speed. Drag the marker to select a trial period; toggle the **x-axis** between frequency and period and switch either axis to **log**. Double-click anywhere to restore the default view. |
+| **Spectrum** (centre) | The full-resolution periodogram, rendered at interactive speed. Drag the marker to select a trial period; toggle the **x-axis** between frequency and period and switch either axis to **log**. **peaks** hides the peak markers and the shaded selection band together, for an unobstructed view of the spectrum. Double-click anywhere to restore the default view. |
 | **Phased** | The light curve folded on the selected period, updating live as you move the marker. **2 cycles** repeats the fold; for multi-band data a **Band** selector overlays all bands or isolates one. |
 | **Raw light curve** | The unfolded time series for the loaded source. |
 | **Peaks** (dock) | The ranked N-best periods ({doc}`results`). Click a row to jump the marker (and the fold) to that peak. |
