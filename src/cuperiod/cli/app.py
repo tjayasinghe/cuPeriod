@@ -5,6 +5,8 @@ code path. Commands:
 
 * ``run`` — one light curve, one or more methods; prints the N best periods.
 * ``batch`` — many light curves with CPU or GPU workers, written to Parquet/CSV.
+* ``prewhiten`` — automated iterative frequency extraction for a pulsator.
+* ``batch-prewhiten`` — the same over many light curves, written to Parquet/CSV.
 * ``methods`` — list registered methods and their backends.
 * ``gpu-info`` — show the CUDA GPU and suggested worker counts.
 * ``doctor`` — diagnose available backends, torch devices, and the precision each uses.
@@ -20,15 +22,18 @@ from typing import Any
 
 import numpy as np
 import typer
+from pydantic import ValidationError
 
 from cuperiod.api import periodogram
 from cuperiod.batch.runner import batch_periodograms
 from cuperiod.core.columns import ColumnMap, Domain
+from cuperiod.core.config import PreWhitenSettings
 from cuperiod.core.device import gpu_info as _gpu_info
 from cuperiod.core.device import suggest_gpu_workers
 from cuperiod.core.lightcurve import LightCurve
 from cuperiod.core.result import MultiResult, Periodogram
 from cuperiod.methods.base import get_method, list_methods
+from cuperiod.prewhiten.result import PreWhitenResult
 
 app = typer.Typer(
     add_completion=False,
@@ -162,6 +167,207 @@ def batch(
     )
     typer.echo(
         f"Processed {summary.n_done} results from {summary.n_inputs} inputs "
+        f"({summary.n_skipped} skipped, {summary.n_failed} failed) -> {summary.sink}"
+    )
+    for key, msg in summary.errors[:10]:
+        typer.echo(f"  ! {key}: {msg}")
+
+
+def _prewhiten_settings(
+    *,
+    max_frequencies: int,
+    snr: float,
+    stop: str,
+    minimum_frequency: float | None,
+    maximum_frequency: float | None,
+    uncertainty: str,
+    combinations: bool,
+    backend: str,
+    store_spectra: bool = True,
+) -> PreWhitenSettings:
+    """Build a :class:`PreWhitenSettings` from CLI options (validated by pydantic)."""
+    criteria = tuple(c.strip().lower() for c in stop.split(",") if c.strip())
+    try:
+        return PreWhitenSettings(
+            max_frequencies=max_frequencies,
+            snr_threshold=snr,
+            stop_criteria=criteria,  # type: ignore[arg-type]
+            minimum_frequency=minimum_frequency,
+            maximum_frequency=maximum_frequency,
+            uncertainty=uncertainty,  # type: ignore[arg-type]
+            combinations=combinations,
+            backend=backend,  # type: ignore[arg-type]
+            store_spectra=store_spectra,
+        )
+    except ValidationError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+@app.command()
+def prewhiten(
+    path: Path = typer.Argument(..., help="Light-curve file (CSV/ECSV/FITS/Parquet)."),
+    backend: str = typer.Option("auto", help="auto | cpu | gpu | concrete backend."),
+    max_frequencies: int = typer.Option(
+        30, "--max-frequencies", "-n", help="Cap on extracted components."
+    ),
+    snr: float = typer.Option(4.0, "--snr", help="Breger signal-to-noise threshold."),
+    stop: str = typer.Option(
+        "snr", "--stop", help="Stopping criteria (comma-sep): snr,fap,bic,amplitude."
+    ),
+    minimum_frequency: float | None = typer.Option(
+        None, "--fmin", help="Lowest trial frequency (cycles/day)."
+    ),
+    maximum_frequency: float | None = typer.Option(
+        None, "--fmax", help="Highest trial frequency (cycles/day)."
+    ),
+    uncertainty: str = typer.Option(
+        "covariance", help="covariance | analytic | bootstrap."
+    ),
+    combinations: bool = typer.Option(
+        True,
+        "--combinations/--no-combinations",
+        help="Identify combination frequencies.",
+    ),
+    spacing: bool = typer.Option(
+        False, "--spacing", help="Also search for a g-mode period-spacing pattern."
+    ),
+    time: str | None = typer.Option(None, help="Time column name override."),
+    value: str | None = typer.Option(None, help="Value column name override."),
+    error: str | None = typer.Option(None, help="Error column name override."),
+    domain: str | None = typer.Option(None, help="magnitude | flux."),
+    out: Path | None = typer.Option(None, help="Write the full solution as JSON here."),
+    csv_out: Path | None = typer.Option(
+        None, "--csv", help="Write the component table as CSV here."
+    ),
+    save_spectrum: Path | None = typer.Option(
+        None, "--save-spectrum", help="Write the amplitude spectra to this .npz."
+    ),
+) -> None:
+    """Extract a pulsator's frequency solution by automated iterative pre-whitening."""
+    from cuperiod.prewhiten import find_period_spacing
+    from cuperiod.prewhiten import prewhiten as _prewhiten
+
+    columns = _column_map(time, value, error, None)
+    lc = LightCurve.from_file(path, columns=columns, domain=_domain(domain))
+    settings = _prewhiten_settings(
+        max_frequencies=max_frequencies,
+        snr=snr,
+        stop=stop,
+        minimum_frequency=minimum_frequency,
+        maximum_frequency=maximum_frequency,
+        uncertainty=uncertainty,
+        combinations=combinations,
+        backend=backend,
+    )
+    result = _prewhiten(lc, settings=settings)
+    typer.echo(result.summary())
+
+    if spacing:
+        independent = result.independent()
+        series = (
+            find_period_spacing(
+                np.asarray([c.period for c in independent], dtype=np.float64),
+                np.asarray([c.amplitude for c in independent], dtype=np.float64),
+            )
+            if len(independent) >= 4
+            else None
+        )
+        typer.echo("")
+        typer.echo(
+            series.summary()
+            if series is not None
+            else "Period spacing: no regular series found."
+        )
+
+    if out is not None:
+        out.write_text(
+            json.dumps(_json_safe(result.to_dict()), indent=2, allow_nan=False),
+            encoding="utf-8",
+        )
+        typer.echo(f"\nWrote {out}")
+    if csv_out is not None:
+        _write_component_csv(result, csv_out)
+        typer.echo(f"Wrote {csv_out}")
+    if save_spectrum is not None:
+        arrays: dict[str, np.ndarray] = {}
+        if result.spectrum is not None:
+            arrays["frequency"] = result.spectrum.frequency
+            arrays["amplitude"] = result.spectrum.amplitude
+        if result.residual_spectrum is not None:
+            arrays["residual_amplitude"] = result.residual_spectrum.amplitude
+        np.savez_compressed(save_spectrum, **arrays)  # type: ignore[arg-type]
+        typer.echo(f"Wrote {save_spectrum}")
+
+
+def _write_component_csv(result: PreWhitenResult, path: Path) -> None:
+    """Write one row per extracted component (the frequency-solution table)."""
+    import csv
+
+    rows = result.to_table()
+    fields = list(rows[0]) if rows else ["rank", "label", "frequency", "amplitude"]
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+@app.command(name="batch-prewhiten")
+def batch_prewhiten_cmd(
+    inputs: str = typer.Argument(..., help="Glob, directory, or file of light curves."),
+    out: Path = typer.Option(..., "--out", help="Output .parquet/.csv file or dir."),
+    device: str = typer.Option("cpu", help="cpu | gpu."),
+    backend: str = typer.Option("auto", help="auto | cpu | gpu | concrete backend."),
+    workers: int | None = typer.Option(None, help="Worker count (None = auto)."),
+    max_frequencies: int = typer.Option(
+        30, "--max-frequencies", "-n", help="Cap on extracted components."
+    ),
+    snr: float = typer.Option(4.0, "--snr", help="Breger signal-to-noise threshold."),
+    stop: str = typer.Option("snr", "--stop", help="Stopping criteria (comma-sep)."),
+    minimum_frequency: float | None = typer.Option(
+        None, "--fmin", help="Lowest trial frequency (cycles/day)."
+    ),
+    maximum_frequency: float | None = typer.Option(
+        None, "--fmax", help="Highest trial frequency (cycles/day)."
+    ),
+    uncertainty: str = typer.Option(
+        "covariance", help="covariance | analytic | bootstrap."
+    ),
+    combinations: bool = typer.Option(
+        True, "--combinations/--no-combinations", help="Identify combinations."
+    ),
+    time: str | None = typer.Option(None, help="Time column name override."),
+    value: str | None = typer.Option(None, help="Value column name override."),
+    error: str | None = typer.Option(None, help="Error column name override."),
+    domain: str | None = typer.Option(None, help="magnitude | flux."),
+    resume: bool = typer.Option(True, "--resume/--no-resume", help="Skip done chunks."),
+) -> None:
+    """Pre-whiten many light curves; writes one row per extracted component."""
+    from cuperiod.prewhiten import batch_prewhiten as _batch_prewhiten
+
+    settings = _prewhiten_settings(
+        max_frequencies=max_frequencies,
+        snr=snr,
+        stop=stop,
+        minimum_frequency=minimum_frequency,
+        maximum_frequency=maximum_frequency,
+        uncertainty=uncertainty,
+        combinations=combinations,
+        backend=backend,
+        store_spectra=False,
+    )
+    summary = _batch_prewhiten(
+        inputs,
+        settings=settings,
+        backend=backend,
+        device=device,
+        workers=workers,
+        columns=_column_map(time, value, error, None),
+        domain=_domain(domain),
+        sink=out,
+        resume=resume,
+    )
+    typer.echo(
+        f"Wrote {summary.n_done} component rows from {summary.n_inputs} inputs "
         f"({summary.n_skipped} skipped, {summary.n_failed} failed) -> {summary.sink}"
     )
     for key, msg in summary.errors[:10]:

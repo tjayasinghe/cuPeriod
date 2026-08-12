@@ -94,3 +94,86 @@ def test_grid_info_command(tmp_path: Path) -> None:
     result = runner.invoke(app, ["grid-info", str(csv), "--method", "GLS"])
     assert result.exit_code == 0
     assert "samples" in result.stdout
+
+
+def _write_pulsator_csv(path: Path) -> Path:
+    from synth import synthetic_pulsator
+
+    time, mag, err = synthetic_pulsator(n=600, span=20.0)
+    pd.DataFrame({"hjd": time, "mag": mag, "mag_err": err}).to_csv(path, index=False)
+    return path
+
+
+def test_prewhiten_command(tmp_path: Path) -> None:
+    csv = _write_pulsator_csv(tmp_path / "pulsator.csv")
+    out = tmp_path / "solution.json"
+    table = tmp_path / "components.csv"
+    result = runner.invoke(
+        app,
+        [
+            "prewhiten", str(csv), "--backend", "finufft", "-n", "4",
+            "--out", str(out), "--csv", str(table),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Pre-whitening" in result.stdout and "F1" in result.stdout
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["n_components"] >= 1
+    assert payload["components"][0]["label"] == "F1"
+    header = table.read_text(encoding="utf-8").splitlines()[0]
+    assert header.startswith("rank,label,frequency")
+
+
+def test_prewhiten_command_saves_spectra(tmp_path: Path) -> None:
+    import numpy as np
+
+    csv = _write_pulsator_csv(tmp_path / "pulsator.csv")
+    npz = tmp_path / "spectra.npz"
+    result = runner.invoke(
+        app,
+        ["prewhiten", str(csv), "--backend", "finufft", "-n", "2",
+         "--save-spectrum", str(npz)],
+    )
+    assert result.exit_code == 0, result.output
+    with np.load(npz) as data:
+        assert {"frequency", "amplitude", "residual_amplitude"} <= set(data)
+
+
+def test_prewhiten_command_reports_a_period_spacing(tmp_path: Path) -> None:
+    from synth import synthetic_gmode
+
+    time, mag, err, _ = synthetic_gmode(n=1500, n_modes=12)
+    csv = tmp_path / "gdor.csv"
+    pd.DataFrame({"hjd": time, "mag": mag, "mag_err": err}).to_csv(csv, index=False)
+    result = runner.invoke(
+        app,
+        ["prewhiten", str(csv), "--backend", "finufft", "-n", "14", "--spacing"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Period spacing" in result.stdout
+
+
+def test_prewhiten_command_rejects_a_bad_criterion(tmp_path: Path) -> None:
+    csv = _write_pulsator_csv(tmp_path / "pulsator.csv")
+    result = runner.invoke(
+        app, ["prewhiten", str(csv), "--stop", "nonsense", "--backend", "finufft"]
+    )
+    assert result.exit_code != 0
+
+
+def test_batch_prewhiten_command(tmp_path: Path) -> None:
+    import pyarrow.parquet as pq
+
+    for index in range(2):
+        _write_pulsator_csv(tmp_path / f"p{index}.csv")
+    out = tmp_path / "modes.parquet"
+    result = runner.invoke(
+        app,
+        ["batch-prewhiten", str(tmp_path / "*.csv"), "--out", str(out),
+         "--backend", "finufft", "-n", "3", "--workers", "1"],
+    )
+    assert result.exit_code == 0, result.output
+    assert out.exists()
+    table = pq.read_table(out).to_pylist()
+    assert {row["key"] for row in table}
+    assert "frequency" in table[0]
