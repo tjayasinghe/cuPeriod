@@ -129,6 +129,10 @@ class AppController(QObject):
             return
         self.state.analysis = analysis
         self._pending_key = None
+        # Dropping the pending key means no completion handler will ever fire for the
+        # in-flight run, so the busy state has to be released here or the Compute button
+        # stays disabled for the rest of the session.
+        self.busy_changed.emit(False)
         self.analysis_changed.emit(analysis)
 
     # -- batch mode --------------------------------------------------------------
@@ -209,7 +213,7 @@ class AppController(QObject):
             return
         if isinstance(lc, MultiBandLightCurve):
             lc_input: LightCurve = (
-                lc.bands[band] if band in lc.bands else self._stack(lc)
+                lc.bands[band] if band in lc.bands else self._stack_centred(lc)
             )
         else:
             lc_input = lc
@@ -247,6 +251,27 @@ class AppController(QObject):
         time, value, error, _ = mblc.finite().stacked()
         domain = next(iter(mblc.bands.values())).domain
         return LightCurve.from_arrays(time, value, error, domain=domain)
+
+    @staticmethod
+    def _stack_centred(mblc: MultiBandLightCurve) -> LightCurve:
+        """Merge all bands after removing each band's own mean.
+
+        Pre-whitening fits a *single* constant for the whole curve, so a raw stack of
+        bands at different zero points buries the pulsation under an inter-band offset
+        of a magnitude or more. Centring each band first is the least the merge can do
+        to stay usable; a per-band amplitude solution would need a multi-band model.
+        """
+        finite = mblc.finite()
+        centred = {
+            name: LightCurve.from_arrays(
+                band.time,
+                band.value - float(np.mean(band.value)) if band.n else band.value,
+                band.error,
+                domain=band.domain,
+            )
+            for name, band in finite.bands.items()
+        }
+        return AppController._stack(MultiBandLightCurve.from_light_curves(centred))
 
     def _tune_auto_grid(self, lc: LoadedCurve, settings: BaseSettings) -> BaseSettings:
         """Improve the default frequency grid for frequency-grid methods.

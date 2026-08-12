@@ -50,6 +50,9 @@ _SUBMULTIPLE_RATIO: Final = 0.8
 #: Largest integer multiple of the winning spacing tested for the promotion above.
 _MAX_SUBMULTIPLE: Final = 6
 
+#: Phase-residual cut (in fractions of a spacing) for "this value is on that comb".
+_COMB_MEMBER_TOL: Final = 0.15
+
 
 @dataclass(frozen=True)
 class SpacingSpectrum:
@@ -307,17 +310,8 @@ def spacing_spectrum(
     u = u_lo + step * np.arange(n_trials, dtype=np.float64)
     u = u[u > 0.0]
 
-    total = float(a.sum())
-    power = np.empty(u.size, dtype=np.float64)
-    block = max(1, _BLOCK_ELEMS // max(1, v.size))
-    for start in range(0, u.size, block):
-        stop = min(start + block, u.size)
-        angle = (2.0 * np.pi) * u[start:stop, None] * v[None, :]
-        real = (np.cos(angle) * a).sum(axis=1)
-        imag = (np.sin(angle) * a).sum(axis=1)
-        power[start:stop] = (real * real + imag * imag) / (total * total)
-
-    best = _pick_spacing(u, power, oversample)
+    power = _comb_response(u, v, a)
+    best = _pick_spacing(u, power, v, oversample)
     return SpacingSpectrum(
         spacing=(1.0 / u)[::-1],
         power=power[::-1],
@@ -327,8 +321,41 @@ def spacing_spectrum(
     )
 
 
+def _comb_response(
+    inverse_spacing: FloatArray, values: FloatArray, weights: FloatArray
+) -> FloatArray:
+    """``|sum_j a_j exp(2 pi i u x_j)|^2 / (sum_j a_j)^2`` on the trial grid."""
+    total = float(weights.sum())
+    power = np.empty(inverse_spacing.size, dtype=np.float64)
+    block = max(1, _BLOCK_ELEMS // max(1, values.size))
+    for start in range(0, inverse_spacing.size, block):
+        stop = min(start + block, inverse_spacing.size)
+        angle = (2.0 * np.pi) * inverse_spacing[start:stop, None] * values[None, :]
+        real = (np.cos(angle) * weights).sum(axis=1)
+        imag = (np.sin(angle) * weights).sum(axis=1)
+        power[start:stop] = (real * real + imag * imag) / (total * total)
+    return power
+
+
+def _comb_members(
+    values: FloatArray, inverse_spacing: float, tolerance: float
+) -> FloatArray:
+    """The values that lie on the comb of spacing ``1/inverse_spacing``.
+
+    The comb's own offset is read off the resultant's phase, so this does not assume the
+    teeth pass through zero, and membership is then a plain phase-residual cut.
+    """
+    phase = values * inverse_spacing
+    offset = float(np.angle(np.sum(np.exp(2j * np.pi * phase)))) / (2.0 * np.pi)
+    residual = np.abs(((phase - offset + 0.5) % 1.0) - 0.5)
+    return values[residual < tolerance]
+
+
 def _pick_spacing(
-    inverse_spacing: FloatArray, power: FloatArray, oversample: int
+    inverse_spacing: FloatArray,
+    power: FloatArray,
+    values: FloatArray,
+    oversample: int,
 ) -> int:
     """Index of the reported comb peak, promoted past any sub-multiple of itself.
 
@@ -343,9 +370,21 @@ def _pick_spacing(
     collapses. So a response at ``m·dP`` still a large fraction of the peak
     (:data:`_SUBMULTIPLE_RATIO`) means ``dP`` was the sub-multiple, and the widest such
     spacing is the one reported.
+
+    ``power`` selects the peak — amplitude-weighted if the caller weighted it, which is
+    what suppresses low-amplitude non-members. The promotion, though, is decided on the
+    *unweighted* response of that peak's **own members**: it asks "do the modes this
+    comb explains also land on the wider one?". Neither a wide amplitude spread — under
+    which a weighted response barely notices a widened comb dropping the weak teeth, and
+    would promote to a *multiple* of the truth — nor unrelated contaminating peaks,
+    which drag an all-values unweighted response around, can distort the decision.
     """
     best = int(np.argmax(power))
-    peak = float(power[best])
+    members = _comb_members(values, inverse_spacing[best], _COMB_MEMBER_TOL)
+    if members.size < 3:
+        return best
+    counting = _comb_response(inverse_spacing, members, np.ones_like(members))
+    peak = float(counting[best])
     if peak <= 0.0:
         return best
     half_width = max(1, int(oversample))
@@ -359,8 +398,8 @@ def _pick_spacing(
         hi = min(int(inverse_spacing.size), index + half_width + 1)
         if lo >= hi:
             continue
-        local = lo + int(np.argmax(power[lo:hi]))
-        if power[local] >= _SUBMULTIPLE_RATIO * peak:
+        local = lo + int(np.argmax(counting[lo:hi]))
+        if counting[local] >= _SUBMULTIPLE_RATIO * peak:
             chosen = local
     return chosen
 
@@ -385,6 +424,22 @@ def _fit_tilt(
         float(solution[1]),
         float(np.sqrt(np.mean(residual**2))),
     )
+
+
+def _step_counts(difference: FloatArray, predicted: FloatArray) -> FloatArray:
+    """How many radial orders each observed step spans, at least one.
+
+    ``predicted`` is the tilted model ``a + b P`` evaluated at the step midpoints. Only
+    ``a + b P`` over the *observed* range has to be positive — ``a`` alone is a nuisance
+    parameter of the parameterisation and is legitimately negative for a steeply tilted
+    series — so a non-positive prediction is treated as "cannot tell" (one order) rather
+    than allowed to produce a negative step count.
+    """
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = np.where(predicted > 0.0, difference / np.where(
+            predicted > 0.0, predicted, 1.0
+        ), 1.0)
+    return np.maximum(np.round(ratio), 1.0)
 
 
 def _longest_chain(
@@ -504,8 +559,8 @@ def find_period_spacing(
         chain = candidate
         members = p[chain]
         difference = np.diff(members)
-        predicted = intercept + slope * 0.5 * (members[:-1] + members[1:])
-        steps = np.maximum(np.round(difference / predicted), 1.0)
+        midpoints = 0.5 * (members[:-1] + members[1:])
+        steps = _step_counts(difference, intercept + slope * midpoints)
         if float(steps.min()) >= 2.0:
             # Not one pair in the chain is a consecutive radial order, which no real
             # series looks like: the working spacing is a sub-multiple of the true one.
@@ -513,19 +568,14 @@ def find_period_spacing(
             intercept *= factor
             slope *= factor
             continue
-        intercept, slope, _ = _fit_tilt(
-            0.5 * (members[:-1] + members[1:]), difference / steps
-        )
-        if intercept <= 0.0:  # pragma: no cover - a pathological fit
-            return None
+        intercept, slope, _ = _fit_tilt(midpoints, difference / steps)
     if len(chain) < cfg.min_length:
         return None
 
     members = p[chain]
     difference = np.diff(members)
     midpoints = 0.5 * (members[:-1] + members[1:])
-    predicted = intercept + slope * midpoints
-    steps = np.maximum(np.round(difference / predicted), 1.0)
+    steps = _step_counts(difference, intercept + slope * midpoints)
     unit = difference / steps
     intercept, slope, rms = _fit_tilt(midpoints, unit)
     mean_spacing = float(np.mean(unit))

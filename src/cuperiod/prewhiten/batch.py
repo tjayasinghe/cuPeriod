@@ -35,7 +35,7 @@ from cuperiod.core.config import PreWhitenSettings
 from cuperiod.core.device import free_gpu_memory, suggest_gpu_workers
 from cuperiod.core.lightcurve import MultiBandLightCurve
 from cuperiod.prewhiten.engine import prewhiten
-from cuperiod.prewhiten.result import PreWhitenResult
+from cuperiod.prewhiten.result import PreWhitenResult, Sinusoid
 
 
 @dataclass(frozen=True)
@@ -90,15 +90,37 @@ def prewhiten_to_rows(
     if max_components is not None:
         components = components[:max_components]
     if not components:
-        empty = dict.fromkeys(
-            (
-                "rank", "label", "frequency", "frequency_error", "period",
-                "period_error", "amplitude", "amplitude_error", "phase",
-                "phase_error", "snr", "fap", "delta_bic", "combination",
-            )
-        )
-        return [{**summary, **empty}]
-    return [{**summary, **component.to_dict()} for component in components]
+        return [{**summary, **dict(_EMPTY_COMPONENT)}]
+    return [{**summary, **_component_cells(component)} for component in components]
+
+
+#: Numeric component fields, in row order. Kept float (``rank`` included) and NaN-filled
+#: rather than ``None`` so every chunk of a directory sink infers the *same* Arrow type:
+#: a part in which no star had a combination would otherwise type that column null,
+#: making the whole dataset unreadable.
+_NUMERIC_FIELDS: tuple[str, ...] = (
+    "rank", "frequency", "frequency_error", "period", "period_error",
+    "amplitude", "amplitude_error", "phase", "phase_error", "snr", "fap", "delta_bic",
+)
+
+#: String component fields, empty-string-filled for the same reason.
+_TEXT_FIELDS: tuple[str, ...] = ("label", "combination")
+
+#: The all-missing component block used for a light curve that yielded nothing.
+_EMPTY_COMPONENT: dict[str, Any] = {
+    **dict.fromkeys(_NUMERIC_FIELDS, float("nan")),
+    **dict.fromkeys(_TEXT_FIELDS, ""),
+}
+
+
+def _component_cells(component: Sinusoid) -> dict[str, Any]:
+    """One component as stably-typed row cells (see :data:`_NUMERIC_FIELDS`)."""
+    values = component.to_dict()
+    cells: dict[str, Any] = {
+        name: float(values[name]) for name in _NUMERIC_FIELDS
+    }
+    cells.update({name: values[name] or "" for name in _TEXT_FIELDS})
+    return cells
 
 
 def _process_chunk(

@@ -267,3 +267,70 @@ def test_spectrum_view_overlays_the_residual_spectrum(qtbot: QtBot) -> None:
     )
     view.set_periodogram(wrapped)  # a new result drops the stale overlay
     assert view._overlay_xy is None
+
+
+# --- regressions -------------------------------------------------------------
+
+
+def test_switching_analysis_mid_run_releases_the_busy_state(qtbot: QtBot) -> None:
+    # Regression: set_analysis() cleared the pending key, so the completion handler for
+    # the in-flight run never fired busy_changed(False) and Compute stayed disabled for
+    # the rest of the session.
+    controller = AppController()
+    panel = ControlsPanel()
+    qtbot.addWidget(panel)
+    panel.set_enabled(True)
+    controller.busy_changed.connect(panel.set_busy)
+    controller.set_light_curve(_curve(4000), "star")
+    with qtbot.waitSignal(controller.busy_changed, timeout=5000):
+        controller.run_prewhiten("finufft", _SETTINGS)
+    assert not panel.can_compute()  # busy
+    with qtbot.waitSignal(controller.busy_changed, timeout=5000) as blocker:
+        controller.set_analysis("periodogram")
+    assert blocker.args == [False]
+    assert panel.can_compute()
+    controller.shutdown()
+
+
+def test_prewhiten_defaults_to_one_band_for_a_multiband_curve(qtbot: QtBot) -> None:
+    # Regression: set_bands() passed the (hidden) method combo's text, so a multiband
+    # curve loaded *after* switching to pre-whitening offered and selected
+    # "combined (all bands)" and silently analysed a raw all-band stack.
+    panel = ControlsPanel()
+    qtbot.addWidget(panel)
+    panel.set_analysis("prewhiten")
+    panel.set_bands(["g", "r"])
+    assert panel.current_band() == "g"
+    assert "combined" not in panel._band_combo.itemText(0)
+    # ...and the same is true whichever order the two happen in.
+    other = ControlsPanel()
+    qtbot.addWidget(other)
+    other.set_bands(["g", "r"])
+    other.set_analysis("prewhiten")
+    assert other.current_band() == "g"
+
+
+def test_a_stacked_multiband_prewhiten_removes_the_band_offsets(qtbot: QtBot) -> None:
+    from cuperiod.core.lightcurve import MultiBandLightCurve
+
+    rng = np.random.default_rng(0)
+    time = np.sort(rng.uniform(0.0, 20.0, 900)) + 2458000.0
+    signal = 0.01 * np.sin(2 * np.pi * 1.3 * (time - time.min()))
+    bands = {
+        "g": LightCurve.from_arrays(
+            time, 15.0 + signal + rng.normal(0, 5e-4, 900), np.full(900, 5e-4)
+        ),
+        "r": LightCurve.from_arrays(
+            time, 14.2 + signal + rng.normal(0, 5e-4, 900), np.full(900, 5e-4)
+        ),
+    }
+    mblc = MultiBandLightCurve.from_light_curves(bands)
+    controller = AppController()
+    controller.set_light_curve(mblc, "multiband")
+    with qtbot.waitSignal(controller.solution_ready, timeout=60000) as blocker:
+        controller.run_prewhiten("finufft", _SETTINGS, band="stacked")
+    (result,) = blocker.args
+    # A raw concatenation would bury the 0.01 mag signal under a 0.8 mag offset.
+    assert result.n_components >= 1
+    assert result.components[0].frequency == pytest.approx(1.3, abs=0.01)
+    controller.shutdown()

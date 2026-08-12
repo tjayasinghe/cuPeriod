@@ -258,7 +258,13 @@ class ControlsPanel(QtWidgets.QWidget):
     def set_bands(self, band_names: list[str] | None) -> None:
         """Show a band selector for multiband curves; hide it for single-band ones."""
         self._band_names = list(band_names) if band_names else None
-        self._rebuild_band_combo(self._method_combo.currentText())
+        # ``None`` means pre-whitening, which is single-band by definition. Passing
+        # the (hidden) method combo's text would offer "combined (all bands)" and
+        # select it, so loading a multiband curve *after* switching analysis would
+        # silently analyse a raw all-band stack instead of one band.
+        self._rebuild_band_combo(
+            None if self._prewhiten else self._method_combo.currentText()
+        )
 
     def set_curve_time(self, time: FloatArray) -> None:
         """Provide the active curve's times so the auto grid range can be shown."""

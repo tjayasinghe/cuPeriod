@@ -221,3 +221,50 @@ def test_spacing_recovered_from_a_pre_whitened_g_mode_star() -> None:
     assert series.mean_spacing == pytest.approx(expected, rel=0.05)
     assert series.slope == pytest.approx(0.008, abs=0.004)
     assert series.n_modes >= 12
+
+
+# --- regressions -------------------------------------------------------------
+
+
+def test_a_steeply_tilted_series_is_not_discarded() -> None:
+    # Regression: the refit loop used to abort whenever the fitted *intercept* went
+    # non-positive. The intercept is a nuisance parameter of dP = a + b*P, not a
+    # spacing; only a + b*P over the observed range has to be positive, and it is.
+    periods = np.cumsum(0.02 + 0.0015 * np.arange(20)) + 0.5
+    series = find_period_spacing(periods)
+    assert series is not None
+    assert series.n_modes == 20
+    assert series.intercept <= 0.0 or series.slope > 0.0
+    assert np.all(series.predicted_spacing(series.midpoints) > 0.0)
+    for gradient in (0.0005, 0.0010, 0.0012, 0.0015):
+        tilted = np.cumsum(0.02 + gradient * np.arange(20)) + 0.5
+        assert find_period_spacing(tilted) is not None, gradient
+
+
+def test_a_tilted_series_survives_realistic_scatter() -> None:
+    rng = np.random.default_rng(0)
+    found = 0
+    for _ in range(40):
+        periods = np.cumsum(0.02 + 0.0015 * np.arange(20)) + 0.5
+        periods = np.sort(periods + rng.normal(0.0, 20.0 / 86400.0, 20))
+        if find_period_spacing(periods) is not None:
+            found += 1
+    assert found == 40
+
+
+def test_a_wide_amplitude_spread_does_not_promote_past_the_true_spacing() -> None:
+    # Regression: the sub-multiple promotion was judged on the amplitude-weighted
+    # response, so dropping every other (weak) tooth barely lowered it and the search
+    # was promoted to 2x the true spacing — doubling the reported dP and Pi_0.
+    periods = 0.5 + 0.03 * np.arange(12)
+    amplitudes = np.where(np.arange(12) % 2 == 0, 10.0, 0.5)
+    assert spacing_spectrum(periods, weights=amplitudes).best_spacing == pytest.approx(
+        0.03, rel=0.02
+    )
+    series = find_period_spacing(periods, amplitudes)
+    assert series is not None
+    assert series.mean_spacing == pytest.approx(0.03, rel=0.02)
+    assert series.n_modes == 12
+    assert series.buoyancy_radius == pytest.approx(
+        buoyancy_radius(0.03, 1), rel=0.02
+    )

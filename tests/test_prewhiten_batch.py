@@ -48,7 +48,9 @@ def test_a_curve_with_no_components_still_produces_a_row() -> None:
     assert solution.n_components == 0
     (row,) = prewhiten_to_rows("quiet", solution)
     assert row["key"] == "quiet" and row["n_components"] == 0
-    assert row["frequency"] is None
+    # Missing cells are NaN / "" rather than None, so a Parquet part written from an
+    # all-quiet chunk infers the same column types as any other chunk.
+    assert np.isnan(row["frequency"]) and row["combination"] == ""
 
 
 def test_max_components_truncates_the_rows() -> None:
@@ -120,3 +122,59 @@ def test_an_invalid_device_is_rejected() -> None:
 def test_top_level_batch_entry_point_exists() -> None:
     summary = cup.batch_prewhiten(_curves(1), settings=_settings(), workers=1)
     assert summary.n_inputs == 1
+
+
+def test_directory_sink_parts_share_one_schema(tmp_path: Path) -> None:
+    # Regression: component fields were emitted as Python None, so a chunk in which no
+    # star had an identified combination typed that column `null` while a later chunk
+    # typed it `string` — and a pyarrow dataset takes its schema from the first
+    # fragment, making the whole directory unreadable.
+    import pyarrow as pa
+    import pyarrow.dataset as ds
+    import pyarrow.parquet as pq
+
+    rng = np.random.default_rng(3)
+    quiet_time = np.sort(rng.uniform(0.0, 27.0, 600)) + 2458000.0
+    quiet = cup.LightCurve.from_arrays(
+        quiet_time, 10.0 + rng.normal(0.0, 0.002, 600), np.full(600, 0.002)
+    )
+    time, value, error = synthetic_pulsator(n=600, span=20.0)
+    loud = cup.LightCurve.from_arrays(time, value, error)
+
+    sink = tmp_path / "parts"
+    # Chunk 0 yields no components at all; chunk 1 yields several with a combination.
+    summary = batch_prewhiten(
+        [("quiet", quiet), ("loud", loud)],
+        settings=_settings(snr_threshold=8.0),
+        workers=1,
+        sink=sink,
+        chunk_size=1,
+    )
+    assert summary.n_failed == 0
+    parts = sorted(sink.glob("part-*.parquet"))
+    assert len(parts) == 2
+    schemas = [pq.read_schema(p) for p in parts]
+    assert schemas[0] == schemas[1]
+    assert pa.types.is_string(schemas[0].field("combination").type)  # never null-typed
+    assert pa.types.is_floating(schemas[0].field("frequency").type)
+    table = ds.dataset(sink, format="parquet").to_table()
+    assert set(table.column("key").to_pylist()) == {"quiet", "loud"}
+
+
+def test_component_cells_are_stably_typed() -> None:
+    time, value, error = synthetic_pulsator(n=600)
+    solution = prewhiten((time, value, error), settings=_settings())
+    (filled,) = prewhiten_to_rows("star", solution, max_components=1)
+    rng = np.random.default_rng(7)
+    quiet_time = np.sort(rng.uniform(0.0, 27.0, 600)) + 2458000.0
+    empty_solution = prewhiten(
+        (quiet_time, 10.0 + rng.normal(0.0, 0.002, 600), np.full(600, 0.002)),
+        settings=_settings(snr_threshold=8.0),
+    )
+    (empty,) = prewhiten_to_rows("quiet", empty_solution)
+    assert set(filled) == set(empty)
+    for name in filled:
+        assert type(filled[name]) is type(empty[name]), name
+    assert isinstance(filled["rank"], float)  # float, so NaN can fill it
+    assert filled["combination"] == "" or isinstance(filled["combination"], str)
+    assert empty["label"] == "" and np.isnan(empty["frequency"])
