@@ -10,6 +10,11 @@ The x-axis toggles frequency/period (arrays are reversed in period mode so x sta
 ascending, as pyqtgraph's clip/downsample require) and each axis toggles linear/log.
 Display adapts to the objective sense: for minimise methods (PDM/CE/string-length) the
 peaks are minima and the y-axis is labelled accordingly.
+
+The same view serves pre-whitening: the main curve becomes the amplitude spectrum of
+the data, an optional **overlay** curve shows the spectrum of the residuals once every
+extracted component has been subtracted, and the peak markers become the components.
+That side-by-side is the whole point of the method — what was there, and what is left.
 """
 
 from __future__ import annotations
@@ -30,6 +35,9 @@ from cuperiod.gui.theme import (
 )
 
 _MIN_OBJECTIVE_LABEL = "dispersion (lower = better)"
+
+#: Method name carried by the synthetic Periodogram that wraps an amplitude spectrum.
+PREWHITEN_METHOD = "Pre-whitening"
 
 
 class SpectrumView(QtWidgets.QWidget):
@@ -76,6 +84,17 @@ class SpectrumView(QtWidgets.QWidget):
         self._curve.setDownsampling(auto=True, method="peak")
         self._curve.setClipToView(True)
         self._curve.setZValue(0)
+
+        # Optional second trace (the pre-whitened residual spectrum), drawn over the
+        # main curve so what is *left* stays readable against what was there.
+        self._overlay = self._plot.plot(
+            [], [], pen=pg.mkPen(self._pal.qcolor(self._pal.accent, 220), width=1)
+        )
+        self._overlay.setDownsampling(auto=True, method="peak")
+        self._overlay.setClipToView(True)
+        self._overlay.setZValue(1)
+        self._overlay.setVisible(False)
+        self._overlay_xy: tuple[np.ndarray, np.ndarray] | None = None
 
         self._markers = pg.ScatterPlotItem(hoverable=True, pxMode=True)
         self._markers.setZValue(5)
@@ -126,6 +145,15 @@ class SpectrumView(QtWidgets.QWidget):
         self._show_peaks.toggled.connect(self._on_peaks_toggled)
         row.addWidget(self._show_peaks)
 
+        self._show_residual = QtWidgets.QCheckBox("residual")
+        self._show_residual.setChecked(True)
+        self._show_residual.setToolTip(
+            "Overlay the amplitude spectrum of the residuals after pre-whitening"
+        )
+        self._show_residual.setVisible(False)
+        self._show_residual.toggled.connect(self._redraw_overlay)
+        row.addWidget(self._show_residual)
+
         reset = QtWidgets.QPushButton("Reset view")
         reset.setToolTip("Auto-range the plot back to the full spectrum")
         reset.clicked.connect(self._autorange)
@@ -151,16 +179,34 @@ class SpectrumView(QtWidgets.QWidget):
 
     # -- data --------------------------------------------------------------------
     def set_periodogram(self, pg_result: Periodogram) -> None:
-        """Show a new spectrum (clears peaks and the selection band)."""
+        """Show a new spectrum (clears peaks, the overlay, and the selection band)."""
         self._pg = pg_result
         self._peaks = []
         self._sel_period = None
         self._markers.clear()
         self._sel_band.setVisible(False)
+        self._overlay_xy = None
+        self._show_residual.setVisible(False)
         self._default_axis_for(pg_result)
         self._redraw_curve()
         self._update_y_label()
         self._autorange()
+
+    def set_overlay(self, frequency: np.ndarray, values: np.ndarray) -> None:
+        """Add a second trace on the same grid (the pre-whitened residual spectrum)."""
+        self._overlay_xy = (
+            np.asarray(frequency, dtype=np.float64),
+            np.asarray(values, dtype=np.float64),
+        )
+        self._show_residual.setVisible(True)
+        self._redraw_overlay()
+
+    def clear_overlay(self) -> None:
+        """Remove the second trace and hide its toggle."""
+        self._overlay_xy = None
+        self._show_residual.setVisible(False)
+        self._overlay.setVisible(False)
+        self._overlay.setData([], [])
 
     def set_peaks(self, peaks: list[Peak]) -> None:
         """Overlay the significant peaks as markers."""
@@ -186,6 +232,7 @@ class SpectrumView(QtWidgets.QWidget):
         self._sel_band.setVisible(False)
         self._hover_text.setVisible(False)
         self._readout.setText("—")
+        self.clear_overlay()
 
     def clear_selection(self) -> None:
         """Hide the selection band (e.g. a compute finished with zero peaks).
@@ -209,7 +256,23 @@ class SpectrumView(QtWidgets.QWidget):
             return
         x, y = self._curve_xy()
         self._curve.setData(x, y)
+        self._redraw_overlay()
         self._apply_log()
+
+    def _redraw_overlay(self) -> None:
+        """Re-place the second trace for the current x mode, or hide it."""
+        if self._overlay_xy is None or not self._show_residual.isChecked():
+            self._overlay.setVisible(False)
+            return
+        frequency, values = self._overlay_xy
+        if self._x_mode == "period":
+            with np.errstate(divide="ignore"):
+                x = (1.0 / frequency)[::-1]
+            y = values[::-1]
+        else:
+            x, y = frequency, values
+        self._overlay.setData(x, y)
+        self._overlay.setVisible(True)
 
     def _selected_index(self) -> int | None:
         """Index into :attr:`_peaks` matching the current selection, if any."""
@@ -279,7 +342,9 @@ class SpectrumView(QtWidgets.QWidget):
         if self._pg is None:
             return
         style = plot_label_style(self._pal)
-        if self._pg.objective_sense == "min":
+        if self._pg.method == PREWHITEN_METHOD:
+            text = "Amplitude"
+        elif self._pg.objective_sense == "min":
             text = f"{self._pg.method} {_MIN_OBJECTIVE_LABEL}"
         else:
             text = f"{self._pg.method} power"
@@ -490,6 +555,9 @@ class SpectrumView(QtWidgets.QWidget):
         """Re-pen the plot items for a new theme (live re-skin)."""
         self._pal = theme_palette
         self._curve.setPen(pg.mkPen(theme_palette.curve, width=1))
+        self._overlay.setPen(
+            pg.mkPen(theme_palette.qcolor(theme_palette.accent, 220), width=1)
+        )
         band_brush = pg.mkBrush(theme_palette.qcolor(theme_palette.accent, 45))
         self._sel_band.setBrush(band_brush)
         band_pen = pg.mkPen(theme_palette.qcolor(theme_palette.accent, 170), width=1)
@@ -502,4 +570,4 @@ class SpectrumView(QtWidgets.QWidget):
         self._redraw_markers()
 
 
-__all__ = ["SpectrumView"]
+__all__ = ["PREWHITEN_METHOD", "SpectrumView"]

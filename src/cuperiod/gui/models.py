@@ -1,11 +1,13 @@
 """Plain data models for the GUI: cache keys, the result cache, and source items.
 
 None of these touch Qt — they are pure Python so they unit-test headlessly. A
-:class:`ResultKey` identifies a spectrum by *(source, method, settings, backend)*; the
+:class:`ResultKey` identifies a result by *(source, analysis, settings, backend)*; the
 :class:`ResultCache` (a small LRU) returns a previously computed
-:class:`~cuperiod.core.result.Periodogram` instantly when the user revisits an unchanged
-setup. A :class:`SourceItem` is one entry in single/batch mode: a label and a lazy
-``loader`` so a folder of thousands of light curves is not all read up front.
+:class:`~cuperiod.core.result.Periodogram` — or a
+:class:`~cuperiod.prewhiten.PreWhitenResult`, since the cache is generic over its value
+type — instantly when the user revisits an unchanged setup. A :class:`SourceItem` is one
+entry in single/batch mode: a label and a lazy ``loader`` so a folder of thousands of
+light curves is not all read up front.
 """
 
 from __future__ import annotations
@@ -15,15 +17,16 @@ import json
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Generic, TypeVar
 
 from pydantic_settings import BaseSettings
 
 from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
-from cuperiod.core.result import Periodogram
 
 #: A loaded source is either a single- or multi-band light curve.
 LoadedCurve = LightCurve | MultiBandLightCurve
+
+_ResultT = TypeVar("_ResultT")
 
 
 def settings_hash(settings: BaseSettings) -> str:
@@ -40,10 +43,12 @@ def settings_hash(settings: BaseSettings) -> str:
 
 @dataclass(frozen=True)
 class ResultKey:
-    """Identity of a computed spectrum, used as the cache key.
+    """Identity of a computed result, used as the cache key.
 
-    ``backend`` is the *requested* backend (``"auto"``/``"cpu"``/``"gpu"``/...), kept
-    distinct so a CPU and a GPU run of the same configuration cache separately.
+    ``method`` is the periodogram method for a spectrum run and ``"PREWHITEN"`` for a
+    frequency-solution run, so the two analyses can never collide. ``backend`` is the
+    *requested* backend (``"auto"``/``"cpu"``/``"gpu"``/...), kept distinct so a CPU and
+    a GPU run of the same configuration cache separately.
     """
 
     source_id: str
@@ -52,25 +57,29 @@ class ResultKey:
     backend: str
 
 
-class ResultCache:
-    """A bounded LRU cache of periodograms keyed by :class:`ResultKey`."""
+class ResultCache(Generic[_ResultT]):
+    """A bounded LRU cache of results keyed by :class:`ResultKey`.
+
+    Generic over the value type: the app keeps one instance for periodograms and one for
+    pre-whitening solutions, so switching analysis mode back and forth is instant.
+    """
 
     def __init__(self, maxsize: int = 64) -> None:
         if maxsize < 1:
             raise ValueError("maxsize must be >= 1")
         self._maxsize = maxsize
-        self._items: OrderedDict[ResultKey, Periodogram] = OrderedDict()
+        self._items: OrderedDict[ResultKey, _ResultT] = OrderedDict()
 
-    def get(self, key: ResultKey) -> Periodogram | None:
-        """Cached periodogram for ``key`` (marks it recently used), else None."""
-        pg = self._items.get(key)
-        if pg is not None:
+    def get(self, key: ResultKey) -> _ResultT | None:
+        """Cached result for ``key`` (marks it recently used), else None."""
+        item = self._items.get(key)
+        if item is not None:
             self._items.move_to_end(key)
-        return pg
+        return item
 
-    def put(self, key: ResultKey, pg: Periodogram) -> None:
+    def put(self, key: ResultKey, value: _ResultT) -> None:
         """Insert/refresh ``key``; evict the LRU entry if over capacity."""
-        self._items[key] = pg
+        self._items[key] = value
         self._items.move_to_end(key)
         while len(self._items) > self._maxsize:
             self._items.popitem(last=False)

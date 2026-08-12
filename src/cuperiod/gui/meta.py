@@ -69,6 +69,40 @@ def auto_max_frequency(time: FloatArray, nyquist_factor: int = 5) -> float:
     return float(max(pseudo_nyquist_frequency(time, nyquist_factor), floor))
 
 
+def prewhiten_backend_options() -> list[str]:
+    """Backends the amplitude spectrum can actually run on this machine.
+
+    Mirrors :func:`backend_options` for the pre-whitening analysis, which is not a
+    registry method: each candidate is test-resolved so only usable entries are offered.
+    """
+    from cuperiod.prewhiten.spectrum import SPECTRUM_BACKENDS, resolve_spectrum_backend
+
+    options: list[str] = []
+    for backend in ("auto", "cpu", "gpu", "torch", *SPECTRUM_BACKENDS):
+        if backend in options:
+            continue
+        try:
+            resolve_spectrum_backend(backend)
+        except BackendUnavailableError:
+            continue
+        options.append(backend)
+    return options
+
+
+def resolved_prewhiten_backend(backend: str) -> tuple[str, bool] | None:
+    """``(concrete_backend, is_gpu)`` for a pre-whitening backend request, or None."""
+    from cuperiod.prewhiten.spectrum import resolve_spectrum_backend
+
+    try:
+        resolved = resolve_spectrum_backend(backend)
+    except BackendUnavailableError:
+        return None
+    is_gpu = resolved == "cufinufft" or (
+        resolved.startswith("torch") and resolved != "torch:cpu"
+    )
+    return resolved, is_gpu
+
+
 def resolved_backend(name: str, backend: str) -> tuple[str, bool] | None:
     """The concrete backend ``backend`` resolves to for ``name`` and whether it's a GPU.
 
@@ -114,7 +148,9 @@ __all__ = [
     "multiband_method_names",
     "natural_domain",
     "objective_sense",
+    "prewhiten_backend_options",
     "resolved_backend",
+    "resolved_prewhiten_backend",
     "settings_class",
     "supports_multiband",
 ]

@@ -3,9 +3,14 @@
 :class:`AppState` is a plain dataclass snapshot of what the app is showing. The
 :class:`AppController` is the single hub: widgets call its setters and listen to its
 signals; it owns the :class:`~cuperiod.gui.compute.ComputeManager` and the
-:class:`~cuperiod.gui.models.ResultCache`, runs (or cache-hits) periodograms, derives
-peaks, and tracks the selected period that drives the phased view. Views never talk to
-each other — only to the controller — so the data flow stays one-directional.
+:class:`~cuperiod.gui.models.ResultCache`, runs (or cache-hits) periodograms *and*
+pre-whitening solutions, derives peaks, and tracks the selected period that drives the
+phased view. Views never talk to each other — only to the controller — so the data flow
+stays one-directional.
+
+The two analyses share every input path (the loaded curve, the source browser, the
+folded view) and differ only in what they compute and which result signal they emit, so
+switching costs nothing and neither can disturb the other's cached results.
 """
 
 from __future__ import annotations
@@ -17,6 +22,7 @@ import numpy as np
 from pydantic_settings import BaseSettings
 
 from cuperiod.core._typing import FloatArray
+from cuperiod.core.config import PreWhitenSettings
 from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
 from cuperiod.core.result import Peak, Periodogram
 from cuperiod.gui.compute import ComputeManager
@@ -34,8 +40,15 @@ from cuperiod.gui.models import (
     settings_hash,
 )
 from cuperiod.gui.qt import QObject, Signal
+from cuperiod.prewhiten.result import PreWhitenResult, Sinusoid
 
 Mode = Literal["single", "batch"]
+
+#: Which analysis the app is running.
+Analysis = Literal["periodogram", "prewhiten"]
+
+#: Registry-style key under which pre-whitening runs are cached.
+PREWHITEN_KEY = "PREWHITEN"
 
 #: Denser default frequency oversampling for smoother, better-resolved periodograms
 #: (helps the jagged look on a period axis at long periods). Applied only when the user
@@ -49,6 +62,7 @@ class AppState:
 
     theme: str = "dark"
     mode: Mode = "single"
+    analysis: Analysis = "periodogram"
     method: str = "GLS"
     backend: str = "auto"
     n_peaks: int = 10
@@ -57,6 +71,7 @@ class AppState:
     source_id: str = ""
     current_lc: LoadedCurve | None = None
     current_pg: Periodogram | None = None
+    current_solution: PreWhitenResult | None = None
     selected_peak: Peak | None = None
     selected_period: float | None = None
     sources: list[SourceItem] | None = None
@@ -71,6 +86,7 @@ class AppController(QObject):
     lc_loaded = Signal(object)  # LoadedCurve
     compute_started = Signal()
     periodogram_ready = Signal(object)  # Periodogram
+    solution_ready = Signal(object)  # PreWhitenResult
     compute_failed = Signal(str)
     peaks_ready = Signal(object)  # list[Peak]
     period_changed = Signal(float)  # drives the spectrum line
@@ -79,14 +95,17 @@ class AppController(QObject):
     busy_changed = Signal(bool)
     sources_changed = Signal(object)  # list[str] labels (batch mode)
     source_selected = Signal(int)
+    analysis_changed = Signal(str)  # "periodogram" | "prewhiten"
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self.state = AppState()
-        self._cache = ResultCache()
+        self._cache: ResultCache[Periodogram] = ResultCache()
+        self._solutions: ResultCache[PreWhitenResult] = ResultCache(maxsize=32)
         self._compute = ComputeManager(self)
         self._pending_key: ResultKey | None = None
         self._compute.signals.finished.connect(self._on_finished)
+        self._compute.signals.solution_ready.connect(self._on_solution)
         self._compute.signals.failed.connect(self._on_failed)
 
     # -- inputs ------------------------------------------------------------------
@@ -95,9 +114,22 @@ class AppController(QObject):
         self.state.current_lc = lc
         self.state.source_id = source_id
         self.state.current_pg = None
+        self.state.current_solution = None
         self.state.selected_peak = None
         self.state.selected_period = None
         self.lc_loaded.emit(lc)
+
+    def set_analysis(self, analysis: Analysis) -> None:
+        """Switch between the periodogram and pre-whitening analyses.
+
+        Only the *pending* run is superseded; both caches survive, so flipping back to a
+        previously computed analysis of the same source redisplays it instantly.
+        """
+        if analysis == self.state.analysis:
+            return
+        self.state.analysis = analysis
+        self._pending_key = None
+        self.analysis_changed.emit(analysis)
 
     # -- batch mode --------------------------------------------------------------
     def load_sources(self, items: list[SourceItem]) -> None:
@@ -164,6 +196,40 @@ class AppController(QObject):
         self.compute_started.emit()
         self._compute.submit(key, lc_input, method, settings, backend)
 
+    def run_prewhiten(
+        self, backend: str, settings: PreWhitenSettings, band: str = ""
+    ) -> None:
+        """Extract (or cache-hit) the frequency solution for the active light curve.
+
+        Pre-whitening is single-band by definition, so a multiband curve is reduced the
+        same way a single-band method does: the selected band, or all bands stacked.
+        """
+        lc = self.state.current_lc
+        if lc is None:
+            return
+        if isinstance(lc, MultiBandLightCurve):
+            lc_input: LightCurve = (
+                lc.bands[band] if band in lc.bands else self._stack(lc)
+            )
+        else:
+            lc_input = lc
+        tuned = self._tune_auto_grid(lc_input, settings)
+        assert isinstance(tuned, PreWhitenSettings)
+        settings = tuned
+        self.state.backend = backend
+        self.state.band = band
+        self.state.method = PREWHITEN_KEY
+        source_id = self.state.source_id + (f"::{band}" if band else "")
+        key = ResultKey(source_id, PREWHITEN_KEY, settings_hash(settings), backend)
+        self._pending_key = key
+        cached = self._solutions.get(key)
+        if cached is not None:
+            self._apply_solution(cached, 0.0, from_cache=True)
+            return
+        self.busy_changed.emit(True)
+        self.compute_started.emit()
+        self._compute.submit_prewhiten(key, lc_input, settings, backend)
+
     def _resolve_input(self, method: str, band: str) -> LoadedCurve | None:
         """Pick the curve to analyse from the (possibly multiband) active curve."""
         lc = self.state.current_lc
@@ -226,10 +292,38 @@ class AppController(QObject):
         if key == self._pending_key:
             self._apply_result(key, pg, elapsed_ms, from_cache=False)
 
+    def _on_solution(
+        self, key: ResultKey, result: PreWhitenResult, elapsed_ms: float
+    ) -> None:
+        self._solutions.put(key, result)
+        if key == self._pending_key:
+            self._apply_solution(result, elapsed_ms, from_cache=False)
+
     def _on_failed(self, key: ResultKey, message: str) -> None:
         if key == self._pending_key:
             self.busy_changed.emit(False)
             self.compute_failed.emit(message)
+
+    def _apply_solution(
+        self, result: PreWhitenResult, elapsed_ms: float, *, from_cache: bool
+    ) -> None:
+        self.state.current_solution = result
+        self.state.current_pg = None
+        self.state.last_compute_ms = elapsed_ms
+        self.state.last_from_cache = from_cache
+        self.busy_changed.emit(False)
+        self.solution_ready.emit(result)
+        if result.components:
+            self.select_component(result.components[0])
+        else:
+            self.state.selected_peak = None
+            self.state.selected_period = None
+            self.selection_cleared.emit()
+
+    def select_component(self, component: Sinusoid) -> None:
+        """Select an extracted sinusoid as the active period (drives the fold)."""
+        self.state.selected_peak = None
+        self.select_period(component.period)
 
     def _apply_result(
         self, key: ResultKey, pg: Periodogram, elapsed_ms: float, *, from_cache: bool
@@ -286,4 +380,4 @@ class AppController(QObject):
         return self._time_of(self.state.current_lc)
 
 
-__all__ = ["AppController", "AppState", "Mode"]
+__all__ = ["PREWHITEN_KEY", "Analysis", "AppController", "AppState", "Mode"]

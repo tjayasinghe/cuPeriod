@@ -220,3 +220,54 @@ def test_placeholder_text_uses_straight_quotes(qtbot: QtBot) -> None:
     text = window._placeholder.text()
     assert "“" not in text and "”" not in text
     assert '"Compute periodogram"' in text
+
+
+def test_analysis_switch_swaps_the_result_docks(qtbot: QtBot) -> None:
+    window = _window(qtbot)
+    assert window._peaks_dock.isVisible()
+    assert not window._solution_dock.isVisible()
+    window._controls.set_analysis("prewhiten")
+    assert window._solution_dock.isVisible()
+    assert window._spacing_dock.isVisible()
+    assert not window._peaks_dock.isVisible()
+    window._controls.set_analysis("periodogram")
+    assert window._peaks_dock.isVisible()
+    assert not window._solution_dock.isVisible()
+    window._controller.shutdown()
+
+
+def test_analysis_switch_keeps_the_loaded_light_curve(qtbot: QtBot) -> None:
+    # Regression: switching analysis used to clear the phased view's light curve,
+    # leaving an empty panel until the next file load.
+    window = _window(qtbot)
+    window._controller.set_light_curve(_light_curve(), "star")
+    window._controls.set_analysis("prewhiten")
+    assert window._phased._lc is not None
+    assert window._controls.can_compute()
+    window._controller.shutdown()
+
+
+def test_prewhiten_run_populates_every_panel(qtbot: QtBot) -> None:
+    from cuperiod.core.config import PreWhitenSettings
+    from cuperiod.gui.widgets.spectrum_view import PREWHITEN_METHOD
+    from synth import synthetic_pulsator
+
+    window = _window(qtbot)
+    time, value, error = synthetic_pulsator(n=600, span=20.0)
+    window._controller.set_light_curve(
+        LightCurve.from_arrays(time, value, error), "pulsator"
+    )
+    window._controls.set_analysis("prewhiten")
+    settings = PreWhitenSettings(
+        backend="finufft", max_frequencies=3, samples_per_peak=6
+    )
+    with qtbot.waitSignal(window._controller.solution_ready, timeout=60000):
+        window._controller.run_prewhiten("finufft", settings)
+    solution = window._controller.state.current_solution
+    assert solution is not None and solution.n_components >= 1
+    assert window._solution_panel._table.rowCount() == solution.n_components
+    assert window._spectrum._pg is not None
+    assert window._spectrum._pg.method == PREWHITEN_METHOD
+    assert window._spectrum._overlay_xy is not None
+    assert window._stack.currentIndex() == 1
+    window._controller.shutdown()

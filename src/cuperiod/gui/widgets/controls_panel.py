@@ -1,10 +1,16 @@
-"""The left-hand controls: method/backend pickers, the options form, and Compute.
+"""The left-hand controls: analysis/method/backend pickers, options form, and Compute.
 
-The method picker drives a dynamically rebuilt :class:`PydanticSettingsForm` (so every
-option of the chosen method is exposed) and a backend picker limited to usable backends.
-Settings are cached per method, so switching back restores your values.
-``Compute`` validates and emits :attr:`run_requested`; invalid input is shown inline
-instead of starting a run.
+The panel drives both analyses from one layout. In **Periodogram** mode the method
+picker selects one of the registered methods; in **Pre-whitening** mode the method and
+peak-count rows are hidden and the same machinery serves
+:class:`~cuperiod.PreWhitenSettings` instead. Either way the options form is a
+dynamically rebuilt :class:`PydanticSettingsForm` — every field of the chosen settings
+model is exposed automatically, so the pre-whitening controls needed no bespoke
+widgets — and the backend picker is limited to backends that actually resolve here.
+
+Settings are cached per analysis/method, so switching back restores your values.
+``Compute`` validates and emits :attr:`run_requested` or :attr:`prewhiten_requested`;
+invalid input is shown inline instead of starting a run.
 """
 
 from __future__ import annotations
@@ -15,6 +21,7 @@ from pydantic import ValidationError
 from pydantic_settings import BaseSettings
 
 from cuperiod.core._typing import FloatArray
+from cuperiod.core.config import PreWhitenSettings
 from cuperiod.gui.meta import (
     auto_max_frequency,
     backend_options,
@@ -22,7 +29,9 @@ from cuperiod.gui.meta import (
     multiband_method_names,
     natural_domain,
     objective_sense,
+    prewhiten_backend_options,
     resolved_backend,
+    resolved_prewhiten_backend,
     settings_class,
     supports_multiband,
 )
@@ -30,6 +39,13 @@ from cuperiod.gui.qt import Qt, QtWidgets, Signal
 from cuperiod.gui.settingsform import PydanticSettingsForm
 
 _DEFAULT_METHOD = "GLS"
+
+#: Display labels for the analysis picker, in order.
+_PERIODOGRAM_LABEL = "Periodogram"
+_PREWHITEN_LABEL = "Pre-whitening"
+
+#: Cache key for the pre-whitening settings form (methods use their own names).
+_PREWHITEN_CACHE_KEY = "__prewhiten__"
 
 #: Item-data sentinels for the synthetic "all bands" combo entries, distinguishing them
 #: from a real band that happens to be named "combined" or "stacked".
@@ -51,8 +67,12 @@ def _first_error_message(exc: ValidationError) -> str:
 class ControlsPanel(QtWidgets.QWidget):
     """Method/backend pickers, the auto-generated options form, and Compute."""
 
-    # Emitted on Compute: (method, backend, settings, n_peaks).
+    # Emitted on Compute in periodogram mode: (method, backend, settings, n_peaks).
     run_requested = Signal(str, str, object, int)
+    # Emitted on Compute in pre-whitening mode: (backend, PreWhitenSettings).
+    prewhiten_requested = Signal(str, object)
+    # Emitted when the analysis picker changes: "periodogram" | "prewhiten".
+    analysis_changed = Signal(str)
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -62,6 +82,7 @@ class ControlsPanel(QtWidgets.QWidget):
         self._curve_time: FloatArray | None = None
         self._has_curve = False
         self._busy = False
+        self._prewhiten = False
 
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -73,6 +94,13 @@ class ControlsPanel(QtWidgets.QWidget):
 
         self._top = QtWidgets.QFormLayout()
         self._top.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        self._analysis_combo = QtWidgets.QComboBox()
+        self._analysis_combo.addItems([_PERIODOGRAM_LABEL, _PREWHITEN_LABEL])
+        self._analysis_combo.setToolTip(
+            "Periodogram: one period-search statistic over a trial grid.\n"
+            "Pre-whitening: iterative sinusoid extraction with uncertainties, "
+            "combination frequencies, and g-mode period spacings."
+        )
         self._method_combo = QtWidgets.QComboBox()
         self._method_combo.addItems(method_display_names())
         self._method_combo.setToolTip("Periodogram method to run")
@@ -87,6 +115,7 @@ class ControlsPanel(QtWidgets.QWidget):
         self._peaks_spin.setRange(1, 100)
         self._peaks_spin.setValue(10)
         self._peaks_spin.setToolTip("Number of significant peaks to find and list")
+        self._top.addRow("Analysis", self._analysis_combo)
         self._top.addRow("Method", self._method_combo)
         self._top.addRow("Band", self._band_combo)
         self._top.addRow("Backend", self._backend_combo)
@@ -136,8 +165,55 @@ class ControlsPanel(QtWidgets.QWidget):
             self._method_combo.setCurrentText(_DEFAULT_METHOD)
         self._method_combo.currentTextChanged.connect(self._on_method_changed)
         self._backend_combo.currentTextChanged.connect(self._update_backend_hint)
+        self._analysis_combo.currentTextChanged.connect(self._on_analysis_changed)
         self._on_method_changed(self._method_combo.currentText())
         self.set_enabled(False)
+
+    # -- analysis switching ------------------------------------------------------
+    @property
+    def analysis(self) -> str:
+        """``"periodogram"`` or ``"prewhiten"``."""
+        return "prewhiten" if self._prewhiten else "periodogram"
+
+    def set_analysis(self, analysis: str) -> None:
+        """Programmatically switch the analysis picker."""
+        label = _PREWHITEN_LABEL if analysis == "prewhiten" else _PERIODOGRAM_LABEL
+        if self._analysis_combo.currentText() != label:
+            self._analysis_combo.setCurrentText(label)
+
+    def _on_analysis_changed(self, label: str) -> None:
+        self._stash_current_settings()
+        self._prewhiten = label == _PREWHITEN_LABEL
+        self._top.setRowVisible(self._method_combo, not self._prewhiten)
+        self._top.setRowVisible(self._peaks_spin, not self._prewhiten)
+        self._compute_btn.setText(
+            "Run pre-whitening" if self._prewhiten else "Compute periodogram"
+        )
+        self._compute_btn.setToolTip(
+            ("Extract the frequency solution" if self._prewhiten else
+             "Compute the periodogram") + "  (Ctrl+Enter)"
+        )
+        if self._prewhiten:
+            self._current_method = _PREWHITEN_CACHE_KEY
+            self._rebuild_backend_combo(None)
+            self._rebuild_band_combo(None)
+            self._rebuild_form(_PREWHITEN_CACHE_KEY, PreWhitenSettings)
+            self._note.setText(
+                "iterative extraction  ·  single-band  ·  amplitude spectrum"
+            )
+        else:
+            self._current_method = None
+            self._on_method_changed(self._method_combo.currentText())
+        self._update_backend_hint()
+        self._update_grid_hint()
+        self._clear_error()
+        self.analysis_changed.emit(self.analysis)
+
+    def _stash_current_settings(self) -> None:
+        """Remember the current form's values under the key it was built for."""
+        if self._current_method is not None and self._form is not None:
+            with contextlib.suppress(ValidationError):
+                self._settings_cache[self._current_method] = self._form.build()
 
     # -- public ------------------------------------------------------------------
     def set_enabled(self, enabled: bool) -> None:
@@ -202,26 +278,27 @@ class ControlsPanel(QtWidgets.QWidget):
 
     # -- method switching --------------------------------------------------------
     def _on_method_changed(self, method: str) -> None:
-        if self._current_method is not None and self._form is not None:
-            with contextlib.suppress(ValidationError):
-                self._settings_cache[self._current_method] = self._form.build()
+        if self._prewhiten:
+            return
+        self._stash_current_settings()
         self._current_method = method
         self._rebuild_backend_combo(method)
         self._rebuild_band_combo(method)
-        self._rebuild_form(method)
+        self._rebuild_form(method, settings_class(method))
         self._update_note(method)
         self._update_backend_hint()
         self._update_grid_hint()
         self._clear_error()
 
-    def _rebuild_band_combo(self, method: str) -> None:
+    def _rebuild_band_combo(self, method: str | None) -> None:
+        """Rebuild the band picker; ``method=None`` means the pre-whitening analysis."""
         if self._band_names is None:
             self._top.setRowVisible(self._band_combo, False)
             return
         self._top.setRowVisible(self._band_combo, True)
         self._band_combo.blockSignals(True)
         self._band_combo.clear()
-        if supports_multiband(method):
+        if method is not None and supports_multiband(method):
             # combined multiband analysis is the default for capable methods
             self._band_combo.addItem("combined (all bands)", _COMBINED_SENTINEL)
             for name in self._band_names:
@@ -234,16 +311,21 @@ class ControlsPanel(QtWidgets.QWidget):
         self._band_combo.setCurrentIndex(0)
         self._band_combo.blockSignals(False)
 
-    def _rebuild_backend_combo(self, method: str) -> None:
+    def _rebuild_backend_combo(self, method: str | None) -> None:
+        """Rebuild the backend picker; ``method=None`` means pre-whitening."""
+        options = (
+            prewhiten_backend_options() if method is None else backend_options(method)
+        )
         self._backend_combo.blockSignals(True)
         self._backend_combo.clear()
-        self._backend_combo.addItems(backend_options(method))
+        self._backend_combo.addItems(options)
         self._backend_combo.setCurrentText("auto")
         self._backend_combo.blockSignals(False)
 
-    def _rebuild_form(self, method: str) -> None:
+    def _rebuild_form(self, cache_key: str, model: type[BaseSettings]) -> None:
+        cached = self._settings_cache.get(cache_key)
         form = PydanticSettingsForm(
-            settings_class(method), initial=self._settings_cache.get(method)
+            model, initial=cached if isinstance(cached, model) else None
         )
         form.changed.connect(self._clear_error)
         form.changed.connect(self._update_grid_hint)
@@ -264,7 +346,11 @@ class ControlsPanel(QtWidgets.QWidget):
 
     def _update_backend_hint(self) -> None:
         chosen = self._backend_combo.currentText()
-        info = resolved_backend(self._method_combo.currentText(), chosen)
+        info = (
+            resolved_prewhiten_backend(chosen)
+            if self._prewhiten
+            else resolved_backend(self._method_combo.currentText(), chosen)
+        )
         if info is None:
             self._backend_hint.setText("")
             return
@@ -273,18 +359,24 @@ class ControlsPanel(QtWidgets.QWidget):
         prefix = "" if resolved == chosen else f"{chosen} → "
         self._backend_hint.setText(f"runs on:  {prefix}{resolved}  ({where})")
 
+    def _settings_model(self) -> type[BaseSettings]:
+        """The settings model backing the current form."""
+        if self._prewhiten:
+            return PreWhitenSettings
+        return settings_class(self._method_combo.currentText())
+
     def _update_grid_hint(self) -> None:
-        method = self._method_combo.currentText()
         if (
             self._curve_time is None
             or self._form is None
-            or "maximum_frequency" not in settings_class(method).model_fields
+            or "maximum_frequency" not in self._settings_model().model_fields
         ):
             self._grid_hint.setText("")
             return
         time = self._curve_time
         baseline = float(time.max() - time.min())
-        nyquist_factor = int(self._form.value_of("nyquist_factor") or 5)
+        default_nyquist = 1 if self._prewhiten else 5
+        nyquist_factor = int(self._form.value_of("nyquist_factor") or default_nyquist)
         auto_min = 1.0 / baseline if baseline > 0.0 else 0.0
         auto_max = auto_max_frequency(time, nyquist_factor)
         # fill the greyed 'auto' spin boxes with the values that will actually be used
@@ -311,6 +403,9 @@ class ControlsPanel(QtWidgets.QWidget):
             self._show_error(_first_error_message(exc))
             return
         self._clear_error()
+        if self._prewhiten:
+            self.prewhiten_requested.emit(self._backend_combo.currentText(), settings)
+            return
         self.run_requested.emit(
             self._method_combo.currentText(),
             self._backend_combo.currentText(),
