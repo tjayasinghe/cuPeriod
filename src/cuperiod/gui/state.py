@@ -40,6 +40,7 @@ from cuperiod.gui.models import (
     settings_hash,
 )
 from cuperiod.gui.qt import QObject, Signal
+from cuperiod.prewhiten.engine import default_maximum_frequency
 from cuperiod.prewhiten.result import PreWhitenResult, Sinusoid
 
 Mode = Literal["single", "batch"]
@@ -277,7 +278,9 @@ class AppController(QObject):
         """Improve the default frequency grid for frequency-grid methods.
 
         (a) Raises an auto max-frequency so sub-day periods aren't missed on sparse data
-        (see :func:`cuperiod.gui.meta.auto_max_frequency`) and (b) densifies the default
+        (see :func:`cuperiod.gui.meta.auto_max_frequency`; pre-whitening uses the
+        engine's own :func:`~cuperiod.prewhiten.default_maximum_frequency`, whose higher
+        floor keeps δ Scuti / HADS frequencies in band) and (b) densifies the default
         ``samples_per_peak`` for smoother, better-resolved periodograms (notably at long
         periods). Explicitly-changed values are left as-is.
         """
@@ -290,7 +293,12 @@ class AppController(QObject):
             and time.size >= 2
         ):
             nyquist_factor = int(getattr(settings, "nyquist_factor", 5))
-            updates["maximum_frequency"] = auto_max_frequency(time, nyquist_factor)
+            auto = (
+                default_maximum_frequency(time, nyquist_factor)
+                if isinstance(settings, PreWhitenSettings)
+                else auto_max_frequency(time, nyquist_factor)
+            )
+            updates["maximum_frequency"] = auto
         if "samples_per_peak" in fields:
             current = getattr(settings, "samples_per_peak", None)
             if current is not None and current == fields["samples_per_peak"].default:

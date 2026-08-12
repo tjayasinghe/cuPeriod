@@ -77,6 +77,17 @@ All notable changes to cuPeriod are documented here. The format is based on
 
 - `cuperiod.gui.models.ResultCache` is now generic over its value type, so the app keeps
   one cache per analysis and switching back and forth is instant.
+- **The automatic pre-whitening band could sit entirely below a δ Scuti star.** The
+  default topped out at the median-gap pseudo-Nyquist (with `nyquist_factor=1`), which
+  for nightly ground-based sampling is ~0.5–2.5 cycles/day — so on the bundled ASAS-SN
+  HADS demo (P = 0.0898 d, f = 11.14 c/d) the extraction fitted the *daily aliases* of
+  the real signal (P = 0.123 d, residual rms 0.245). The auto band is now
+  `max(pseudo-Nyquist × nyquist_factor, 50 c/d)` with `nyquist_factor=5` (matching the
+  periodogram methods), exposed as
+  {func}`cuperiod.prewhiten.default_maximum_frequency`, and the GUI's auto value uses
+  the same helper. The demo star now yields P = 0.089757 d — the VSX period to the
+  last digit — with its 2f, 3f, 4f harmonics extracted and combination-labelled
+  (residual rms 0.073).
 - **Bootstrap frequency errors were exactly zero for every component but the newest.**
   The engine handed its per-iteration refinement policy (default `"last"`, which pins
   all established frequencies) to the bootstrap's replicate fits, so their scatter

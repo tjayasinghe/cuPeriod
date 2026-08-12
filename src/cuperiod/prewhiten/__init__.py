@@ -42,7 +42,11 @@ from __future__ import annotations
 
 from cuperiod.prewhiten.batch import batch_prewhiten
 from cuperiod.prewhiten.combinations import Combination, identify_combinations
-from cuperiod.prewhiten.engine import default_prewhiten_grid, prewhiten
+from cuperiod.prewhiten.engine import (
+    default_maximum_frequency,
+    default_prewhiten_grid,
+    prewhiten,
+)
 from cuperiod.prewhiten.fap import baluev_fap
 from cuperiod.prewhiten.fit import MultiSineFit, fit_multisine
 from cuperiod.prewhiten.result import PreWhitenResult, Sinusoid
@@ -87,6 +91,7 @@ __all__ = [
     "buoyancy_radius",
     "component_uncertainties",
     "correlation_factor",
+    "default_maximum_frequency",
     "default_prewhiten_grid",
     "echelle",
     "find_period_spacing",

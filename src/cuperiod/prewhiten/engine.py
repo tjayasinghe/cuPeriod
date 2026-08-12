@@ -49,15 +49,50 @@ _MAX_PRUNE_PASSES = 20
 #: existing component) before the run gives up looking for more.
 _MAX_REJECTED_CANDIDATES = 20
 
+#: Floor of the automatic search band (cycles/day). The median-gap pseudo-Nyquist of
+#: nightly ground-based sampling collapses to a few cycles/day — far below the
+#: delta Scuti / HADS frequencies (periods down to ~0.02 d) this tool exists to
+#: extract, whose non-sinusoidal light curves also need the first few harmonics in
+#: band. Irregular sampling has no true Nyquist limit, so searching above the
+#: pseudo-Nyquist is legitimate; dense space cadences exceed the floor and ignore it.
+DEFAULT_MAX_FREQUENCY_FLOOR = 50.0
+
+
+def default_maximum_frequency(time: FloatArray, nyquist_factor: int = 5) -> float:
+    """The automatic top of the pre-whitening band for this sampling (cycles/day).
+
+    ``nyquist_factor`` times the median-gap pseudo-Nyquist frequency, but never below
+    :data:`DEFAULT_MAX_FREQUENCY_FLOOR`: sparse ground-based sampling would otherwise
+    put the whole classical-pulsator regime out of band and the extraction would fit
+    the daily aliases of the real signal instead.
+
+    Parameters
+    ----------
+    time : numpy.ndarray
+        Observation times (days).
+    nyquist_factor : int, default 5
+        Multiple of the pseudo-Nyquist frequency to allow.
+
+    Returns
+    -------
+    float
+        The default ``maximum_frequency`` in cycles/day.
+    """
+    return max(
+        pseudo_nyquist_frequency(time, nyquist_factor), DEFAULT_MAX_FREQUENCY_FLOOR
+    )
+
 
 def default_prewhiten_grid(
     lc: LightCurve, settings: PreWhitenSettings | None = None
 ) -> GridSpec:
     """The default uniform frequency grid for pre-whitening ``lc``.
 
-    Runs from ``1/T`` to the pseudo-Nyquist frequency of the sampling, oversampled by
-    ``samples_per_peak`` (10 by default — a finer grid than a plain period search needs,
-    because each peak's position seeds a non-linear fit).
+    Runs from ``1/T`` to :func:`default_maximum_frequency` — the pseudo-Nyquist of the
+    sampling, floored at :data:`DEFAULT_MAX_FREQUENCY_FLOOR` so short-period pulsators
+    stay in band on sparse ground-based data — oversampled by ``samples_per_peak``
+    (10 by default — a finer grid than a plain period search needs, because each peak's
+    position seeds a non-linear fit).
 
     Parameters
     ----------
@@ -77,7 +112,7 @@ def default_prewhiten_grid(
         raise InsufficientDataError("pre-whitening: no usable time baseline")
     maximum = cfg.maximum_frequency
     if maximum is None:
-        maximum = pseudo_nyquist_frequency(finite.time, cfg.nyquist_factor)
+        maximum = default_maximum_frequency(finite.time, cfg.nyquist_factor)
     minimum = cfg.minimum_frequency
     if minimum is None:
         minimum = 1.0 / finite.baseline
@@ -482,4 +517,9 @@ def prewhiten(
     )
 
 
-__all__ = ["default_prewhiten_grid", "prewhiten"]
+__all__ = [
+    "DEFAULT_MAX_FREQUENCY_FLOOR",
+    "default_maximum_frequency",
+    "default_prewhiten_grid",
+    "prewhiten",
+]

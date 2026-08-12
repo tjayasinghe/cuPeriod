@@ -233,7 +233,7 @@ Every field of {class}`~cuperiod.PreWhitenSettings` is documented in the
 | `snr_threshold` | 4.0 | The Breger criterion (see the note above). |
 | `min_separation_rayleigh` | 1.5 | Resolution guard between components. |
 | `samples_per_peak` | 10 | Frequency oversampling of the search grid. |
-| `maximum_frequency` | pseudo-Nyquist | Top of the search band. |
+| `maximum_frequency` | max(pseudo-Nyquist, 50 /d) | Top of the search band. The floor matters: the median-gap pseudo-Nyquist of nightly ground-based sampling is a few c/d, and a band capped there sees only the *daily aliases* of a δ Scuti or HADS star. |
 | `uncertainty` | `"covariance"` | Error estimator. |
 | `refine` | `"last"` | Per-iteration refinement; the final polish is simultaneous. |
 | `combination_max_order` | 2 | Largest `Σ|nᵢ|` in the combination search. |

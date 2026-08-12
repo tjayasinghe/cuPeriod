@@ -37,6 +37,7 @@ from cuperiod.gui.meta import (
 )
 from cuperiod.gui.qt import Qt, QtWidgets, Signal
 from cuperiod.gui.settingsform import PydanticSettingsForm
+from cuperiod.prewhiten.engine import default_maximum_frequency
 
 _DEFAULT_METHOD = "GLS"
 
@@ -381,10 +382,15 @@ class ControlsPanel(QtWidgets.QWidget):
             return
         time = self._curve_time
         baseline = float(time.max() - time.min())
-        default_nyquist = 1 if self._prewhiten else 5
-        nyquist_factor = int(self._form.value_of("nyquist_factor") or default_nyquist)
+        nyquist_factor = int(self._form.value_of("nyquist_factor") or 5)
         auto_min = 1.0 / baseline if baseline > 0.0 else 0.0
-        auto_max = auto_max_frequency(time, nyquist_factor)
+        # Pre-whitening floors its auto band higher (delta Scuti / HADS coverage);
+        # mirror the engine exactly so the greyed value is the one that will run.
+        auto_max = (
+            default_maximum_frequency(time, nyquist_factor)
+            if self._prewhiten
+            else auto_max_frequency(time, nyquist_factor)
+        )
         # fill the greyed 'auto' spin boxes with the values that will actually be used
         self._form.set_auto_value("minimum_frequency", auto_min)
         self._form.set_auto_value("maximum_frequency", auto_max)

@@ -212,6 +212,61 @@ def test_default_grid_spans_one_over_baseline_to_pseudo_nyquist() -> None:
     assert grid.values[-1] > 24.68
 
 
+def _nightly_hads(n_nights: int = 220, seed: int = 11):
+    """A HADS-like curve with ground-based nightly sampling (median gap ~1 d)."""
+    rng = np.random.default_rng(seed)
+    time = np.sort(
+        np.concatenate(
+            [night + rng.uniform(0.0, 0.25, 2) for night in range(n_nights)]
+        )
+    )
+    frequency = 11.2354  # P = 0.089004 d — above any median-gap pseudo-Nyquist
+    value = (
+        13.0
+        + 0.30 * np.sin(2 * np.pi * frequency * time + 0.7)
+        + 0.12 * np.sin(2 * np.pi * 2 * frequency * time + 1.9)
+        + rng.normal(0.0, 0.02, time.size)
+    )
+    return time, value, np.full(time.size, 0.02), frequency
+
+
+def test_default_band_reaches_short_period_pulsators_on_sparse_sampling() -> None:
+    # Regression: the auto band topped out at the median-gap pseudo-Nyquist, which for
+    # nightly ground-based cadence is ~0.5-2.5 c/d — the entire delta Scuti / HADS
+    # regime sat out of band and the extraction fitted the *daily aliases* instead
+    # (the bundled ASAS-SN HADS demo, P = 0.0898 d, came out as P = 0.123 d).
+    time, value, error, frequency = _nightly_hads()
+    lc = cup.LightCurve.from_arrays(time, value, error)
+    from cuperiod.core.grid import pseudo_nyquist_frequency
+    from cuperiod.prewhiten.engine import (
+        DEFAULT_MAX_FREQUENCY_FLOOR,
+        default_maximum_frequency,
+    )
+
+    assert pseudo_nyquist_frequency(time, 5) < frequency  # the trap this guards
+    assert default_maximum_frequency(time) == DEFAULT_MAX_FREQUENCY_FLOOR
+    # The grid builder rounds up to a whole number of steps, hence the tolerance.
+    assert default_prewhiten_grid(lc).values[-1] == pytest.approx(
+        DEFAULT_MAX_FREQUENCY_FLOOR, abs=0.01
+    )
+    # Dense sampling is governed by the pseudo-Nyquist itself, not the floor.
+    dense = np.linspace(0.0, 27.0, 20_000)
+    assert default_maximum_frequency(dense) == pytest.approx(
+        pseudo_nyquist_frequency(dense, 5), rel=1e-9
+    )
+
+
+def test_sparse_hads_is_recovered_not_its_daily_alias() -> None:
+    time, value, error, frequency = _nightly_hads()
+    solution = prewhiten((time, value, error), settings=_settings())
+    assert solution.n_components >= 2
+    strongest = solution.components[0]
+    assert strongest.frequency == pytest.approx(frequency, abs=2e-4)
+    labels = [c.combination for c in solution.components if c.combination]
+    assert any("2F1" in label for label in labels)  # the harmonic is in band too
+    assert solution.rms < 0.05  # the aliased fit left ~0.25 mag of signal behind
+
+
 def test_store_spectra_false_drops_the_big_arrays() -> None:
     time, value, error = synthetic_pulsator(n=400)
     solution = prewhiten(

@@ -439,11 +439,13 @@ class TLSSettings(_DeviceSettings):
 class PreWhitenSettings(_DeviceSettings):
     """Settings for automated iterative pre-whitening of a pulsator.
 
-    The defaults are the conservative, widely-cited choices: a Nyquist-limited grid
-    oversampled ten times, extraction until a component fails the Breger et al. (1993)
-    signal-to-noise 4.0 criterion, a Loumos & Deeming (1978) resolution guard of
-    1.5 Rayleigh widths between components, and least-squares covariance uncertainties
-    inflated by the Schwarzenberg-Czerny correlation factor.
+    The defaults are the conservative, widely-cited choices: a search band from ``1/T``
+    to the pseudo-Nyquist frequency — floored at 50 cycles/day so short-period
+    pulsators stay in band on sparse ground-based sampling — oversampled ten times,
+    extraction until a component fails the Breger et al. (1993) signal-to-noise 4.0
+    criterion, a Loumos & Deeming (1978) resolution guard of 1.5 Rayleigh widths
+    between components, and least-squares covariance uncertainties inflated by the
+    Schwarzenberg-Czerny correlation factor.
     """
 
     model_config = SettingsConfigDict(env_prefix="CUPERIOD_PREWHITEN_", extra="forbid")
@@ -463,10 +465,15 @@ class PreWhitenSettings(_DeviceSettings):
     )
     maximum_frequency: float | None = Field(
         default=None,
-        description="Highest trial frequency (cycles/day); None -> pseudo-Nyquist.",
+        description=(
+            "Highest trial frequency (cycles/day); "
+            "None -> pseudo-Nyquist, floored at 50."
+        ),
     )
     nyquist_factor: int = Field(
-        default=1, ge=1, description="Pseudo-Nyquist multiple when max is None."
+        default=5,
+        ge=1,
+        description="Pseudo-Nyquist multiple when max is None (as the periodograms).",
     )
     samples_per_peak: int = Field(
         default=10, ge=1, description="Frequency oversampling factor."
