@@ -395,25 +395,27 @@ def _run_gpu_single(
 def _run_pool(
     chunks: list[list[InputItem]],
     pending: list[int],
-    cfg: _ChunkConfig,
+    cfg: Any,
     absorb: Any,
     max_workers: int,
     *,
     initializer: Any = None,
     initargs: tuple[Any, ...] = (),
+    worker: Any = None,
 ) -> None:
     # Always use "spawn". Linux's default "fork" copies the parent's already-built
     # native thread pools (numba / OpenBLAS / OpenMP, plus any CUDA context for the
     # GPU pool) into the child and deadlocks the workers. Spawn starts fresh,
     # thread-pinned workers (the Windows/macOS default) — see pin_worker_threads.
+    # ``worker`` lets a sibling batch driver (pre-whitening) reuse this pool with its
+    # own per-chunk function; it must be a module-level callable so spawn can pickle it.
+    task = worker or _process_chunk
     ctx = multiprocessing.get_context("spawn")
     with ProcessPoolExecutor(
         max_workers=max_workers, mp_context=ctx,
         initializer=initializer, initargs=initargs,
     ) as pool:
-        futures = {
-            pool.submit(_process_chunk, chunks[idx], cfg): idx for idx in pending
-        }
+        futures = {pool.submit(task, chunks[idx], cfg): idx for idx in pending}
         for future in as_completed(futures):
             idx = futures[future]
             rows, errs = future.result()

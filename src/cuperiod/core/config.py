@@ -436,6 +436,208 @@ class TLSSettings(_DeviceSettings):
     )
 
 
+class PreWhitenSettings(_DeviceSettings):
+    """Settings for automated iterative pre-whitening of a pulsator.
+
+    The defaults are the conservative, widely-cited choices: a Nyquist-limited grid
+    oversampled ten times, extraction until a component fails the Breger et al. (1993)
+    signal-to-noise 4.0 criterion, a Loumos & Deeming (1978) resolution guard of
+    1.5 Rayleigh widths between components, and least-squares covariance uncertainties
+    inflated by the Schwarzenberg-Czerny correlation factor.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="CUPERIOD_PREWHITEN_", extra="forbid")
+
+    @model_validator(mode="after")
+    def _check_bounds(self) -> Self:
+        _require_lt(
+            self.minimum_frequency, self.maximum_frequency,
+            "minimum_frequency", "maximum_frequency",
+        )
+        return self
+
+    # -- search grid -------------------------------------------------------------
+    minimum_frequency: float | None = Field(
+        default=None,
+        description="Lowest trial frequency (cycles/day); None -> 1/baseline.",
+    )
+    maximum_frequency: float | None = Field(
+        default=None,
+        description="Highest trial frequency (cycles/day); None -> pseudo-Nyquist.",
+    )
+    nyquist_factor: int = Field(
+        default=1, ge=1, description="Pseudo-Nyquist multiple when max is None."
+    )
+    samples_per_peak: int = Field(
+        default=10, ge=1, description="Frequency oversampling factor."
+    )
+    normalization: Literal["lsq", "dft"] = Field(
+        default="lsq",
+        description="Amplitude convention: least-squares, or classical Deeming DFT.",
+    )
+
+    # -- extraction --------------------------------------------------------------
+    max_frequencies: int = Field(
+        default=30, ge=0, description="Hard cap on extracted components."
+    )
+    min_separation_rayleigh: float = Field(
+        default=1.5,
+        ge=0.0,
+        description="Resolution guard between components, in Rayleigh widths.",
+    )
+    refine_bound_rayleigh: float = Field(
+        default=1.0,
+        gt=0.0,
+        description="How far a frequency may move when refined, in Rayleigh widths.",
+    )
+    fit_mean: bool = Field(
+        default=True, description="Fit a free constant term alongside the sinusoids."
+    )
+
+    # -- stopping criteria -------------------------------------------------------
+    stop_criteria: tuple[Literal["snr", "fap", "bic", "amplitude"], ...] = Field(
+        default=("snr",),
+        description="Criteria a new component must pass; failing one stops the run.",
+    )
+    snr_threshold: float = Field(
+        default=4.0, gt=0.0, description="Minimum Breger signal-to-noise to accept."
+    )
+    snr_window: float = Field(
+        default=1.0,
+        gt=0.0,
+        description="Half-width (cycles/day) of the residual noise box.",
+    )
+    noise_estimator: Literal["mean", "median"] = Field(
+        default="mean",
+        description="Box noise statistic; 'mean' matches the classical S/N scale.",
+    )
+    fap_threshold: float = Field(
+        default=1e-3, gt=0.0, le=1.0, description="Maximum accepted false-alarm prob."
+    )
+    min_delta_bic: float = Field(
+        default=10.0,
+        ge=0.0,
+        description="Minimum BIC improvement required of a new component.",
+    )
+    min_amplitude: float | None = Field(
+        default=None, description="Absolute amplitude floor; None disables the check."
+    )
+    prune: bool = Field(
+        default=True,
+        description="Re-check significance after the final fit and drop failures.",
+    )
+
+    # -- fitting -----------------------------------------------------------------
+    refine: Literal["none", "last", "cyclic", "simultaneous"] = Field(
+        default="last", description="Per-iteration frequency-refinement policy."
+    )
+    sweeps: int = Field(
+        default=1, ge=1, description="Cyclic sweeps per iteration and per final polish."
+    )
+    final_refine: bool = Field(
+        default=True,
+        description="Polish the accepted solution with a simultaneous (or cyclic) fit.",
+    )
+    max_simultaneous: int = Field(
+        default=60,
+        ge=1,
+        description="Largest component count given a simultaneous final polish.",
+    )
+    max_nfev: int = Field(
+        default=200, ge=1, description="Optimiser evaluation cap per non-linear solve."
+    )
+
+    # -- uncertainties -----------------------------------------------------------
+    uncertainty: Literal["covariance", "analytic", "bootstrap"] = Field(
+        default="covariance", description="Uncertainty estimator."
+    )
+    correlation_correction: bool = Field(
+        default=True,
+        description="Inflate errors by sqrt(D) for correlated residuals.",
+    )
+    n_resamples: int = Field(
+        default=200,
+        ge=2,
+        description="Bootstrap replicates when uncertainty='bootstrap'.",
+    )
+    seed: int = Field(default=0, description="Seed for the bootstrap resampling.")
+
+    # -- combination frequencies -------------------------------------------------
+    combinations: bool = Field(
+        default=True, description="Identify combination frequencies and harmonics."
+    )
+    combination_max_order: int = Field(
+        default=2, ge=1, description="Largest sum|n_i| considered."
+    )
+    combination_parents: int = Field(
+        default=5, ge=1, description="Highest-amplitude components usable as parents."
+    )
+    combination_tolerance_rayleigh: float = Field(
+        default=0.25, ge=0.0, description="Tolerance floor in Rayleigh widths."
+    )
+    combination_sigma: float = Field(
+        default=3.0, ge=0.0, description="Tolerance in propagated sigma_f units."
+    )
+
+    # -- execution ---------------------------------------------------------------
+    min_detections: int = Field(
+        default=20, ge=4, description="Skip if fewer finite points."
+    )
+    backend: Literal[
+        "auto", "cpu", "gpu", "finufft", "cufinufft", "torch", "numpy"
+    ] = Field(default="auto", description="Amplitude-spectrum backend.")
+    nufft_eps: float = Field(
+        default=1e-9, gt=0.0, description="NUFFT relative tolerance."
+    )
+    direct_freq_batch: int = Field(
+        default=4096, ge=1, description="Frequency chunk for the direct (torch) path."
+    )
+    store_spectra: bool = Field(
+        default=True,
+        description="Keep the full initial and residual spectra in the result.",
+    )
+    downsample_points: int = Field(
+        default=2000, ge=2, description="Stored downsampled-spectrum size."
+    )
+
+
+class SpacingSettings(BaseSettings):
+    """Settings for the g-mode period-spacing tools."""
+
+    model_config = SettingsConfigDict(env_prefix="CUPERIOD_SPACING_", extra="forbid")
+
+    minimum_spacing: float | None = Field(
+        default=None,
+        description="Shortest trial spacing (days); None -> half the smallest gap.",
+    )
+    maximum_spacing: float | None = Field(
+        default=None,
+        description="Longest trial spacing (days); None -> the full period range.",
+    )
+    oversample: int = Field(
+        default=20, ge=1, description="Oversampling of the spacing search grid."
+    )
+    amplitude_weighted: bool = Field(
+        default=True, description="Weight the comb response by mode amplitude."
+    )
+    max_gap: int = Field(
+        default=3,
+        ge=1,
+        description="Largest number of missing modes bridged inside a series.",
+    )
+    tolerance: float = Field(
+        default=0.25,
+        gt=0.0,
+        description="Series membership tolerance as a fraction of the local spacing.",
+    )
+    min_length: int = Field(
+        default=4, ge=3, description="Shortest reported period-spacing series."
+    )
+    ell: int = Field(
+        default=1, ge=1, description="Spherical degree assumed for the buoyancy radius."
+    )
+
+
 class BatchSettings(BaseSettings):
     """Settings for batch processing of many light curves."""
 
@@ -465,6 +667,8 @@ __all__ = [
     "GLSSettings",
     "MHAOVSettings",
     "PDMSettings",
+    "PreWhitenSettings",
+    "SpacingSettings",
     "StringLengthSettings",
     "TLSSettings",
 ]

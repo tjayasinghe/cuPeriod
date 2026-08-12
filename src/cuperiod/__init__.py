@@ -29,6 +29,8 @@ from cuperiod.core.config import (
     GLSSettings,
     MHAOVSettings,
     PDMSettings,
+    PreWhitenSettings,
+    SpacingSettings,
     StringLengthSettings,
     TLSSettings,
 )
@@ -44,13 +46,33 @@ from cuperiod.core.grid import GridSpec, log_period_grid, uniform_frequency_grid
 from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
 from cuperiod.core.result import MultiResult, Peak, Periodogram
 from cuperiod.methods.base import MethodInfo, get_method, list_methods, method_names
+from cuperiod.prewhiten import (
+    AmplitudeSpectrum,
+    Combination,
+    MultiSineFit,
+    PeriodSpacingSeries,
+    PreWhitenResult,
+    Sinusoid,
+    SpacingSpectrum,
+    SpectrumEngine,
+    amplitude_spectrum,
+    batch_prewhiten,
+    buoyancy_radius,
+    echelle,
+    find_period_spacing,
+    fit_multisine,
+    identify_combinations,
+    prewhiten,
+    spacing_spectrum,
+)
 
 try:
     __version__ = _version("cuperiod")
 except PackageNotFoundError:  # pragma: no cover - source tree, no metadata
-    __version__ = "1.1.0"
+    __version__ = "1.2.0.dev0"
 
 __all__ = [
+    "AmplitudeSpectrum",
     "BLSSettings",
     "BackendUnavailableError",
     "BatchSettings",
@@ -58,6 +80,7 @@ __all__ = [
     "CESettings",
     "ColumnMap",
     "ColumnResolutionError",
+    "Combination",
     "CuPeriodError",
     "Domain",
     "GLSSettings",
@@ -69,22 +92,39 @@ __all__ = [
     "MethodInfo",
     "MultiBandLightCurve",
     "MultiResult",
+    "MultiSineFit",
     "PDMSettings",
     "Peak",
     "Periodogram",
+    "PeriodSpacingSeries",
+    "PreWhitenResult",
+    "PreWhitenSettings",
+    "Sinusoid",
+    "SpacingSettings",
+    "SpacingSpectrum",
+    "SpectrumEngine",
     "StringLengthSettings",
     "TLSSettings",
     "UnknownMethodError",
     "__version__",
+    "amplitude_spectrum",
     "batch_periodograms",
+    "batch_prewhiten",
     "best_periods",
+    "buoyancy_radius",
+    "echelle",
+    "find_period_spacing",
+    "fit_multisine",
     "free_gpu_memory",
     "get_method",
     "gpu_info",
+    "identify_combinations",
     "list_methods",
     "log_period_grid",
     "method_names",
     "periodogram",
+    "prewhiten",
+    "spacing_spectrum",
     "suggest_gpu_workers",
     "to_input",
     "uniform_frequency_grid",
