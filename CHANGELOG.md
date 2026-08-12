@@ -92,6 +92,14 @@ All notable changes to cuPeriod are documented here. The format is based on
   and GLS now also recovers the demo star's period; the fold-based methods (PDM, CE,
   string-length), which pay a full fold per trial frequency, keep their 10 c/d auto
   ceiling.
+- **GUI: component markers floated above the amplitude spectrum.** They were drawn at
+  each component's *fitted* amplitude while the curve shows the single-frequency
+  amplitude spectrum. Those agree for a well-separated mode but diverge as soon as
+  components are correlated — on the bundled HADS demo, whose harmonics each carry
+  yearly alias sidelobes (Δf = 1/365.25 d), the two differ by up to a factor of 4.6 —
+  so markers hung in empty space claiming peaks the spectrum does not have. Markers
+  now sit at the height of the curve they annotate; the fitted amplitude and S/N moved
+  to the hover readout, alongside the Frequencies dock that already reported them.
 - **Bootstrap frequency errors were exactly zero for every component but the newest.**
   The engine handed its per-iteration refinement policy (default `"last"`, which pins
   all established frequencies) to the bootstrap's replicate fits, so their scatter

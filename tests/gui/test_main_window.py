@@ -271,3 +271,45 @@ def test_prewhiten_run_populates_every_panel(qtbot: QtBot) -> None:
     assert window._spectrum._overlay_xy is not None
     assert window._stack.currentIndex() == 1
     window._controller.shutdown()
+
+
+def test_component_markers_are_drawn_on_the_spectrum_curve(qtbot: QtBot) -> None:
+    # Regression: markers were placed at the component's *fitted* amplitude while the
+    # curve shows the single-frequency amplitude spectrum. The two diverge as soon as
+    # components are correlated (a HADS harmonic and its yearly alias sidelobes trade
+    # amplitude in the joint fit), leaving dots floating in empty space above the
+    # curve — a peak the spectrum does not have.
+    from dataclasses import replace
+
+    from cuperiod.core.config import PreWhitenSettings
+    from cuperiod.prewhiten import prewhiten
+    from synth import synthetic_pulsator
+
+    window = _window(qtbot)
+    time, value, error = synthetic_pulsator(n=600, span=20.0)
+    solution = prewhiten(
+        (time, value, error),
+        settings=PreWhitenSettings(
+            backend="finufft", max_frequencies=3, samples_per_peak=6
+        ),
+    )
+    assert solution.spectrum is not None and solution.n_components >= 2
+    # Force the pathological case rather than hoping for it: an amplitude nothing like
+    # the spectrum at that frequency, in both directions.
+    components = list(solution.components)
+    components[0] = replace(components[0], amplitude=components[0].amplitude * 5.0)
+    components[1] = replace(components[1], amplitude=components[1].amplitude * 0.1)
+    solution = replace(solution, components=tuple(components))
+
+    window._show_solution_spectrum(solution)
+    grid, curve = solution.spectrum.frequency, solution.spectrum.amplitude
+    peaks = window._spectrum._peaks
+    assert len(peaks) == solution.n_components
+    for peak in peaks:
+        nearest = int(np.argmin(np.abs(grid - peak.frequency)))
+        assert peak.power == pytest.approx(float(curve[nearest]))
+        assert peak.power <= float(curve.max())
+    # The fitted amplitude is not lost — it moves to the hover readout.
+    assert peaks[0].extra["amplitude"] == pytest.approx(components[0].amplitude)
+    assert peaks[0].power != pytest.approx(components[0].amplitude)
+    window._controller.shutdown()

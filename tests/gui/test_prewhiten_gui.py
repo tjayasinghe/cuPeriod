@@ -301,6 +301,29 @@ def test_spectrum_view_offers_the_spectral_window(qtbot: QtBot) -> None:
     assert view._window_xy is None and not view._window_curve.isVisible()
 
 
+def test_marker_hover_reports_the_fitted_amplitude(qtbot: QtBot) -> None:
+    # The marker sits at the height of the *curve*, so the component's fitted
+    # amplitude has to be readable from the hover text instead of its position.
+    from cuperiod.core.result import Peak
+
+    component = Peak(
+        period=0.08, frequency=12.5, power=0.046, rank=1,
+        extra={"amplitude": 0.0855, "snr": 20.9},
+    )
+    detail = SpectrumView._peak_detail(component)
+    assert "0.0855" in detail and "20.9" in detail
+    assert "0.046" not in detail  # that is where the marker sits, not what it is
+    # A plain periodogram peak has no amplitude and keeps reporting its power.
+    plain = Peak(period=2.0, frequency=0.5, power=0.83, rank=1)
+    assert SpectrumView._peak_detail(plain) == "power=0.83"
+    # A missing/NaN S/N must not put "nan" in front of the user.
+    quiet = Peak(
+        period=0.08, frequency=12.5, power=0.046, rank=1,
+        extra={"amplitude": 0.0855, "snr": float("nan")},
+    )
+    assert "nan" not in SpectrumView._peak_detail(quiet).lower()
+
+
 # --- regressions -------------------------------------------------------------
 
 

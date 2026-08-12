@@ -554,10 +554,27 @@ class SpectrumView(QtWidgets.QWidget):
         peak = self._peaks[int(idx)]
         x = peak.frequency if self._x_mode == "frequency" else peak.period
         self._hover_text.setText(
-            f"#{peak.rank}  P={peak.period:.6g} d\npower={peak.power:.4g}"
+            f"#{peak.rank}  P={peak.period:.6g} d\n{self._peak_detail(peak)}"
         )
         self._hover_text.setPos(self._to_plot_x(x), self._to_plot_y(peak.power))
         self._hover_text.setVisible(True)
+
+    @staticmethod
+    def _peak_detail(peak: Peak) -> str:
+        """The hover line under a marker: fitted amplitude and S/N when present.
+
+        A pre-whitening marker is drawn at the height of the *spectrum*, so its fitted
+        amplitude — which can differ once components are correlated — has to be read
+        out here rather than inferred from where the marker sits.
+        """
+        amplitude = peak.extra.get("amplitude")
+        if amplitude is None:
+            return f"power={peak.power:.4g}"
+        detail = f"A={amplitude:.4g}"
+        snr = peak.extra.get("snr")
+        if snr is not None and np.isfinite(snr):
+            detail += f"   S/N={snr:.1f}"
+        return detail
 
     def _on_mouse_moved(self, event: Any) -> None:
         if self._pg is None:
