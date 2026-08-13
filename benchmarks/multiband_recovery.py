@@ -12,11 +12,12 @@ Setup (deliberately simple, stated so the numbers can be judged):
   within-night time (no rolling cadence, no lunation weighting).
 * The per-band epoch share follows the WFD flavor (r/i deepest:
   u 6%, g 9%, r 26%, i 26%, z 17%, y 16%); the *total* number of epochs across
-  all six bands is swept (60 / 120 / 240) to span the first survey years.
+  all six bands is swept (30 / 60 / 120) to span the first survey years.
 * RRab proxy: fundamental sine plus a phase-locked 0.35-amplitude second
   harmonic; period ~ U(0.35, 0.9) d; g amplitude ~ U(0.5, 1.0) mag scaled by
   band (u 1.05, g 1.0, r 0.72, i 0.57, z 0.53, y 0.48); photometric noise
-  0.02 mag in every band (bright-star regime).
+  0.20 mag per point by default (--noise) — an r ~ 23 halo RR Lyrae in
+  single Rubin visits, the population the multiband methods exist for.
 * Recovery = the periodogram's top period within 1% of the truth, no harmonic
   credit.
 
@@ -51,15 +52,15 @@ SPAN_DAYS = 3.0 * 365.25
 BANDS = ("u", "g", "r", "i", "z", "y")
 BAND_SHARE = {"u": 0.06, "g": 0.09, "r": 0.26, "i": 0.26, "z": 0.17, "y": 0.16}
 AMP_SCALE = {"u": 1.05, "g": 1.00, "r": 0.72, "i": 0.57, "z": 0.53, "y": 0.48}
-MEAN_MAG = {"u": 16.2, "g": 15.6, "r": 15.4, "i": 15.3, "z": 15.3, "y": 15.2}
-NOISE_MAG = 0.02
+MEAN_MAG = {"u": 23.4, "g": 22.8, "r": 22.5, "i": 22.4, "z": 22.4, "y": 22.3}
+NOISE_MAG = 0.20
 HARMONIC_FRACTION = 0.35
-EPOCH_BUDGETS = (60, 120, 240)
+EPOCH_BUDGETS = (30, 60, 120)
 REL_TOL = 0.01
 
 
 def simulate_star(
-    rng: np.random.Generator, total_epochs: int
+    rng: np.random.Generator, total_epochs: int, noise: float
 ) -> tuple[cup.MultiBandLightCurve, float]:
     """One RRab-like star on a sparse six-band cadence; returns (bands, period)."""
     period = float(rng.uniform(0.35, 0.9))
@@ -75,8 +76,8 @@ def simulate_star(
         signal += HARMONIC_FRACTION * amp * np.sin(
             2 * (2 * np.pi * t / period + phase)
         )
-        err = np.full(n, NOISE_MAG)
-        mag = MEAN_MAG[band] + signal + rng.normal(0.0, NOISE_MAG, size=n)
+        err = np.full(n, noise)
+        mag = MEAN_MAG[band] + signal + rng.normal(0.0, noise, size=n)
         bands[band] = cup.LightCurve.from_arrays(t, mag, err)
     return cup.MultiBandLightCurve.from_light_curves(bands), period
 
@@ -89,7 +90,7 @@ def recovered(p_found: float, p_true: float) -> bool:
     return abs(p_found / p_true - 1.0) <= REL_TOL
 
 
-def run(n_stars: int, backend: str) -> pd.DataFrame:
+def run(n_stars: int, backend: str, noise: float) -> pd.DataFrame:
     from cuperiod.multiband.gls_mb import gls_multiband_power
 
     grid = cup.GridSpec(
@@ -108,7 +109,7 @@ def run(n_stars: int, backend: str) -> pd.DataFrame:
     t0 = time.perf_counter()
     for budget in EPOCH_BUDGETS:
         for star in range(n_stars):
-            mblc, p_true = simulate_star(rng, budget)
+            mblc, p_true = simulate_star(rng, budget, noise)
             row: dict[str, object] = {
                 "star": star, "epochs": budget, "p_true": p_true,
             }
@@ -144,11 +145,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--n-stars", type=int, default=250)
     parser.add_argument("--backend", default="finufft")
+    parser.add_argument("--noise", type=float, default=NOISE_MAG,
+                        help="per-point photometric noise (mag)")
     args = parser.parse_args()
 
     print(f"multiband recovery: {args.n_stars} stars x {EPOCH_BUDGETS} epochs, "
-          f"backend {args.backend}")
-    df = run(args.n_stars, args.backend)
+          f"noise {args.noise} mag, backend {args.backend}")
+    df = run(args.n_stars, args.backend, args.noise)
     out = RESULTS / "multiband_recovery.parquet"
     df.to_parquet(out)
     print(f"wrote {out}")
