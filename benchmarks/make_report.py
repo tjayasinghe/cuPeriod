@@ -917,16 +917,18 @@ def main():
             laggards = speedup[speedup <= 0.2].sort_values()
             lag_txt = ""
             if len(laggards):
+                verb = "is" if len(laggards) == 1 else "are"
+                these = "this method" if len(laggards) == 1 else "these methods"
                 lag_txt = (
                     " "
                     + " and ".join(f"{lbl.get(m, m)} ({1.0/v:.0f}× slower)"
                                    for m, v in laggards.items())
-                    + " pay per-launch overhead on hundreds of small chunked "
-                      "kernels (default `batch_periods`) that a single-shot "
-                      "call cannot amortise — for one-off searches of these "
-                      "methods use the CPU tier, and at catalogue scale use "
-                      "the batch runner, which amortises launches and reuses "
-                      "engines across stars.")
+                    + f" {verb} dominated by fixed per-call dispatch and "
+                      f"transfer overhead that a single-shot call cannot "
+                      f"amortise — for one-off searches of {these} use the "
+                      f"CPU tier, and at catalogue scale use the batch "
+                      f"runner, which amortises launches and reuses engines "
+                      f"across stars.")
             L.append(
                 f"**Backends.** The GPU pass picks the same top period as the "
                 f"scored {scored_backend} pass in {gagree*100:.1f}% of "
@@ -1104,6 +1106,12 @@ def main():
                  "this wide. The GPU's case is catalogue throughput and non-NVIDIA hardware "
                  "(the portable torch backend), not single-curve latency on the CPU-tier "
                  "methods; see §8.\n")
+        L.append("> The MHAOV rows here predate v1.2's auto-sized device batching "
+                 "(`batch_periods=0`), which removed most of MHAOV's and SuperSmoother's "
+                 "per-chunk dispatch overhead; the real multi-band validation (§4), run "
+                 "under the new defaults, has single-shot GPU MHAOV at CPU parity. This "
+                 "single-curve table keeps the recorded measurement until the sweep is "
+                 "re-run.\n")
         if len(bls) and "cpu_port_s" in bls and np.isfinite(bls.cpu_port_s.iloc[0]):
             b = bls.iloc[0]
             L.append(f"\n> The pure-`numpy` BLS backend shares one array-module-generic source "

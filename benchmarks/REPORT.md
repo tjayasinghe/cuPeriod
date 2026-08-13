@@ -123,14 +123,14 @@ Every method runs on an identical grid through cuPeriod's CPU and GPU backends a
 | single-band GLS, z | 100 | 72.0% [62.5–79.9%] | 77.0% [67.8–84.2%] | — | — | — |
 | single-band GLS, any band | 100 | 92.0% [85.0–95.9%] | — | — | — | — |
 | **GLS offsets (1,0)** | 100 | 76.0% [66.8–83.3%] | 80.0% [71.1–86.7%] | 1.0e-05 | 0.07 | 0.13 |
-| **GLS perband (0,1)** | 100 | 78.0% [68.9–85.0%] | 81.0% [72.2–87.5%] | 9.6e-06 | 0.11 | 0.19 |
-| **GLS flex (1,1)** | 100 | 78.0% [68.9–85.0%] | 81.0% [72.2–87.5%] | 9.6e-06 | 0.35 | 0.25 |
+| **GLS perband (0,1)** | 100 | 78.0% [68.9–85.0%] | 81.0% [72.2–87.5%] | 9.6e-06 | 0.11 | 0.21 |
+| **GLS flex (1,1)** | 100 | 78.0% [68.9–85.0%] | 81.0% [72.2–87.5%] | 9.6e-06 | 0.37 | 0.27 |
 | **PDM** | 100 | 93.0% [86.3–96.6%] | 94.0% [87.5–97.2%] | 9.0e-06 | 0.01 | 0.07 |
 | **CE** | 100 | 85.0% [76.7–90.7%] | 90.0% [82.6–94.5%] | 9.8e-06 | 0.02 | 0.05 |
 | **String-Len** | 100 | 93.0% [86.3–96.6%] | 97.0% [91.5–99.0%] | 8.1e-06 | 0.04 | 0.03 |
-| **MHAOV** | 100 | 83.0% [74.5–89.1%] | 84.0% [75.6–89.9%] | 8.4e-06 | 0.54 | 23.77 |
-| **SuperSmoother** | 100 | 85.0% [76.7–90.7%] | 96.0% [90.2–98.4%] | 8.0e-06 | 0.29 | 23.71 |
-| **BLS** | 100 | 22.0% [15.0–31.1%] | 34.0% [25.5–43.7%] | 1.4e-03 | 3.04 | 3.37 |
+| **MHAOV** | 100 | 83.0% [74.5–89.1%] | 84.0% [75.6–89.9%] | 8.4e-06 | 0.54 | 0.48 |
+| **SuperSmoother** | 100 | 85.0% [76.7–90.7%] | 96.0% [90.2–98.4%] | 8.0e-06 | 0.30 | 0.87 |
+| **BLS** | 100 | 22.0% [15.0–31.1%] | 34.0% [25.5–43.7%] | 1.4e-03 | 3.02 | 3.66 |
 
 **Table 3.** Multi-band period recovery on real Stripe 82 RR Lyrae, Wilson 95% CIs. *median \|ΔP\|/P* is over strict hits (grid resolution is ~3e-5 of the period at these frequencies). Timings are median wall time per star on the shared ~97k-frequency grid, warm JIT, single shot — the batch runner amortises further via engine reuse. BLS is transit-shaped by design and is included for completeness, not as a recommended RR Lyrae tool.
 
@@ -138,7 +138,7 @@ Every method runs on an identical grid through cuPeriod's CPU and GPU backends a
 
 **Model choice depends on sampling density.** On these well-sampled curves (~280 points) the three GLS models perform comparably (offsets 76%, perband 78%, flex 78% strict). The **simulated sparse-cadence benchmark** (`multiband_recovery.py`) probes the opposite regime: at 30 total epochs the shared-phase `offsets` model recovers 82% vs ≤20% for the flexible models — fewer parameters win when epochs are few. Both regimes are real; `offsets` stays the default because the sparse regime (early Rubin) is the one that needs a joint method most, and the flexible models are one `mb_model=` switch away.
 
-**Backends.** The GPU pass picks the same top period as the scored cpu pass in 100.0% of model×star runs. Per-star GPU timings in Table 3 are single-shot periodogram calls; no model gains ≥1.5× from the GPU at this single-shot size. SuperSmoother (81× slower) and MHAOV (44× slower) and PDM (6× slower) pay per-launch overhead on hundreds of small chunked kernels (default `batch_periods`) that a single-shot call cannot amortise — for one-off searches of these methods use the CPU tier, and at catalogue scale use the batch runner, which amortises launches and reuses engines across stars.
+**Backends.** The GPU pass picks the same top period as the scored cpu pass in 100.0% of model×star runs. Per-star GPU timings in Table 3 are single-shot periodogram calls; no model gains ≥1.5× from the GPU at this single-shot size. PDM (7× slower) is dominated by fixed per-call dispatch and transfer overhead that a single-shot call cannot amortise — for one-off searches of this method use the CPU tier, and at catalogue scale use the batch runner, which amortises launches and reuses engines across stars.
 
 ![multiband real](figures/fig7_multiband_real.png)
 
@@ -213,6 +213,8 @@ Every method runs on an identical grid through cuPeriod's CPU and GPU backends a
 **Table 6.** Single-curve wall time per method (methodology in §1.2). *CPU backend* = what `backend="cpu"` resolves to — the fast default a user gets: finufft (GLS), the multicore numba box search (BLS), numba for the rest (with the `[fast]` extra) or numpy otherwise. *CPU vs ref* = cuPeriod-CPU speedup over the established external tool; *GPU vs CPU* = CUDA backend over cuPeriod's own CPU backend. *t_torch* = the portable PyTorch backend (device in *torch device*: cpu/cuda/mps/xpu) — the cross-vendor path that also runs on AMD/Intel/Mac GPUs.
 
 cuPeriod's CPU path already outperforms every external reference tool it has (GLS, PDM, BLS). **With the multicore numba tier, the GPU's single-curve margin over the CPU is modest almost everywhere** on this 16-core machine — 2–4× for BLS/String-Length/TLS, essentially a wash for PDM/CE, and the GPU is slower than the warm CPU kernel for MHAOV at this size. GLS is the one consistent exception (~3×): its CPU path is finufft, not a numba kernel. The scaling sweep (up to 30 000 points / a 100 000-frequency grid; Figure 5b) shows the same pattern across that whole range for PDM and MHAOV — the GPU's fixed per-call overhead (kernel launch, host↔device transfer) does not amortise at these problem sizes on a CPU this wide. The GPU's case is catalogue throughput and non-NVIDIA hardware (the portable torch backend), not single-curve latency on the CPU-tier methods; see §8.
+
+> The MHAOV rows here predate v1.2's auto-sized device batching (`batch_periods=0`), which removed most of MHAOV's and SuperSmoother's per-chunk dispatch overhead; the real multi-band validation (§4), run under the new defaults, has single-shot GPU MHAOV at CPU parity. This single-curve table keeps the recorded measurement until the sweep is re-run.
 
 
 > The pure-`numpy` BLS backend shares one array-module-generic source with the CUDA kernel (so they validate to floating-point), but it is a *parity reference*, not the product path — 17.7 s here, slower than numba and astropy because its GPU-shaped layout trades memory traffic for the parallelism that makes the GPU fast.

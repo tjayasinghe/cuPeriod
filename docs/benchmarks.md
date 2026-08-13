@@ -381,15 +381,15 @@ accepts a small-integer harmonic within 2%.
 * - GLS `offsets` (1,0)
   - 76%
   - 80%
-  - 0.067
+  - 0.070
 * - GLS `perband` (0,1)
   - 78%
   - 81%
-  - 0.107
+  - 0.112
 * - GLS `flex` (1,1)
   - 78%
   - 81%
-  - 0.348
+  - 0.367
 * - PDM
   - **93%**
   - 94%
@@ -397,23 +397,23 @@ accepts a small-integer harmonic within 2%.
 * - CE
   - 85%
   - 90%
-  - 0.024
+  - 0.023
 * - String-Length
   - **93%**
   - **97%**
-  - 0.039
+  - 0.036
 * - MHAOV
   - 83%
   - 84%
-  - 0.539
+  - 0.538
 * - SuperSmoother
   - 85%
   - 96%
-  - 0.293
+  - 0.296
 * - BLS
   - 22%
   - 34%
-  - 3.044
+  - 3.024
 ```
 
 Single-band GLS, one filter at a time, is the baseline: 72–78% strict per band (*z* worst,

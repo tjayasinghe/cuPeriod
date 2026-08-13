@@ -51,14 +51,15 @@ from __future__ import annotations
 import argparse
 import time
 import warnings
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 warnings.filterwarnings("ignore")
-import cuperiod as cup  # noqa: E402
-
 from _common import DATASET, RESULTS, period_match  # noqa: E402
+
+import cuperiod as cup  # noqa: E402
 
 S82_PARQUET = DATASET / "s82_rrlyrae.parquet"
 P_MIN_DAYS, P_MAX_DAYS = 0.15, 1.2
@@ -140,7 +141,7 @@ def run_star(
     return top_period(pg), seconds
 
 
-def run(backends: list[str], limit: int | None) -> pd.DataFrame:
+def run(backends: list[str], limit: int | None, out_path: Path) -> pd.DataFrame:
     stars = load_stars()
     if limit is not None:
         stars = stars[:limit]
@@ -202,9 +203,7 @@ def run(backends: list[str], limit: int | None) -> pd.DataFrame:
                       f"{time.perf_counter() - t_start:.0f}s", flush=True)
         # Checkpoint after each backend pass so a crash or kill in a later
         # pass cannot lose the scored results.
-        pd.DataFrame(rows).to_parquet(
-            RESULTS / "multiband_real.parquet", index=False
-        )
+        pd.DataFrame(rows).to_parquet(out_path, index=False)
         print(f"  checkpoint: {backend} pass written "
               f"({len(rows)} rows)", flush=True)
     return pd.DataFrame(rows)
@@ -259,11 +258,15 @@ def main() -> None:
                         help="comma-separated; first one is the scored pass")
     parser.add_argument("--limit", type=int, default=None,
                         help="run only the first N stars (smoke test)")
+    parser.add_argument("--out", type=Path,
+                        default=RESULTS / "multiband_real.parquet",
+                        help="output parquet (point a smoke run elsewhere so it "
+                             "cannot clobber the committed results)")
     args = parser.parse_args()
     backends = [b.strip() for b in args.backends.split(",") if b.strip()]
 
-    df = run(backends, args.limit)
-    out = RESULTS / "multiband_real.parquet"
+    df = run(backends, args.limit, args.out)
+    out = args.out
     df.to_parquet(out, index=False)
     print(f"\nwrote {out}", flush=True)
     summarize(df, backends[0])
