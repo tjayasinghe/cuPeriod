@@ -196,6 +196,81 @@ def fig_recovery(val):
     plt.close(fig)
 
 
+MBR_ORDER = [
+    ("gls_offsets", "GLS offsets (1,0)"), ("gls_perband", "GLS perband (0,1)"),
+    ("gls_flex", "GLS flex (1,1)"), ("pdm", "PDM"), ("ce", "CE"),
+    ("stringlength", "String-Len"), ("mhaov", "MHAOV"),
+    ("supersmoother", "SuperSmoother"), ("bls", "BLS"),
+]
+
+
+def _mbr_scored(mbr):
+    """The scored (first-listed backend) pass of the multiband-real results."""
+    scored_backend = str(mbr["backend"].iloc[0])
+    return mbr[mbr["backend"] == scored_backend], scored_backend
+
+
+def fig_multiband_real(mbr):
+    scored, _ = _mbr_scored(mbr)
+    mb = scored[~scored.model.str.startswith("single_")]
+    single = scored[scored.model.str.startswith("single_")]
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))
+    # (a) strict + harmonic-aware recovery per model, single-band baselines first
+    ax = axes[0]
+    band_rate = single.groupby("model")["strict"].mean()
+    best_band = band_rate.idxmax().removeprefix("single_")
+    any_rate = single.groupby("sesar_id")["strict"].any().mean()
+    labels = [f"best band ({best_band})", "any band"]
+    strict = [band_rate.max() * 100, any_rate * 100]
+    harm = [np.nan, np.nan]
+    for key, label in MBR_ORDER:
+        g = mb[mb.model == key]
+        labels.append(label)
+        strict.append(g["strict"].mean() * 100)
+        harm.append(g["harmonic_ok"].mean() * 100)
+    x = np.arange(len(labels))
+    ax.bar(x - 0.2, np.nan_to_num(harm), 0.4,
+           label="incl. harmonic (P, P/2, 2P…)", color="#4c72b0")
+    ax.bar(x + 0.2, strict, 0.4, label="strict (=P within 1%)", color="#dd8452")
+    ax.axvline(1.5, color="gray", lw=0.8, ls=":")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=35, ha="right", fontsize=7)
+    ax.set_ylabel("recovery rate [%]")
+    ax.set_ylim(0, 105)
+    ax.set_title("(a) Recovery on 100 real S82 RR Lyrae\n"
+                 "left of dots: single-band GLS baseline", fontsize=8)
+    ax.legend(fontsize=7, loc="lower right")
+
+    # (b) where the misses go: ratio vs true period, harmonic + 1-day alias loci
+    ax = axes[1]
+    ratio = mb.p_top / mb.p_true
+    hit = mb["harmonic_ok"].to_numpy()
+    ax.scatter(mb.p_true[hit], ratio[hit], s=8, alpha=.3, color="#4c72b0",
+               edgecolor="none", label="harmonic-aware hit")
+    ax.scatter(mb.p_true[~hit], ratio[~hit], s=14, alpha=.8, color="crimson",
+               edgecolor="none", label="miss")
+    pp = np.linspace(mb.p_true.min() * 0.95, mb.p_true.max() * 1.05, 200)
+    for r in (0.5, 1.0, 2.0):
+        ax.axhline(r, color="gray", lw=0.7, ls="--", alpha=.6)
+    for s, lab in ((1, "+1 d$^{-1}$ alias"), (-1, "−1 d$^{-1}$ alias")):
+        with np.errstate(divide="ignore"):
+            loc = 1.0 / (1.0 + s * pp)
+        ok = (loc > 0) & (loc < 10)
+        ax.plot(pp[ok], loc[ok], lw=0.9, ls=":", color="#2ca02c", alpha=.9)
+        if ok.any():
+            ax.text(pp[ok][-1], loc[ok][-1], lab, fontsize=6, color="#2ca02c")
+    ax.set_yscale("log")
+    ax.set_xlabel("Sesar 2010 literature period [d]")
+    ax.set_ylabel("recovered / literature period")
+    ax.set_title("(b) All multi-band model–star pairs\n"
+                 "dashed: harmonics · dotted: ±1 cycle/day aliases", fontsize=8)
+    ax.legend(fontsize=7, loc="upper left", framealpha=0.9)
+    fig.tight_layout()
+    fig.savefig(FIGURES / "fig7_multiband_real.png")
+    plt.close(fig)
+
+
 INJ_SIGNAL_ORDER = ["sinusoid", "eclipse", "transit"]
 INJ_MCOLOR = {"GLS": "#1f77b4", "MHAOV": "#ff7f0e", "PDM": "#2ca02c", "CE": "#9467bd",
              "STRINGLENGTH": "#8c564b", "BLS": "#d62728", "TLS": "#17becf"}
@@ -370,6 +445,7 @@ def main():
     batch = load("bench_batch.parquet")
     tls = load("tls_results.parquet")
     inj = load("injection_recovery.parquet")
+    mbr = load("multiband_real.parquet")
     spectra = sorted(glob.glob(str(RESULTS / "spectra" / "*.npz")))
 
     made = []
@@ -385,6 +461,8 @@ def main():
         fig_tls(tls); made.append("fig5")
     if inj is not None:
         fig_injection(inj); made.append("fig6")
+    if mbr is not None:
+        fig_multiband_real(mbr); made.append("fig7")
     print("figures:", made)
 
     # ---- assemble REPORT.md ----------------------------------------------
@@ -408,20 +486,30 @@ def main():
         same_pct = val.cpu_gpu_same.mean() * 100
         harm_lo = val.groupby("method").recover_harmonic.mean().min() * 100
         summary = (
-            f"**Summary.** All {val.method.nunique()} period-search methods in cuPeriod "
-            f"{cup.__version__} were validated on {len(meta)} real ASAS-SN light curves with "
+            f"**Summary.** cuPeriod {cup.__version__}'s {val.method.nunique()} "
+            f"single-band-benchmarked period-search methods were validated on {len(meta)} "
+            "real ASAS-SN light curves with "
             "literature periods, plus 12 confirmed Kepler KOIs for the transit methods. "
             f"CPU and GPU backends agree to round-off (worst-case relative difference "
             f"{worst_par:.0e}, dominated by the two single-precision GPU paths) and select "
             f"the identical best period on {same_pct:.0f}% of targets; every method with an "
             "established external reference implementation reproduces it on an identical "
-            f"grid. Harmonic-aware period recovery is ≥{harm_lo:.0f}% for all methods. ")
+            f"grid. Harmonic-aware period recovery is ≥{harm_lo:.0f}% for all of them. ")
         if batch is not None:
             gpk = batch.loc[batch.gpu_lc_per_s.idxmax()]
             summary += (f"Peak measured throughput is {gpk.gpu_lc_per_s:,.0f} light curves/s "
                         f"({ml(gpk.method)}) on one GPU. ")
+        if mbr is not None:
+            mb_scored, _ = _mbr_scored(mbr)
+            mb_only = mb_scored[~mb_scored.model.str.startswith("single_")]
+            best_strict = mb_only.groupby("model")["strict"].mean().max() * 100
+            summary += (
+                f"Every multi-band method was additionally validated on "
+                f"{mb_scored.sesar_id.nunique()} real SDSS Stripe 82 RR Lyrae "
+                f"with literature periods (best joint model: {best_strict:.0f}% "
+                "strict top-period recovery; §4). ")
         summary += ("Practical guidance on backend selection is given in "
-                    "§7; limitations in §8.")
+                    "§8; limitations in §9.")
         L.append(summary + "\n")
 
     # ---- 1. environment & methodology --------------------------------------
@@ -446,7 +534,9 @@ def main():
              "an extension selected/downloaded via `dataset/download_extension.py` from "
              "ASAS-SN Sky Patrol — clean single VSX types, n_det≥300, baseline≥1000 d); 12 "
              "confirmed Kepler KOIs (Mendeley *Dataset_Machine_Learning_Exoplanets_2024*; "
-             "flux via MAST/lightkurve) |\n")
+             "flux via MAST/lightkurve); 100 SDSS Stripe 82 RR Lyrae with ugriz "
+             "photometry and literature periods (Sesar et al. 2010, "
+             "`dataset/s82_rrlyrae.parquet`) for the multi-band methods |\n")
     L.append("### 1.2 Timing methodology\n")
     L.append("Wall-clock times use `time.perf_counter()`. Every timed configuration is run "
              "once untimed first — so JIT compilation (numba), CUDA kernel/plan caching and "
@@ -654,10 +744,207 @@ def main():
                     L.append(f"\n- *{cat}*: {EXPL[cat]}.")
             L.append("\n")
 
+    if mbr is not None:
+        scored, scored_backend = _mbr_scored(mbr)
+        mb = scored[~scored.model.str.startswith("single_")].copy()
+        sb = scored[scored.model.str.startswith("single_")]
+        n_stars = int(scored.sesar_id.nunique())
+        types = scored.drop_duplicates("sesar_id").rrl_type.value_counts()
+        gpu = mbr[mbr.backend != scored_backend]
+
+        L.append("## 4 — Multi-band period recovery: real Stripe 82 RR Lyrae\n")
+        L.append(
+            f"§3 validates the single-band methods on real data; this section does "
+            f"the same for every **multi-band** method, on the canonical real "
+            f"multi-band test set: the SDSS Stripe 82 RR Lyrae of Sesar et al. "
+            f"2010 (ApJ 708, 717) — the dataset VanderPlas & Ivezić 2015 "
+            f"developed the shared-phase multiband periodogram on, the model that "
+            f"ships as cuPeriod's default `offsets` GLS. {n_stars} stars "
+            f"({int(types.get('ab', 0))} RRab, {int(types.get('c', 0))} RRc; the "
+            f"first {n_stars} of 483 by Sesar ID, no quality selection), each with "
+            f"real ugriz photometry (~55 epochs per band, ~280 points total) over "
+            f"a ~3200-day baseline, and a literature period from the discovery "
+            f"paper. Ground-based cadence at its most adversarial: strong ±1 "
+            f"cycle/day aliasing. Blind search, identical for every star: periods "
+            f"0.15–1.2 d at 5 samples per Rayleigh width (~97 000 trial "
+            f"frequencies), every method at default settings (BLS builds its "
+            f"native duration grid inside the same window). **strict** = top "
+            f"period within 1% of the literature value, no harmonic credit; "
+            f"**harmonic-aware** = §1.3's 2% harmonic tolerance. Bundle: "
+            f"`dataset/s82_rrlyrae.parquet` via "
+            f"`dataset/download_s82_rrlyrae.py`.\n")
+
+        rows = []
+        for band in ("u", "g", "r", "i", "z"):
+            s = sb[sb.model == f"single_{band}"]
+            if s.empty:
+                continue
+            rows.append(dict(
+                model=f"single-band GLS, {band}", n=len(s),
+                strict=fmt_pct_ci(int(s.strict.sum()), len(s)),
+                harmonic=fmt_pct_ci(int(s.harmonic_ok.sum()), len(s)),
+                dpp="—", tcpu="—", tgpu="—"))
+        any_hits = sb.groupby("sesar_id")["strict"].any()
+        rows.append(dict(
+            model="single-band GLS, any band", n=len(any_hits),
+            strict=fmt_pct_ci(int(any_hits.sum()), len(any_hits)),
+            harmonic="—", dpp="—", tcpu="—", tgpu="—"))
+        for key, label in MBR_ORDER:
+            g = mb[mb.model == key]
+            if g.empty:
+                continue
+            hits = g[g.strict]
+            dpp = (f"{np.median(np.abs(hits.p_top / hits.p_true - 1.0)):.1e}"
+                   if len(hits) else "—")
+            gg = gpu[gpu.model == key]
+            tgpu = f"{gg.seconds.median():.2f}" if len(gg) else "—"
+            rows.append(dict(
+                model=f"**{label}**", n=len(g),
+                strict=fmt_pct_ci(int(g.strict.sum()), len(g)),
+                harmonic=fmt_pct_ci(int(g.harmonic_ok.sum()), len(g)),
+                dpp=dpp, tcpu=f"{g.seconds.median():.2f}", tgpu=tgpu))
+        mtbl = pd.DataFrame(rows).rename(columns={
+            "model": "model", "n": "N", "strict": "strict (1%)",
+            "harmonic": "harmonic-aware (2%)", "dpp": "median \\|ΔP\\|/P",
+            "tcpu": "t_CPU [s/★]", "tgpu": "t_GPU [s/★]"})
+        L.append(md_table(mtbl, list(mtbl.columns), {"N": str}))
+        L.append(
+            "\n**Table 3.** Multi-band period recovery on real Stripe 82 RR "
+            "Lyrae, Wilson 95% CIs. *median \\|ΔP\\|/P* is over strict hits "
+            "(grid resolution is ~3e-5 of the period at these frequencies). "
+            "Timings are median wall time per star on the shared ~97k-frequency "
+            "grid, warm JIT, single shot — the batch runner amortises further "
+            "via engine reuse. BLS is transit-shaped by design and is included "
+            "for completeness, not as a recommended RR Lyrae tool.\n")
+
+        # -- data-driven reading of the results ---------------------------
+        notes = []
+        # which family leads on this (dense) data?
+        by_model = mb.groupby("model")["strict"].mean()
+        fold_keys = ["pdm", "ce", "stringlength", "supersmoother"]
+        gls_keys = ["gls_offsets", "gls_perband", "gls_flex"]
+        fold_best = by_model.reindex(fold_keys).max()
+        gls_best = by_model.reindex(gls_keys).max()
+        if fold_best - gls_best >= 0.05:
+            lblmap = dict(MBR_ORDER)
+            fold_name = lblmap[by_model.reindex(fold_keys).idxmax()]
+            notes.append(
+                f"The pooled fold statistics lead on these well-sampled "
+                f"curves: {fold_name} reaches {fold_best*100:.0f}% strict vs "
+                f"{gls_best*100:.0f}% for the best GLS model. With ~280 points "
+                "a fold uses the full non-sinusoidal light-curve shape, while "
+                "the single-harmonic GLS models stay alias-limited — dense "
+                "data reward shape, sparse data reward parsimony (see the "
+                "model-choice note below).")
+        # 1-day aliasing among non-harmonic misses
+        miss = mb[~mb.harmonic_ok & np.isfinite(mb.p_top)]
+        if len(miss):
+            df_alias = np.abs(1.0 / miss.p_top - 1.0 / miss.p_true)
+            on_alias = ((np.abs(df_alias - 1.0) < 0.05)
+                        | (np.abs(df_alias - 2.0) < 0.05)).mean()
+            notes.append(
+                f"Of the {len(miss)} non-harmonic misses across all models, "
+                f"{on_alias*100:.0f}% sit on the ±1 or ±2 cycle/day window "
+                "aliases (Figure 7b) — the failure mode is the ground-based "
+                "window function, not noise.")
+        # fold-family: strict-vs-harmonic gap = integer-multiple picks
+        fold = mb[mb.model.isin(["pdm", "ce", "stringlength", "supersmoother"])]
+        gap = fold[fold.harmonic_ok & ~fold.strict]
+        if len(gap):
+            frac2 = (gap.ratio == 2.0).mean()
+            notes.append(
+                f"For the fold-family statistics (PDM/CE/String-Length/"
+                f"SuperSmoother), {len(gap)} harmonic-aware hits are not strict "
+                f"hits; {frac2*100:.0f}% of those sit at exactly 2P — the "
+                "documented integer-multiple degeneracy of phase-folding "
+                "statistics (a fold at 2P, 3P… of a true period stays coherent). "
+                "The practical recipe stands: treat the *shortest* member of a "
+                "near-tied family as the period, or arbitrate with "
+                "`cuperiod.alias_diagnostics`.")
+        if notes:
+            L.append("**Reading the result.** " + " ".join(notes) + "\n")
+
+        # offsets vs flexible models, tied to the simulated-cadence benchmark
+        r_off = mb[mb.model == "gls_offsets"].strict.mean()
+        r_flex = mb[mb.model == "gls_flex"].strict.mean()
+        r_per = mb[mb.model == "gls_perband"].strict.mean()
+        gls_rates = (f"offsets {r_off*100:.0f}%, perband {r_per*100:.0f}%, "
+                     f"flex {r_flex*100:.0f}% strict")
+        if max(r_flex, r_per) - r_off >= 0.05:
+            reading = (
+                f"On these well-sampled curves (~280 points) the flexible GLS "
+                f"models beat the rigid shared-phase model ({gls_rates}): real "
+                f"RR Lyrae amplitudes vary strongly with wavelength (u ≈ 2× z), "
+                f"which `offsets` (common amplitude and phase, per-band offsets "
+                f"only) cannot express, and the model mismatch leaks power "
+                f"toward the 1-day alias.")
+        elif r_off - max(r_flex, r_per) >= 0.05:
+            reading = (
+                f"Even on these well-sampled curves the shared-phase model "
+                f"leads ({gls_rates}).")
+        else:
+            reading = (
+                f"On these well-sampled curves (~280 points) the three GLS "
+                f"models perform comparably ({gls_rates}).")
+        L.append(
+            f"**Model choice depends on sampling density.** {reading} "
+            f"The **simulated sparse-cadence benchmark** "
+            f"(`multiband_recovery.py`) probes the opposite regime: at 30 total "
+            f"epochs the shared-phase `offsets` model recovers 82% vs ≤20% for "
+            f"the flexible models — fewer parameters win when epochs are few. "
+            f"Both regimes are real; `offsets` stays the default because the "
+            f"sparse regime (early Rubin) is the one that needs a joint method "
+            f"most, and the flexible models are one `mb_model=` switch away.\n")
+
+        gagree = np.nan
+        if len(gpu):
+            merged = gpu.merge(
+                mb[["sesar_id", "model", "p_top"]],
+                on=["sesar_id", "model"], suffixes=("", "_ref"))
+            gagree = (np.abs(merged.p_top / merged.p_top_ref - 1.0)
+                      <= 1e-4).mean()
+            t_cpu = mb.groupby("model").seconds.median()
+            t_gpu = gpu.groupby("model").seconds.median()
+            speedup = (t_cpu / t_gpu).dropna()
+            gainers = speedup[speedup >= 1.5].sort_values(ascending=False)
+            lbl = dict(MBR_ORDER)
+            gain_txt = (
+                "; GPU speedups ≥1.5× at this grid size: "
+                + ", ".join(f"{lbl.get(m, m)} {v:.1f}×"
+                            for m, v in gainers.items())
+                if len(gainers) else
+                "; no model gains ≥1.5× from the GPU at this single-shot size")
+            laggards = speedup[speedup <= 0.2].sort_values()
+            lag_txt = ""
+            if len(laggards):
+                lag_txt = (
+                    " "
+                    + " and ".join(f"{lbl.get(m, m)} ({1.0/v:.0f}× slower)"
+                                   for m, v in laggards.items())
+                    + " pay per-launch overhead on hundreds of small chunked "
+                      "kernels (default `batch_periods`) that a single-shot "
+                      "call cannot amortise — for one-off searches of these "
+                      "methods use the CPU tier, and at catalogue scale use "
+                      "the batch runner, which amortises launches and reuses "
+                      "engines across stars.")
+            L.append(
+                f"**Backends.** The GPU pass picks the same top period as the "
+                f"scored {scored_backend} pass in {gagree*100:.1f}% of "
+                f"model×star runs. Per-star GPU timings in Table 3 are "
+                f"single-shot periodogram calls{gain_txt}.{lag_txt}\n")
+        L.append("![multiband real](figures/fig7_multiband_real.png)\n")
+        L.append(
+            "**Figure 7.** (a) Strict and harmonic-aware recovery per model; "
+            "the single-band GLS baseline (left of the dotted line) is what a "
+            "per-band search achieves on the same grid. (b) Recovered/literature "
+            "period ratio for every model×star pair: misses (red) concentrate "
+            "on the ±1 cycle/day alias loci (dotted) and the integer-multiple "
+            "harmonics (dashed).\n")
+
     if inj is not None:
-        L.append("## 4 — Injection–recovery sensitivity\n")
+        L.append("## 5 — Injection–recovery sensitivity\n")
         n_trials = int(inj.groupby(["method", "signal_type", "snr"]).size().max())
-        L.append("§2–3 validate against real, bright, well-established stars — a favourable "
+        L.append("§2–4 validate against real, bright, well-established stars — a favourable "
                  "regime. This section complements that with a controlled sweep: a known "
                  "synthetic signal of tunable amplitude, drawn onto *real* ASAS-SN "
                  "observation cadences (so the irregular sampling and seasonal gaps of "
@@ -686,7 +973,7 @@ def main():
         itbl = itbl.rename(columns=hdr)
         fmtd = {v: (lambda x: f"{x:.0f}%") for v in hdr.values()}
         L.append(md_table(itbl, ["signal", "method"] + list(hdr.values()), fmtd))
-        L.append(f"\n**Table 3.** Recovery fraction (%) per method × signal × SNR, "
+        L.append(f"\n**Table 4.** Recovery fraction (%) per method × signal × SNR, "
                  f"n={n_trials} trials/cell. Wilson intervals per cell are wide at this "
                  "trial count (omitted here for readability; §3's Table 2 shows the CI "
                  "convention on the larger real-star sample).\n")
@@ -714,7 +1001,7 @@ def main():
                      "method (BLS) is the appropriate tool for narrow eclipses/transits.\n")
 
     if tls is not None:
-        L.append("## 5 — TLS on Kepler transits\n")
+        L.append("## 6 — TLS on Kepler transits\n")
         good = (tls.cup_gpu_relerr < 0.02).mean() * 100
         par = tls.cpu_gpu_parity.dropna()
         spd = tls.gpu_speedup.dropna()
@@ -751,7 +1038,7 @@ def main():
         if "tls_ref_rel_err" in tls:
             refnote = (f"the `transitleastsquares` reference recovers "
                        f"{int((tls.tls_ref_rel_err < 0.02).sum())}/{len(tls)}. ")
-        L.append(f"\n**Table 3.** Blind TLS period recovery on confirmed Kepler KOIs. "
+        L.append(f"\n**Table 5.** Blind TLS period recovery on confirmed Kepler KOIs. "
                  f"cuPeriod recovers {n_cup}/{len(tls)}; {refnote}Both miss only the "
                  "shallowest transits, where a blind 0.5–12 d search aliases — a failure "
                  "mode shared with the reference implementation, not a backend defect.\n")
@@ -760,7 +1047,7 @@ def main():
                  "and `transitleastsquares`; (b) GPU speedup on the CPU-timed subset.\n")
 
     if single is not None:
-        L.append("## 6 — Performance\n")
+        L.append("## 7 — Performance\n")
         s = single.copy()
         s = s.set_index("method").reindex([m for m in METHOD_ORDER if m in set(single.method)]).reset_index()
         bls = s[s.method == "BLS"]
@@ -796,7 +1083,7 @@ def main():
             "CPU vs ref": nan_dash(lambda v: f"{v:.0f}×"),
             "t_ref [s]": nan_dash(lambda v: f"{v:.2f}"),
             "method": ml}))
-        L.append("\n**Table 4.** Single-curve wall time per method (methodology in §1.2). "
+        L.append("\n**Table 6.** Single-curve wall time per method (methodology in §1.2). "
                  "*CPU backend* = what `backend=\"cpu\"` resolves to — the fast default a "
                  "user gets: finufft (GLS), the multicore numba box search (BLS), numba for "
                  "the rest (with the `[fast]` extra) or numpy otherwise. *CPU vs ref* = "
@@ -816,7 +1103,7 @@ def main():
                  "host↔device transfer) does not amortise at these problem sizes on a CPU "
                  "this wide. The GPU's case is catalogue throughput and non-NVIDIA hardware "
                  "(the portable torch backend), not single-curve latency on the CPU-tier "
-                 "methods; see §7.\n")
+                 "methods; see §8.\n")
         if len(bls) and "cpu_port_s" in bls and np.isfinite(bls.cpu_port_s.iloc[0]):
             b = bls.iloc[0]
             L.append(f"\n> The pure-`numpy` BLS backend shares one array-module-generic source "
@@ -850,7 +1137,7 @@ def main():
             L.append(msg + "\n")
 
     if single is not None:
-        L.append("## 7 — Backend recommendations\n")
+        L.append("## 8 — Backend recommendations\n")
         rec = backend_recommendations(
             single.set_index("method")
                   .reindex([m for m in METHOD_ORDER if m in set(single.method)])
@@ -859,7 +1146,7 @@ def main():
             "fastest": "fastest measured", "t_best": "best time",
             "gpu_over_cpu": "GPU vs CPU", "recommendation": "single-curve recommendation"})
         L.append(md_table(rec, list(rec.columns)))
-        L.append("\n**Table 5.** Fastest measured backend per method on this machine "
+        L.append("\n**Table 7.** Fastest measured backend per method on this machine "
                  "(single curve, ~900 points; grids as in Table 4).\n")
         L.append("Guidance by use case, from the measurements above:\n")
         L.append("1. **Interactive, single-curve analysis (default).** Use "
@@ -893,7 +1180,7 @@ def main():
                  "pure-numpy BLS parity reference takes ~18 s vs 0.19 s with numba). "
                  "Install the `[fast]` extra, or use `backend=\"astropy\"` for BLS.\n")
 
-    L.append("## 8 — Limitations\n")
+    L.append("## 9 — Limitations\n")
     L.append("- All timings are from a single machine (Table in §1.1); CPU↔GPU ratios "
              "depend strongly on core count. The 16-core/32-thread CPU used here is near "
              "the top of the desktop range, so the reported GPU margins are conservative "
@@ -901,41 +1188,50 @@ def main():
              "- Batch throughput was swept only to 4096 curves per batch and is a "
              "single-shot rate including worker-pool start-up; sustained throughput and "
              "larger batches favour the GPU further.\n"
-             "- The GLS and MHAOV GPU statistics are single precision (§7, item 5).\n"
+             "- The GLS and MHAOV GPU statistics are single precision (§8, item 5).\n"
              "- The torch backend was timed on a CUDA device only; Apple (mps) and Intel "
              "(xpu) devices are supported but not benchmarked here.\n"
              "- The TLS blind search uses a fixed 0.5–12 d window; the unrecovered KOIs "
              "are the shallowest transits, which alias within that window (the reference "
-             "implementation misses one of the same targets; §5). The recovery rate "
+             "implementation misses one of the same targets; §6). The recovery rate "
              "therefore reflects the search configuration as much as the implementation.\n"
+             "- The real multi-band validation (§4) covers one variable class (RR Lyrae) "
+             "on well-sampled ~280-point curves; the sparse-cadence regime is covered by "
+             "the simulated `multiband_recovery.py` benchmark, not by real data. BLS is "
+             "included there for completeness but is transit-shaped by design.\n"
              "- Recovery rates are measured on light curves with well-established "
              "literature periods and moderate noise; they are upper bounds relative to "
              "survey-quality data with weaker signals.\n")
 
-    L.append("## 9 — References\n")
+    L.append("## 10 — References\n")
     L.append("Method papers: "
              "GLS — Zechmeister & Kürster 2009, A&A 496, 577; "
-             "Lomb–Scargle practicalities — VanderPlas 2018, ApJS 236, 16. "
+             "Lomb–Scargle practicalities — VanderPlas 2018, ApJS 236, 16; "
+             "multiband GLS — VanderPlas & Ivezić 2015, ApJ 812, 18. "
              "BLS — Kovács, Zucker & Mazeh 2002, A&A 391, 369. "
              "PDM — Stellingwerf 1978, ApJ 224, 953. "
              "Conditional Entropy — Graham et al. 2013, MNRAS 434, 2629. "
              "String Length — Dworetsky 1983, MNRAS 203, 917. "
              "MHAOV — Schwarzenberg-Czerny 1996, ApJ 460, L107. "
-             "TLS — Hippke & Heller 2019, A&A 623, A39.\n")
+             "TLS — Hippke & Heller 2019, A&A 623, A39. "
+             "SuperSmoother — Friedman 1984; Reimann 1994.\n")
     L.append("Reference software: Astropy Collaboration 2022, ApJ 935, 167; "
              "PyAstronomy — Czesla et al. 2019, ascl:1906.010; "
              "`transitleastsquares` — Hippke & Heller 2019.\n")
     L.append("Data: ASAS-SN — Shappee et al. 2014, ApJ 788, 48; Kochanek et al. 2017, "
              "PASP 129, 104502. VSX — Watson, Henden & Price 2006, SASS 25, 47. "
-             "Kepler KOI light curves via MAST/lightkurve.\n")
+             "SDSS Stripe 82 RR Lyrae — Sesar et al. 2010, ApJ 708, 717 (files via the "
+             "astroML-data mirror). Kepler KOI light curves via MAST/lightkurve.\n")
 
-    L.append("## 10 — Reproducibility\n"
+    L.append("## 11 — Reproducibility\n"
              "The validation light curves and their literature periods ship in "
-             "`dataset/light_curves.parquet`; §2, §3, §4 and §6 need no network access or "
-             "external catalogue. The Kepler/TLS comparison (§5) downloads flux from MAST "
-             "and runs `transitleastsquares` in a separate pinned environment.\n```\n"
+             "`dataset/light_curves.parquet` and `dataset/s82_rrlyrae.parquet`; §2, §3, "
+             "§4, §5 and §7 need no network access or external catalogue. The Kepler/TLS "
+             "comparison (§6) downloads flux from MAST and runs `transitleastsquares` in "
+             "a separate pinned environment.\n```\n"
              "python benchmarks/validate_periodograms.py  # 1-1 validation (main GPU venv)\n"
-             "python benchmarks/injection_recovery.py     # synthetic sensitivity sweep (§4)\n"
+             "python benchmarks/multiband_real.py         # real S82 multi-band recovery (§4)\n"
+             "python benchmarks/injection_recovery.py     # synthetic sensitivity sweep (§5)\n"
              "python benchmarks/benchmark.py              # performance\n"
              ".venv-ref/.../python benchmarks/tls_download_ref.py   # Kepler + transitleastsquares\n"
              "python benchmarks/tls_cuperiod.py           # cuPeriod TLS\n"
