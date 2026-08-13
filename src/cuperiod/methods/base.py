@@ -203,8 +203,13 @@ class PeriodogramMethod(ABC):
         mblc: MultiBandLightCurve,
         settings: BaseSettings,
         backend: str,
+        engine: object | None = None,
     ) -> Periodogram:
-        """Compute a multi-band periodogram. Override in multi-band methods."""
+        """Compute a multi-band periodogram. Override in multi-band methods.
+
+        ``engine`` is the same reusable object :meth:`make_engine` builds for the
+        single-band path; methods without a reusable plan simply ignore it.
+        """
         raise NotImplementedError(f"{self.name} does not support multi-band input")
 
     def make_engine(self, backend: str, settings: BaseSettings) -> object | None:

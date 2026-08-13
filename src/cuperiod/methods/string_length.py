@@ -430,6 +430,7 @@ class StringLengthMethod(PeriodogramMethod):
         mblc: MultiBandLightCurve,
         settings: StringLengthSettings,
         backend: str,
+        engine: object | None = None,
     ) -> Periodogram:
         from cuperiod.multiband.string_length_mb import string_length_multiband
 

@@ -479,6 +479,7 @@ class PDMMethod(PeriodogramMethod):
         mblc: MultiBandLightCurve,
         settings: PDMSettings,
         backend: str,
+        engine: object | None = None,
     ) -> Periodogram:
         from cuperiod.multiband.pdm_mb import pdm_multiband_theta
 

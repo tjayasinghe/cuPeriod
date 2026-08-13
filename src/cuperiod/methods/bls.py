@@ -235,6 +235,7 @@ class BLSMethod(PeriodogramMethod):
         mblc: MultiBandLightCurve,
         settings: BLSSettings,
         backend: str,
+        engine: object | None = None,
     ) -> Periodogram:
         from cuperiod.multiband.bls_mb import bls_multiband_power
 

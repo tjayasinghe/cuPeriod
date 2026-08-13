@@ -104,7 +104,7 @@ def _compute_one(
         if not method.supports_multiband:
             raise ValueError(f"{method.name} does not support multi-band input")
         grid = _multiband_grid(method, lc, settings)
-        return method.multiband_power(grid, lc, settings, backend)
+        return method.multiband_power(grid, lc, settings, backend, engine=engine)
     single = lc.in_domain(method.natural_domain) if method.natural_domain else lc
     grid = method.default_grid(single, settings)
     return method.power(grid, single, settings, backend, engine=engine)

@@ -432,7 +432,7 @@ class _Kernel:
         """Run one light curve, reusing ``engine`` when the method has one."""
         if isinstance(lc, MultiBandLightCurve):
             grid = self.grid or _multiband_grid(method, lc, settings)
-            return method.multiband_power(grid, lc, settings, backend)
+            return method.multiband_power(grid, lc, settings, backend, engine=engine)
         single = lc.in_domain(method.natural_domain) if method.natural_domain else lc
         grid = self.grid or method.default_grid(single, settings)
         return method.power(grid, single, settings, backend, engine=engine)

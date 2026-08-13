@@ -65,6 +65,7 @@ from cuperiod.core.grid import GridSpec
 from cuperiod.core.lightcurve import MultiBandLightCurve
 from cuperiod.core.result import Periodogram
 from cuperiod.methods.gls import (
+    CufinufftGLS,
     _gls_sums_direct,
     _trig_sums,
     lombscargle_power,
@@ -161,6 +162,30 @@ def _prep_multiband(mblc: MultiBandLightCurve, settings: GLSSettings) -> _MBPrep
     )
 
 
+def _nufft_sums(
+    tau: Any,
+    strengths: Any,
+    f0: float,
+    df: float,
+    nf: int,
+    backend: str,
+    eps: float,
+    engine: object | None,
+) -> Any:
+    """One type-1 trig-sum transform, through the batch engine when one is supplied.
+
+    The batch runner (and the interop partition kernel) hand the single-band
+    :class:`~cuperiod.methods.gls.CufinufftGLS` engine to the multi-band path too;
+    its bucketed plan cache serves the ``K + 2`` offsets transforms and the flex
+    harmonic sums equally well, since a plan is fixed by mode count and ``n_trans``
+    alone. Anything other than a cufinufft engine on the cufinufft backend falls
+    through to the plain per-call transform.
+    """
+    if backend == "cufinufft" and isinstance(engine, CufinufftGLS):
+        return engine.trig_sums(tau, strengths, f0, df, nf)
+    return _trig_sums(tau, strengths, f0, df, nf, backend, eps)  # type: ignore[arg-type]
+
+
 # --- offsets model -----------------------------------------------------------
 
 
@@ -199,7 +224,13 @@ def _offsets_assemble(
 
 
 def _offsets_power_nufft(
-    prep: _MBPrep, f0: float, df: float, nf: int, backend: str, eps: float
+    prep: _MBPrep,
+    f0: float,
+    df: float,
+    nf: int,
+    backend: str,
+    eps: float,
+    engine: object | None = None,
 ) -> FloatArray:
     """Offsets-model power via NUFFT band sums (finufft on CPU, cufinufft on GPU).
 
@@ -223,10 +254,10 @@ def _offsets_power_nufft(
 
     band_cs: list[tuple[Any, Any]] = []
     for sl in prep.slices:
-        sw_k = _trig_sums(tau[sl], w[sl][None, :], f0, df, nf, backend, eps)[0]  # type: ignore[arg-type]
+        sw_k = _nufft_sums(tau[sl], w[sl][None, :], f0, df, nf, backend, eps, engine)[0]
         band_cs.append((sw_k.real, sw_k.imag))
-    swy = _trig_sums(tau, wy[None, :], f0, df, nf, backend, eps)[0]  # type: ignore[arg-type]
-    sw2 = _trig_sums(tau, w[None, :], 2.0 * f0, 2.0 * df, nf, backend, eps)[0]  # type: ignore[arg-type]
+    swy = _nufft_sums(tau, wy[None, :], f0, df, nf, backend, eps, engine)[0]
+    sw2 = _nufft_sums(tau, w[None, :], 2.0 * f0, 2.0 * df, nf, backend, eps, engine)[0]
 
     if xp is np:
         with np.errstate(divide="ignore", invalid="ignore"):
@@ -294,6 +325,7 @@ def _perband_power(
     nf: int,
     backend: str,
     settings: GLSSettings,
+    engine: object | None = None,
 ) -> tuple[FloatArray, int, float, tuple[str, ...]]:
     """Multi-phase ``(0, 1)`` model: chi2_0-weighted per-band floating-mean GLS.
 
@@ -332,6 +364,10 @@ def _perband_power(
                 device=device,
                 precision=settings.precision,
                 freq_batch=settings.direct_freq_batch,
+            )
+        elif backend == "cufinufft" and isinstance(engine, CufinufftGLS):
+            p_k = engine.power(
+                lc.time, lc.value, lc.error, f0, df, nf, fit_mean=True
             )
         else:
             p_k = lombscargle_power(
@@ -382,7 +418,7 @@ def _flex_orders(nterms_base: int, nterms_band: int) -> tuple[int, int]:
 
 def _flex_sums_nufft(
     prep: _MBPrep, f0: float, df: float, nf: int, backend: str, eps: float,
-    h_w: int, h_wy: int,
+    h_w: int, h_wy: int, engine: object | None = None,
 ) -> list[_BandSums]:
     """Per-band harmonic sums via NUFFT (harmonic ``m`` runs on the ``m``-scaled
     grid; the ``w``/``w*y`` pair shares one batched transform where both are
@@ -410,8 +446,8 @@ def _flex_sums_nufft(
         pair = xp.stack([w[sl], wy[sl]])
         for m in range(1, h_w + 1):
             strengths = pair if m <= h_wy else pair[:1]
-            sums = _trig_sums(
-                tau[sl], strengths, m * f0, m * df, nf, backend, eps  # type: ignore[arg-type]
+            sums = _nufft_sums(
+                tau[sl], strengths, m * f0, m * df, nf, backend, eps, engine
             )
             cw.append(sums[0].real)
             sw.append(sums[0].imag)
@@ -666,12 +702,12 @@ def _flex_power_from_sums(
 
 def _flex_power_nufft(
     prep: _MBPrep, f0: float, df: float, nf: int, backend: str,
-    settings: GLSSettings,
+    settings: GLSSettings, engine: object | None = None,
 ) -> FloatArray:
     """Flex-model power via NUFFT harmonic sums + batched normal-equation solve."""
     h_w, h_wy = _flex_orders(settings.mb_nterms_base, settings.mb_nterms_band)
     band_sums = _flex_sums_nufft(
-        prep, f0, df, nf, backend, settings.nufft_eps, h_w, h_wy
+        prep, f0, df, nf, backend, settings.nufft_eps, h_w, h_wy, engine
     )
     if backend == "cufinufft":
         import cupy as cp
@@ -781,6 +817,7 @@ def gls_multiband_power(
     mblc: MultiBandLightCurve,
     settings: GLSSettings,
     backend: str,
+    engine: object | None = None,
 ) -> Periodogram:
     """Compute the multi-band GLS power on ``grid``.
 
@@ -796,6 +833,13 @@ def gls_multiband_power(
     backend : str
         Resolved backend: ``"finufft"``, ``"cufinufft"``, ``"torch"`` /
         ``"torch:<device>"``, or ``"astropy"``.
+    engine : object, optional
+        A :class:`~cuperiod.methods.gls.CufinufftGLS` batch engine; on the
+        cufinufft backend its plan cache is reused across bands, harmonics, and
+        light curves. Ignored on every other backend. The bootstrap-FAP pass
+        deliberately does not use it: the resample chunks batch through
+        transforms whose ``n_trans`` varies with the grid size, and caching a
+        plan per ``n_trans`` value would balloon device memory in a batch run.
 
     Returns
     -------
@@ -828,7 +872,7 @@ def gls_multiband_power(
             else:
                 actual_backend = backend
             power, n, baseline, band_names = _perband_power(
-                mblc, f0, df, nf, backend, settings
+                mblc, f0, df, nf, backend, settings, engine
             )
         else:
             prep = _prep_multiband(mblc, settings)
@@ -846,7 +890,7 @@ def gls_multiband_power(
                 else:
                     actual_backend = backend
                     power = _offsets_power_nufft(
-                        prep, f0, df, nf, backend, settings.nufft_eps
+                        prep, f0, df, nf, backend, settings.nufft_eps, engine
                     )
             else:  # flex
                 if is_torch:
@@ -858,7 +902,7 @@ def gls_multiband_power(
                 else:
                     actual_backend = backend
                     power = _flex_power_nufft(
-                        prep, f0, df, nf, backend, settings
+                        prep, f0, df, nf, backend, settings, engine
                     )
     power = np.nan_to_num(
         np.asarray(power, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0

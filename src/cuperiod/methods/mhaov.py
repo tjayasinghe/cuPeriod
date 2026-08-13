@@ -525,6 +525,7 @@ class MHAOVMethod(PeriodogramMethod):
         mblc: MultiBandLightCurve,
         settings: MHAOVSettings,
         backend: str,
+        engine: object | None = None,
     ) -> Periodogram:
         from cuperiod.multiband.mhaov_mb import mhaov_multiband_power
 

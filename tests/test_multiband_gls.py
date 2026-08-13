@@ -131,6 +131,38 @@ def test_torch_cpu_matches_finufft(model: str) -> None:
     assert np.allclose(torch_power, cpu, atol=1e-8)
 
 
+# --- batch engine reuse ------------------------------------------------------
+
+
+@pytest.mark.parametrize("model", ["offsets", "perband", "flex"])
+def test_foreign_engine_ignored_on_cpu(model: str) -> None:
+    """A non-cufinufft engine (any object) must not change the CPU result."""
+    mb, grid = make_mblc(), make_grid(1001)
+    s = cup.GLSSettings(mb_model=model)  # type: ignore[arg-type]
+    plain = gls_multiband_power(grid, mb, s, "finufft").power
+    with_engine = gls_multiband_power(
+        grid, mb, s, "finufft", engine=object()
+    ).power
+    np.testing.assert_array_equal(with_engine, plain)
+
+
+@requires_gpu
+@pytest.mark.parametrize("model", ["offsets", "perband", "flex"])
+def test_cufinufft_engine_matches_planless(model: str) -> None:
+    """The plan-cached engine path returns the plan-per-call cufinufft result."""
+    from cuperiod.methods.gls import CufinufftGLS
+
+    mb, grid = make_mblc(), make_grid()
+    s = cup.GLSSettings(mb_model=model)  # type: ignore[arg-type]
+    engine = CufinufftGLS(eps=s.nufft_eps)
+    plain = gls_multiband_power(grid, mb, s, "cufinufft").power
+    reused = gls_multiband_power(grid, mb, s, "cufinufft", engine=engine).power
+    # A second run through the now-warm plan cache must be deterministic.
+    again = gls_multiband_power(grid, mb, s, "cufinufft", engine=engine).power
+    assert np.allclose(reused, plain, atol=1e-8)
+    np.testing.assert_array_equal(again, reused)
+
+
 # --- API wiring and guards ---------------------------------------------------
 
 

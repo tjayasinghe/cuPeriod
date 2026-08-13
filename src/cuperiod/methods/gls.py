@@ -324,6 +324,11 @@ class CufinufftGLS:
     to ``f0 + k*df``. One instance per GPU-owning process (not thread-safe). Results are
     identical to :func:`lombscargle_power` with ``backend="cufinufft"``.
 
+    The multi-band paths reuse the same plan cache through :meth:`trig_sums` — the
+    offsets model's ``K + 2`` transforms and the flex model's harmonic sums all run
+    on grids of the same mode count, so one bucketed plan pair serves every band,
+    every harmonic, and every star of a batch.
+
     Parameters
     ----------
     eps : float, default 1e-9
@@ -352,6 +357,30 @@ class CufinufftGLS:
             self._plans[(nf, n_trans)] = plan
         return plan
 
+    def trig_sums(
+        self, tau: Any, strengths: Any, f0: float, df: float, nf: int
+    ) -> Any:
+        """Plan-cached type-1 trig sums on ``f0 + df*arange(nf)``.
+
+        The plan-reusing equivalent of :func:`_trig_sums` with
+        ``backend="cufinufft"``: ``tau`` and ``strengths`` (``(n_trans, N)``) are
+        cupy arrays and the ``(n_trans, nf)`` complex sums stay on device. The plan
+        is sized to the bucketed mode count and keyed by ``(modes, n_trans)``, so
+        transforms of the same shape — across bands, harmonics, and light curves —
+        share one plan.
+        """
+        cp = self._cp
+        nf_plan = ((nf + self._bucket - 1) // self._bucket) * self._bucket
+        two_pi = 2.0 * np.pi
+        x = (two_pi * df) * tau
+        x = cp.mod(x + np.pi, two_pi) - np.pi
+        mod = cp.exp(2j * np.pi * (f0 + (nf_plan // 2) * df) * tau)
+        plan = self._plan(nf_plan, int(strengths.shape[0]))
+        plan.setpts(x)
+        out = plan.execute((strengths * mod[None, :]).astype(cp.complex128))
+        out = out if out.ndim == 2 else out[None, :]
+        return out[:, :nf]
+
     def power(
         self,
         t: FloatArray,
@@ -375,23 +404,9 @@ class CufinufftGLS:
         tau, w, y, y_mean, yy = _prep(t, y, dy)
         tau_g = cp.asarray(tau)
         base = cp.asarray(np.stack([w, w * y]))
-        nf_plan = ((nf + self._bucket - 1) // self._bucket) * self._bucket
-        two_pi = 2.0 * np.pi
-
-        def sums(f0_: float, df_: float, strengths: Any) -> Any:
-            x = (two_pi * df_) * tau_g
-            x = cp.mod(x + np.pi, two_pi) - np.pi
-            mod = cp.exp(2j * np.pi * (f0_ + (nf_plan // 2) * df_) * tau_g)
-            plan = self._plan(nf_plan, int(strengths.shape[0]))
-            plan.setpts(x)
-            out = plan.execute((strengths * mod[None, :]).astype(cp.complex128))
-            return out if out.ndim == 2 else out[None, :]
-
-        pair = sums(f0, df, base)
-        sw2 = sums(2.0 * f0, 2.0 * df, base[:1])
-        power = _assemble_power(
-            pair[0, :nf], pair[1, :nf], sw2[0, :nf], y_mean, yy, fit_mean
-        )
+        pair = self.trig_sums(tau_g, base, f0, df, nf)
+        sw2 = self.trig_sums(tau_g, base[:1], 2.0 * f0, 2.0 * df, nf)
+        power = _assemble_power(pair[0], pair[1], sw2[0], y_mean, yy, fit_mean)
         return np.asarray(cp.asnumpy(power), dtype=np.float64)
 
 
@@ -545,10 +560,11 @@ class GLSMethod(PeriodogramMethod):
         mblc: MultiBandLightCurve,
         settings: GLSSettings,
         backend: str,
+        engine: object | None = None,
     ) -> Periodogram:
         from cuperiod.multiband.gls_mb import gls_multiband_power
 
-        return gls_multiband_power(grid, mblc, settings, backend)
+        return gls_multiband_power(grid, mblc, settings, backend, engine=engine)
 
     def make_engine(self, backend: str, settings: GLSSettings) -> object | None:  # type: ignore[override]
         if backend == "cufinufft":

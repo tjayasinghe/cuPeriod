@@ -407,6 +407,7 @@ class ConditionalEntropyMethod(PeriodogramMethod):
         mblc: MultiBandLightCurve,
         settings: CESettings,
         backend: str,
+        engine: object | None = None,
     ) -> Periodogram:
         from cuperiod.multiband.conditional_entropy_mb import ce_multiband_entropy
 
