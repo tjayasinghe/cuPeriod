@@ -30,7 +30,7 @@ from cuperiod.core.columns import ColumnMap, Domain
 from cuperiod.core.config import PreWhitenSettings
 from cuperiod.core.device import gpu_info as _gpu_info
 from cuperiod.core.device import suggest_gpu_workers
-from cuperiod.core.lightcurve import LightCurve
+from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
 from cuperiod.core.result import MultiResult, Periodogram
 from cuperiod.methods.base import get_method, list_methods
 from cuperiod.prewhiten.result import PreWhitenResult
@@ -97,7 +97,13 @@ def run(
 ) -> None:
     """Compute periodogram(s) for a single light curve and print the best periods."""
     columns = _column_map(time, value, error, band)
-    lc = LightCurve.from_file(path, columns=columns, domain=_domain(domain))
+    lc: LightCurve | MultiBandLightCurve
+    if band is not None:
+        lc = MultiBandLightCurve.from_file(
+            path, band_column=band, columns=columns, domain=_domain(domain)
+        )
+    else:
+        lc = LightCurve.from_file(path, columns=columns, domain=_domain(domain))
     result = periodogram(lc, _parse_methods(method), backend=backend)
     results = (
         result.results if isinstance(result, MultiResult) else {result.method: result}

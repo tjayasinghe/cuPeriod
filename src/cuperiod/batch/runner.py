@@ -55,6 +55,7 @@ class _ChunkConfig:
     settings_map: Mapping[str, BaseSettings]
     columns: ColumnMap | None
     domain: Domain | None
+    band_column: str | None
     n_best: int
     store_raw: bool
 
@@ -117,7 +118,12 @@ def _process_chunk(
     errors: list[tuple[str, str]] = []
     for key, source in items:
         try:
-            lc = load_source(source, columns=cfg.columns, domain=cfg.domain)
+            lc = load_source(
+                source,
+                columns=cfg.columns,
+                domain=cfg.domain,
+                band_column=cfg.band_column,
+            )
             for method_name in cfg.methods:
                 method = get_method(method_name)
                 engine = _WORKER_ENGINES.get(method.name)
@@ -266,6 +272,7 @@ def batch_periodograms(
         settings_map=settings_map,
         columns=columns,
         domain=domain,
+        band_column=band_column,
         n_best=n_best,
         store_raw=store_raw,
     )

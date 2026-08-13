@@ -134,10 +134,20 @@ def load_source(
     *,
     columns: ColumnMap | None = None,
     domain: Domain | None = None,
+    band_column: str | None = None,
 ) -> LightCurve | MultiBandLightCurve:
-    """Materialize a source: return a light curve unchanged, or load it from a path."""
+    """Materialize a source: return a light curve unchanged, or load it from a path.
+
+    A file source loads as a :class:`MultiBandLightCurve` split on the band
+    column when ``band_column`` (or ``columns.band``) is set; otherwise as a
+    single-band :class:`LightCurve`.
+    """
     if isinstance(source, (LightCurve, MultiBandLightCurve)):
         return source
+    if band_column is not None or (columns is not None and columns.band is not None):
+        return MultiBandLightCurve.from_file(
+            source, band_column=band_column, columns=columns, domain=domain
+        )
     return LightCurve.from_file(source, columns=columns, domain=domain)
 
 

@@ -15,7 +15,7 @@ verbatim.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -319,6 +319,58 @@ class MultiBandLightCurve:
             )
         return cls(bands=bands, meta=dict(meta or {}))
 
+    @classmethod
+    def from_file(
+        cls,
+        path: str | Path,
+        *,
+        band_column: str | None = None,
+        columns: ColumnMap | None = None,
+        domain: Domain | None = None,
+        meta: Mapping[str, Any] | None = None,
+    ) -> MultiBandLightCurve:
+        """Build from one long-format table file split on a band column.
+
+        Parameters
+        ----------
+        path : str or Path
+            CSV/ECSV/FITS/Parquet/ASCII file with a band/filter column and shared
+            time/value/error columns.
+        band_column : str, optional
+            Band column name; auto-detected from the standard filter-column names
+            if ``None``.
+        columns, domain, meta
+            As for :meth:`LightCurve.from_file`.
+
+        Raises
+        ------
+        ColumnResolutionError
+            If no band column can be resolved.
+        """
+        table = _read_table_object(Path(path))
+        names, _ = _adapt_table(table)
+        cmap = columns or ColumnMap(band=band_column)
+        if band_column is not None and cmap.band is None:
+            cmap = replace(cmap, band=band_column)
+        resolved = cmap.resolve(names, domain=domain)
+        if resolved.band is None:
+            raise ColumnResolutionError(
+                "could not resolve a band column; pass band_column=... "
+                f"or ColumnMap(band=...). Available columns: {names}"
+            )
+        labels = np.array(
+            [_band_label(v) for v in _raw_column(table, resolved.band)], dtype=object
+        )
+        bands: dict[str, LightCurve] = {}
+        for label in dict.fromkeys(labels):  # first-appearance order
+            sub = _row_subset(table, labels == label)
+            names_s, getter_s = _adapt_table(sub)
+            bands[str(label)] = LightCurve._from_table(
+                names_s, getter_s, columns, resolved.domain, {"band": str(label)}
+            )
+        base_meta = {"source": str(path), **dict(meta or {})}
+        return cls(bands=bands, meta=base_meta)
+
     def finite(self) -> MultiBandLightCurve:
         """Return a copy with each band's non-finite points removed."""
         return MultiBandLightCurve(
@@ -391,26 +443,57 @@ def _adapt_table(obj: Any) -> tuple[list[str], Callable[[str], FloatArray]]:
     raise TypeError(f"unsupported table type: {type(obj)!r}")
 
 
-def _read_table_file(path: Path) -> tuple[list[str], Callable[[str], FloatArray]]:
-    """Read a tabular file into ``(column_names, getter)`` by extension."""
+def _read_table_object(path: Path) -> Any:
+    """Read a tabular file into a table object (pyarrow or astropy) by extension."""
     suffix = path.suffix.lower()
     if suffix in {".parquet", ".pq"}:
         import pyarrow.parquet as pq
 
-        return _adapt_table(pq.read_table(path))
+        return pq.read_table(path)
 
     from astropy.table import Table
 
     if suffix in {".fits", ".fit", ".fz"}:
-        return _adapt_table(Table.read(path))
+        return Table.read(path)
     if suffix in {".csv"}:
-        return _adapt_table(Table.read(path, format="ascii.csv"))
+        return Table.read(path, format="ascii.csv")
     if suffix in {".ecsv"}:
-        return _adapt_table(Table.read(path, format="ascii.ecsv"))
+        return Table.read(path, format="ascii.ecsv")
     if suffix in {".tsv", ".tab"}:
-        return _adapt_table(Table.read(path, format="ascii.tab"))
+        return Table.read(path, format="ascii.tab")
     # .dat/.txt and unknowns: let astropy guess the ASCII flavor.
-    return _adapt_table(Table.read(path, format="ascii"))
+    return Table.read(path, format="ascii")
+
+
+def _read_table_file(path: Path) -> tuple[list[str], Callable[[str], FloatArray]]:
+    """Read a tabular file into ``(column_names, getter)`` by extension."""
+    return _adapt_table(_read_table_object(path))
+
+
+def _raw_column(obj: Any, name: str) -> np.ndarray:
+    """A table column as-is (labels stay strings — no float coercion)."""
+    if hasattr(obj, "column_names") and hasattr(obj, "column"):  # pyarrow
+        return np.asarray(obj.column(name).to_numpy(zero_copy_only=False))
+    values = obj[name]
+    if hasattr(values, "filled"):
+        values = values.filled()  # type: ignore[attr-defined]
+    return np.asarray(values)
+
+
+def _row_subset(obj: Any, mask: np.ndarray) -> Any:
+    """The rows of a table object selected by a boolean ``mask``."""
+    if hasattr(obj, "column_names") and hasattr(obj, "column"):  # pyarrow
+        import pyarrow as pa
+
+        return obj.filter(pa.array(mask))
+    return obj[mask]
+
+
+def _band_label(value: Any) -> str:
+    """A band cell as a clean string (FITS byte strings decoded)."""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace").strip()
+    return str(value).strip()
 
 
 __all__ = ["LightCurve", "MultiBandLightCurve"]
