@@ -45,6 +45,12 @@ from cuperiod.core.errors import (
 from cuperiod.core.grid import GridSpec, log_period_grid, uniform_frequency_grid
 from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
 from cuperiod.core.result import MultiResult, Peak, Periodogram
+from cuperiod.diagnostics import (
+    AliasCandidate,
+    AliasReport,
+    WindowPeak,
+    alias_diagnostics,
+)
 from cuperiod.methods.base import MethodInfo, get_method, list_methods, method_names
 from cuperiod.multiband.fap_mb import MultibandFAP, multiband_fap
 from cuperiod.prewhiten import (
@@ -75,6 +81,8 @@ except PackageNotFoundError:  # pragma: no cover - source tree, no metadata
     __version__ = "1.2.0.dev0"
 
 __all__ = [
+    "AliasCandidate",
+    "AliasReport",
     "AmplitudeSpectrum",
     "BLSSettings",
     "BackendUnavailableError",
@@ -110,7 +118,9 @@ __all__ = [
     "StringLengthSettings",
     "TLSSettings",
     "UnknownMethodError",
+    "WindowPeak",
     "__version__",
+    "alias_diagnostics",
     "amplitude_spectrum",
     "baluev_fap",
     "batch_periodograms",
