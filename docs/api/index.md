@@ -209,10 +209,11 @@ imported from there, not from the top level.
    interop.partition_periodogram
    interop.resolve_nested_columns
    interop.NestedColumns
+   interop.COLUMN_PRESETS
 ```
 
-The survey column layouts these accept as `preset=` live in the module-level dict
-`cuperiod.interop.COLUMN_PRESETS`; they are tabulated in {doc}`../guide/interop`.
+The survey column layouts {data}`~cuperiod.interop.COLUMN_PRESETS` accepts as
+`preset=` are tabulated in {doc}`../guide/interop`.
 
 ## Exceptions
 

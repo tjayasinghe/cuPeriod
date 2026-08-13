@@ -35,7 +35,6 @@ Examples
 from __future__ import annotations
 
 from cuperiod.interop.lincc import (
-    COLUMN_PRESETS,
     PRESET_KEYS,
     NestedColumns,
     nested_periodogram,
@@ -43,6 +42,14 @@ from cuperiod.interop.lincc import (
     require_nested_pandas,
     resolve_nested_columns,
 )
+from cuperiod.interop.lincc import COLUMN_PRESETS as _COLUMN_PRESETS
+
+#: Column presets for common survey layouts, keyed by preset name — currently
+#: ``"ztf_dr22"``, ``"ztf_alerts"``, ``"rubin_dp1_object"``, and
+#: ``"rubin_dp1_dia"``. Each value is the keyword mapping that
+#: :func:`~cuperiod.interop.lincc.resolve_nested_columns` expands into a
+#: :class:`~cuperiod.interop.lincc.NestedColumns`; pass the key as ``preset=``.
+COLUMN_PRESETS = _COLUMN_PRESETS
 
 __all__ = [
     "COLUMN_PRESETS",

@@ -327,6 +327,30 @@ Full per-SNR grid and figure in the
   **~2×** faster at CPU↔GPU agreement ≤ 2.1e-14 (the numba CPU tier narrowed what used
   to be a much larger single-curve gap).
 
+## 6. Multi-band recovery at survey cadence
+
+`benchmarks/multiband_recovery.py` (fully synthetic, offline) measures what joint
+multi-band fitting buys at sparse survey cadence: 300 faint RRab-like stars per cell
+(0.2 mag noise), six bands with WFD-like epoch shares over a 3-year window, recovery =
+top period within 1% of truth with no harmonic credit.
+
+| strategy | 30 epochs | 60 epochs | 120 epochs |
+|---|---|---|---|
+| best single band (*r*) | 0.0% | 37.3% | 97.3% |
+| any single band | 0.0% | 49.3% | 99.0% |
+| multi-band `perband` (0,1) | 17.7% | 97.0% | 100.0% |
+| multi-band `flex` (1,1) | 20.0% | 97.0% | 100.0% |
+| multi-band `offsets` (1,0) | **81.7%** | **99.7%** | 100.0% |
+
+At 30 total epochs — roughly Rubin's first year for one band's worth of visits spread
+over six filters — single-band search recovers nothing and the shared-phase `offsets`
+model recovers 82%. The models that grant each band its own phase (`perband`, `flex`)
+sit far below it at this sparsity: pooling phase information is what buys the
+recovery, which is why `offsets` is the default. Model definitions and guidance live
+in {doc}`guide/multiband`; the native `offsets` path is also ~400× faster than
+astropy's `LombScargleMultiband` on a 6-band, 200k-frequency search (55 s → 0.13 s,
+CPU).
+
 See the
 [full report](https://github.com/tjayasinghe/cuPeriod/blob/main/benchmarks/REPORT.md)
 for the figures, per-KOI detail, and reproduction commands.
