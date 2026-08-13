@@ -345,7 +345,12 @@ class SuperSmootherSettings(_DeviceSettings):
         "auto", "cpu", "gpu", "numba", "numpy", "cupy", "torch"
     ] = Field(default="auto", description="Compute backend.")
     batch_periods: int = Field(
-        default=1024, ge=1, description="Trial periods per vectorized batch."
+        default=0,
+        ge=0,
+        description=(
+            "Trial periods per vectorized batch; 0 auto-sizes the batch from a "
+            "transient-memory budget (much larger on device backends)."
+        ),
     )
     downsample_points: int = Field(
         default=2000, ge=2, description="Stored downsampled-spectrum size."
@@ -393,7 +398,12 @@ class MHAOVSettings(_DeviceSettings):
         "auto", "cpu", "gpu", "numba", "numpy", "cupy", "torch"
     ] = Field(default="auto", description="Compute backend.")
     batch_periods: int = Field(
-        default=512, ge=1, description="Trial frequencies per vectorized batch."
+        default=0,
+        ge=0,
+        description=(
+            "Trial frequencies per vectorized batch; 0 auto-sizes the batch from "
+            "a transient-memory budget (much larger on device backends)."
+        ),
     )
     downsample_points: int = Field(
         default=2000, ge=2, description="Stored downsampled-spectrum size."

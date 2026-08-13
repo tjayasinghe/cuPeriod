@@ -67,15 +67,33 @@ from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
 from cuperiod.core.result import Periodogram
 from cuperiod.methods.base import PeriodogramMethod, register
 
-#: Trial periods per vectorized batch (bounds the (P, N) phase workspaces).
+#: Trial periods per vectorized batch on host backends when ``batch`` is auto (0).
 DEFAULT_BATCH: Final = 1024
 
-#: Transient byte budget per frequency chunk; the chunk adapts to the light-curve
-#: length so long curves cannot blow device memory.
+#: Transient byte budgets per trial-period chunk; the chunk adapts to the
+#: light-curve length, so long curves cannot blow memory. Device backends get a
+#: far larger budget — their single-shot latency is dominated by per-chunk
+#: dispatch overhead, so fewer, larger chunks are strictly faster at identical
+#: results.
 _CHUNK_BYTES: Final = 1 << 27
+_DEVICE_CHUNK_BYTES: Final = 1 << 29
 
 #: Rough number of (chunk, N)-sized float64 workspaces alive at once.
 _WORKSPACES: Final = 28
+
+
+def _resolve_chunk(batch: int, n: int, on_device: bool) -> int:
+    """Effective trial-period chunk length: explicit ``batch`` (byte-capped), or auto.
+
+    An explicit ``batch > 0`` is honored up to the byte budget; ``batch <= 0``
+    fills the device budget outright, or keeps the classic ``DEFAULT_BATCH`` on
+    host backends. The chunk length does not affect the result.
+    """
+    per_row = max(1, n * 8 * _WORKSPACES)
+    cap = max(1, (_DEVICE_CHUNK_BYTES if on_device else _CHUNK_BYTES) // per_row)
+    if batch > 0:
+        return min(batch, cap)
+    return cap if on_device else min(DEFAULT_BATCH, cap)
 
 
 def span_windows(spans: tuple[float, ...], n: int) -> tuple[int, ...]:
@@ -271,27 +289,30 @@ def _score_batches(
     j_fin: int,
     alpha: float | None,
     baseline: float,
-    batch: int,
+    chunk: int,
 ) -> FloatArray:
-    """Fold, sort, and score every trial frequency in memory-bounded chunks."""
-    n = int(tau.shape[0])
+    """Fold, sort, and score every trial frequency in ``chunk``-sized pieces.
+
+    The scores accumulate on the compute device and cross to the host **once**
+    at the end — a per-chunk transfer would synchronize the stream every
+    iteration, which is what used to dominate single-shot GPU latency.
+    """
     nf = int(freqs.shape[0])
     fdtype = tau.dtype
     dev = device_ref(tau)
-    chunk = max(1, min(batch, _CHUNK_BYTES // max(1, n * 8 * _WORKSPACES)))
-    out = np.empty(nf, dtype=np.float64)
+    freqs_dev = xp.asarray(freqs, dtype=fdtype, device=dev)
+    out = xp.empty(nf, dtype=fdtype, device=dev)
     for start in range(0, nf, chunk):
         stop = min(start + chunk, nf)
-        fc = xp.asarray(freqs[start:stop], dtype=fdtype, device=dev)
+        fc = freqs_dev[start:stop]
         x = xp.remainder(tau[None, :] * fc[:, None], 1.0)
         order = xp.argsort(x, axis=-1)
         xs = _take_rows(xp, x, order)
-        scores = _chunk_scores(
+        out[start:stop] = _chunk_scores(
             xp, xs, y[order], w[order], inv_dy[order],
             span_fracs, windows, j_mid, j_fin, alpha, baseline,
         )
-        out[start:stop] = to_host(scores)
-    return out
+    return to_host(out)
 
 
 # --- numba fast CPU tier ------------------------------------------------------
@@ -522,7 +543,7 @@ def supersmoother_score(
     final_span: float = 0.05,
     bass_enhancement: float | None = None,
     backend: str = "numpy",
-    batch: int = DEFAULT_BATCH,
+    batch: int = 0,
     precision: str = "auto",
 ) -> FloatArray:
     """SuperSmoother periodogram score for each trial period.
@@ -543,8 +564,11 @@ def supersmoother_score(
         Friedman's ``alpha`` in [0, 10]; ``None`` disables it.
     backend : str, default "numpy"
         ``"numpy"``, ``"numba"``, ``"cupy"``, or ``"torch"`` / ``"torch:<device>"``.
-    batch : int, default 1024
-        Trial periods per vectorized chunk (auto-capped by a byte budget).
+    batch : int, default 0
+        Trial periods per vectorized chunk (capped by a byte budget); 0
+        auto-sizes the chunk — much larger on device backends, whose
+        single-shot latency is per-chunk dispatch overhead, not arithmetic.
+        The chunk does not affect the result.
     precision : str, default "auto"
         Compute dtype for the cupy/torch paths (numpy/numba always run float64).
 
@@ -609,7 +633,8 @@ def supersmoother_score(
             cp.asarray(w.astype(rdtype)), cp.asarray(inv_dy.astype(rdtype)),
             freqs,
             span_fracs=spans, windows=windows, j_mid=j_mid, j_fin=j_fin,
-            alpha=alpha, baseline=baseline, batch=batch,
+            alpha=alpha, baseline=baseline,
+            chunk=_resolve_chunk(batch, n, on_device=True),
         )
     if backend == "torch" or backend.startswith("torch:"):
         import torch
@@ -629,7 +654,8 @@ def supersmoother_score(
             to_device_array(inv_dy, device=device, dtype=tdtype),
             freqs,
             span_fracs=spans, windows=windows, j_mid=j_mid, j_fin=j_fin,
-            alpha=alpha, baseline=baseline, batch=batch,
+            alpha=alpha, baseline=baseline,
+            chunk=_resolve_chunk(batch, n, on_device=device != "cpu"),
         )
     if backend != "numpy":
         raise ValueError(f"unknown backend {backend!r}")
@@ -637,7 +663,8 @@ def supersmoother_score(
         array_namespace(periods_host),
         tau, y0, w, inv_dy, freqs,
         span_fracs=spans, windows=windows, j_mid=j_mid, j_fin=j_fin,
-        alpha=alpha, baseline=baseline, batch=batch,
+        alpha=alpha, baseline=baseline,
+        chunk=_resolve_chunk(batch, n, on_device=False),
     )
 
 
@@ -731,7 +758,7 @@ class SuperSmootherMethod(PeriodogramMethod):
         return supersmoother_multiband(grid, mblc, settings, backend)
 
     def estimate_device_bytes(self, n_points: int) -> int:
-        return 192 * 1024**2 + n_points * 8 * 8
+        return _DEVICE_CHUNK_BYTES + 64 * 1024**2 + n_points * 8 * 8
 
 
 register(SuperSmootherMethod())

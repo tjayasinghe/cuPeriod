@@ -48,8 +48,30 @@ from cuperiod.methods.base import PeriodogramMethod, register
 
 MHAOVBackend = Literal["numpy", "cupy"]
 
-#: Trial frequencies per vectorized batch (bounds the (F, N, 2H+1) design tensor).
+#: Trial frequencies per vectorized batch on host backends when ``batch`` is auto (0).
 DEFAULT_BATCH: Final = 512
+
+#: Transient byte budgets for auto-sized frequency chunks (``batch <= 0``): the chunk
+#: adapts to the light-curve length, so long curves cannot blow memory. Device
+#: backends get a far larger budget — their single-shot latency is dominated by
+#: per-chunk dispatch (kernel launches plus the batched-solve sync), so fewer,
+#: larger chunks are strictly faster at identical results.
+_CHUNK_BYTES: Final = 1 << 27
+_DEVICE_CHUNK_BYTES: Final = 1 << 29
+
+#: Rough number of (chunk, N)-sized float64 workspaces alive at once in
+#: :func:`_model_ss_batch` (angle, cos/sin pairs, Chebyshev recurrence temps, the
+#: weighted product), used to convert the byte budgets into a chunk length.
+_WORKSPACES: Final = 12
+
+
+def _resolve_batch(batch: int, n_points: int, on_device: bool) -> int:
+    """Effective frequency-chunk length: ``batch`` verbatim, or auto when ``<= 0``."""
+    if batch > 0:
+        return batch
+    budget = _DEVICE_CHUNK_BYTES if on_device else _CHUNK_BYTES
+    auto = max(1, budget // max(1, n_points * 8 * _WORKSPACES))
+    return auto if on_device else min(DEFAULT_BATCH, auto)
 
 #: Diagonal ridge that keeps the harmonic normal equations solvable at degenerate
 #: frequencies (f→0, where the cosine columns collapse onto the constant column). It is
@@ -326,7 +348,7 @@ def _compute_model_ss(
         out = _model_ss_batch(
             array_namespace(freqs_cp), cp.asarray(tau), cp.asarray(y), freqs_cp,
             n_harmonics=n_harmonics, total_ss=total_ss, y_mean=y_mean,
-            n_points=n, batch=batch,
+            n_points=n, batch=_resolve_batch(batch, n, on_device=True),
         )
         return np.asarray(cp.asnumpy(out), dtype=np.float64), total_ss, n
     if backend == "torch" or backend.startswith("torch:"):
@@ -341,7 +363,7 @@ def _compute_model_ss(
             to_device_array(y, device=device, dtype=fdt),
             to_device_array(freqs, device=device, dtype=fdt),
             n_harmonics=n_harmonics, total_ss=total_ss, y_mean=y_mean,
-            n_points=n, batch=batch,
+            n_points=n, batch=_resolve_batch(batch, n, on_device=device != "cpu"),
         )
         return to_host(out), total_ss, n
     if backend != "numpy":
@@ -349,7 +371,7 @@ def _compute_model_ss(
     out = _model_ss_batch(
         np, tau, y, freqs,
         n_harmonics=n_harmonics, total_ss=total_ss, y_mean=y_mean,
-        n_points=n, batch=batch,
+        n_points=n, batch=_resolve_batch(batch, n, on_device=False),
     )
     return np.asarray(out, dtype=np.float64), total_ss, n
 
@@ -361,7 +383,7 @@ def aov_power(
     *,
     n_harmonics: int = 3,
     backend: str = "numpy",
-    batch: int = DEFAULT_BATCH,
+    batch: int = 0,
     precision: str = "auto",
 ) -> FloatArray:
     """Multiharmonic AOV statistic for each trial frequency.
@@ -376,8 +398,11 @@ def aov_power(
         Harmonic order ``H`` (model has ``2H+1`` terms).
     backend : {"numpy", "cupy"}, default "numpy"
         CPU or GPU.
-    batch : int, default 512
-        Trial frequencies per vectorized batch.
+    batch : int, default 0
+        Trial frequencies per vectorized batch; 0 auto-sizes the batch from a
+        transient-memory budget (much larger on device backends, whose
+        single-shot latency is per-batch dispatch overhead, not arithmetic).
+        The batch does not affect the result.
 
     Returns
     -------
@@ -403,7 +428,7 @@ def aov_multiband_power(
     *,
     n_harmonics: int = 3,
     backend: str = "numpy",
-    batch: int = DEFAULT_BATCH,
+    batch: int = 0,
     precision: str = "auto",
 ) -> FloatArray:
     """Pooled multiband AOV F-statistic at a shared frequency, per-band amplitudes.
@@ -534,7 +559,7 @@ class MHAOVMethod(PeriodogramMethod):
         return mhaov_multiband_power(grid, mblc, settings, backend)
 
     def estimate_device_bytes(self, n_points: int) -> int:
-        return 128 * 1024**2 + n_points * 8 * 12
+        return _DEVICE_CHUNK_BYTES + 64 * 1024**2 + n_points * 8 * 12
 
 
 register(MHAOVMethod())

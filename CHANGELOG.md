@@ -258,8 +258,19 @@ All notable changes to cuPeriod are documented here. The format is based on
   bootstrap-FAP pass deliberately stays planless: its `n_trans` varies with the grid, and
   caching a plan per value would balloon device memory. The fold methods accept and ignore
   the parameter; their kernels are already module-cached.
-
-### Fixed
+- **Single-shot GPU calls of MHAOV and SuperSmoother no longer pay per-chunk dispatch
+  overhead.** Both kernels walked the trial grid in small fixed chunks (512/1024), and on
+  a ~100k-frequency grid the hundreds of chunk iterations — each a burst of kernel
+  launches, for SuperSmoother plus a device→host copy that synchronized the stream every
+  chunk — dominated the wall clock: on the Stripe 82 validation stars a single multi-band
+  call took ~24 s on GPU against ~0.3–0.5 s on the numba CPU tier. `batch_periods` now
+  defaults to `0` = auto-sized from a transient-memory budget (`~512 MiB` of workspaces
+  on device backends, the previous chunk sizes on host numpy, always adapted to the
+  light-curve length so long curves cannot blow memory), and SuperSmoother accumulates
+  scores on the device and crosses to the host once. Chunking never affects the result —
+  the same stars now run at CPU-tier speed on the GPU (MHAOV ~0.5 s, SuperSmoother
+  ~0.8 s single-shot; identical spectra). An explicit `batch_periods` value is honored
+  as before.
 
 - `cuperiod.gui.models.ResultCache` is now generic over its value type, so the app keeps
   one cache per analysis and switching back and forth is instant.
