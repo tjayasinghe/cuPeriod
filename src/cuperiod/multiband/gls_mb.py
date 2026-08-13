@@ -74,9 +74,10 @@ from cuperiod.methods.gls import (
 #: A band needs this many finite points to get its own sinusoid (perband model).
 _MIN_PERBAND_POINTS = 3
 
-#: Frequencies per normal-equation batch: bounds the transient ``(chunk, p, p)``
-#: stack near 64 MB float64 for the default LSST-like six-band flex model.
-_FLEX_CHUNK = 1 << 15
+#: Byte budget for one ``(chunk, p, p)`` normal-equation stack; the frequency
+#: chunk adapts to the parameter count so large-``nterms``/many-band models
+#: cannot blow device memory.
+_FLEX_CHUNK_BYTES = 1 << 27
 
 
 @dataclass(frozen=True)
@@ -609,8 +610,9 @@ def _flex_power_from_sums(
         if dev is None
         else xp.empty(nf, dtype=fdtype, device=dev)
     )
-    for start in range(0, nf, _FLEX_CHUNK):
-        stop = min(start + _FLEX_CHUNK, nf)
+    chunk = max(256, _FLEX_CHUNK_BYTES // (p * p * 8))
+    for start in range(0, nf, chunk):
+        stop = min(start + chunk, nf)
         sl = slice(start, stop)
         n_chunk = stop - start
         if dev is None:
