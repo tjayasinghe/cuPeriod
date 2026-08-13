@@ -1,10 +1,14 @@
 # cuPeriod validation & benchmark suite
 
-Reproducible validation and performance benchmarks for every cuPeriod method on
-**real survey data**, comparing the CPU and GPU backends against each other and
-against established third-party implementations.
+Reproducible validation and performance benchmarks for cuPeriod's period-search
+methods on **real survey data**, comparing the CPU and GPU backends against each
+other and against established third-party implementations.
 
 The rendered results are in **[REPORT.md](REPORT.md)** with figures in `figures/`.
+
+The suite covers seven methods. SuperSmoother, added in v1.2, is not in it yet —
+it is pinned against the reference `supersmoother` package and `gatspy` in the
+unit tests (`tests/test_supersmoother.py`) instead.
 
 ## What it checks
 

@@ -58,6 +58,10 @@ The selectors:
   - `numba` *(with `[fast]`)*, `numpy`
   - `cupy`
   - `numba` if installed, else `numpy`
+* - SuperSmoother
+  - `numba` *(with `[fast]`)*, `numpy`
+  - `cupy`
+  - `numba` if installed, else `numpy`
 ```
 
 † BLS's `numpy` backend is a GPU-parity *reference*, not the product path — it shares one
@@ -164,7 +168,18 @@ vs. the `[fast]`-extra CPU backends, on a 32-thread machine):
   - 0.043 s
   - 2.110 s
   - ~4×
+* - SuperSmoother ‡
+  - numba
+  - 0.05 s
+  - not yet measured
+  - not yet measured
+  - not yet measured
 ```
+
+‡ SuperSmoother has not been through the benchmark sweep yet. Its CPU figure is a separate
+measurement on the same 32-thread machine — a 600-point curve over 20 000 trial
+frequencies, where the plain `numpy` path takes 6.6 s — and no GPU timing has been taken,
+so the row is left blank rather than guessed at.
 
 How to read this:
 
@@ -182,9 +197,10 @@ How to read this:
   reproducible win is **catalog throughput** — many curves in flight at once — and reaching
   non-NVIDIA hardware via the portable torch backend, not single-curve latency on the
   CPU-tier methods ({doc}`batch`).
-- Without the `[fast]` extra, PDM/CE/String-Length/MHAOV/TLS fall back to the **vectorized
-  numpy paths** on the CPU — one to two orders of magnitude slower than the numba column
-  above (e.g. PDM ~300×, CE ~135×, MHAOV ~57× on a 3k-point curve).
+- Without the `[fast]` extra, PDM/CE/String-Length/MHAOV/TLS/SuperSmoother fall back to the
+  **vectorized numpy paths** on the CPU — one to two orders of magnitude slower than the
+  numba column above (e.g. PDM ~300×, CE ~135×, MHAOV ~57× on a 3k-point curve, and
+  SuperSmoother ~130× on the 600-point curve above).
 - On **consumer NVIDIA cards** (GeForce), whose float64 throughput is 1/64 of float32,
   the opt-in `precision="float32"` runs the BLS/TLS CUDA kernels ~8-9× faster at
   detection-grade accuracy; float64 stays the default.

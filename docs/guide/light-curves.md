@@ -205,7 +205,7 @@ pg = cup.periodogram(df, "GLS", domain=Domain.FLUX)     # or domain="flux"
 Why it matters: **box/transit methods (BLS, TLS) work in flux**, where an eclipse or
 transit is a *dip*. If you hand them magnitudes, cuPeriod converts to flux automatically
 (`flux = 10 ** (-0.4 * mag)`, with error propagation), so you don't have to. The Fourier
-and fold methods (GLS, PDM, CE, string-length, MHAOV) are domain-agnostic.
+and fold methods (GLS, PDM, CE, string-length, MHAOV, SuperSmoother) are domain-agnostic.
 
 You can convert by hand too:
 

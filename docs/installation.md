@@ -19,7 +19,7 @@ CPU, the command line, and batch processing over a process pool.
 | --- | --- | --- |
 | **gpu** | `pip install "cuperiod[gpu]"` | CUDA-12 GPU backends (`cupy-cuda12x`, `cufinufft`, the NVIDIA runtime wheels) |
 | **torch** | `pip install "cuperiod[torch]"` | the portable **PyTorch** backend — runs every method on AMD (ROCm), Intel (XPU), Apple (MPS), and a CPU path |
-| **fast** | `pip install "cuperiod[fast]"` | multicore `numba` CPU kernels for BLS, PDM, CE, String-Length, MHAOV, and TLS — the CPU default when installed, one to two orders of magnitude faster than the fallback CPU paths |
+| **fast** | `pip install "cuperiod[fast]"` | multicore `numba` CPU kernels for BLS, PDM, CE, String-Length, MHAOV, TLS, and SuperSmoother — the CPU default when installed, one to two orders of magnitude faster than the fallback CPU paths |
 | **gui** | `pip install "cuperiod[gui]"` | the interactive desktop GUI, `cuperiod-gui` (PySide6 + pyqtgraph) — see {doc}`guide/gui` |
 | **pandas** | `pip install "cuperiod[pandas]"` | pandas `DataFrame` ingestion |
 | **nested** | `pip install "cuperiod[nested]"` | nested-pandas `NestedFrame` light curves, one row per object — see {doc}`guide/interop` |
@@ -29,19 +29,19 @@ Extras combine, e.g. `pip install "cuperiod[gpu,fast]"` or `"cuperiod[gui,torch]
 
 :::{tip}
 The `[fast]` extra is worth installing even without a GPU: it gives BLS, PDM, CE,
-String-Length, MHAOV, and TLS multicore JIT kernels that are one to two orders of
-magnitude faster than the fallback CPU paths while matching them to floating point.
-When present they become the default CPU backends automatically.
+String-Length, MHAOV, TLS, and SuperSmoother multicore JIT kernels that are one to two
+orders of magnitude faster than the fallback CPU paths while matching them to floating
+point. When present they become the default CPU backends automatically.
 :::
 
 ### What the `[fast]` extra changes
 
 Installing `numba` flips `backend="cpu"` (and the CPU fallback of `"auto"`) from the
 fallback implementations — astropy's `BoxLeastSquares` for BLS, the vectorized numpy
-kernels for PDM, CE, String-Length, MHAOV, and TLS — to in-house multicore JIT kernels.
-Nothing else about your code changes: the results match the fallbacks to round-off
-(BLS still matches astropy), they just arrive much sooner (~20× for BLS over astropy;
-~25–300× for the others over their numpy paths). (Note that `numba` currently caps
+kernels for PDM, CE, String-Length, MHAOV, TLS, and SuperSmoother — to in-house multicore
+JIT kernels. Nothing else about your code changes: the results match the fallbacks to
+round-off (BLS still matches astropy), they just arrive much sooner (~20× for BLS over
+astropy; ~25–300× for the others over their numpy paths). (Note that `numba` currently caps
 `numpy < 2.5`, so installing it may downgrade numpy slightly.)
 
 ## GPU requirements
@@ -52,7 +52,7 @@ GPU acceleration needs:
 - the `[gpu]` extra, which installs `cupy-cuda12x`, `cufinufft`, and the
   `nvidia-*-cu12` runtime wheels (no system CUDA toolkit required).
 
-All seven methods have a GPU backend. With the extra installed and a device present,
+All eight methods have a GPU backend. With the extra installed and a device present,
 `backend="auto"` (the default) uses the GPU and falls back to the CPU otherwise — so the
 same code runs on both. See {doc}`guide/backends`.
 

@@ -10,7 +10,8 @@ Each method has a settings model with documented, defaulted fields (a pydantic m
 {class}`~cuperiod.GLSSettings`, {class}`~cuperiod.BLSSettings`,
 {class}`~cuperiod.PDMSettings`, {class}`~cuperiod.CESettings`,
 {class}`~cuperiod.MHAOVSettings`, {class}`~cuperiod.StringLengthSettings`,
-{class}`~cuperiod.TLSSettings`. Pass one via `settings=`:
+{class}`~cuperiod.SuperSmootherSettings`, {class}`~cuperiod.TLSSettings`. Pass one via
+`settings=`:
 
 ```python
 pg = cup.periodogram(lc, "GLS",
@@ -29,8 +30,8 @@ res = cup.periodogram(lc, ["GLS", "BLS"], settings={
 
 ### Settings shared by most methods
 
-The Fourier and fold methods (GLS, PDM, CE, String-Length, MHAOV) share a common set of
-knobs that shape the **trial grid** and **peak selection**:
+The Fourier and fold methods (GLS, PDM, CE, String-Length, MHAOV, SuperSmoother) share a
+common set of knobs that shape the **trial grid** and **peak selection**:
 
 ```{list-table}
 :header-rows: 1
@@ -95,6 +96,14 @@ knobs that shape the **trial grid** and **peak selection**:
   - `n_phase_bins`, `n_mag_bins` (the 2-D histogram resolution).
 * - **String-Length**
   - the shared grid/peak settings only.
+* - **SuperSmoother**
+  - `primary_spans` (the candidate span fractions, default `(0.05, 0.2, 0.5)` — strictly
+    increasing, each in `(0, 1]`), `middle_span` and `final_span` (the CV-residual and
+    final smoothing passes), `bass_enhancement` (Friedman's alpha, `0`–`10`, pulls the
+    chosen spans toward the largest; `None` disables it), `batch_periods`. `maximum_frequency`
+    earns extra attention here: an integer *multiple* of the true period folds to a
+    coherent curve too, so bounding the search from above is the cleanest way to keep
+    `2P`, `3P`, … from crowding the peak list.
 ```
 
 The {doc}`API reference <../api/index>` lists every field of every model with its type,
@@ -111,8 +120,8 @@ export CUPERIOD_BLS_MAX_PERIOD_DAYS=30
 ```
 
 (The BLS/PDM/etc. prefixes follow the model's `env_prefix`; String-Length uses
-`CUPERIOD_SL_`.) A settings object you pass explicitly takes precedence over the
-environment.
+`CUPERIOD_SL_` and SuperSmoother `CUPERIOD_SUPERSMOOTHER_`.) A settings object you pass
+explicitly takes precedence over the environment.
 
 ## Custom grids
 

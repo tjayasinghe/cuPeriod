@@ -31,8 +31,9 @@ Every implementation is validated against the standard reference (astropy
 
 - **Validated, not just fast.** GLS and BLS match astropy to floating-point round-off,
   and every other method is checked against an independent reference implementation
-  (PyAstronomy, or a direct implementation of the published algorithm) on identical
-  grids. CPU, CUDA, and the portable PyTorch backend agree to round-off and pick the
+  (PyAstronomy, the `supersmoother` package and gatspy, or a direct implementation of the
+  published algorithm) on identical grids. Across the seven benchmark-suite methods, CPU,
+  CUDA, and the portable PyTorch backend agree to round-off and pick the
   identical best period on 126 real ASAS-SN light curves
   across six variability classes plus 12 confirmed *Kepler* transits — 88–96%
   harmonic-aware period recovery on this deliberately heterogeneous sample (a synthetic
@@ -48,9 +49,10 @@ Every implementation is validated against the standard reference (astropy
 - **Built for catalogue scale.** `batch_periodograms` sustains up to 587 light curves/s
   (>2 million/hour) on a single GPU, with a resumable batch sink for runs spanning
   millions of curves.
-- **Seven methods, one API.** GLS, BLS, PDM, CE, String-Length, MHAOV, and TLS share one
-  entry point, one CLI, and an optional desktop GUI, with frictionless column handling.
-- **Multi-band search that earns its keep.** Six of the seven methods fit several filters
+- **Eight methods, one API.** GLS, BLS, PDM, CE, String-Length, MHAOV, TLS, and
+  SuperSmoother share one entry point, one CLI, and an optional desktop GUI, with
+  frictionless column handling.
+- **Multi-band search that earns its keep.** Seven of the eight methods fit several filters
   of one star jointly. The native multi-band GLS offers three models — shared-phase
   offsets (the default), independent per-band sinusoids, and a regularized per-band
   harmonic model — runs on every backend (a six-band star over 200k frequencies: 55 s
@@ -84,8 +86,9 @@ Implemented now, each with optimized CPU and GPU backends:
 | **PDM** | non-sinusoidal folds (Stellingwerf) | yes | yes |
 | **CE** | sparse survey data (conditional entropy) | yes | yes |
 | **String-Length** | eclipsing / eccentric shapes | yes | yes |
+| **SuperSmoother** | any repeating shape, non-parametric (Friedman) | yes | yes |
 
-All seven methods have CPU and GPU backends, plus the full single/batch/CLI machinery.
+All eight methods have CPU and GPU backends, plus the full single/batch/CLI machinery.
 
 ## Install
 
@@ -93,7 +96,7 @@ All seven methods have CPU and GPU backends, plus the full single/batch/CLI mach
 pip install cuperiod            # CPU (numpy, scipy, astropy, finufft)
 pip install "cuperiod[gpu]"     # + CUDA 12 GPU backends (cupy, cufinufft)
 pip install "cuperiod[torch]"   # + portable PyTorch backend (AMD/Intel/Apple GPUs + CPU)
-pip install "cuperiod[fast]"    # + numba multicore CPU kernels (all 7 methods, 20-300x)
+pip install "cuperiod[fast]"    # + numba multicore CPU kernels (all 8 methods, 20-300x)
 pip install "cuperiod[gui]"     # + interactive desktop GUI (cuperiod-gui)
 pip install "cuperiod[pandas]"  # + pandas DataFrame ingestion
 pip install "cuperiod[nested]"  # + nested-pandas light curves (cuperiod.interop)
@@ -106,9 +109,9 @@ backend that reaches AMD (ROCm), Intel (XPU), and Apple-Silicon (MPS) GPUs — a
 everywhere — so the accelerated code runs beyond NVIDIA (install the wheel matching your
 accelerator from [pytorch.org](https://pytorch.org/get-started/locally/); the default is
 CPU-only). The `[fast]` extra adds multicore `numba` CPU kernels that become the default
-`"cpu"`/`"auto"` backend for **every** method — BLS, PDM, CE, String-Length, MHAOV, and
-TLS — one to two orders of magnitude faster than the fallback CPU paths and matching them
-to floating point.
+`"cpu"`/`"auto"` backend for **every** method — BLS, PDM, CE, String-Length, MHAOV, TLS,
+and SuperSmoother — one to two orders of magnitude faster than the fallback CPU paths and
+matching them to floating point.
 
 Not sure what will run where? `cuperiod doctor` reports every installed backend, the torch
 devices it sees and the precision each uses, and what `backend="auto"` resolves to.
@@ -146,8 +149,9 @@ Method names are case-insensitive (`"gls"` == `"GLS"`).
 
 ### Multi-band (one star, several filters)
 
-GLS, BLS, MHAOV, PDM, CE, and String-Length jointly model two or more bands of the same
-star — one period, but each band keeps its own mean, amplitude, and normalization:
+GLS, BLS, MHAOV, PDM, CE, String-Length, and SuperSmoother jointly model two or more bands
+of the same star — one period, but each band keeps its own mean, amplitude, and
+normalization:
 
 ```python
 mb = cup.MultiBandLightCurve.from_light_curves({"g": lc_g, "r": lc_r})

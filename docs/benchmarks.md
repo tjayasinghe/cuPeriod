@@ -13,6 +13,11 @@ broaden coverage of harder classes. TLS is validated on 12 confirmed Kepler KOIs
 curves and their literature periods ship with the suite, so §1–2 and §4 are fully
 reproducible offline.
 
+SuperSmoother is new in this release and has **not** been through this suite yet, so every
+number on this page covers the other seven methods. It is instead pinned in the unit tests
+against the reference `supersmoother` package and `gatspy`
+({doc}`guide/methods`).
+
 ## 1. Numerical validation
 
 Every method runs the **same grid** through cuPeriod's CPU and GPU backends and through an
@@ -121,8 +126,8 @@ own CPU backend on the same grid, on an NVIDIA device (`torch:cuda`):
   - 100%
 ```
 
-All seven methods pick the identical best period as the CPU backend on every validated
-star. The same torch code path also runs on Apple (`mps`) and Intel (`xpu`) devices, but
+All seven benchmarked methods pick the identical best period as the CPU backend on every
+validated star. The same torch code path also runs on Apple (`mps`) and Intel (`xpu`) devices, but
 those were not exercised in this report (see {doc}`guide/backends`).
 
 ## 2. Period recovery on real light curves
@@ -256,7 +261,8 @@ Two takeaways:
 
 :::{note}
 The **`torch:cuda`** column is the portable PyTorch backend on the *same* RTX 5070 Ti — now
-validated on NVIDIA hardware, where all seven methods match the CPU reference to round-off.
+validated on NVIDIA hardware, where all seven benchmarked methods match the CPU reference to
+round-off.
 It is competitive with the cupy fast paths on PDM/CE/String-Length/MHAOV and slower on
 BLS/TLS, whose cupy `RawKernel`s are hand-tuned. Its real value is reaching **AMD, Intel,
 and Apple** GPUs the CUDA paths can't (those share the same code and are CPU-validated; see

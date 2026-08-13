@@ -8,8 +8,9 @@ same period** — and in the sparse regime that is most of the information there
 
 A multi-band search fits all bands jointly at every trial frequency: one period, but each
 band keeps its own mean magnitude, amplitude, and (depending on the model) its own phase.
-Six of the seven methods do it — **GLS, BLS, MHAOV, PDM, CE, and String-Length**; only TLS
-is single-band. Asking a single-band method for a multi-band run raises a clear error.
+Seven of the eight methods do it — **GLS, BLS, MHAOV, PDM, CE, String-Length, and
+SuperSmoother**; only TLS is single-band. Asking a single-band method for a multi-band run
+raises a clear error.
 
 :::{note}
 How much this buys you depends on how sparse the data are. At 30 total epochs across six
@@ -202,9 +203,10 @@ Practical guidance:
 
 ## The fold-based methods
 
-PDM, conditional entropy, and String-Length join the existing MHAOV (pooled `F`) and BLS
-(shared ephemeris, stacked depth-SNR) with the same structure: **each band keeps its own
-mean curve, histogram, or normalization**, and only the resulting statistics are pooled.
+PDM, conditional entropy, String-Length, and SuperSmoother join the existing MHAOV (pooled
+`F`) and BLS (shared ephemeris, stacked depth-SNR) with the same structure: **each band
+keeps its own mean curve, histogram, or normalization**, and only the resulting statistics
+are pooled.
 
 ```{math}
 S_{\rm mb}(f) = \frac{\sum_k w_k\, S_k(f)}{\sum_k w_k}
@@ -214,14 +216,15 @@ Forcing the bands onto one common curve would be wrong: filters differ in mean m
 and amplitude, so a joint fold would be smeared by the band offsets alone and would look
 disordered at *every* trial period. The per-band statistics are already scale-free — PDM's
 `Theta` divides by that band's own variance, CE rescales magnitudes to the band's range,
-String-Length rescales to Dworetsky's span — so pooling needs no separate standardization
-step.
+String-Length rescales to Dworetsky's span, SuperSmoother divides by that band's own mean
+absolute deviation — so pooling needs no separate standardization step.
 
 | Method | Pooled quantity | Weight `w_k` |
 | --- | --- | --- |
 | **PDM** | Stellingwerf `Theta_k` | `max(n_k - n_bins, 1)` (within-bin degrees of freedom) |
 | **CE** | conditional entropy `H_k` | `n_k` (makes `H_mb` the entropy per observation) |
 | **String-Length** | string length `L_k` | `n_k` (a string over `n_k` points is `n_k` steps) |
+| **SuperSmoother** | smoother score `S_k` | `B_k`, band `k`'s baseline error (its mean absolute standardized deviation about its own mean) |
 | **MHAOV** | pooled `F`-statistic | — |
 | **BLS** | stacked depth-SNR, shared ephemeris | — |
 
@@ -229,15 +232,30 @@ step.
 pg = cup.periodogram(mb, "PDM")            # dof-weighted mean of the per-band Theta
 pg = cup.periodogram(mb, "CE")             # point-count-weighted mean entropy
 pg = cup.periodogram(mb, "String-Length")  # point-count-weighted mean length
+pg = cup.periodogram(mb, "SuperSmoother")  # baseline-error-weighted mean score
 pg = cup.periodogram(mb, "MHAOV")          # pooled F-statistic across bands
 pg = cup.periodogram(mb, "BLS")            # joint box search across bands
 ```
 
-All three pooled statistics are **minimized** at the true period, as their single-band
-counterparts are; {meth}`~cuperiod.Periodogram.best_periods` handles the sense for you
-({doc}`results`). A band too sparse to be searched alone is skipped rather than fatal
-(the thresholds are `n_bins + 2` points for PDM, `max(n_phase_bins, 8)` for CE, and 8 for
-String-Length).
+The pooled PDM, CE, and String-Length statistics are **minimized** at the true period and
+SuperSmoother's is **maximized**, exactly as their single-band counterparts are;
+{meth}`~cuperiod.Periodogram.best_periods` handles the sense for you ({doc}`results`). A
+band too sparse to be searched alone is skipped rather than fatal (the thresholds are
+`n_bins + 2` points for PDM, `max(n_phase_bins, 8)` for CE, 8 for String-Length, and 3 —
+the smallest span window — for SuperSmoother).
+
+SuperSmoother's weights are gatspy's `SuperSmootherMultiband`: `B_k` is the denominator of
+band `k`'s own score, so the combined statistic is the *total* fractional reduction in mean
+absolute deviation across all bands, a noisy or flat band contributes little weight, and
+with one band it collapses to the single-band score.
+
+:::{note}
+SuperSmoother pools **scores, not phases** — being non-parametric there is no shared-phase
+model to fit, so each band's fold is smoothed on its own. For sparse Rubin-cadence data,
+where no single band is separately solvable, the GLS `"offsets"` model above remains the
+right search tool; multi-band SuperSmoother is for characterizing an arbitrary fold shape
+when the individual bands are already decent.
+:::
 
 ## False-alarm probabilities
 
@@ -314,7 +332,7 @@ if report.ambiguous:
 The bands are stacked into one sampling for the window measurement. Harmonics and
 subharmonics are reported but never make a result `ambiguous`, since `2f` is expected
 structure in any non-sinusoidal signal. Works for both objective senses, so the pooled PDM
-/ CE / String-Length periodograms can be checked the same way. See
+/ CE / String-Length / SuperSmoother periodograms can be checked the same way. See
 {class}`~cuperiod.AliasReport` for the fields.
 
 ---

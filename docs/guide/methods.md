@@ -1,6 +1,6 @@
 # Choosing a method
 
-cuPeriod ships seven period-search methods. They all take the same inputs and return the
+cuPeriod ships eight period-search methods. They all take the same inputs and return the
 same {class}`~cuperiod.Periodogram`, so trying several is cheap — but picking the right one
 for your signal saves time and gives cleaner peaks. This page is a decision guide.
 
@@ -36,6 +36,10 @@ for your signal saves time and gives cleaner peaks. This page is a decision guid
 * - Eclipsing / eccentric, want a shape-free statistic
   - **String-Length**
   - Minimizes the path length through the folded curve; cheap and assumption-light.
+* - Any repeating shape, without picking a harmonic budget
+  - **SuperSmoother**
+  - Fits the fold itself with a variable-span smoother — fully non-parametric. Watch the
+    integer-multiple caveat below.
 ```
 
 Not sure? Run a few at once and compare — see {ref}`several-methods` below.
@@ -44,7 +48,7 @@ Not sure? Run a few at once and compare — see {ref}`several-methods` below.
 
 Each method's statistic is either **maximized** or **minimized** at the true period:
 
-- **Maximized** (a tall peak = significant): GLS, BLS, MHAOV, TLS.
+- **Maximized** (a tall peak = significant): GLS, BLS, MHAOV, TLS, SuperSmoother.
 - **Minimized** (a deep trough = significant): PDM, CE, String-Length.
 
 You don't have to track this — {meth}`~cuperiod.Periodogram.best_periods` knows each
@@ -53,8 +57,8 @@ matters only if you inspect the raw `power` array yourself ({doc}`results`).
 
 ## Multi-band
 
-Six of the seven take several filters of the same star and fit them jointly: **GLS, BLS,
-MHAOV, PDM, CE, and String-Length**. Only TLS is single-band. Pass a
+Seven of the eight take several filters of the same star and fit them jointly: **GLS, BLS,
+MHAOV, PDM, CE, String-Length, and SuperSmoother**. Only TLS is single-band. Pass a
 {class}`~cuperiod.MultiBandLightCurve` instead of a {class}`~cuperiod.LightCurve` and the
 method's joint model runs; a single-band method asked for a multi-band run raises a clear
 error. See {doc}`multiband`.
@@ -97,9 +101,10 @@ for peak in pg.best_periods(5, alias_diverse=True):     # alias-aware for box se
 ```
 
 With the `[fast]` extra, BLS's CPU backend is a multicore `numba` search ~20× faster than
-astropy (PDM, CE, String-Length, MHAOV, and TLS gain `numba` CPU kernels too — see
-{doc}`backends`). Key settings ({class}`~cuperiod.BLSSettings`): `min_period_days` /
-`max_period_days`, `duration_min_frac` / `duration_max_frac`, `n_durations`, `objective`.
+astropy (PDM, CE, String-Length, MHAOV, TLS, and SuperSmoother gain `numba` CPU kernels
+too — see {doc}`backends`). Key settings ({class}`~cuperiod.BLSSettings`):
+`min_period_days` / `max_period_days`, `duration_min_frac` / `duration_max_frac`,
+`n_durations`, `objective`.
 
 ### TLS — transit least squares
 
@@ -159,6 +164,42 @@ pg = cup.periodogram(lc, "String-Length")     # or "StringLength"
 
 (`String-Length` is the canonical name; lookup is case-insensitive and tolerant of the
 hyphen.)
+
+### SuperSmoother
+
+Friedman's (1984) variable-span smoother applied to every phase-fold: three local-linear
+smooths over span fractions 0.05 / 0.2 / 0.5 of the points, leave-one-out cross-validation
+to pick the best span at each phase point, and a final pass over the blended curve. The
+statistic follows gatspy's `SuperSmoother` — `1 - mean|y - model|/dy / mean|y - mu|/dy`,
+the fractional reduction in mean absolute (error-standardized) deviation about the
+inverse-variance weighted mean `mu`. It is **maximized**: `1` is a perfect fit, `0` is no
+better than a constant, and a slightly negative value means the fold fits worse than the
+mean.
+
+Being fully non-parametric, it captures **any repeating shape** — an RR Lyrae sawtooth, an
+eclipsing binary, a fold nothing analytic describes — without your choosing a harmonic
+budget. It is the classic period finder of the Stripe 82 RR Lyrae work (Sesar et al.) and
+one of the methods compared by VanderPlas & Ivezić (2015). The price is cost (a sort plus
+several smooths per trial period) and a soft spectrum.
+
+**Integer multiples score nearly as high.** A fold at `2P`, `3P`, … is still a coherent
+repeating curve — it just draws the shape twice — so the smoother fits it about as well as
+`P` itself. Read the *shortest* period of a high-scoring family as the candidate, bound
+the search from above with `maximum_frequency`, or let
+{func}`~cuperiod.alias_diagnostics` arbitrate.
+
+```python
+pg = cup.periodogram(lc, "SuperSmoother")     # or "super-smoother"
+```
+
+Key settings ({class}`~cuperiod.SuperSmootherSettings`): `primary_spans` (the candidate
+span fractions, default `(0.05, 0.2, 0.5)`), `middle_span`, `final_span`,
+`bass_enhancement` (Friedman's alpha, `0`–`10`, pulls the chosen spans toward the largest;
+`None` disables it), `min_detections` (20 here). Runs on `numpy`, the multicore `numba`
+tier (the CPU default with `[fast]`), `cupy`, and the portable `torch` path, with the same
+statistic on all four ({doc}`backends`). Supports {doc}`multi-band <multiband>`: each band
+is smoothed independently on the shared grid and the per-band scores are combined with
+baseline-error weights, exactly as in gatspy's `SuperSmootherMultiband`.
 
 (several-methods)=
 ## Running several at once

@@ -8,6 +8,52 @@ All notable changes to cuPeriod are documented here. The format is based on
 
 ### Added
 
+- **SuperSmoother — a fully non-parametric period search** (`"SuperSmoother"`,
+  {class}`cuperiod.SuperSmootherSettings`): Friedman's (1984) variable-span smoother
+  applied to every phase-fold — three local-linear smooths over span fractions
+  `(0.05, 0.2, 0.5)`, leave-one-out cross-validation picking the best span at each phase
+  point, and a final pass over the blended curve. The statistic follows gatspy,
+  `1 - mean|y - model|/dy / mean|y - mu|/dy`, the fractional reduction in mean absolute
+  (error-standardized) deviation about the inverse-variance weighted mean, *maximized* at
+  the true period (`1` a perfect fit, `0` no better than a constant, slightly negative
+  when the fold fits worse than the mean). Fitting the fold itself instead of a harmonic
+  model is the point: no harmonic budget to choose, and an RR Lyrae sawtooth, an eclipse,
+  or a shape nothing analytic describes are all captured — this was the period finder
+  behind the Stripe 82 RR Lyrae work (Sesar et al.) and one of the methods compared by
+  VanderPlas & Ivezić (2015). The price is cost and a soft spectrum, plus one caveat worth
+  stating plainly: a fold at an integer *multiple* of the true period is still a coherent
+  repeating curve, so `2P`, `3P`, … score nearly as high as `P` — read the shortest period
+  of a high-scoring family as the candidate, bound the search from above, or let
+  {func}`cuperiod.alias_diagnostics` arbitrate the family.
+- **SuperSmoother on every backend.** One vectorized array-API kernel serves `numpy` on the
+  CPU, `cupy` on NVIDIA and `torch` on any device, alongside a numba-parallel CPU tier that
+  becomes the default with the `[fast]` extra: 20 000 trial frequencies on a 600-point
+  curve take **0.05 s** there against 6.6 s for plain numpy on the same 32-thread machine.
+  Every window sum comes from prefix sums over circularly padded folds, so the periodic
+  path is exact and the plain smoother's edge pathologies cannot arise, and the
+  leave-one-out span selection subtracts each point's own contribution rather than
+  refitting. float32 is available on cupy/torch, automatic only where the device forces it
+  (MPS).
+- **Multi-band SuperSmoother** — gatspy's `SuperSmootherMultiband` exactly. Being
+  non-parametric there is no shared-phase model to pool into, so each band is smoothed
+  independently on the shared trial grid and the per-band scores are combined with
+  baseline-error weights `B_k = mean|y - mu_k|/dy`. `B_k` is the denominator of that band's
+  own score, which makes the combination the *total* fractional reduction in mean absolute
+  deviation across all bands: a flat or noisy band contributes little weight, and with one
+  band it collapses exactly to the single-band score. A band participates with at least 3
+  finite points. Since nothing ties the bands' phases together, the GLS `"offsets"` model
+  remains the right tool for a sparse Rubin-cadence *search*; this one is for
+  characterizing an arbitrary fold shape when the bands are individually decent.
+- **SuperSmoother is pinned against the reference implementations** — the `supersmoother`
+  package (VanderPlas) and `gatspy.periodic.SuperSmoother` / `SuperSmootherMultiband`, to
+  ~1e-9 in `tests/test_supersmoother.py` on the point counts where the window conventions
+  coincide; both join the `dev` extra as test-only pins (BSD-2-Clause). Four deviations
+  from the reference are deliberate and documented in the module: span windows are forced
+  to odd point counts (upstream master's fix of the released 0.4 truncation), folding is
+  always periodic, degenerate duplicate-phase windows fall back to the weighted mean
+  instead of raising, and the bass-enhancement factor is clamped to close the reference's
+  `alpha` ∈ (9, 10) NaN bug. Cross-backend parity (numba, torch, cupy against numpy) is
+  asserted at ~1e-11.
 - **A native multi-band GLS, replacing the astropy delegation** on every backend
   (finufft on the CPU, cufinufft on CUDA, torch on any device). Three joint models are
   selected with `GLSSettings.mb_model`. The default `"offsets"` is the shared-phase
@@ -173,6 +219,19 @@ All notable changes to cuPeriod are documented here. The format is based on
   dock scans for a regular spacing and draws the échelle diagram. The settings form is
   generated from `PreWhitenSettings` by the existing machinery, so every knob is exposed
   with no bespoke widgets.
+
+### Performance
+
+- **The GPU plan cache is now reused for multi-band periodograms too.** The batch runner
+  and the interop partition kernel built a `CufinufftGLS` engine per worker/partition but
+  dropped it on the multi-band branch, so every star paid full plan setup again.
+  `multiband_power` accepts the same engine the single-band path uses, and the `"offsets"`
+  model's `K + 2` transforms, the flex harmonic sums, and the perband per-band powers all
+  route through its bucketed plan cache — a plan is fixed by mode count and `n_trans`
+  alone, so one pair serves every band, harmonic, and star in a partition. The
+  bootstrap-FAP pass deliberately stays planless: its `n_trans` varies with the grid, and
+  caching a plan per value would balloon device memory. The fold methods accept and ignore
+  the parameter; their kernels are already module-cached.
 
 ### Fixed
 

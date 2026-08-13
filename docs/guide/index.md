@@ -13,7 +13,7 @@ plus column auto-detection and the magnitude/flux domain.
 :::
 
 :::{grid-item-card} {doc}`methods`
-A decision guide to the seven methods: what each is for, its objective sense, and its
+A decision guide to the eight methods: what each is for, its objective sense, and its
 key knobs.
 :::
 

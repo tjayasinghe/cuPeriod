@@ -16,9 +16,9 @@ Optimized, GPU-accelerated periodograms for astronomy
 
 **cuPeriod** computes period-search statistics for variable stars and transiting
 systems — from a single light curve to millions. One Python API, one command-line
-tool, and an optional desktop GUI cover seven methods, each with a fast CPU backend and
+tool, and an optional desktop GUI cover eight methods, each with a fast CPU backend and
 GPU-accelerated paths: the NVIDIA CUDA fast paths plus a portable PyTorch backend that
-also reaches AMD, Intel, and Apple GPUs (and a CPU-only path). Six of the methods search
+also reaches AMD, Intel, and Apple GPUs (and a CPU-only path). Seven of the methods search
 several filters of one star jointly — including a native multi-band GLS with three models
 and bootstrap false-alarm probabilities — and the LINCC adapters run the whole thing over
 nested-pandas / lsdb survey catalogs. Add frictionless column handling, alias diagnostics,
@@ -82,8 +82,9 @@ you drag across peaks — `pip install "cuperiod[gui]"`, then `cuperiod-gui`.
 | **PDM** | non-sinusoidal folds (Stellingwerf) | ✅ | ✅ |
 | **CE** | sparse survey data (conditional entropy) | ✅ | ✅ |
 | **String-Length** | eclipsing / eccentric shapes | ✅ | ✅ |
+| **SuperSmoother** | any repeating shape, non-parametric (Friedman) | ✅ | ✅ |
 
-All seven share one API, one CLI, and the full single/batch machinery. See
+All eight share one API, one CLI, and the full single/batch machinery. See
 {doc}`guide/methods` for a decision guide and {doc}`guide/multiband` for the joint models.
 
 Multiperiodic pulsators need more than a single best period. {func}`cuperiod.prewhiten`

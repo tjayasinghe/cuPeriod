@@ -132,6 +132,7 @@ Per-method tuning models (see {doc}`../guide/tuning`).
    CESettings
    MHAOVSettings
    StringLengthSettings
+   SuperSmootherSettings
    TLSSettings
    PreWhitenSettings
    SpacingSettings
