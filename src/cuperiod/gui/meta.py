@@ -49,7 +49,7 @@ def method_display_names() -> list[str]:
 
 
 def multiband_method_names() -> list[str]:
-    """Only the methods that support multiband input (GLS, BLS, MHAOV)."""
+    """Only the methods that support multiband input (everything but TLS)."""
     return [name for name in method_names() if supports_multiband(name)]
 
 

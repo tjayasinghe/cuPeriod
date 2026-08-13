@@ -35,7 +35,7 @@ from cuperiod.core.grid import (
     pseudo_nyquist_frequency,
     uniform_frequency_grid,
 )
-from cuperiod.core.lightcurve import LightCurve
+from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
 from cuperiod.core.result import Periodogram
 from cuperiod.methods.base import PeriodogramMethod, register
 
@@ -342,7 +342,7 @@ class ConditionalEntropyMethod(PeriodogramMethod):
 
     name: ClassVar[str] = "CE"
     objective_sense: ClassVar[Literal["max", "min"]] = "min"
-    supports_multiband: ClassVar[bool] = False
+    supports_multiband: ClassVar[bool] = True
     settings_cls: ClassVar[type] = CESettings
     cpu_backend: ClassVar[str] = "numpy"
     fast_cpu_backend: ClassVar[str | None] = "numba"
@@ -400,6 +400,19 @@ class ConditionalEntropyMethod(PeriodogramMethod):
             baseline=finite.baseline,
             meta=finite.meta,
         )
+
+    def multiband_power(  # type: ignore[override]
+        self,
+        grid: GridSpec,
+        mblc: MultiBandLightCurve,
+        settings: CESettings,
+        backend: str,
+    ) -> Periodogram:
+        from cuperiod.multiband.conditional_entropy_mb import ce_multiband_entropy
+
+        if backend == "torch" or backend.startswith("torch:"):
+            backend = f"torch:{resolve_torch_device(backend, settings.device)}"
+        return ce_multiband_entropy(grid, mblc, settings, backend)
 
     def estimate_device_bytes(self, n_points: int) -> int:
         return 128 * 1024**2 + n_points * 8 * 8

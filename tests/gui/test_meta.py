@@ -12,7 +12,8 @@ from cuperiod.gui.meta import (
 
 def test_multiband_method_names() -> None:
     multiband = set(multiband_method_names())
-    assert multiband == {"GLS", "BLS", "MHAOV"}
+    # The joint-fit methods plus the pooled fold statistics; TLS is single-band only.
+    assert multiband == {"GLS", "BLS", "MHAOV", "PDM", "CE", "STRINGLENGTH"}
     assert multiband.issubset(method_display_names())
 
 
