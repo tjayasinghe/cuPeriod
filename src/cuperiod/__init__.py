@@ -32,6 +32,7 @@ from cuperiod.core.config import (
     PreWhitenSettings,
     SpacingSettings,
     StringLengthSettings,
+    SuperSmootherSettings,
     TLSSettings,
 )
 from cuperiod.core.device import GpuInfo, free_gpu_memory, gpu_info, suggest_gpu_workers
@@ -116,6 +117,7 @@ __all__ = [
     "SpacingSpectrum",
     "SpectrumEngine",
     "StringLengthSettings",
+    "SuperSmootherSettings",
     "TLSSettings",
     "UnknownMethodError",
     "WindowPeak",

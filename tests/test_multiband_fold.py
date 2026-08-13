@@ -23,8 +23,8 @@ PERIOD = 0.6234
 #: fold also shorten the string) and small enough to stay fast on every backend.
 GRID = cup.GridSpec(kind="frequency", values=np.linspace(1.0, 2.5, 1200), uniform=True)
 
-#: The three pooled fold methods, spelled as a user would.
-FOLD_METHODS = ("PDM", "CE", "StringLength")
+#: The pooled fold methods, spelled as a user would.
+FOLD_METHODS = ("PDM", "CE", "StringLength", "SuperSmoother")
 
 
 def _two_band(period: float = PERIOD) -> cup.MultiBandLightCurve:
@@ -45,7 +45,7 @@ def _two_band(period: float = PERIOD) -> cup.MultiBandLightCurve:
 @pytest.mark.parametrize("method", FOLD_METHODS)
 def test_multiband_fold_recovers_period(method: str) -> None:
     pg = cup.periodogram(_two_band(), method, grid=GRID)
-    assert pg.objective_sense == "min"
+    assert pg.objective_sense == cup.get_method(method).objective_sense
     assert pg.meta["bands"] == ("g", "r")
     assert pg.n_samples == 600  # both bands' points
     assert pg.best_period() == pytest.approx(PERIOD, rel=2e-2)
@@ -131,5 +131,6 @@ def test_torch_multiband_matches_numpy(method: str) -> None:
 def test_fold_methods_report_multiband_support() -> None:
     support = {info.name: info.supports_multiband for info in cup.list_methods()}
     assert support["PDM"] and support["CE"] and support["STRINGLENGTH"]
+    assert support["SUPERSMOOTHER"]
     for name in FOLD_METHODS:
         assert cup.get_method(name).supports_multiband

@@ -16,7 +16,7 @@ from conftest import requires_torch
 from cuperiod.methods.mhaov import aov_power
 from synth import synthetic_eclipser, synthetic_sine
 
-FREQ_METHODS = ["CE", "STRINGLENGTH", "MHAOV", "PDM"]
+FREQ_METHODS = ["CE", "STRINGLENGTH", "MHAOV", "PDM", "SUPERSMOOTHER"]
 
 
 @requires_torch

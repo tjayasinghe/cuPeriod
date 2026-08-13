@@ -111,6 +111,11 @@ dev = [
     # against the current nested-pandas line; the adapter itself stays
     # 0.6.10-compatible for the lsdb (pandas-2) world.
     "nested-pandas>=0.7",
+    # SuperSmoother reference implementations (BSD-2-Clause), test-only: the native
+    # kernel is pinned against them exactly (tests/test_supersmoother.py). gatspy
+    # ships no install_requires; its scipy/astropy needs are core deps here anyway.
+    "supersmoother>=0.4",
+    "gatspy>=0.3",
     # Exercise the portable torch-CPU path in CI (GPU devices auto-skip).
     "torch>=2.2",
     # Drive the Qt GUI headlessly (QT_QPA_PLATFORM=offscreen) in tests.
@@ -202,12 +207,14 @@ module = [
 ]
 ignore_missing_imports = true
 
-# numba >=0.66 ships py.typed, but its jit/prange decorators leave the wrapped
-# callables untyped (prange trips no-untyped-call / attr-defined in a typed
-# context). Skip following into it so the whole module stays Any, as before.
+# numba: whether or not the installed release ships py.typed (0.66 added it), its
+# jit/prange decorators leave the wrapped callables untyped (prange trips
+# no-untyped-call / attr-defined in a typed context). Skip following into it and
+# accept it stub-less so the module stays Any on every numba version.
 [[tool.mypy.overrides]]
 module = ["numba", "numba.*"]
 follow_imports = "skip"
+ignore_missing_imports = true
 
 # pyarrow ships py.typed but leaves read_table/write_table untyped; skip it.
 [[tool.mypy.overrides]]

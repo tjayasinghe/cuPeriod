@@ -82,7 +82,8 @@ def test_numba_tls_matches_numpy() -> None:
 
 @requires_numba
 def test_cpu_request_resolves_to_numba() -> None:
-    for name in ("PDM", "CE", "STRINGLENGTH", "MHAOV", "TLS", "BLS"):
+    for name in ("PDM", "CE", "STRINGLENGTH", "MHAOV", "TLS", "BLS",
+                 "SUPERSMOOTHER"):
         assert cup.get_method(name).resolve_backend("cpu") == "numba"
 
 

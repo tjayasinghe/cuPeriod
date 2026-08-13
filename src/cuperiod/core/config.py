@@ -271,6 +271,87 @@ class PDMSettings(_DeviceSettings):
     )
 
 
+class SuperSmootherSettings(_DeviceSettings):
+    """Settings for the SuperSmoother (Friedman variable-span) periodogram."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="CUPERIOD_SUPERSMOOTHER_", extra="forbid"
+    )
+
+    @model_validator(mode="after")
+    def _check_bounds(self) -> Self:
+        _require_lt(
+            self.minimum_frequency, self.maximum_frequency,
+            "minimum_frequency", "maximum_frequency",
+        )
+        spans = tuple(self.primary_spans)
+        if any(not (0.0 < s <= 1.0) for s in spans):
+            raise ValueError(f"primary_spans must lie in (0, 1], got {spans}")
+        if any(b <= a for a, b in zip(spans, spans[1:], strict=False)):
+            raise ValueError(f"primary_spans must be strictly increasing, got {spans}")
+        return self
+
+    minimum_frequency: float | None = Field(
+        default=None,
+        description="Lowest trial frequency (cycles/day); None -> 1/baseline.",
+    )
+    maximum_frequency: float | None = Field(
+        default=None,
+        description="Highest trial frequency (cycles/day); None -> pseudo-Nyquist.",
+    )
+    nyquist_factor: int = Field(
+        default=5, ge=1, description="Pseudo-Nyquist multiple when max is None."
+    )
+    samples_per_peak: int = Field(
+        default=5, ge=1, description="Frequency oversampling factor."
+    )
+    primary_spans: tuple[float, ...] = Field(
+        default=(0.05, 0.2, 0.5),
+        min_length=1,
+        description=(
+            "Candidate span fractions (Friedman's tweeter/midrange/woofer); the "
+            "best span is chosen per phase point by cross-validation."
+        ),
+    )
+    middle_span: float = Field(
+        default=0.2,
+        gt=0.0,
+        le=1.0,
+        description="Span used to smooth the CV residuals and the chosen spans.",
+    )
+    final_span: float = Field(
+        default=0.05,
+        gt=0.0,
+        le=1.0,
+        description="Span of the final smoothing pass over the blended curve.",
+    )
+    bass_enhancement: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=10.0,
+        description=(
+            "Friedman's alpha: pull chosen spans toward the largest primary span "
+            "(0 = none, 10 = always the largest). None disables the adjustment."
+        ),
+    )
+    n_peaks: int = Field(default=10, ge=1, description="Default stored peak count.")
+    peak_separation_rayleigh: float = Field(
+        default=3.0, gt=0.0, description="Min peak separation in Rayleigh widths."
+    )
+    min_detections: int = Field(
+        default=20, ge=3, description="Skip if fewer finite points."
+    )
+    backend: Literal[
+        "auto", "cpu", "gpu", "numba", "numpy", "cupy", "torch"
+    ] = Field(default="auto", description="Compute backend.")
+    batch_periods: int = Field(
+        default=1024, ge=1, description="Trial periods per vectorized batch."
+    )
+    downsample_points: int = Field(
+        default=2000, ge=2, description="Stored downsampled-spectrum size."
+    )
+
+
 class MHAOVSettings(_DeviceSettings):
     """Settings for the multiharmonic Analysis of Variance (MHAOV) periodogram."""
 
@@ -732,5 +813,6 @@ __all__ = [
     "PreWhitenSettings",
     "SpacingSettings",
     "StringLengthSettings",
+    "SuperSmootherSettings",
     "TLSSettings",
 ]

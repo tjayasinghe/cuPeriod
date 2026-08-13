@@ -34,6 +34,7 @@ Examples
 
 from __future__ import annotations
 
+from cuperiod.interop.lincc import COLUMN_PRESETS as _COLUMN_PRESETS
 from cuperiod.interop.lincc import (
     PRESET_KEYS,
     NestedColumns,
@@ -42,7 +43,6 @@ from cuperiod.interop.lincc import (
     require_nested_pandas,
     resolve_nested_columns,
 )
-from cuperiod.interop.lincc import COLUMN_PRESETS as _COLUMN_PRESETS
 
 #: Column presets for common survey layouts, keyed by preset name — currently
 #: ``"ztf_dr22"``, ``"ztf_alerts"``, ``"rubin_dp1_object"``, and

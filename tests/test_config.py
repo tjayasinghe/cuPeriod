@@ -17,6 +17,7 @@ def test_defaults_construct() -> None:
         cup.CESettings,
         cup.MHAOVSettings,
         cup.StringLengthSettings,
+        cup.SuperSmootherSettings,
         cup.TLSSettings,
         cup.BatchSettings,
     ):
@@ -25,7 +26,8 @@ def test_defaults_construct() -> None:
 
 def test_frequency_bounds_validated() -> None:
     for cls in (cup.GLSSettings, cup.PDMSettings, cup.CESettings,
-                cup.MHAOVSettings, cup.StringLengthSettings):
+                cup.MHAOVSettings, cup.StringLengthSettings,
+                cup.SuperSmootherSettings):
         with pytest.raises(ValidationError, match="must be <"):
             cls(minimum_frequency=10.0, maximum_frequency=1.0)
         # a valid ordering is accepted
