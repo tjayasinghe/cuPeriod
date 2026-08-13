@@ -299,7 +299,7 @@ def multiband_fap(
     --------
     >>> calib = multiband_fap(mblc, n_bootstrap=1000)          # doctest: +SKIP
     >>> pg = cup.periodogram(mblc, "GLS")                      # doctest: +SKIP
-    >>> calib.fap(pg.best_peak().power)                        # doctest: +SKIP
+    >>> calib.fap(pg.best_periods(1)[0].power)                 # doctest: +SKIP
     >>> calib.level(0.01)  # 1% false-alarm power threshold    # doctest: +SKIP
     """
     from cuperiod.api import to_input

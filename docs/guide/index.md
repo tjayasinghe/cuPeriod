@@ -38,7 +38,13 @@ pulsators — with combination frequencies and g-mode period spacings.
 :::
 
 :::{grid-item-card} {doc}`multiband`
-Jointly model several filters of the same star with GLS, BLS, and MHAOV.
+Jointly model several filters of the same star: three GLS models, pooled fold statistics,
+bootstrap false-alarm probabilities, and alias checks.
+:::
+
+:::{grid-item-card} {doc}`interop`
+Run a search straight over nested-pandas / lsdb survey catalogs — row-wise, or
+partition-wise with one GPU engine per partition.
 :::
 
 :::{grid-item-card} {doc}`batch`

@@ -114,6 +114,19 @@ pg = cup.periodogram(df, "BLS",
 
 See {doc}`guide/light-curves` for every accepted input form.
 
+## Several filters of one star
+
+Model all bands jointly instead of searching each on its own — one period, per-band
+offsets, and far better recovery when no single band is well sampled:
+
+```python
+mb = cup.MultiBandLightCurve.from_file("star_ugrizy.csv", band_column="band")
+pg = cup.periodogram(mb, "GLS")          # shared-phase model (VanderPlas & Ivezić)
+print(pg.best_period(), pg.meta["bands"])
+```
+
+See {doc}`guide/multiband`.
+
 ## Running several methods at once
 
 Pass a list of methods to get a {class}`~cuperiod.MultiResult` keyed by method name:

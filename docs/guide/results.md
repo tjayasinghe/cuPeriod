@@ -82,6 +82,27 @@ print(top.extra.get("fap"))          # GLS
 # print(top.extra["depth"], top.extra["duration"])   # BLS
 ```
 
+## Is the best peak an alias?
+
+Irregular sampling convolves the true spectrum with the **spectral window**, so a single
+signal at `f_true` shows up as a family of peaks at `f_true ± m·f_w` — one set per
+sidereal day, synodic month, and year. Picking the tallest is a convention, not a
+measurement. {func}`~cuperiod.alias_diagnostics` measures this light curve's window,
+predicts where it would place each competitor, looks each prediction up in the
+periodogram, and scores it against the peak being diagnosed:
+
+```python
+report = cup.alias_diagnostics(pg, (time, mag, err))
+print(report.summary())
+report.ambiguous       # True if a non-harmonic competitor scores >= threshold (0.7)
+```
+
+A score of `1.0` means "the periodogram likes this frequency exactly as much as the one
+being diagnosed", on both objective senses. Harmonics and subharmonics are listed but
+never make a result `ambiguous` — `2f` is expected structure in any non-sinusoidal signal.
+Omit the light curve and the classic ground-based suspects (sidereal day, solar day,
+synodic month, year) stand in for a measured window. See {class}`~cuperiod.AliasReport`.
+
 ## The raw spectrum
 
 The full arrays are attributes — use them directly for plotting or custom analysis:

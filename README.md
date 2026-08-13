@@ -13,8 +13,8 @@ fast CPU backends and GPU-accelerated paths that scale from a single light curve
 millions. The NVIDIA CUDA fast paths are joined by a portable **PyTorch** backend that also
 runs on AMD, Intel, and Apple GPUs (and a CPU-only path), so the accelerated code is no
 longer NVIDIA-only. One API, one CLI, and an optional desktop GUI cover every method, with
-frictionless column handling, multi-band support, raw-spectrum output, and an
-N-best-periods utility.
+frictionless column handling, joint multi-band search, alias diagnostics, raw-spectrum
+output, and an N-best-periods utility.
 
 📖 **Documentation:** <https://cuperiod.readthedocs.io> — a [5-minute
 quickstart](https://cuperiod.readthedocs.io/en/latest/quickstart.html), a full user guide,
@@ -49,8 +49,22 @@ Every implementation is validated against the standard reference (astropy
   (>2 million/hour) on a single GPU, with a resumable batch sink for runs spanning
   millions of curves.
 - **Seven methods, one API.** GLS, BLS, PDM, CE, String-Length, MHAOV, and TLS share one
-  entry point, one CLI, and an optional desktop GUI, with frictionless column handling and
-  multi-band support.
+  entry point, one CLI, and an optional desktop GUI, with frictionless column handling.
+- **Multi-band search that earns its keep.** Six of the seven methods fit several filters
+  of one star jointly. The native multi-band GLS offers three models — shared-phase
+  offsets (the default), independent per-band sinusoids, and a regularized per-band
+  harmonic model — runs on every backend (a six-band star over 200k frequencies: 55 s
+  through astropy, **0.13 s** native), and comes with **bootstrap false-alarm
+  probabilities**, which astropy's `LombScargleMultiband` does not provide at all. On a
+  simulated Rubin-like cadence with 30 epochs spread over six bands, single-band GLS
+  recovers 0% of faint RRab proxies and the shared-phase model recovers **82%**.
+- **Survey catalogues, in place.** `cuperiod.interop` runs a search directly over LINCC
+  nested-pandas / lsdb light curves — one row per object, epochs in a nested column — with
+  no flattening or `groupby`. A partition tier reuses **one GPU engine** across every
+  object in a dask partition, with verified column presets for ZTF and Rubin DP1.
+- **Alias-checked periods.** `alias_diagnostics` measures the sampling's spectral window,
+  predicts the alias family it implies, scores each competitor against the peak you got,
+  and says plainly when the period is ambiguous.
 - **Pulsators get a frequency solution, not just a period.** `prewhiten` automates the
   whole Period04-style loop — GPU/NUFFT amplitude spectrum, iterative sinusoid extraction,
   simultaneous re-fitting, principled stopping criteria, propagated uncertainties,
@@ -67,9 +81,9 @@ Implemented now, each with optimized CPU and GPU backends:
 | **BLS** | eclipses / box-like transits | yes | yes |
 | **MHAOV** | sharply non-sinusoidal signals (multiharmonic AOV) | yes | yes |
 | **TLS** | limb-darkened transit matched filter | yes | — |
-| **PDM** | non-sinusoidal folds (Stellingwerf) | yes | — |
-| **CE** | sparse survey data (conditional entropy) | yes | — |
-| **String-Length** | eclipsing / eccentric shapes | yes | — |
+| **PDM** | non-sinusoidal folds (Stellingwerf) | yes | yes |
+| **CE** | sparse survey data (conditional entropy) | yes | yes |
+| **String-Length** | eclipsing / eccentric shapes | yes | yes |
 
 All seven methods have CPU and GPU backends, plus the full single/batch/CLI machinery.
 
@@ -82,6 +96,8 @@ pip install "cuperiod[torch]"   # + portable PyTorch backend (AMD/Intel/Apple GP
 pip install "cuperiod[fast]"    # + numba multicore CPU kernels (all 7 methods, 20-300x)
 pip install "cuperiod[gui]"     # + interactive desktop GUI (cuperiod-gui)
 pip install "cuperiod[pandas]"  # + pandas DataFrame ingestion
+pip install "cuperiod[nested]"  # + nested-pandas light curves (cuperiod.interop)
+pip install "cuperiod[lsdb]"    # + lsdb HATS catalogs (lazy, dask-partitioned)
 ```
 
 The `[gpu]` extra needs an NVIDIA GPU with the CUDA 12 runtime; it pulls in `cupy-cuda12x`,
@@ -130,12 +146,61 @@ Method names are case-insensitive (`"gls"` == `"GLS"`).
 
 ### Multi-band (one star, several filters)
 
-GLS, BLS, and MHAOV jointly model two or more bands of the same star:
+GLS, BLS, MHAOV, PDM, CE, and String-Length jointly model two or more bands of the same
+star — one period, but each band keeps its own mean, amplitude, and normalization:
 
 ```python
 mb = cup.MultiBandLightCurve.from_light_curves({"g": lc_g, "r": lc_r})
 pg = cup.periodogram(mb, "GLS")          # VanderPlas & Ivezić shared-phase model
+
+# ...or straight from a long-format file / the CLI / batch:
+mb = cup.MultiBandLightCurve.from_file("star_ugrizy.parquet", band_column="band")
+
+# One of three joint models (offsets / perband / flex):
+settings = cup.GLSSettings(mb_model="flex")
+pg = cup.periodogram(mb, "GLS", settings=settings)
+
+# Honest false-alarm probabilities, from a within-band bootstrap:
+calib = cup.multiband_fap(mb, settings, n_bootstrap=1000)
+print(calib.fap(pg.best_periods(1)[0].power), calib.level(0.01))
 ```
+
+`mb_model` is `"offsets"` (shared phase + per-band offsets, the default), `"perband"`
+(independent per-band sinusoids, `chi2_0`-weighted), or `"flex"` (regularized per-band
+harmonics, matching astropy to ~2e-10). All three run natively on finufft, cufinufft, and
+torch — astropy is kept only as the reference they're tested against.
+
+Period recovery on a simulated Rubin-like six-band cadence
+(`benchmarks/multiband_recovery.py`; faint RRab proxies, 0.20 mag per-point noise, 300
+stars per cell, top period within 1% and no harmonic credit), by *total* epochs across all
+six bands:
+
+| strategy | 30 epochs | 60 epochs | 120 epochs |
+| --- | --- | --- | --- |
+| best single band (r) | 0.0% | 37.3% | 97.3% |
+| any single band | 0.0% | 49.3% | 99.0% |
+| multi-band `offsets` (1,0) | **81.7%** | **99.7%** | 100.0% |
+
+`perband` and `flex` land in between (17.7% / 20.0% at 30 epochs, 97.0% at 60): sharing
+the phase is what buys sparse-cadence recovery, which is why `"offsets"` is the default.
+These are simulations on a deliberately simplified cadence (random nights, no rolling
+cadence) — read the ordering, not the absolute numbers. See the
+[multi-band guide](https://cuperiod.readthedocs.io/en/latest/guide/multiband.html).
+
+### Survey catalogs (LINCC: nested-pandas / lsdb)
+
+```python
+from cuperiod.interop import nested_periodogram, partition_periodogram
+
+out = nested_periodogram(frame, "lc", preset="ztf_dr22")            # row-wise
+res = partition_periodogram(cat, preset="rubin_dp1_object",         # one GPU engine
+                            method="GLS", backend="gpu")            # per partition
+```
+
+Runs on the nested layout directly — no flattening, no `groupby`. Column presets for ZTF
+DR22, ZTF alerts, and Rubin DP1 object/DIA photometry; a failed object yields NaN rather
+than aborting the run. See the
+[interop guide](https://cuperiod.readthedocs.io/en/latest/guide/interop.html).
 
 ### Backends
 
@@ -195,7 +260,9 @@ cuperiod grid-info star.fits -m GLS
 ```
 
 `run` accepts `--time/--value/--error/--band` overrides and `--domain magnitude|flux`, and
-can write JSON (`--out`) and the raw spectrum (`--save-periodogram`).
+can write JSON (`--out`) and the raw spectrum (`--save-periodogram`). `--band` splits a
+long-format file on its filter column and runs a **joint** multi-band fit; `batch` takes
+the same via `band_column`.
 
 ## Desktop GUI
 

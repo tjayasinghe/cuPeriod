@@ -8,6 +8,91 @@ All notable changes to cuPeriod are documented here. The format is based on
 
 ### Added
 
+- **A native multi-band GLS, replacing the astropy delegation** on every backend
+  (finufft on the CPU, cufinufft on CUDA, torch on any device). Three joint models are
+  selected with `GLSSettings.mb_model`. The default `"offsets"` is the shared-phase
+  `(1, 0)` model of VanderPlas & Ivezić (2015) — one sinusoid on a phase shared by every
+  band plus an independent constant offset per band, their recommended search model for
+  sparse multi-band data. The offsets are profiled out in closed form, which leaves the
+  Zechmeister-Kürster assembly with every trigonometric sum replaced by its band-centered
+  counterpart and costs `K + 2` NUFFTs for `K` bands: on a six-band, 100-point star over
+  200 000 frequencies, **55 s through astropy becomes 0.13 s** (~400×). With one band it
+  reduces exactly to single-band GLS.
+- **`mb_model="perband"`** — the multi-phase `(0, 1)` model: independent per-band
+  floating-mean sinusoids combined with the paper's reference-chi-squared weights
+  (eq. 23), `P = sum_k chi2_0k P_k / sum_k chi2_0k`. astropy's `method="fast"` intends
+  this model but weighs the bands by the summed *squared periodogram* instead of
+  `chi2_0k`, which makes its output depend on the frequency grid it was evaluated on;
+  that differs from the published weighting. gatspy uses `chi2_0k`, and so does cuPeriod.
+- **`mb_model="flex"`** — astropy's flexible regularized model (`mb_nterms_base` shared
+  harmonics plus `mb_nterms_band` harmonics-with-offset per band, trace-scaled ridge
+  `mb_reg_band=1e-6` on the band columns), reproduced from per-band harmonic trig sums
+  and batched normal-equation solves. Parity with astropy is ~2e-10 across term counts
+  and under both ridge conventions (`tests/test_multiband_gls.py`).
+- **Multi-band false-alarm probabilities** ({func}`cuperiod.multiband_fap`), which
+  astropy's `LombScargleMultiband` does not offer at all — its FAP methods raise
+  `NotImplementedError`, because the single-band analytic formulas assume one sinusoid fit
+  to one band. cuPeriod calibrates the joint periodogram by within-band bootstrap: each
+  band's `(value, error)` pairs are resampled with replacement while every observation
+  *time* stays fixed, which preserves the window function, the per-band sample sizes and
+  the heteroskedastic errors while destroying phase coherence. `MultibandFAP` carries the
+  null sample with `.fap(power)` and `.level(fap)`; `GLSSettings(mb_fap_bootstrap=N)`
+  attaches `extras["fap"]` at the spectrum's peaks plus `meta["fap_level_10pct"]` /
+  `fap_level_1pct`. On the NUFFT backends the whole bootstrap runs as the *same* `K + 2`
+  transforms as one power evaluation, with the resamples stacked along `n_trans`; the
+  perband/flex models and torch fall back to a per-resample loop. The smallest resolvable
+  false-alarm probability is `1/(n_bootstrap + 1)`, and asking for less raises.
+- **Every method is now multi-band** — pooled PDM, conditional entropy, and string length
+  join the existing MHAOV (pooled `F`) and BLS (shared ephemeris, stacked depth-SNR); only
+  TLS remains single-band. Each band keeps its own mean curve, histogram, and
+  normalization, and only the resulting statistics are pooled: PDM by within-bin degrees
+  of freedom `max(n_k - n_bins, 1)`, CE and string length by point count. Forcing the
+  filters onto one common fold would smear it by the band offsets alone and look
+  disordered at *every* trial period.
+- **Multi-band ingestion everywhere a light curve loads.**
+  `MultiBandLightCurve.from_file` reads a long-format CSV/ECSV/FITS/Parquet table and
+  splits it on an auto-detected or named band column, with no pandas dependency. The CLI's
+  `cuperiod run FILE --band COL` now performs a true joint fit — it silently dropped to
+  single-band before — and `batch_periodograms` honors `band_column` for file, glob, and
+  directory inputs, so a directory of survey tables runs multi-band end to end.
+- **Alias diagnostics for any periodogram** ({func}`cuperiod.alias_diagnostics`). A peak
+  quoted without an alias check is a period a referee will ask about, so this measures the
+  spectral window of *this* light curve's sampling, predicts the alias family it implies
+  (`f0 ± m·f_w` off the window's own peaks, plus harmonics and subharmonics; the classic
+  sidereal-day/solar-day/synodic-month/year suspects when no light curve is supplied),
+  matches each prediction to a local optimum of the periodogram within a Rayleigh
+  tolerance, and scores the competitors on one scale where `1.0` means "as good as the
+  peak being diagnosed". Harmonics are reported but never make a result `ambiguous`, since
+  `2f` is expected structure. Works for maximized and minimized statistics alike and for
+  multi-band input; `AliasReport.summary()` prints the competitor table a period-search
+  paper is expected to show.
+- **LINCC Frameworks interoperability** (`cuperiod.interop`, new `[nested]` and `[lsdb]`
+  extras): run a period search directly on nested-pandas / lsdb light curves — one row per
+  object, the epochs in a nested column — with no flattening, no `groupby`, and no
+  per-object DataFrames. {func}`cuperiod.interop.nested_periodogram` is the row-wise tier
+  (`map_rows`, composable, right for a CPU backend or a quick look);
+  {func}`cuperiod.interop.partition_periodogram` is the throughput tier, reading a
+  partition's flat Arrow buffers and list offsets once and evaluating every object in it
+  against **one** GPU engine, so plan/kernel setup is amortized over thousands of stars
+  instead of paid per star. Both accept an in-memory `NestedFrame` or a lazy lsdb
+  `Catalog`, resolve their columns from the nest's schema without computing, and turn a
+  failed object into NaN result columns rather than an aborted run. `COLUMN_PRESETS`
+  carries verified layouts for `"ztf_dr22"`, `"ztf_alerts"`, `"rubin_dp1_object"` and
+  `"rubin_dp1_dia"`; the Rubin presets search in the **flux** domain because DP1 fluxes
+  are nJy and can legitimately be negative. One code path supports both ecosystem worlds —
+  nested-pandas 0.6.10 (the lsdb / pandas-2 pin) and 0.7.x (pandas 3) — using only
+  `map_rows` / `map_partitions` / `join_nested`, never the `reduce` that 0.7.0 removed.
+- **A multi-band recovery benchmark** (`benchmarks/multiband_recovery.py`): faint
+  RRab-like stars on a simulated Rubin-like six-band cadence (3-year span, WFD epoch
+  shares, 0.20 mag per-point noise ≈ an *r* ≈ 23 halo RR Lyrae), 300 stars per cell,
+  recovery = top period within 1% with no harmonic credit. At 30 total epochs across all
+  six bands the best single band recovers 0.0% and any-single-band 0.0%, while multi-band
+  `perband` reaches 17.7%, `flex` 20.0%, and the shared-phase `offsets` model **81.7%**;
+  at 60 epochs, 37.3% / 49.3% versus 97.0% / 97.0% / **99.7%**; by 120 epochs everything
+  converges. The cadence is deliberately simplified (random nights, no rolling cadence),
+  so the result to read is the *ordering*: sharing the phase is what buys sparse-cadence
+  recovery, consistent with Rubin's own alert-production study and with VanderPlas &
+  Ivezić (2015) — and it is why `"offsets"` is the default.
 - **Automated, uncertainty-aware pre-whitening for classical pulsators**
   ({func}`cuperiod.prewhiten`). Frequency analysis of δ Scuti, γ Doradus and SPB stars
   has funnelled through interactive Period04-style sessions one star at a time; this

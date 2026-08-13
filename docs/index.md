@@ -18,8 +18,11 @@ Optimized, GPU-accelerated periodograms for astronomy
 systems — from a single light curve to millions. One Python API, one command-line
 tool, and an optional desktop GUI cover seven methods, each with a fast CPU backend and
 GPU-accelerated paths: the NVIDIA CUDA fast paths plus a portable PyTorch backend that
-also reaches AMD, Intel, and Apple GPUs (and a CPU-only path). Add frictionless column
-handling, multi-band support, raw-spectrum output, and an N-best-periods utility.
+also reaches AMD, Intel, and Apple GPUs (and a CPU-only path). Six of the methods search
+several filters of one star jointly — including a native multi-band GLS with three models
+and bootstrap false-alarm probabilities — and the LINCC adapters run the whole thing over
+nested-pandas / lsdb survey catalogs. Add frictionless column handling, alias diagnostics,
+raw-spectrum output, and an N-best-periods utility.
 
 Every implementation is validated against an established reference (astropy's
 `LombScargle` / `BoxLeastSquares`, and others) to floating-point round-off.
@@ -43,7 +46,7 @@ then shows how to load your own.
 
 :::{grid-item-card} 📖 Learn the package
 The {doc}`User Guide <guide/index>` walks through inputs, methods, results, backends,
-tuning, multi-band, batch, and the CLI.
+tuning, multi-band, LINCC catalogs, batch, and the CLI.
 :::
 
 :::{grid-item-card} ⚡ Scale to millions
@@ -76,12 +79,12 @@ you drag across peaks — `pip install "cuperiod[gui]"`, then `cuperiod-gui`.
 | **BLS** | eclipses / box-like transits | ✅ | ✅ |
 | **MHAOV** | sharply non-sinusoidal signals (multiharmonic AOV) | ✅ | ✅ |
 | **TLS** | limb-darkened transit matched filter | ✅ | — |
-| **PDM** | non-sinusoidal folds (Stellingwerf) | ✅ | — |
-| **CE** | sparse survey data (conditional entropy) | ✅ | — |
-| **String-Length** | eclipsing / eccentric shapes | ✅ | — |
+| **PDM** | non-sinusoidal folds (Stellingwerf) | ✅ | ✅ |
+| **CE** | sparse survey data (conditional entropy) | ✅ | ✅ |
+| **String-Length** | eclipsing / eccentric shapes | ✅ | ✅ |
 
 All seven share one API, one CLI, and the full single/batch machinery. See
-{doc}`guide/methods` for a decision guide.
+{doc}`guide/methods` for a decision guide and {doc}`guide/multiband` for the joint models.
 
 Multiperiodic pulsators need more than a single best period. {func}`cuperiod.prewhiten`
 extracts the whole frequency solution — iterative sinusoid fitting with principled
@@ -121,6 +124,7 @@ guide/backends
 guide/tuning
 guide/prewhitening
 guide/multiband
+guide/interop
 guide/batch
 guide/cli
 guide/gui

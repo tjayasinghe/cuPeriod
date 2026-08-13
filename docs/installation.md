@@ -22,6 +22,8 @@ CPU, the command line, and batch processing over a process pool.
 | **fast** | `pip install "cuperiod[fast]"` | multicore `numba` CPU kernels for BLS, PDM, CE, String-Length, MHAOV, and TLS — the CPU default when installed, one to two orders of magnitude faster than the fallback CPU paths |
 | **gui** | `pip install "cuperiod[gui]"` | the interactive desktop GUI, `cuperiod-gui` (PySide6 + pyqtgraph) — see {doc}`guide/gui` |
 | **pandas** | `pip install "cuperiod[pandas]"` | pandas `DataFrame` ingestion |
+| **nested** | `pip install "cuperiod[nested]"` | nested-pandas `NestedFrame` light curves, one row per object — see {doc}`guide/interop` |
+| **lsdb** | `pip install "cuperiod[lsdb]"` | the same adapter over lazy, dask-partitioned lsdb HATS catalogs |
 
 Extras combine, e.g. `pip install "cuperiod[gpu,fast]"` or `"cuperiod[gui,torch]"`.
 

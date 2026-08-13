@@ -51,6 +51,14 @@ You don't have to track this — {meth}`~cuperiod.Periodogram.best_periods` know
 method's `objective_sense` and always returns the *most significant* periods first. It
 matters only if you inspect the raw `power` array yourself ({doc}`results`).
 
+## Multi-band
+
+Six of the seven take several filters of the same star and fit them jointly: **GLS, BLS,
+MHAOV, PDM, CE, and String-Length**. Only TLS is single-band. Pass a
+{class}`~cuperiod.MultiBandLightCurve` instead of a {class}`~cuperiod.LightCurve` and the
+method's joint model runs; a single-band method asked for a multi-band run raises a clear
+error. See {doc}`multiband`.
+
 ## The methods in detail
 
 ### GLS — generalized Lomb–Scargle
@@ -59,7 +67,7 @@ The workhorse for periodic variable stars. cuPeriod computes the floating-mean
 Lomb–Scargle power of Zechmeister & Kürster (2009) — the same statistic as astropy's
 `LombScargle(..., fit_mean=True)` — but evaluates the trigonometric sums with a
 non-uniform FFT, matching astropy to ~1e-9 while running much faster. Each peak carries a
-false-alarm probability (`extra["fap"]`). Supports {doc}`multi-band <multiband>`.
+false-alarm probability (`extra["fap"]`).
 
 ```python
 pg = cup.periodogram(lc, "GLS")
@@ -67,6 +75,12 @@ pg = cup.periodogram(lc, "GLS")
 
 Key settings ({class}`~cuperiod.GLSSettings`): `samples_per_peak`, `nyquist_factor`,
 `fit_mean`, `fap_method`, `minimum_frequency` / `maximum_frequency`.
+
+{doc}`Multi-band <multiband>` GLS is native on every backend and offers three joint
+models (`mb_model`): a shared-phase sinusoid with per-band offsets (`"offsets"`, the
+default), independent per-band sinusoids (`"perband"`), and a regularized model with
+per-band harmonics (`"flex"`). Multi-band false-alarm probabilities come from a
+within-band bootstrap ({func}`~cuperiod.multiband_fap`, or `mb_fap_bootstrap`).
 
 ### BLS — box least squares
 
@@ -114,6 +128,8 @@ pg = cup.periodogram(lc, "MHAOV", settings=cup.MHAOVSettings(n_harmonics=4))
 Stellingwerf's method: bin the folded light curve and minimize the within-bin variance
 relative to the total. Makes **no assumption about the waveform**, so it suits arbitrary
 non-sinusoidal shapes. Key settings ({class}`~cuperiod.PDMSettings`): `n_bins`, `n_covers`.
+Supports {doc}`multi-band <multiband>`: each band is folded and binned on its own and the
+`Theta` values are pooled by within-bin degrees of freedom.
 
 ```python
 pg = cup.periodogram(lc, "PDM")
@@ -123,7 +139,8 @@ pg = cup.periodogram(lc, "PDM")
 
 Graham et al. (2013): minimize the conditional entropy of the folded phase–magnitude
 diagram. Robust on **sparse, unevenly sampled survey data**. Key settings
-({class}`~cuperiod.CESettings`): `n_phase_bins`, `n_mag_bins`.
+({class}`~cuperiod.CESettings`): `n_phase_bins`, `n_mag_bins`. Supports
+{doc}`multi-band <multiband>`: one histogram per band, entropies pooled by point count.
 
 ```python
 pg = cup.periodogram(lc, "CE")
@@ -133,7 +150,8 @@ pg = cup.periodogram(lc, "CE")
 
 Dworetsky / Lafler–Kinman: minimize the total length of the "string" connecting
 phase-ordered points in the folded curve. Cheap and shape-agnostic; handy for eclipsing or
-eccentric systems. Settings: {class}`~cuperiod.StringLengthSettings`.
+eccentric systems. Settings: {class}`~cuperiod.StringLengthSettings`. Supports
+{doc}`multi-band <multiband>`: one string per band, lengths pooled by point count.
 
 ```python
 pg = cup.periodogram(lc, "String-Length")     # or "StringLength"

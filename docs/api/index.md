@@ -58,6 +58,36 @@ follow it (see {doc}`../guide/prewhitening`).
    buoyancy_radius
 ```
 
+## Multi-band
+
+Joint multi-band false-alarm calibration (see {doc}`../guide/multiband`). The multi-band
+models themselves are selected through {class}`GLSSettings` and run through
+{func}`periodogram`.
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   multiband_fap
+   MultibandFAP
+```
+
+## Diagnostics
+
+Is the best peak the true frequency, or a sidelobe of the sampling's spectral window?
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   alias_diagnostics
+   AliasReport
+   AliasCandidate
+   WindowPeak
+```
+
 ## Light curves & inputs
 
 Containers for the data, and the column/domain mapping that ingests heterogeneous tables.
@@ -163,6 +193,26 @@ The batch run summary (see {doc}`../guide/batch`).
 
    BatchSummary
 ```
+
+## LINCC interoperability
+
+Adapters for nested-pandas / lsdb catalogs (see {doc}`../guide/interop`). These live in
+the optional `cuperiod.interop` subpackage — `pip install "cuperiod[nested]"` — and are
+imported from there, not from the top level.
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   interop.nested_periodogram
+   interop.partition_periodogram
+   interop.resolve_nested_columns
+   interop.NestedColumns
+```
+
+The survey column layouts these accept as `preset=` live in the module-level dict
+`cuperiod.interop.COLUMN_PRESETS`; they are tabulated in {doc}`../guide/interop`.
 
 ## Exceptions
 
