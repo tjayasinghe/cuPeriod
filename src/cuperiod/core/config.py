@@ -57,6 +57,15 @@ class GLSSettings(_DeviceSettings):
             self.minimum_frequency, self.maximum_frequency,
             "minimum_frequency", "maximum_frequency",
         )
+        if (
+            self.mb_model == "flex"
+            and self.mb_nterms_base == 0
+            and self.mb_nterms_band == 0
+        ):
+            raise ValueError(
+                "flex multi-band model: at least one of mb_nterms_base and "
+                "mb_nterms_band must be greater than 0"
+            )
         return self
 
     minimum_frequency: float | None = Field(
@@ -75,6 +84,44 @@ class GLSSettings(_DeviceSettings):
     )
     fit_mean: bool = Field(
         default=True, description="Floating-mean (generalized) Lomb-Scargle."
+    )
+    mb_model: Literal["offsets", "perband", "flex"] = Field(
+        default="offsets",
+        description=(
+            "Multi-band model: a shared sinusoid with per-band offsets "
+            "('offsets', the VanderPlas & Ivezić shared-phase (1,0) model), "
+            "independent per-band sinusoids combined with chi2_0 weights "
+            "('perband', their multi-phase (0,1) model, eq. 23), or the "
+            "flexible regularized model with per-band harmonics ('flex')."
+        ),
+    )
+    mb_nterms_base: int = Field(
+        default=1, ge=0, description="Flex model: shared (base) harmonic terms."
+    )
+    mb_nterms_band: int = Field(
+        default=1, ge=0, description="Flex model: per-band harmonic terms."
+    )
+    mb_reg_base: float | None = Field(
+        default=None, description="Flex model: ridge on the base terms (None = 0)."
+    )
+    mb_reg_band: float | None = Field(
+        default=1e-6, description="Flex model: ridge on the per-band terms."
+    )
+    mb_regularize_by_trace: bool = Field(
+        default=True,
+        description="Flex model: scale the ridge by the normal-matrix trace.",
+    )
+    mb_fap_bootstrap: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Within-band bootstrap resamples for multi-band false-alarm "
+            "probabilities (0 disables; the smallest resolvable FAP is "
+            "1/(n+1))."
+        ),
+    )
+    mb_fap_seed: int = Field(
+        default=0, description="Seed for the multi-band FAP bootstrap."
     )
     n_peaks: int = Field(default=10, ge=1, description="Default stored peak count.")
     peak_separation_rayleigh: float = Field(

@@ -46,6 +46,7 @@ from cuperiod.core.grid import GridSpec, log_period_grid, uniform_frequency_grid
 from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
 from cuperiod.core.result import MultiResult, Peak, Periodogram
 from cuperiod.methods.base import MethodInfo, get_method, list_methods, method_names
+from cuperiod.multiband.fap_mb import MultibandFAP, multiband_fap
 from cuperiod.prewhiten import (
     AmplitudeSpectrum,
     Combination,
@@ -95,6 +96,7 @@ __all__ = [
     "MultiBandLightCurve",
     "MultiResult",
     "MultiSineFit",
+    "MultibandFAP",
     "PDMSettings",
     "Peak",
     "Periodogram",
@@ -125,6 +127,7 @@ __all__ = [
     "list_methods",
     "log_period_grid",
     "method_names",
+    "multiband_fap",
     "periodogram",
     "prewhiten",
     "spacing_spectrum",

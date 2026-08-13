@@ -548,7 +548,7 @@ class GLSMethod(PeriodogramMethod):
     ) -> Periodogram:
         from cuperiod.multiband.gls_mb import gls_multiband_power
 
-        return gls_multiband_power(grid, mblc, settings)
+        return gls_multiband_power(grid, mblc, settings, backend)
 
     def make_engine(self, backend: str, settings: GLSSettings) -> object | None:  # type: ignore[override]
         if backend == "cufinufft":

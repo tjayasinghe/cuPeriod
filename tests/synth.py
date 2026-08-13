@@ -87,6 +87,37 @@ def synthetic_gmode(
     return t, mag, err, period_array
 
 
+def synthetic_multiband_sine(
+    *,
+    band_points: tuple[int, ...] = (60, 45, 30),
+    period: float = 0.7365,
+    amplitudes: tuple[float, ...] = (0.30, 0.22, 0.15),
+    offsets: tuple[float, ...] = (15.0, 14.2, 13.9),
+    phase: float = 0.3,
+    span: float = 180.0,
+    noise: float = 0.05,
+    base_jd: float = 2458000.0,
+    seed: int = 0,
+) -> dict[str, tuple[FloatArray, FloatArray, FloatArray]]:
+    """Several bands of one shared-phase sine: per-band ``(t, mag, err)`` arrays.
+
+    Bands share the period and phase but differ in amplitude, mean magnitude,
+    sampling, and per-point noise — the sparse multi-band regime the joint models
+    are for. Band labels count up from ``"b0"``.
+    """
+    out: dict[str, tuple[FloatArray, FloatArray, FloatArray]] = {}
+    for index, (n, amp, offset) in enumerate(
+        zip(band_points, amplitudes, offsets, strict=True)
+    ):
+        rng = np.random.default_rng(seed + index)
+        t = np.sort(rng.uniform(0.0, span, n)) + base_jd
+        err = noise * (0.8 + 0.4 * rng.random(n))
+        mag = offset + amp * np.sin(2 * np.pi * t / period + phase)
+        mag = mag + rng.normal(0.0, err)
+        out[f"b{index}"] = (t, mag, err)
+    return out
+
+
 def synthetic_eclipser(
     *,
     n: int = 800,
