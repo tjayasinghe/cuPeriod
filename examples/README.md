@@ -2,9 +2,11 @@
 
 ## [`cuperiod_tour.ipynb`](cuperiod_tour.ipynb) — a guided tour
 
-A hands-on walkthrough of cuPeriod on **real light curves**. For each kind of object it
-loads the data, runs the appropriate periodogram, reads the peak, and phase-folds to
-reveal the signal — three pictures per star (raw → periodogram → phased).
+A hands-on walkthrough of cuPeriod on **real light curves** — plus one deliberately
+simulated star at the end, because the closing lesson is a search *failing*, and for that
+you have to know the true period. For each kind of object it loads the data, runs the
+appropriate periodogram, reads the peak, and phase-folds to reveal the signal — three
+pictures per star (raw → periodogram → phased).
 
 | Object | Method | What it teaches |
 | --- | --- | --- |
@@ -14,6 +16,7 @@ reveal the signal — three pictures per star (raw → periodogram → phased).
 | Long-period variable (Mira) | **PDM** | non-sinusoidal folds, long baselines |
 | Exoplanet (Kepler KIC 7532973) | **TLS** | a transit matched filter |
 | — | several at once | comparing methods, reading the N-best peaks |
+| Sparse six-band star (synthetic survey cadence) | **multi-band GLS** + FAP + alias diagnostics | why joint fitting wins in the Rubin era |
 
 ### Run it
 
@@ -32,6 +35,9 @@ the GPU automatically (`backend="auto"`).
   light curves (one per variability class), each with its VSX literature period.
 - `data/kepler_KIC7532973.csv` — *Kepler* PDCSAP flux for a confirmed hot-Jupiter host,
   fetched once with [lightkurve](https://docs.lightkurve.org/).
+- The sparse six-band star is **not** a bundled file: it is simulated inline with numpy
+  from a fixed seed, on the Rubin/LSST-like cadence of
+  [`benchmarks/multiband_recovery.py`](../benchmarks/multiband_recovery.py).
 
 ## The desktop GUI (`cuperiod-gui`)
 
