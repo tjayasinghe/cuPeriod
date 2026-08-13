@@ -139,6 +139,32 @@ All notable changes to cuPeriod are documented here. The format is based on
   so the result to read is the *ordering*: sharing the phase is what buys sparse-cadence
   recovery, consistent with Rubin's own alert-production study and with VanderPlas &
   Ivezić (2015) — and it is why `"offsets"` is the default.
+- **A bundled real multi-band validation set** (`benchmarks/dataset/s82_rrlyrae.parquet`,
+  built by the re-runnable `benchmarks/dataset/download_s82_rrlyrae.py`): 100 SDSS Stripe 82
+  RR Lyrae from Sesar et al. 2010 (ApJ 708, 717) — real *ugriz* photometry on the real
+  ground-based cadence, ~55 epochs per band over a ~3200 d baseline, 80 RRab and 20 RRc with
+  periods 0.26–0.91 d, each carrying the discovery paper's literature period. It is the
+  canonical real multi-band test set: VanderPlas & Ivezić (2015) developed the multiband
+  periodogram on these very stars. The script fetches the paper's tables from the astroML-data
+  mirror (the original MPIA host is dead) and keeps the first 100 stars by ascending Sesar ID,
+  a deterministic cut with no quality selection and no filtering on how any method performs.
+  At ~390 KB the bundle is committed, so the validation reproduces offline.
+- **Every multi-band method validated on that real data** (`benchmarks/multiband_real.py`,
+  written up as a new REPORT.md §4): one identical blind search per star — periods 0.15–1.2 d
+  at 5 samples per Rayleigh width (~97 000 trial frequencies), every method at its default
+  settings — scored **strict** (top period within 1% of the literature value, no harmonic
+  credit) and **harmonic-aware** (a small-integer harmonic within 2%). The pooled fold
+  statistics lead on curves this well sampled: PDM and string length reach **93%** strict,
+  with string length at **97%** harmonic-aware and SuperSmoother at **96%**, against 76–78%
+  for the three GLS models — about what the best single band manages (78%, or 92% if any of
+  the five bands is allowed to be the right one). That is the mirror image of the simulated
+  sparse-cadence benchmark above, where `"offsets"` leads: dense per-band data reward fold
+  shape, sparse data reward parsimony. SuperSmoother's strict-vs-harmonic gap is exactly the
+  documented integer-multiples family (11 of 21 fold-family harmonic picks land on precisely
+  2P; 55% strict on the near-sinusoidal RRc against 92.5% on RRab), and 54% of the 163
+  non-harmonic misses across all models sit on the ±1 or ±2 cycle/day window-alias loci — the
+  ground-based window function, not noise. BLS is reported for completeness (22%) and stays
+  the wrong tool for a pulsator.
 - **Automated, uncertainty-aware pre-whitening for classical pulsators**
   ({func}`cuperiod.prewhiten`). Frequency analysis of δ Scuti, γ Doradus and SPB stars
   has funnelled through interactive Period04-style sessions one star at a time; this

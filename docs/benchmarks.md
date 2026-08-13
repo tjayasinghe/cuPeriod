@@ -13,10 +13,10 @@ broaden coverage of harder classes. TLS is validated on 12 confirmed Kepler KOIs
 curves and their literature periods ship with the suite, so §1–2 and §4 are fully
 reproducible offline.
 
-SuperSmoother is new in this release and has **not** been through this suite yet, so every
-number on this page covers the other seven methods. It is instead pinned in the unit tests
-against the reference `supersmoother` package and `gatspy`
-({doc}`guide/methods`).
+§1–5 below cover the seven methods that go through the single-band suite. SuperSmoother, new
+in this release, is instead pinned in the unit tests against the reference `supersmoother`
+package and `gatspy` ({doc}`guide/methods`), and is validated on real data alongside every
+other multi-band method in §7.
 
 ## 1. Numerical validation
 
@@ -315,7 +315,7 @@ tested SNR is String-Length on the narrow eclipse model (~78%) — a method–si
 not a bug: its rank-based statistic is comparatively insensitive to narrow, low duty-cycle
 dips, and a box-fitting method (BLS) is the appropriate tool for narrow eclipses/transits.
 Full per-SNR grid and figure in the
-[full report](https://github.com/tjayasinghe/cuPeriod/blob/main/benchmarks/REPORT.md#4--injection–recovery-sensitivity).
+[full report](https://github.com/tjayasinghe/cuPeriod/blob/main/benchmarks/REPORT.md#5--injection–recovery-sensitivity).
 
 ## 5. Batch throughput & transits
 
@@ -357,6 +357,91 @@ in {doc}`guide/multiband`; the native `offsets` path is also ~400× faster than
 astropy's `LombScargleMultiband` on a 6-band, 200k-frequency search (55 s → 0.13 s,
 CPU).
 
+## 7. Multi-band validation on real data
+
+§6 is simulated; this is the same question asked of **real** photometry with known answers.
+`benchmarks/multiband_real.py` runs every multi-band method over 100 SDSS Stripe 82 RR Lyrae
+from Sesar et al. (2010) — 80 RRab and 20 RRc, real SDSS *ugriz* cadence with ~55 epochs per
+band over a ~3200 d baseline, each with a literature period from that paper's ~10-year
+solution. These are the stars VanderPlas & Ivezić (2015) built the multiband periodogram on,
+so the shared-phase model that ships as cuPeriod's default `offsets` is being checked on its
+home ground. Every star gets one identical blind search: periods 0.15–1.2 d at 5 samples per
+Rayleigh width (~97,000 trial frequencies), all methods at default settings. *Strict* means
+the top period is within 1% of the literature value with no harmonic credit; *harmonic-aware*
+accepts a small-integer harmonic within 2%.
+
+```{list-table}
+:header-rows: 1
+:widths: 30 16 22 22
+
+* - Multi-band model
+  - strict
+  - harmonic-aware
+  - median CPU s/star
+* - GLS `offsets` (1,0)
+  - 76%
+  - 80%
+  - 0.067
+* - GLS `perband` (0,1)
+  - 78%
+  - 81%
+  - 0.107
+* - GLS `flex` (1,1)
+  - 78%
+  - 81%
+  - 0.348
+* - PDM
+  - **93%**
+  - 94%
+  - 0.011
+* - CE
+  - 85%
+  - 90%
+  - 0.024
+* - String-Length
+  - **93%**
+  - **97%**
+  - 0.039
+* - MHAOV
+  - 83%
+  - 84%
+  - 0.539
+* - SuperSmoother
+  - 85%
+  - 96%
+  - 0.293
+* - BLS
+  - 22%
+  - 34%
+  - 3.044
+```
+
+Single-band GLS, one filter at a time, is the baseline: 72–78% strict per band (*z* worst,
+*r* best) and 92% for *any* single band — the optimistic bound that counts a star as recovered
+if any of the five searches lands on the right period, which in practice you cannot know.
+
+Two regimes, one conclusion. On curves this well sampled (~280 points across five bands) the
+pooled fold statistics lead: PDM and String-Length reach 93% strict and String-Length 97%
+harmonic-aware, because a dense fold exploits the whole non-sinusoidal RRab shape while the
+single-harmonic GLS models stay alias-limited. The three GLS models are indistinguishable here
+(76–78%) and no better than the best single band, the *opposite* of §6's sparse cadence where
+`offsets` recovers 82% against ≤20% for the flexible models. Dense per-band data reward shape;
+sparse data reward parsimony — the fold methods were not run at sparse cadence, so §6 remains
+the guidance for a survey-cadence search. SuperSmoother's 85% → 96% gap is the documented
+integer-multiples family: of 21 fold-family picks that are harmonic but not strict, 11 sit at
+exactly 2P and 5 at 3P, and its strict rate is 55% on the near-sinusoidal RRc against 92.5% on
+RRab, since a fold at twice the period stays coherent. Read the shortest member of a near-tied
+family, or let {func}`~cuperiod.alias_diagnostics` arbitrate. Of the 163 non-harmonic misses
+across all models, 54% fall on the ±1 or ±2 cycle/day loci — the ground-based window function,
+not noise. BLS's 22% is expected and not a defect: it fits transit shapes, and is reported for
+completeness rather than recommended for RR Lyrae. Model definitions and guidance live in
+{doc}`guide/multiband`.
+
+To reproduce: `benchmarks/dataset/download_s82_rrlyrae.py` builds the bundle from the
+astroML-data mirror (needs network, one time only), then `benchmarks/multiband_real.py` runs
+offline — the ~390 KB bundle is committed with the suite.
+
 See the
 [full report](https://github.com/tjayasinghe/cuPeriod/blob/main/benchmarks/REPORT.md)
-for the figures, per-KOI detail, and reproduction commands.
+for the figures, per-band and per-subtype breakdowns, per-KOI detail, and reproduction
+commands.

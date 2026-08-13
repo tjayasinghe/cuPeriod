@@ -39,7 +39,10 @@ Every implementation is validated against the standard reference (astropy
   harmonic-aware period recovery on this deliberately heterogeneous sample (a synthetic
   injection–recovery sweep further characterizes sensitivity vs. signal-to-noise) — see the
   [full benchmark report](benchmarks/REPORT.md) and the
-  [benchmarks docs page](https://cuperiod.readthedocs.io/en/latest/benchmarks.html).
+  [benchmarks docs page](https://cuperiod.readthedocs.io/en/latest/benchmarks.html). The
+  multi-band methods are further validated blind on 100 real SDSS Stripe 82 RR Lyrae with
+  literature periods — the pooled fold statistics recover up to 93% of periods strictly
+  (97% harmonic-aware) on real five-band data.
 - **A fast CPU tier, no GPU required.** The `[fast]` extra's multicore `numba` kernels
   make `backend="cpu"` 18x faster than astropy's `BoxLeastSquares` and 2106x faster than
   PyAstronomy's PDM on a representative light curve, while recovering the same periods.
