@@ -24,8 +24,8 @@ plt.rcParams.update({
     "grid.alpha": 0.25, "axes.axisbelow": True, "savefig.bbox": "tight",
 })
 
-METHOD_ORDER = ["GLS", "BLS", "PDM", "CE", "STRINGLENGTH", "MHAOV", "TLS"]
-MLABEL = {"STRINGLENGTH": "String-Len"}
+METHOD_ORDER = ["GLS", "BLS", "PDM", "CE", "STRINGLENGTH", "MHAOV", "SUPERSMOOTHER", "TLS"]
+MLABEL = {"STRINGLENGTH": "String-Len", "SUPERSMOOTHER": "SuperSmoother"}
 CLASS_ORDER = ["ECLIPSING", "RR_LYRAE", "CEPHEID", "DELTA_SCUTI", "LONG_PERIOD", "ROTATIONAL"]
 CCOLOR = dict(zip(CLASS_ORDER, plt.cm.tab10(np.linspace(0, 1, 10))))
 
@@ -311,7 +311,8 @@ def fig_benchmark(single, npts, grid, batch):
         ax.bar(x, s["gpu_speedup"], 0.6, color="#4c72b0")
         top = float(s["gpu_speedup"].max())
         for i, (m, row) in enumerate(s.iterrows()):
-            ax.text(i, row["gpu_speedup"], f"{row['gpu_speedup']:.0f}x",
+            v = row["gpu_speedup"]
+            ax.text(i, v, f"{v:.0f}x" if v >= 2 else f"{v:.1f}x",
                     ha="center", va="bottom", fontsize=7)
             cvr = row.get("cpu_vs_ref", np.nan) if "cpu_vs_ref" in s.columns else np.nan
             if np.isfinite(cvr):
@@ -324,9 +325,11 @@ def fig_benchmark(single, npts, grid, batch):
                      "green = cuPeriod CPU speedup over the reference tool", fontsize=7.5)
     # (b) scaling vs grid size — one colour per method, solid=GPU, dashed=CPU
     ax = axes[1]
-    mcol = {"GLS": "#1f77b4", "PDM": "#2ca02c", "MHAOV": "#ff7f0e"}
+    mcol = {"GLS": "#1f77b4", "PDM": "#2ca02c", "MHAOV": "#ff7f0e",
+            "SUPERSMOOTHER": "#9467bd"}
     if grid is not None:
-        for m, mk in [("GLS", "o"), ("PDM", "s"), ("MHAOV", "^")]:
+        for m, mk in [("GLS", "o"), ("PDM", "s"), ("MHAOV", "^"),
+                      ("SUPERSMOOTHER", "D")]:
             g = grid[grid.method == m].sort_values("n")
             if g.empty:
                 continue
@@ -1093,25 +1096,26 @@ def main():
                  "CUDA backend over cuPeriod's own CPU backend. *t_torch* = the portable "
                  "PyTorch backend (device in *torch device*: cpu/cuda/mps/xpu) — the "
                  "cross-vendor path that also runs on AMD/Intel/Mac GPUs.\n")
-        L.append("cuPeriod's CPU path already outperforms every external reference tool it "
-                 "has (GLS, PDM, BLS). **With the multicore numba tier, the GPU's "
-                 "single-curve margin over the CPU is modest almost everywhere** on this "
-                 "16-core machine — 2–4× for BLS/String-Length/TLS, essentially a wash for "
-                 "PDM/CE, and the GPU is slower than the warm CPU kernel for MHAOV at this "
-                 "size. GLS is the one consistent exception (~3×): its CPU path is finufft, "
-                 "not a numba kernel. The scaling sweep (up to 30 000 points / a "
-                 "100 000-frequency grid; Figure 5b) shows the same pattern across that whole "
-                 "range for PDM and MHAOV — the GPU's fixed per-call overhead (kernel launch, "
-                 "host↔device transfer) does not amortise at these problem sizes on a CPU "
-                 "this wide. The GPU's case is catalogue throughput and non-NVIDIA hardware "
-                 "(the portable torch backend), not single-curve latency on the CPU-tier "
-                 "methods; see §8.\n")
-        L.append("> The MHAOV rows here predate v1.2's auto-sized device batching "
-                 "(`batch_periods=0`), which removed most of MHAOV's and SuperSmoother's "
-                 "per-chunk dispatch overhead; the real multi-band validation (§4), run "
-                 "under the new defaults, has single-shot GPU MHAOV at CPU parity. This "
-                 "single-curve table keeps the recorded measurement until the sweep is "
-                 "re-run.\n")
+        gsp = s.dropna(subset=["gpu_speedup"]).set_index("method").gpu_speedup
+        fast = [(m, v) for m, v in gsp.items() if v >= 2.0]
+        wash = [(m, v) for m, v in gsp.items() if 0.8 <= v < 2.0]
+        slow = [(m, v) for m, v in gsp.items() if v < 0.8]
+        _fmt = lambda pairs: (", ".join(f"{ml(m)} ({v:.1f}×)" for m, v in pairs)
+                              if pairs else "none")
+        gls_note = (" GLS's edge reflects its CPU path being finufft rather than a "
+                    "numba kernel." if any(m == "GLS" for m, _ in fast) else "")
+        L.append("cuPeriod's CPU path already outperforms every external reference tool "
+                 "it has (GLS, PDM, BLS). **With the multicore numba tier, the GPU's "
+                 "single-curve margin over the CPU is modest almost everywhere** on "
+                 f"this 16-core machine: a ≥2× win for {_fmt(fast)}; a wash (0.8–2×) "
+                 f"for {_fmt(wash)}; slower than the warm CPU kernel for {_fmt(slow)} "
+                 "at this size — fixed per-call dispatch and transfer overhead does "
+                 f"not amortise once the CPU kernel itself runs in milliseconds."
+                 f"{gls_note} The scaling sweep (up to 30 000 points / a "
+                 "100 000-frequency grid; Figure 5b) shows where that balance shifts "
+                 "with problem size. The GPU's case is catalogue throughput and "
+                 "non-NVIDIA hardware (the portable torch backend), not single-curve "
+                 "latency on the CPU-tier methods; see §8.\n")
         if len(bls) and "cpu_port_s" in bls and np.isfinite(bls.cpu_port_s.iloc[0]):
             b = bls.iloc[0]
             L.append(f"\n> The pure-`numpy` BLS backend shares one array-module-generic source "
@@ -1132,7 +1136,7 @@ def main():
                    f"**>{gpeak.gpu_lc_per_s*3600/1e6:.1f} million light curves/hour**. "
                    f"This is a *single-batch* rate that includes the one-off worker-pool "
                    f"spin-up (process spawn + per-worker CUDA context); a warmed pool "
-                   f"sustains a higher rate (≈490 lc/s here) over many chunks.")
+                   f"sustains a higher rate over many chunks.")
             if len(cmp):
                 rows_txt = "; ".join(
                     f"{ml(r.method)} n={int(r.n_lc)} {r.speedup:.1f}×"
@@ -1155,29 +1159,41 @@ def main():
             "gpu_over_cpu": "GPU vs CPU", "recommendation": "single-curve recommendation"})
         L.append(md_table(rec, list(rec.columns)))
         L.append("\n**Table 7.** Fastest measured backend per method on this machine "
-                 "(single curve, ~900 points; grids as in Table 4).\n")
+                 "(single curve, ~900 points; grids as in Table 6).\n")
+        slow_names = "/".join(ml(m) for m, _ in slow) if slow else "none"
+        fast_names = "/".join(ml(m) for m, _ in fast) if fast else "none"
+        gls_grid_txt = ""
+        if grid is not None and (grid.method == "GLS").any():
+            gg = grid[grid.method == "GLS"].speedup.dropna()
+            if len(gg):
+                gls_grid_txt = (f" — GLS holds {gg.min():.1f}–{gg.max():.1f}× across "
+                                f"the grid-size sweep")
+        peak_txt = "hundreds of curves/s"
+        if batch is not None and len(batch):
+            pk = batch.gpu_lc_per_s.max()
+            peak_txt = f"{pk:,.0f} curves/s (>{pk*3600/1e6:.0f} million curves/hour)"
         L.append("Guidance by use case, from the measurements above:\n")
         L.append("1. **Interactive, single-curve analysis (default).** Use "
                  "`backend=\"cpu\"` with the `[fast]` extra installed. On a modern "
                  "multi-core CPU it is within a small factor of the GPU on every method, "
-                 "faster than the GPU for PDM/CE/MHAOV at typical light-curve sizes, and "
+                 f"faster than the GPU for {slow_names} at typical light-curve sizes, and "
                  "already 2–2000× faster than the established external tools. No GPU is "
                  "required for competitive single-curve performance.\n"
                  "2. **GLS-dominated pipelines on NVIDIA hardware.** Use `backend=\"gpu\"`: "
-                 "GLS is the one method with a consistent GPU advantage (~3× single-curve, "
-                 "~1.4× at batch scale), because its CPU path is finufft rather than a "
-                 "numba kernel.\n"
+                 f"{fast_names} show a consistent single-curve GPU advantage "
+                 f"(Table 6{gls_grid_txt}; GLS keeps ~1.4× at batch scale too, because "
+                 "its CPU path is finufft rather than a numba kernel).\n"
                  "3. **Catalogue-scale processing (10³–10⁶ curves).** Use "
                  "`batch_periodograms(..., device=\"gpu\")` on NVIDIA hardware — peak "
-                 "measured throughput 587 curves/s (>2 million curves/hour) on one GPU. On "
+                 f"measured throughput {peak_txt} on one GPU. On "
                  "this 32-thread CPU the process pool keeps pace for the numba-tier "
                  "methods, so on wide CPU nodes `device=\"cpu\"` is a legitimate "
                  "alternative; expect the GPU margin to widen on narrower CPUs and larger "
                  "batches.\n"
                  "4. **AMD, Intel or Apple GPUs.** Use `backend=\"torch\"` — the portable "
-                 "path validated to the same parity standard. On NVIDIA hardware it is "
-                 "slower than the native CUDA backend (Table 4), so treat it as the "
-                 "portability path, not the speed path.\n"
+                 "path validated to the same parity standard. On NVIDIA hardware the "
+                 "native CUDA backend is usually at least as fast (Table 6), so treat "
+                 "torch as the portability path, not the speed path.\n"
                  "5. **Strict double-precision requirements.** The GLS and MHAOV CUDA "
                  "kernels are single precision (parity ≈1e-6/1e-7; Table 1). The selected "
                  f"best period was unaffected on all {len(meta)} validation stars, but if statistic "

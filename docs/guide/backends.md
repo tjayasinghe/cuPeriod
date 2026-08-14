@@ -128,28 +128,28 @@ vs. the `[fast]`-extra CPU backends, on a 32-thread machine):
   - GPU speed-up
 * - GLS
   - finufft
-  - 0.015 s
+  - 0.013 s
   - 0.005 s
-  - 0.008 s
-  - ~3×
+  - 0.009 s
+  - ~2×
 * - BLS
   - numba
-  - 0.188 s
-  - 0.092 s
-  - 0.392 s
+  - 0.171 s
+  - 0.093 s
+  - 0.396 s
   - ~2×
 * - PDM
   - numba
   - 0.003 s
   - 0.005 s
-  - 0.011 s
+  - 0.009 s
   - ~0.6× (GPU slower)
 * - CE
   - numba
   - 0.003 s
   - 0.004 s
-  - 0.009 s
-  - ~0.8× (GPU slower)
+  - 0.021 s
+  - ~0.7× (GPU slower)
 * - String-Length
   - numba
   - 0.043 s
@@ -158,42 +158,40 @@ vs. the `[fast]`-extra CPU backends, on a 32-thread machine):
   - ~4×
 * - MHAOV
   - numba
-  - 0.025 s
-  - 0.135 s
-  - 0.114 s
-  - ~0.2× (GPU slower)
+  - 0.026 s
+  - 0.038 s
+  - 0.032 s
+  - ~0.7× (GPU slower)
 * - TLS
   - numba
-  - 0.150 s
-  - 0.043 s
-  - 2.110 s
-  - ~4×
-* - SuperSmoother ‡
+  - 0.132 s
+  - 0.072 s
+  - 2.205 s
+  - ~2×
+* - SuperSmoother
   - numba
-  - 0.05 s
-  - not yet measured
-  - not yet measured
-  - not yet measured
+  - 0.099 s
+  - 0.284 s
+  - 0.222 s
+  - ~0.3× (GPU slower)
 ```
-
-‡ SuperSmoother has not been through the benchmark sweep yet. Its CPU figure is a separate
-measurement on the same 32-thread machine — a 600-point curve over 20 000 trial
-frequencies, where the plain `numpy` path takes 6.6 s — and no GPU timing has been taken,
-so the row is left blank rather than guessed at.
 
 How to read this:
 
 - **The CPU backend for every method is now the multicore `numba` kernel** (with the
   `[fast]` extra installed — one to two orders of magnitude faster than the vectorized
   numpy fallback, see {doc}`../installation`). On this 32-thread machine, that CPU tier is
-  now fast enough that a single-curve GPU run is only a modest win for BLS/String-Length/TLS
-  (~2-4×), a wash for CE, and the GPU is actually a touch *slower* than the CPU for PDM and
-  MHAOV at this curve size — kernel-launch and host↔device transfer overhead no longer
-  amortizes when the CPU kernel itself takes low single-digit milliseconds. GLS is the one
-  consistent exception (~3×), because its CPU path is finufft, not a numba kernel.
-- This holds up in the benchmark's scaling sweep too, up to 30k points and a 100k-frequency
-  grid — the GPU doesn't pull ahead of the numba CPU tier for PDM/MHAOV anywhere in that
-  range on this machine. Expect a wider GPU margin on a narrower CPU. The GPU's clear,
+  now fast enough that a single-curve GPU run is only a modest win for GLS/String-Length
+  (~2-4×), a near-wash for BLS/TLS (~1.8×), and the GPU is actually a touch *slower* than
+  the CPU for PDM/CE/MHAOV (~0.6-0.7×) and SuperSmoother (~0.3×) at this curve size —
+  fixed dispatch and host↔device transfer overhead no longer amortizes when the CPU
+  kernel itself takes low single-digit milliseconds. GLS keeps its edge because its CPU
+  path is finufft, not a numba kernel.
+- The scaling sweep (up to 30k points and a 100k-frequency grid) tells the same story
+  with two nuances: GLS holds a ~4-5× GPU edge at every grid size, and v1.2's auto-sized
+  batching lifted MHAOV's GPU from ~5× slower to a near-wash (~0.5-0.7×) across the whole
+  range, while SuperSmoother's GPU only approaches CPU parity once curves reach several
+  thousand points. Expect a wider GPU margin on a narrower CPU. The GPU's clear,
   reproducible win is **catalog throughput** — many curves in flight at once — and reaching
   non-NVIDIA hardware via the portable torch backend, not single-curve latency on the
   CPU-tier methods ({doc}`batch`).
@@ -205,7 +203,7 @@ How to read this:
   the opt-in `precision="float32"` runs the BLS/TLS CUDA kernels ~8-9× faster at
   detection-grade accuracy; float64 stays the default.
 - cuPeriod's **CPU** path already beats the established reference tools it was checked
-  against — GLS ~2× astropy, BLS ~18× astropy's `BoxLeastSquares`, and PDM's numba kernel
+  against — GLS ~3× astropy, BLS ~20× astropy's `BoxLeastSquares`, and PDM's numba kernel
   over 2,000× PyAstronomy's pure-Python `pyPDM` (the numpy PDM path alone is already ~4×).
 
 :::{tip}

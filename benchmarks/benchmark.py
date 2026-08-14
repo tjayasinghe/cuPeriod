@@ -16,6 +16,7 @@ per section so progress is durable.
 
 from __future__ import annotations
 
+import argparse
 import time
 import warnings
 
@@ -95,7 +96,13 @@ FREQ_SETTINGS = {
     "CE": lambda: cup.CESettings(),
     "STRINGLENGTH": lambda: cup.StringLengthSettings(),
     "MHAOV": lambda: cup.MHAOVSettings(),
+    "SUPERSMOOTHER": lambda: cup.SuperSmootherSettings(),
 }
+
+#: Methods swept in the scaling sections (2 and 3). SuperSmoother joins GLS/PDM/MHAOV
+#: as the costliest fold method; no external reference tool is timed for it (gatspy's
+#: pure-python smoother would dominate the sweep; accuracy parity is pinned in tests).
+SCALING_METHODS = ["GLS", "PDM", "MHAOV", "SUPERSMOOTHER"]
 
 
 # --------------------------------------------------------------------------
@@ -117,7 +124,15 @@ def bench_single(t, y, e):
               if has_torch else np.nan)
         tbe = (cup.periodogram((t, y, e), m, backend="torch", grid=grid, settings=st()).backend
                if has_torch and np.isfinite(tt) else "—")
-        tr = best_time(reftime[m], repeat=1) if m in reftime else np.nan
+        # Reference tools are ad-hoc installs (`uv sync` prunes them) — a missing
+        # one blanks its cell rather than killing the whole section.
+        tr = np.nan
+        if m in reftime:
+            try:
+                tr = best_time(reftime[m], repeat=1)
+            except ImportError as exc:
+                print(f"  {m}: reference tool unavailable ({exc}); skipping ref timing",
+                      flush=True)
         rows.append(dict(method=m, n_grid=grid.size, cpu_backend=be, cpu_s=tc, gpu_s=tg,
                          torch_s=tt, torch_backend=tbe,
                          ref_s=tr, ref=refname.get(m, "—"),
@@ -175,7 +190,7 @@ def bench_scaling_npoints(t, y, e):
     rows = []
     for n in [100, 300, 1000, 3000, 10000, 30000]:
         tt, yy, ee = resample(t, y, e, n)
-        for m in ["GLS", "PDM", "MHAOV"]:
+        for m in SCALING_METHODS:
             st = FREQ_SETTINGS[m]
             tc = best_time(lambda: cup.periodogram((tt, yy, ee), m, backend="cpu", grid=grid, settings=st()), repeat=1)
             tg = safe_best_time(lambda: cup.periodogram((tt, yy, ee), m, backend="gpu", grid=grid, settings=st()), repeat=1)
@@ -194,7 +209,7 @@ def bench_scaling_grid(t, y, e):
     rows = []
     for n in [1000, 3000, 10000, 30000, 100000]:
         grid = freq_grid(n)
-        for m in ["GLS", "PDM", "MHAOV"]:
+        for m in SCALING_METHODS:
             st = FREQ_SETTINGS[m]
             tc = best_time(lambda: cup.periodogram((t, y, e), m, backend="cpu", grid=grid, settings=st()), repeat=1)
             tg = safe_best_time(lambda: cup.periodogram((t, y, e), m, backend="gpu", grid=grid, settings=st()), repeat=1)
@@ -251,20 +266,42 @@ def bench_batch(t, y, e):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--sections", default=None,
+        help="comma-separated subset of single,npoints,grid,batch. Default runs "
+             "all four, skipping 'single' when results/bench_single.parquet "
+             "already exists (resume behaviour); naming sections runs exactly "
+             "those, re-measuring even if a parquet exists.")
+    args = parser.parse_args()
+    known = ("single", "npoints", "grid", "batch")
+    chosen = None
+    if args.sections is not None:
+        chosen = [s.strip() for s in args.sections.split(",") if s.strip()]
+        bad = sorted(set(chosen) - set(known))
+        if bad:
+            parser.error(f"unknown sections {bad}; choose from {known}")
+
+    def want(name: str, default: bool = True) -> bool:
+        return name in chosen if chosen is not None else default
+
     t, y, e, P = representative_lc()
     print(f"representative LC: N={t.size}, baseline={t.max()-t.min():.0f} d, P={P:.4f}", flush=True)
-    if (RESULTS / "bench_single.parquet").exists():
-        print("\n[1/4] single-LC: already done, skipping", flush=True)
-    else:
+    if want("single", default=not (RESULTS / "bench_single.parquet").exists()):
         print("\n[1/4] single-LC per-method timing...", flush=True)
         bench_single(t, y, e)
-    print("\n[2/4] scaling vs N points...", flush=True)
-    bench_scaling_npoints(t, y, e)
-    print("\n[3/4] scaling vs grid size...", flush=True)
-    bench_scaling_grid(t, y, e)
-    print("\n[4/4] batch throughput...", flush=True)
-    bench_batch(t, y, e)
-    print("\ndone — wrote results/bench_*.parquet", flush=True)
+    else:
+        print("\n[1/4] single-LC: skipped", flush=True)
+    if want("npoints"):
+        print("\n[2/4] scaling vs N points...", flush=True)
+        bench_scaling_npoints(t, y, e)
+    if want("grid"):
+        print("\n[3/4] scaling vs grid size...", flush=True)
+        bench_scaling_grid(t, y, e)
+    if want("batch"):
+        print("\n[4/4] batch throughput...", flush=True)
+        bench_batch(t, y, e)
+    print("\nBENCHMARK_DONE — wrote results/bench_*.parquet", flush=True)
 
 
 if __name__ == "__main__":

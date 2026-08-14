@@ -270,7 +270,10 @@ All notable changes to cuPeriod are documented here. The format is based on
   scores on the device and crosses to the host once. Chunking never affects the result —
   the same stars now run at CPU-tier speed on the GPU (MHAOV ~0.5 s, SuperSmoother
   ~0.8 s single-shot; identical spectra). An explicit `batch_periods` value is honored
-  as before.
+  as before. The single-curve benchmark sweep was re-measured under the new defaults
+  (single-band MHAOV GPU 0.135 s → 0.038 s, from ~5× slower than the numba CPU tier to a
+  near-wash across the whole grid-size sweep), and SuperSmoother joined the sweep with
+  its first recorded single-curve and scaling numbers.
 
 - `cuperiod.gui.models.ResultCache` is now generic over its value type, so the app keeps
   one cache per analysis and switching back and forth is instant.
