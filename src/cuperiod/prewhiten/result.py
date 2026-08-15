@@ -171,7 +171,8 @@ class PreWhitenResult:
     rms, chi2, reduced_chi2, bic : float
         Fit statistics of the accepted solution.
     correlation_factor : float
-        Schwarzenberg-Czerny ``D`` applied to the uncertainties (1.0 if uncorrected).
+        Schwarzenberg-Czerny ``D`` applied to the uncertainties (1.0 if uncorrected
+        or when ``uncertainty="bootstrap"``, which is never inflated).
     uncertainty_method : str
         Which estimator produced the reported errors.
     backend : str

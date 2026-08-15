@@ -74,6 +74,29 @@ def test_from_file_parquet_roundtrip(tmp_path: Path) -> None:
     assert mb.bands["g"].n == 30 and mb.bands["r"].n == 20
 
 
+def test_from_dataframe_band_column_with_explicit_columns() -> None:
+    # band_column must survive an explicit ColumnMap that pins only time/value:
+    # the caller has no way to spell the band otherwise than the keyword.
+    import pandas as pd
+
+    bands = synthetic_multiband_sine(band_points=(30, 20), amplitudes=(0.3, 0.2),
+                                     offsets=(15.0, 14.2))
+    df = pd.DataFrame(
+        {
+            "t_obs": np.concatenate([bands["b0"][0], bands["b1"][0]]),
+            "brightness": np.concatenate([bands["b0"][1], bands["b1"][1]]),
+            "survey_filter": np.array(["g"] * 30 + ["r"] * 20),
+        }
+    )
+    mb = cup.MultiBandLightCurve.from_dataframe(
+        df,
+        band_column="survey_filter",
+        columns=cup.ColumnMap(time="t_obs", value="brightness"),
+    )
+    assert mb.band_names == ("g", "r")
+    assert mb.bands["g"].n == 30 and mb.bands["r"].n == 20
+
+
 def test_from_file_without_band_column_raises(tmp_path: Path) -> None:
     csv = tmp_path / "noband.csv"
     csv.write_text("jd,mag\n1.0,12.0\n2.0,12.1\n", encoding="utf-8")

@@ -16,10 +16,11 @@ Three estimators, in increasing order of cost and decreasing order of assumption
     Resample the residuals, re-fit, and take the scatter. Makes no linearity assumption
     and needs no error bars, at the price of ``n_resamples`` extra fits.
 
-All three can be inflated by the Schwarzenberg-Czerny (1991) correlation factor: real
-photometry has residuals that are correlated point-to-point (instrumental drifts,
-unresolved modes), so the *effective* number of independent samples is smaller than
-``N`` and the formal errors are optimistic.
+The covariance and analytic errors can be inflated by the Schwarzenberg-Czerny (1991)
+correlation factor: real photometry has residuals that are correlated point-to-point
+(instrumental drifts, unresolved modes), so the *effective* number of independent
+samples is smaller than ``N`` and the formal errors are optimistic. The bootstrap is
+never inflated — it already resamples the residuals as they are.
 """
 
 from __future__ import annotations
@@ -47,7 +48,8 @@ class Uncertainties:
     method : str
         Which estimator produced them.
     correlation_factor : float
-        The inflation factor that was applied (1.0 when the correction is off).
+        The Schwarzenberg-Czerny ``D``; errors were multiplied by ``sqrt(D)``
+        (1.0 when the correction is off or the estimator is the bootstrap).
     """
 
     frequency: FloatArray

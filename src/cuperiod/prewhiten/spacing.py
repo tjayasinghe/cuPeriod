@@ -64,8 +64,11 @@ class SpacingSpectrum:
         Trial spacings, ascending, in the units of the input (days for periods).
     power : numpy.ndarray
         Response in ``[0, 1]``; 1 means every value lands on the same comb.
-    best_spacing, best_power : float
-        The tallest response and where it sits.
+    best_spacing : float
+        The reported comb spacing — the tallest response, promoted past any sub-multiple
+        of itself (see the module notes).
+    best_power : float
+        The response at ``best_spacing``; not necessarily ``power.max()``.
     n_values : int
         Number of input values.
     """

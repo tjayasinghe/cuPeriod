@@ -379,10 +379,23 @@ class _Kernel:
         names += [f"{p}period_{i}" for i in range(2, max(self.n_best, 1) + 1)]
         return tuple(names)
 
+    def validate(self) -> PeriodogramMethod:
+        """Look the method up and reject a configuration no object can satisfy.
+
+        A multi-band run with a single-band-only method cannot produce a result for
+        *any* row, and :meth:`evaluate` turns per-object failures into NaN rows — so
+        the combination has to raise here, before a single object is touched, or the
+        misconfiguration ships as a silently all-NaN frame.
+        """
+        method = get_method(self.method)
+        if self.columns.band is not None and not method.supports_multiband:
+            raise ValueError(f"{method.name} does not support multi-band input")
+        return method
+
     def prepare(self) -> tuple[PeriodogramMethod, BaseSettings, str]:
         """Resolve method, settings and backend once (raises on misconfiguration)."""
         if self._prepared is None:
-            method = get_method(self.method)
+            method = self.validate()
             self._prepared = (
                 method,
                 method.coerce_settings(self.settings),
@@ -431,6 +444,8 @@ class _Kernel:
     ) -> Periodogram:
         """Run one light curve, reusing ``engine`` when the method has one."""
         if isinstance(lc, MultiBandLightCurve):
+            if not method.supports_multiband:
+                raise ValueError(f"{method.name} does not support multi-band input")
             grid = self.grid or _multiband_grid(method, lc, settings)
             return method.multiband_power(grid, lc, settings, backend, engine=engine)
         single = lc.in_domain(method.natural_domain) if method.natural_domain else lc
@@ -678,6 +693,13 @@ def nested_periodogram(
         ``{prefix}best_power``, ``{prefix}fap`` (NaN when the method reports none) and
         any ``{prefix}period_i`` columns.
 
+    Raises
+    ------
+    ValueError
+        If ``band`` resolves but ``method`` has no multi-band model. Per-object
+        failures become NaN rows, so a configuration that can never work is rejected
+        up front instead.
+
     See Also
     --------
     partition_periodogram : the batched, engine-reusing tier (GPU throughput).
@@ -727,6 +749,7 @@ def nested_periodogram(
         n_best=n_best,
         prefix=prefix,
     )
+    kernel.validate()  # fail now, not once per object as an all-NaN row
     read = columns.read_columns
     if _is_lsdb_catalog(data):
         return data.map_rows(
@@ -794,6 +817,12 @@ def partition_periodogram(
         copied). An empty input yields a correctly-typed empty frame, which is what
         lets lsdb infer a schema by calling the kernel on an empty partition.
 
+    Raises
+    ------
+    ValueError
+        If ``band`` resolves but ``method`` has no multi-band model, exactly as in
+        :func:`nested_periodogram`.
+
     See Also
     --------
     nested_periodogram : the row-wise tier.
@@ -843,6 +872,7 @@ def partition_periodogram(
         n_best=n_best,
         prefix=prefix,
     )
+    kernel.validate()  # fail now, not once per object as an all-NaN row
     if _is_lsdb_catalog(data):
         return data.map_partitions(
             kernel, meta=kernel.empty_result() if meta is None else meta

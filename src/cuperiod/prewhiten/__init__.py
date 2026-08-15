@@ -21,8 +21,9 @@ What it provides
 * A batch-capable GPU/NUFFT **amplitude spectrum** (:mod:`~cuperiod.prewhiten.spectrum`)
   whose sampling-only terms are cached, so each pre-whitening iteration costs a single
   transform.
-* **Iterative extraction** (:mod:`~cuperiod.prewhiten.engine`) with a simultaneous
-  non-linear re-fit of every component after each step.
+* **Iterative extraction** (:mod:`~cuperiod.prewhiten.engine`): after each step every
+  amplitude, phase and the offset are re-solved jointly and the newest frequency is
+  refined non-linearly; all frequencies are swept together in the final polish.
 * **Principled stopping criteria** — Breger signal-to-noise, false-alarm probability,
   ΔBIC, an amplitude floor — combined and always reported.
 * **Error propagation** (:mod:`~cuperiod.prewhiten.uncertainty`): least-squares

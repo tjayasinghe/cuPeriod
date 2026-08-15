@@ -305,6 +305,8 @@ class MultiBandLightCurve:
         """
         names, _ = _adapt_table(df)
         cmap = columns or ColumnMap(band=band_column)
+        if band_column is not None and cmap.band is None:
+            cmap = replace(cmap, band=band_column)
         resolved = cmap.resolve(names, domain=domain)
         if resolved.band is None:
             raise ColumnResolutionError(

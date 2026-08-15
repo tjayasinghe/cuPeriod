@@ -89,7 +89,7 @@ def _coefficient_vectors(n_parents: int, max_order: int) -> Iterator[tuple[int, 
     """All integer vectors with ``0 < sum|n_i| <= max_order``.
 
     Enumerated depth-first against the remaining order budget, so the count stays modest
-    (152 vectors for five parents at order 2) instead of the ``(2m+1)^P`` a naive
+    (60 vectors for five parents at order 2) instead of the ``(2m+1)^P`` a naive
     product would produce.
     """
 

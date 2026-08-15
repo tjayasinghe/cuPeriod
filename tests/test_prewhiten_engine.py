@@ -11,7 +11,7 @@ import cuperiod as cup
 from conftest import requires_gpu
 from cuperiod.core.errors import InsufficientDataError
 from cuperiod.core.grid import uniform_frequency_grid
-from cuperiod.prewhiten import default_prewhiten_grid, prewhiten
+from cuperiod.prewhiten import correlation_factor, default_prewhiten_grid, prewhiten
 from synth import synthetic_pulsator, synthetic_sine
 
 
@@ -323,6 +323,47 @@ def test_bootstrap_errors_are_nonzero_for_every_component() -> None:
     assert boot.n_components == cova.n_components >= 2
     assert np.all(boot.frequency_error > 0.1 * cova.frequency_error)
     assert np.all(boot.frequency_error < 10.0 * cova.frequency_error)
+
+
+def _drifting_pulsator(n: int = 600, span: float = 20.0, seed: int = 5):
+    # A random-walk drift on top of the planted modes, so whatever the extraction leaves
+    # behind is correlated point to point and D comes out well above 1.
+    time, value, error = synthetic_pulsator(n=n, span=span)
+    drift = np.cumsum(np.random.default_rng(seed).normal(0.0, 2e-4, time.size))
+    return time, value + drift - drift.mean(), error
+
+
+def test_only_the_inflated_estimators_report_a_correlation_factor() -> None:
+    # Regression: the engine recomputed D from the residuals and stored it whatever the
+    # estimator was, so a bootstrap run reported (and wrote to every catalogue row) a D
+    # its error bars had never been multiplied by — the bootstrap is deliberately left
+    # uncorrected, since it resamples the residuals as they are.
+    time, value, error = _drifting_pulsator()
+    for method in ("covariance", "analytic"):
+        solution = prewhiten(
+            (time, value, error), settings=_settings(uncertainty=method)
+        )
+        assert solution.correlation_factor > 1.0
+        assert solution.correlation_factor == pytest.approx(
+            correlation_factor(solution.residuals)
+        )
+
+    boot = prewhiten(
+        (time, value, error),
+        settings=_settings(uncertainty="bootstrap", n_resamples=10),
+    )
+    assert boot.correlation_factor == 1.0
+    # ...and not because the residuals happen to be uncorrelated.
+    assert correlation_factor(boot.residuals) > 1.0
+
+
+def test_correlation_correction_off_reports_no_factor() -> None:
+    time, value, error = _drifting_pulsator()
+    plain = prewhiten(
+        (time, value, error), settings=_settings(correlation_correction=False)
+    )
+    assert plain.correlation_factor == 1.0
+    assert correlation_factor(plain.residuals) > 1.0
 
 
 def test_clean_components_agree_with_the_spectrum_and_are_not_blended() -> None:

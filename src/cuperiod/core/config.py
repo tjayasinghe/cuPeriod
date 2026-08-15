@@ -669,7 +669,10 @@ class PreWhitenSettings(_DeviceSettings):
     )
     prune: bool = Field(
         default=True,
-        description="Re-check significance after the final fit and drop failures.",
+        description=(
+            "Re-check significance after the final fit and drop failures; the re-check "
+            "is the S/N test, so it runs only when 'snr' is among stop_criteria."
+        ),
     )
     blend_tolerance: float = Field(
         default=2.0,
@@ -706,7 +709,10 @@ class PreWhitenSettings(_DeviceSettings):
     )
     correlation_correction: bool = Field(
         default=True,
-        description="Inflate errors by sqrt(D) for correlated residuals.",
+        description=(
+            "Inflate errors by sqrt(D) for correlated residuals "
+            "(not applied to the bootstrap estimator)."
+        ),
     )
     n_resamples: int = Field(
         default=200,
@@ -776,7 +782,10 @@ class SpacingSettings(BaseSettings):
     max_gap: int = Field(
         default=3,
         ge=1,
-        description="Largest number of missing modes bridged inside a series.",
+        description=(
+            "Largest number of radial orders one observed step may span "
+            "(1 = consecutive; N bridges up to N-1 missing modes)."
+        ),
     )
     tolerance: float = Field(
         default=0.25,

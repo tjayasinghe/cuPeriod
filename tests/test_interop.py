@@ -216,6 +216,14 @@ def test_band_is_not_auto_detected() -> None:
     assert resolve_nested_columns(frame, "lc", band="band").band == "lc.band"
 
 
+def test_multiband_with_single_band_method_raises() -> None:
+    """TLS has no multi-band model: raise up front, never a frame of NaNs."""
+    frame, grid = make_multiband_frame(), make_grid()
+    for run in (nested_periodogram, partition_periodogram):
+        with pytest.raises(ValueError, match="does not support multi-band"):
+            run(frame, "lc", band="lc.band", method="TLS", grid=grid)
+
+
 def test_unknown_band_column_raises() -> None:
     with pytest.raises(ColumnResolutionError, match="band column"):
         nested_periodogram(make_frame(), "lc", band="filterid", grid=make_grid())

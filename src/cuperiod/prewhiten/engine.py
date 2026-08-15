@@ -5,7 +5,8 @@ the raw light curve it repeats
 
 1. compute the amplitude spectrum of the current residuals,
 2. take the tallest peak that is resolved from everything already extracted,
-3. re-fit **all** components simultaneously (frequencies, amplitudes, phases, offset),
+3. re-solve every amplitude, phase and the offset jointly and refine the new frequency
+   non-linearly (``refine``, ``"last"`` by default; the final polish sweeps them all),
 4. decide whether the new component survives the stopping criteria,
 
 until a component fails, no resolved peak remains, or the frequency cap is reached. The
@@ -39,7 +40,7 @@ from cuperiod.prewhiten.fap import baluev_fap
 from cuperiod.prewhiten.fit import MultiSineFit, fit_multisine
 from cuperiod.prewhiten.result import PreWhitenResult, Sinusoid, amplitude_ratio
 from cuperiod.prewhiten.spectrum import AmplitudeSpectrum, SpectrumEngine
-from cuperiod.prewhiten.uncertainty import component_uncertainties, correlation_factor
+from cuperiod.prewhiten.uncertainty import component_uncertainties
 
 #: Upper bound on the prune/re-fit passes of the final solution (each strictly shrinks
 #: the component count, so this is a safety net rather than a real limit).
@@ -520,9 +521,9 @@ def prewhiten(
         chi2=fit.chi2,
         reduced_chi2=fit.reduced_chi2,
         bic=fit.bic,
-        correlation_factor=(
-            correlation_factor(fit.residuals) if cfg.correlation_correction else 1.0
-        ),
+        # The D the estimator actually applied: it returns 1.0 whenever nothing was
+        # inflated, including for the bootstrap, which is never corrected.
+        correlation_factor=errors.correlation_factor,
         uncertainty_method=cfg.uncertainty,
         backend=engine.backend,
         spectrum=initial_spectrum if keep else None,

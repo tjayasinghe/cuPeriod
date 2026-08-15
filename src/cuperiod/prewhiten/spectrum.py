@@ -480,7 +480,8 @@ class SpectrumEngine:
     Parameters
     ----------
     time : numpy.ndarray
-        Observation times in days (finite, at least two distinct values).
+        Observation times in days (finite, at least three points spanning a non-zero
+        baseline).
     error : numpy.ndarray, optional
         1-sigma uncertainties. ``None`` gives uniform weights.
     grid : GridSpec
