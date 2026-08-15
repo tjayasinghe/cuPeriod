@@ -92,7 +92,7 @@ Two orthogonal settings tune it (both environment-overridable, e.g. `CUPERIOD_GL
 - **`device`** — `"auto"` (default; the best present), `"cpu"`, `"cuda"`, `"mps"`, `"xpu"`.
   A `"torch:<device>"` backend string overrides it.
 - **`precision`** — `"auto"` (default) is float64 everywhere it is supported and float32
-  only where the device forces it (Apple MPS; some Intel GPUs). `"float64"` and `"float32"`
+  only where the device forces it (Apple MPS). `"float64"` and `"float32"`
   force it; `precision="float64"` on MPS raises rather than silently downgrading. Results
   are always returned as float64 numpy arrays regardless of the device precision.
 
@@ -178,7 +178,7 @@ vs. the `[fast]`-extra CPU backends, on a 32-thread machine):
 
 How to read this:
 
-- **The CPU backend for every method is now the multicore `numba` kernel** (with the
+- **The CPU backend for every method but GLS is now the multicore `numba` kernel** (with the
   `[fast]` extra installed — one to two orders of magnitude faster than the vectorized
   numpy fallback, see {doc}`../installation`). On this 32-thread machine, that CPU tier is
   now fast enough that a single-curve GPU run is only a modest win for GLS/String-Length
@@ -198,7 +198,7 @@ How to read this:
 - Without the `[fast]` extra, PDM/CE/String-Length/MHAOV/TLS/SuperSmoother fall back to the
   **vectorized numpy paths** on the CPU — one to two orders of magnitude slower than the
   numba column above (e.g. PDM ~300×, CE ~135×, MHAOV ~57× on a 3k-point curve, and
-  SuperSmoother ~130× on the 600-point curve above).
+  SuperSmoother ~130× on a separate 600-point curve over a 20 000-frequency grid).
 - On **consumer NVIDIA cards** (GeForce), whose float64 throughput is 1/64 of float32,
   the opt-in `precision="float32"` runs the BLS/TLS CUDA kernels ~8-9× faster at
   detection-grade accuracy; float64 stays the default.

@@ -27,10 +27,11 @@ Add `[gpu]` or `[torch]` alongside `[gui]` to explore on an accelerator —
 actionable message instead of a traceback.
 
 :::{tip}
-The window opens with **bundled demo light curves** — a *Kepler* transit, six ASAS-SN
-variables (each labelled with its VSX type and literature period), and a synthetic
-multi-band curve — so there's something to explore on first launch, no data of your own
-required.
+The toolbar's **Load demo** menu always offers a **synthetic multi-band demo curve**, so
+there's something to explore on first launch, no data of your own required. In a source
+checkout (or with `CUPERIOD_EXAMPLE_DATA` pointed at `examples/data`) the same menu also
+lists a *Kepler* transit and six ASAS-SN variables, each labelled with its VSX type and
+literature period.
 :::
 
 ## A two-minute tour
@@ -64,9 +65,9 @@ required.
 | Area | What it does |
 | --- | --- |
 | **Analysis** (top left) | Switch between **Periodogram** — one method over a trial grid — and **Pre-whitening**, the automated frequency extraction of {doc}`prewhitening`. The rest of the window is shared: same inputs, same spectrum/phased views, same source browser; only the result docks change. |
-| **Controls** (left) | Choose the method and edit its settings. The form is built automatically from each method's settings model ({doc}`tuning`), so every knob — grid bounds, `n_harmonics`, transit-duration fractions, backend/device/precision — is exposed with the right type and defaults. Press **Compute** to run. |
+| **Controls** (left) | Choose the method and edit its settings. The form is built automatically from each method's settings model ({doc}`tuning`), so every knob — grid bounds, `n_harmonics`, transit-duration fractions, backend/device/precision — is exposed with the right type and defaults. For multi-band input a **Band** selector chooses what is analysed (all bands jointly, or one). Press **Compute** to run. |
 | **Spectrum** (centre) | The full-resolution periodogram, rendered at interactive speed. Drag the marker to select a trial period; toggle the **x-axis** between frequency and period and switch either axis to **log**. **peaks** hides the peak markers and the shaded selection band together, for an unobstructed view of the spectrum. Double-click anywhere to restore the default view. |
-| **Phased** | The light curve folded on the selected period, updating live as you move the marker. **2 cycles** repeats the fold; for multi-band data a **Band** selector overlays all bands or isolates one. |
+| **Phased** | The light curve folded on the selected period, updating live as you move the marker. **2 cycles** repeats the fold; for multi-band data every band is overlaid, colour-coded with a legend. |
 | **Raw light curve** | The unfolded time series for the loaded source. |
 | **Peaks** (dock) | The ranked N-best periods ({doc}`results`). Click a row to jump the marker (and the fold) to that peak. |
 | **Frequencies** (dock) | In pre-whitening mode, the extracted components with their 1-sigma uncertainties, S/N, false-alarm probability, blend ratio (**A/Asp**) and any combination-frequency identification, plus the stopping reason and fit statistics. Click a row to fold on that component; right-click to copy or export CSV. |
@@ -79,19 +80,19 @@ responsive even while a long grid is evaluating and rapid re-runs don't queue up
 
 ## Loading your own data
 
-**File → Open** reads a single light curve through the same auto-detecting loader as the CLI
-(`*.csv`, `*.ecsv`, `*.fits`/`*.fit`/`*.fz`, `*.parquet`/`*.pq`, `*.tsv`/`*.tab`, `*.dat`,
-`*.txt`). For tabular files a **preview dialog** shows the first rows and the column mapping
-cuPeriod auto-detected (time / value / error / band) before you commit — the same
-{class}`~cuperiod.ColumnMap` resolution described under {doc}`light-curves`. If a band/filter
-column is present the file loads as a {class}`~cuperiod.MultiBandLightCurve`; otherwise as a
-single {class}`~cuperiod.LightCurve`.
+The toolbar's **Open…** button reads a single light curve through the same auto-detecting
+loader as the CLI (`*.csv`, `*.ecsv`, `*.fits`/`*.fit`/`*.fz`, `*.parquet`/`*.pq`,
+`*.tsv`/`*.tab`, `*.dat`, `*.txt`). For tabular files a **preview dialog** shows the first
+rows and the column mapping cuPeriod auto-detected (time / value / error / band) before you
+commit — the same {class}`~cuperiod.ColumnMap` resolution described under
+{doc}`light-curves`. If a band/filter column is present the file loads as a
+{class}`~cuperiod.MultiBandLightCurve`; otherwise as a single {class}`~cuperiod.LightCurve`.
 
-**Batch mode** points the **Sources** browser at a whole set of light curves — a folder, a
-glob, or a list of files — reusing the same input resolution as
-{func}`~cuperiod.batch_periodograms` ({doc}`batch`). Sources are read lazily (a big folder
-isn't loaded up front) and each computed source is cached, so scrolling back and forth is
-instant.
+**Batch mode** — the toolbar's **Open folder…** button, or dropping several light-curve files
+on the window — points the **Sources** browser at a whole set of light curves, reusing the same
+input resolution as {func}`~cuperiod.batch_periodograms` ({doc}`batch`). Sources are read lazily (a
+big folder isn't loaded up front) and each computed source is cached, so scrolling back and
+forth is instant.
 
 ## Backends & devices
 

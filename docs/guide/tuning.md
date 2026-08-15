@@ -48,7 +48,9 @@ common set of knobs that shape the **trial grid** and **peak selection**:
   - Highest trial frequency. `None` → a pseudo-Nyquist limit.
 * - `nyquist_factor`
   - `5`
-  - Multiple of the median-sampling Nyquist used when `maximum_frequency` is `None`.
+  - Multiple of the pseudo-Nyquist used when `maximum_frequency` is `None` — the *average*
+    rate `0.5·N/T` for GLS, the *median*-sampling rate `0.5/median(Δt)` for every other
+    method in this table (MHAOV included).
 * - `samples_per_peak`
   - `5`
   - Frequency oversampling — higher = finer grid, more compute.
@@ -100,10 +102,11 @@ common set of knobs that shape the **trial grid** and **peak selection**:
   - `primary_spans` (the candidate span fractions, default `(0.05, 0.2, 0.5)` — strictly
     increasing, each in `(0, 1]`), `middle_span` and `final_span` (the CV-residual and
     final smoothing passes), `bass_enhancement` (Friedman's alpha, `0`–`10`, pulls the
-    chosen spans toward the largest; `None` disables it), `batch_periods`. `maximum_frequency`
+    chosen spans toward the largest; `None` disables it), `batch_periods`. `minimum_frequency`
     earns extra attention here: an integer *multiple* of the true period folds to a
-    coherent curve too, so bounding the search from above is the cleanest way to keep
-    `2P`, `3P`, … from crowding the peak list.
+    coherent curve too, so bounding the trial periods from above (the longest period
+    searched is `1/minimum_frequency`) is the cleanest way to keep `2P`, `3P`, … from
+    crowding the peak list.
 ```
 
 The {doc}`API reference <../api/index>` lists every field of every model with its type,

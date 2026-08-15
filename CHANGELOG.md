@@ -6,10 +6,12 @@ All notable changes to cuPeriod are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-08-14
+
 ### Added
 
 - **SuperSmoother — a fully non-parametric period search** (`"SuperSmoother"`,
-  {class}`cuperiod.SuperSmootherSettings`): Friedman's (1984) variable-span smoother
+  `cuperiod.SuperSmootherSettings`): Friedman's (1984) variable-span smoother
   applied to every phase-fold — three local-linear smooths over span fractions
   `(0.05, 0.2, 0.5)`, leave-one-out cross-validation picking the best span at each phase
   point, and a final pass over the blended curve. The statistic follows gatspy,
@@ -23,8 +25,9 @@ All notable changes to cuPeriod are documented here. The format is based on
   VanderPlas & Ivezić (2015). The price is cost and a soft spectrum, plus one caveat worth
   stating plainly: a fold at an integer *multiple* of the true period is still a coherent
   repeating curve, so `2P`, `3P`, … score nearly as high as `P` — read the shortest period
-  of a high-scoring family as the candidate, bound the search from above, or let
-  {func}`cuperiod.alias_diagnostics` arbitrate the family.
+  of a high-scoring family as the candidate, bound the trial periods from above by raising
+  `minimum_frequency` (the longest period searched is `1/minimum_frequency`), or let
+  `cuperiod.alias_diagnostics` arbitrate the family.
 - **SuperSmoother on every backend.** One vectorized array-API kernel serves `numpy` on the
   CPU, `cupy` on NVIDIA and `torch` on any device, alongside a numba-parallel CPU tier that
   becomes the default with the `[fast]` extra: 20 000 trial frequencies on a 600-point
@@ -75,7 +78,7 @@ All notable changes to cuPeriod are documented here. The format is based on
   `mb_reg_band=1e-6` on the band columns), reproduced from per-band harmonic trig sums
   and batched normal-equation solves. Parity with astropy is ~2e-10 across term counts
   and under both ridge conventions (`tests/test_multiband_gls.py`).
-- **Multi-band false-alarm probabilities** ({func}`cuperiod.multiband_fap`), which
+- **Multi-band false-alarm probabilities** (`cuperiod.multiband_fap`), which
   astropy's `LombScargleMultiband` does not offer at all — its FAP methods raise
   `NotImplementedError`, because the single-band analytic formulas assume one sinusoid fit
   to one band. cuPeriod calibrates the joint periodogram by within-band bootstrap: each
@@ -101,7 +104,7 @@ All notable changes to cuPeriod are documented here. The format is based on
   `cuperiod run FILE --band COL` now performs a true joint fit — it silently dropped to
   single-band before — and `batch_periodograms` honors `band_column` for file, glob, and
   directory inputs, so a directory of survey tables runs multi-band end to end.
-- **Alias diagnostics for any periodogram** ({func}`cuperiod.alias_diagnostics`). A peak
+- **Alias diagnostics for any periodogram** (`cuperiod.alias_diagnostics`). A peak
   quoted without an alias check is a period a referee will ask about, so this measures the
   spectral window of *this* light curve's sampling, predicts the alias family it implies
   (`f0 ± m·f_w` off the window's own peaks, plus harmonics and subharmonics; the classic
@@ -115,9 +118,9 @@ All notable changes to cuPeriod are documented here. The format is based on
 - **LINCC Frameworks interoperability** (`cuperiod.interop`, new `[nested]` and `[lsdb]`
   extras): run a period search directly on nested-pandas / lsdb light curves — one row per
   object, the epochs in a nested column — with no flattening, no `groupby`, and no
-  per-object DataFrames. {func}`cuperiod.interop.nested_periodogram` is the row-wise tier
+  per-object DataFrames. `cuperiod.interop.nested_periodogram` is the row-wise tier
   (`map_rows`, composable, right for a CPU backend or a quick look);
-  {func}`cuperiod.interop.partition_periodogram` is the throughput tier, reading a
+  `cuperiod.interop.partition_periodogram` is the throughput tier, reading a
   partition's flat Arrow buffers and list offsets once and evaluating every object in it
   against **one** GPU engine, so plan/kernel setup is amortized over thousands of stars
   instead of paid per star. Both accept an in-memory `NestedFrame` or a lazy lsdb
@@ -166,7 +169,7 @@ All notable changes to cuPeriod are documented here. The format is based on
   ground-based window function, not noise. BLS is reported for completeness (22%) and stays
   the wrong tool for a pulsator.
 - **Automated, uncertainty-aware pre-whitening for classical pulsators**
-  ({func}`cuperiod.prewhiten`). Frequency analysis of δ Scuti, γ Doradus and SPB stars
+  (`cuperiod.prewhiten`). Frequency analysis of δ Scuti, γ Doradus and SPB stars
   has funnelled through interactive Period04-style sessions one star at a time; this
   runs the whole loop — amplitude spectrum, peak selection, simultaneous non-linear
   re-fit of every component, significance test — end to end, and makes every judgement
@@ -183,7 +186,8 @@ All notable changes to cuPeriod are documented here. The format is based on
   the Breger et al. (1993) signal-to-noise ratio, the Baluev false-alarm probability,
   a ΔBIC improvement threshold, and an absolute amplitude floor. After the final
   simultaneous polish the solution is re-checked and components that no longer pass are
-  pruned, so every reported frequency satisfies the criterion it was admitted by.
+  pruned — the re-check is the S/N test, so it runs when `"snr"` is among the criteria,
+  and every reported frequency then satisfies it.
 - **Error propagation** with three estimators (`uncertainty=`): the linearised
   least-squares covariance of the joint fit (the default, and the only one that accounts
   for correlations between close frequencies), the classical Montgomery & O'Donoghue
@@ -193,24 +197,24 @@ All notable changes to cuPeriod are documented here. The format is based on
   against Monte Carlo: reported 1-sigma errors match the realised scatter to within
   ~5% in frequency, amplitude, and phase.
 - **Combination-frequency identification**
-  ({func}`cuperiod.identify_combinations`) with uncertainty-aware tolerances — a match
+  (`cuperiod.identify_combinations`) with uncertainty-aware tolerances — a match
   must fall within `max(3σ, 0.25/T)` of the *propagated* prediction — and a
   chance-coincidence rate reported per identification, so a spurious match is visible as
   such. `PreWhitenResult.independent()` returns the candidate independent-mode list.
 - **g-mode period-spacing tools**: a comb scan over trial spacings
-  ({func}`cuperiod.spacing_spectrum`, unaffected by missing radial orders, and immune to
+  (`cuperiod.spacing_spectrum`, unaffected by missing radial orders, and immune to
   the sub-multiple ambiguity that makes a naive scan report ΔΠ/2), extraction of the
   longest *tilted* series `ΔP(P) = a + bP` bridging missing orders
-  ({func}`cuperiod.find_period_spacing`), échelle coordinates
-  ({func}`cuperiod.echelle`), and the buoyancy radius Π₀
-  ({func}`cuperiod.buoyancy_radius`).
-- **Batch pre-whitening** ({func}`cuperiod.batch_prewhiten`) over the existing CPU/GPU
+  (`cuperiod.find_period_spacing`), échelle coordinates
+  (`cuperiod.echelle`), and the buoyancy radius Π₀
+  (`cuperiod.buoyancy_radius`).
+- **Batch pre-whitening** (`cuperiod.batch_prewhiten`) over the existing CPU/GPU
   worker pools, writing one row per extracted component to Parquet/CSV with resumable
   directory sinks.
 - **CLI**: `cuperiod prewhiten` (with `--spacing`, JSON/CSV/npz output) and
   `cuperiod batch-prewhiten`.
 - **The spectral window as a first-class diagnostic**: `SpectrumEngine.window()`,
-  {func}`cuperiod.spectral_window`, and `PreWhitenResult.window` expose `|W(f)|` of the
+  `cuperiod.spectral_window`, and `PreWhitenResult.window` expose `|W(f)|` of the
   sampling — the alias-lobe pattern every real peak is convolved with — at zero extra
   transforms (its sums are already part of the cached normal equations). The GUI
   spectrum view gains a *window* overlay toggle (scaled to the tallest peak,
@@ -231,7 +235,7 @@ All notable changes to cuPeriod are documented here. The format is based on
   and nothing is dropped because of it. `PreWhitenResult.n_blended` counts them,
   `summary()` gains an `A/Asp` column, the batch catalogue gains both floats, and the
   GUI's Frequencies dock marks the affected rows.
-- **A native Baluev (2008) false-alarm probability** ({func}`cuperiod.baluev_fap`)
+- **A native Baluev (2008) false-alarm probability** (`cuperiod.baluev_fap`)
   matching astropy's `false_alarm_probability(method="baluev")` to machine precision on
   centred times — and staying accurate on raw Julian dates, where the one-pass time
   variance loses ~11 digits. Pre-whitening no longer imports `astropy.timeseries`,
@@ -277,14 +281,20 @@ All notable changes to cuPeriod are documented here. The format is based on
 
 - `cuperiod.gui.models.ResultCache` is now generic over its value type, so the app keeps
   one cache per analysis and switching back and forth is instant.
+- `batch_prewhiten` forces `store_spectra=False`: catalogue rows never carry spectra,
+  so keeping them only made each worker hold megabytes of grid arrays per star.
+
+### Fixed
+
 - **The automatic pre-whitening band could sit entirely below a δ Scuti star.** The
   default topped out at the median-gap pseudo-Nyquist (with `nyquist_factor=1`), which
   for nightly ground-based sampling is ~0.5–2.5 cycles/day — so on the bundled ASAS-SN
-  HADS demo (P = 0.0898 d, f = 11.14 c/d) the extraction fitted the *daily aliases* of
-  the real signal (P = 0.123 d, residual rms 0.245). The auto band is now
+  HADS demo (P = 0.0898 d, f = 11.14 c/d) the extraction fitted a spurious low-frequency
+  solution instead (P = 9.00 d, residual rms 0.245), while the GUI — whose own ceiling
+  was 10 c/d — fitted the signal's daily alias (P = 0.123 d). The auto band is now
   `max(pseudo-Nyquist × nyquist_factor, 50 c/d)` with `nyquist_factor=5` (matching the
   periodogram methods), exposed as
-  {func}`cuperiod.prewhiten.default_maximum_frequency`, and the GUI's auto value uses
+  `cuperiod.prewhiten.default_maximum_frequency`, and the GUI's auto value uses
   the same helper. The demo star now yields P = 0.089757 d — the VSX period to the
   last digit — with its 2f, 3f, 4f harmonics extracted and combination-labelled
   (residual rms 0.073). The GUI applies the same floor to the **GLS and MHAOV**
@@ -292,6 +302,11 @@ All notable changes to cuPeriod are documented here. The format is based on
   and GLS now also recovers the demo star's period; the fold-based methods (PDM, CE,
   string-length), which pay a full fold per trial frequency, keep their 10 c/d auto
   ceiling.
+- **`MultiBandLightCurve.from_dataframe` ignored `band_column` when `columns=` was also
+  given.** An explicit `ColumnMap` replaced the map built from `band_column` outright, so
+  `from_dataframe(df, band_column="filter", columns=ColumnMap(time=..., value=...))`
+  raised `ColumnResolutionError` telling the caller to pass `band_column` — which they
+  had. The two are now merged, matching `from_file`.
 - **GUI: hiding the peaks left their hover label behind.** The label is anchored to a
   marker, but nothing dismissed it when the markers went away — so unchecking *peaks*
   right after hovering one to read it (the natural order) stranded the numbers over an
@@ -316,8 +331,6 @@ All notable changes to cuPeriod are documented here. The format is based on
   all established frequencies) to the bootstrap's replicate fits, so their scatter
   collapsed. Replicates now always sweep every frequency, boxed by the same
   per-frequency bounds as the fit they characterise.
-- `batch_prewhiten` forces `store_spectra=False`: catalogue rows never carry spectra,
-  so keeping them only made each worker hold megabytes of grid arrays per star.
 
 ## [1.1.0] - 2026-07-08
 
@@ -504,5 +517,6 @@ First public release.
   parity, on 72 real ASAS-SN light curves across six variability classes and on confirmed
   Kepler transits.
 
+[1.2.0]: https://github.com/tjayasinghe/cuPeriod/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/tjayasinghe/cuPeriod/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/tjayasinghe/cuPeriod/releases/tag/v1.0.0

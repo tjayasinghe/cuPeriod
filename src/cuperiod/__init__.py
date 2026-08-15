@@ -79,7 +79,7 @@ from cuperiod.prewhiten import (
 try:
     __version__ = _version("cuperiod")
 except PackageNotFoundError:  # pragma: no cover - source tree, no metadata
-    __version__ = "1.2.0.dev0"
+    __version__ = "1.2.0"
 
 __all__ = [
     "AliasCandidate",

@@ -13,10 +13,10 @@ broaden coverage of harder classes. TLS is validated on 12 confirmed Kepler KOIs
 curves and their literature periods ship with the suite, so §1–2 and §4 are fully
 reproducible offline.
 
-§1–5 below cover the seven methods that go through the single-band validation suite.
-SuperSmoother, new in this release, is pinned in the unit tests against the reference
+§1, §2, §4 and §5 below cover the seven methods that go through the single-band validation
+suite. SuperSmoother, new in this release, is pinned in the unit tests against the reference
 `supersmoother` package and `gatspy` ({doc}`guide/methods`), joins the performance sweep
-in §2, and is validated on real data alongside every other multi-band method in §7.
+in §3, and is validated on real data alongside every other multi-band method in §7.
 
 ## 1. Numerical validation
 
@@ -79,7 +79,7 @@ agree to round-off) and cuPeriod↔**reference** (must match an established impl
 ```
 
 *parity* is the worst-case relative difference between the CPU and GPU statistic over all
-stars (GLS/MHAOV GPU paths are single precision, hence ~1e-6/1e-7; the rest — String-Length
+stars (GLS/MHAOV GPU paths are single precision, hence ~1e-6 and ~1e-5; the rest — String-Length
 now included, via a stable phase sort on every backend — are double). † String-Length's
 *reference* agreement shows one isolated outlier: a heavily phase-tied star where the
 textbook reference breaks ties with an unstable sort. Its correlation stays ≈ 1 (median
@@ -302,7 +302,7 @@ seasonal gaps are realistic) and scores recovery with the same harmonic-aware 2%
   - 98–100%
 * - Sinusoid
   - CE / String-Length
-  - 42–98%
+  - 98–100%
   - 100%
 * - Eclipse
   - BLS

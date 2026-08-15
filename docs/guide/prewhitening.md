@@ -21,10 +21,10 @@ Pre-whitening: 3 components from 2500 points over 26.96 d  (backend=cufinufft)
   stopped: S/N 2.88 < 4
   residual rms 0.00148   reduced chi2 0.984   D=1.00   errors: covariance
 
-  ID     frequency (1/d)         +/-     amplitude         +/-    phase     S/N  note
-  F1          12.3400341    7.16e-05     0.0119791    4.19e-05   6.1123  235.77
-  F2          17.8099479    0.000122    0.00697566    4.25e-05   0.4786  143.80
-  F3          24.6799702    0.000214    0.00399532    4.21e-05   5.9160   75.66  F3 = 2F1
+  ID     frequency (1/d)         +/-     amplitude         +/-    phase     S/N   A/Asp  note
+  F1          12.3400341    7.16e-05     0.0119791    4.19e-05   6.1123  235.77    0.99
+  F2          17.8099479    0.000122    0.00697566    4.25e-05   0.4786  143.80    1.00
+  F3          24.6799702    0.000214    0.00399532    4.21e-05   5.9160   75.66    1.11  F3 = 2F1
 ```
 
 Everything the run decided is in the object: the components with their uncertainties, the
@@ -39,8 +39,9 @@ residuals and their spectrum, the fit statistics, and — crucially — **why it
 2. **Pick the tallest peak** that is resolved from everything already extracted — at
    least `min_separation_rayleigh` (1.5 by default, after Loumos & Deeming 1978) Rayleigh
    widths away — and locate its apex by parabolic interpolation.
-3. **Re-fit every component simultaneously**: all frequencies, amplitudes, phases and the
-   offset, by non-linear least squares.
+3. **Re-solve the whole model**: every amplitude, phase and the offset jointly, plus a
+   non-linear refinement of the *new* frequency (`refine`, `"last"` by default — the
+   established frequencies are swept again in the final polish).
 4. **Test the new component** against the stopping criteria. If it fails, the run stops
    and the component is discarded.
 
@@ -82,8 +83,9 @@ stopping criterion. It is also available directly as {func}`~cuperiod.baluev_fap
 After the loop, the accepted solution is polished with one simultaneous fit of all
 frequencies and then **re-checked**: the joint fit redistributes power between close
 components, so a frequency that cleared the threshold when it was extracted can end up
-insignificant. Those are dropped and the solution re-fitted (`prune`, on by default), and
-the count appears in `n_pruned` and in `stop_reason`.
+insignificant. Those are dropped and the solution re-fitted (`prune`, on by default; the
+re-check is the S/N test, so it runs only when `"snr"` is among `stop_criteria`), and the
+count appears in `n_pruned` and in `stop_reason`.
 
 ## Uncertainties
 
@@ -103,10 +105,11 @@ Reported errors are 1-sigma and come from one of three estimators, set by `uncer
   assumption, at the price of that many extra fits. Every replicate re-optimises *all*
   frequencies, boxed by the same per-frequency bounds as the fit it characterises.
 
-All three are inflated by `sqrt(D)` with `D` the Schwarzenberg-Czerny (1991) correlation
-factor (`correlation_correction`, on by default), because real photometry has residuals
-that are correlated point to point and the formal errors are correspondingly optimistic.
-`D = 1` means the residuals look white.
+The covariance and analytic errors are inflated by `sqrt(D)` with `D` the
+Schwarzenberg-Czerny (1991) correlation factor (`correlation_correction`, on by default),
+because real photometry has residuals that are correlated point to point and the formal
+errors are correspondingly optimistic. The bootstrap is left alone — it already resamples
+the residuals as they are. `D = 1` means the residuals look white.
 
 Phases are referenced to `solution.t_ref`, the **weighted mean of the observation times**.
 That epoch is not arbitrary: it is the one at which a phase is uncorrelated with its own
@@ -212,9 +215,9 @@ print(series.summary())
 {func}`~cuperiod.spacing_spectrum` scans trial spacings with a comb response — unlike a
 histogram of consecutive differences it is unaffected by missing radial orders — and
 {func}`~cuperiod.find_period_spacing` then extracts the longest chain of modes following
-a *tilted* pattern `ΔP(P) = a + bP`, bridging up to `max_gap` missing orders. Use
-{func}`~cuperiod.echelle` for the diagnostic plot in which a clean series is a
-near-vertical ridge:
+a *tilted* pattern `ΔP(P) = a + bP`, bridging steps of up to `max_gap` radial orders (so
+up to `max_gap - 1` missing modes). Use {func}`~cuperiod.echelle` for the diagnostic plot
+in which a clean series is a near-vertical ridge:
 
 ```python
 x, y = cup.echelle(series.periods, series.mean_spacing)
@@ -232,14 +235,14 @@ extracted component** — the shape a frequency catalogue wants.
 ```python
 cup.batch_prewhiten(
     "lightcurves/*.csv",
-    settings=cup.PreWhitenSettings(store_spectra=False, max_frequencies=20),
+    settings=cup.PreWhitenSettings(max_frequencies=20),
     device="cpu",
     sink="modes.parquet",
 )
 ```
 
-Set `store_spectra=False` in batch runs (the default for this entry point): the full
-amplitude spectra are large and rarely wanted a million times over.
+**`batch_prewhiten` forces `store_spectra=False`**: the full amplitude spectra are large
+and rarely wanted a million times over.
 
 ## From the command line
 

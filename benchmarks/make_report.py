@@ -593,8 +593,9 @@ def main():
         L.append(md_table(tbl, list(tbl.columns)))
         L.append("\n**Table 1.** Numerical validation per method (metrics defined in §1.3). "
                  "The GLS and MHAOV GPU kernels are single precision, bounding their parity "
-                 "at ≈1e-6/1e-7; all other GPU paths — String-Length included, via a stable "
-                 "phase sort on every backend — are double precision. String-Length's "
+                 "at ≈1e-6 (GLS) / ≈1e-5 (MHAOV); all other GPU paths — String-Length "
+                 "included, via a stable phase sort on every backend — are double "
+                 "precision. String-Length's "
                  "worst-case reference difference is an isolated outlier on 1–2 heavily "
                  "phase-tied stars, where the textbook reference breaks ties with an "
                  "unstable sort (correlation ≈1, median \\|Δ\\| ≈ 6e-12, recovered period "
@@ -1172,6 +1173,11 @@ def main():
         if batch is not None and len(batch):
             pk = batch.gpu_lc_per_s.max()
             peak_txt = f"{pk:,.0f} curves/s (>{pk*3600/1e6:.0f} million curves/hour)"
+        numba_txt = "much slower"
+        nb = single[single.method == "BLS"]
+        if len(nb) and "cpu_port_s" in nb and np.isfinite(nb.cpu_port_s.iloc[0]):
+            numba_txt = (f"~{nb.cpu_port_s.iloc[0]:.0f} s vs "
+                         f"{nb.cpu_s.iloc[0]:.2f} s with numba")
         L.append("Guidance by use case, from the measurements above:\n")
         L.append("1. **Interactive, single-curve analysis (default).** Use "
                  "`backend=\"cpu\"` with the `[fast]` extra installed. On a modern "
@@ -1195,13 +1201,13 @@ def main():
                  "native CUDA backend is usually at least as fast (Table 6), so treat "
                  "torch as the portability path, not the speed path.\n"
                  "5. **Strict double-precision requirements.** The GLS and MHAOV CUDA "
-                 "kernels are single precision (parity ≈1e-6/1e-7; Table 1). The selected "
+                 "kernels are single precision (parity ≈1e-6 / ≈1e-5; Table 1). The selected "
                  f"best period was unaffected on all {len(meta)} validation stars, but if statistic "
                  "values matter beyond ~6 significant digits (e.g. FAP tail comparisons), "
                  "use the CPU backend, which is double precision throughout.\n"
                  "6. **Minimal installations (no numba).** `backend=\"cpu\"` falls back to "
                  "numpy — numerically identical but much slower for the box methods (the "
-                 "pure-numpy BLS parity reference takes ~18 s vs 0.19 s with numba). "
+                 f"pure-numpy BLS parity reference takes {numba_txt}). "
                  "Install the `[fast]` extra, or use `backend=\"astropy\"` for BLS.\n")
 
     L.append("## 9 — Limitations\n")

@@ -1,6 +1,6 @@
 # cuPeriod — Validation & Benchmark Report
 
-**Summary.** cuPeriod 1.2.0.dev0's 7 single-band-benchmarked period-search methods were validated on 126 real ASAS-SN light curves with literature periods, plus 12 confirmed Kepler KOIs for the transit methods. CPU and GPU backends agree to round-off (worst-case relative difference 1e-05, dominated by the two single-precision GPU paths) and select the identical best period on 100% of targets; every method with an established external reference implementation reproduces it on an identical grid. Harmonic-aware period recovery is ≥88% for all of them. Peak measured throughput is 574 light curves/s (GLS) on one GPU. Every multi-band method was additionally validated on 100 real SDSS Stripe 82 RR Lyrae with literature periods (best joint model: 93% strict top-period recovery; §4). Practical guidance on backend selection is given in §8; limitations in §9.
+**Summary.** cuPeriod 1.2.0's 7 single-band-benchmarked period-search methods were validated on 126 real ASAS-SN light curves with literature periods, plus 12 confirmed Kepler KOIs for the transit methods. CPU and GPU backends agree to round-off (worst-case relative difference 1e-05, dominated by the two single-precision GPU paths) and select the identical best period on 100% of targets; every method with an established external reference implementation reproduces it on an identical grid. Harmonic-aware period recovery is ≥88% for all of them. Peak measured throughput is 574 light curves/s (GLS) on one GPU. Every multi-band method was additionally validated on 100 real SDSS Stripe 82 RR Lyrae with literature periods (best joint model: 93% strict top-period recovery; §4). Practical guidance on backend selection is given in §8; limitations in §9.
 
 ## 1 — Test environment and methodology
 
@@ -11,7 +11,7 @@
 | GPU | NVIDIA GeForce RTX 5070 Ti, 16 GB (compute capability 12.0, sm_120) |
 | CPU | AMD Ryzen 9 9950X3D, 16 cores / 32 threads |
 | Memory | 32 GB |
-| Software | cuPeriod 1.2.0.dev0, Python 3.12, CuPy (CUDA 12), PyTorch cu128 (torch:cuda), numba, finufft |
+| Software | cuPeriod 1.2.0, Python 3.12, CuPy (CUDA 12), PyTorch cu128 (torch:cuda), numba, finufft |
 | torch device (validated) | torch:cuda |
 | Reference tools | astropy (`LombScargle`, `BoxLeastSquares`), PyAstronomy (`pyPDM`), `transitleastsquares`; CE/String-Length/MHAOV vs direct NumPy implementations of the published algorithms |
 | Validation data | 126 ASAS-SN g-band light curves (6 variability classes: Eclipsing 28, Rr Lyrae 22, Cepheid 16, Delta Scuti 16, Long Period 22, Rotational 22) with VSX literature periods, bundled in `dataset/light_curves.parquet` (core sample plus an extension selected/downloaded via `dataset/download_extension.py` from ASAS-SN Sky Patrol — clean single VSX types, n_det≥300, baseline≥1000 d); 12 confirmed Kepler KOIs (Mendeley *Dataset_Machine_Learning_Exoplanets_2024*; flux via MAST/lightkurve); 100 SDSS Stripe 82 RR Lyrae with ugriz photometry and literature periods (Sesar et al. 2010, `dataset/s82_rrlyrae.parquet`) for the multi-band methods |
@@ -41,7 +41,7 @@ Every method runs on an identical grid through cuPeriod's CPU and GPU backends a
 | MHAOV | 126 | 1.1e-05 | 100% | Sch.-Czerny | 1.4e-04 |
 | TLS | 28 | 9.3e-10 | 100% | — | — |
 
-**Table 1.** Numerical validation per method (metrics defined in §1.3). The GLS and MHAOV GPU kernels are single precision, bounding their parity at ≈1e-6/1e-7; all other GPU paths — String-Length included, via a stable phase sort on every backend — are double precision. String-Length's worst-case reference difference is an isolated outlier on 1–2 heavily phase-tied stars, where the textbook reference breaks ties with an unstable sort (correlation ≈1, median \|Δ\| ≈ 6e-12, recovered period unaffected).
+**Table 1.** Numerical validation per method (metrics defined in §1.3). The GLS and MHAOV GPU kernels are single precision, bounding their parity at ≈1e-6 (GLS) / ≈1e-5 (MHAOV); all other GPU paths — String-Length included, via a stable phase sort on every backend — are double precision. String-Length's worst-case reference difference is an isolated outlier on 1–2 heavily phase-tied stars, where the textbook reference breaks ties with an unstable sort (correlation ≈1, median \|Δ\| ≈ 6e-12, recovered period unaffected).
 
 ![parity](figures/fig1_parity_reference.png)
 
@@ -245,8 +245,8 @@ Guidance by use case, from the measurements above:
 2. **GLS-dominated pipelines on NVIDIA hardware.** Use `backend="gpu"`: GLS/String-Len show a consistent single-curve GPU advantage (Table 6 — GLS holds 3.9–4.7× across the grid-size sweep; GLS keeps ~1.4× at batch scale too, because its CPU path is finufft rather than a numba kernel).
 3. **Catalogue-scale processing (10³–10⁶ curves).** Use `batch_periodograms(..., device="gpu")` on NVIDIA hardware — peak measured throughput 574 curves/s (>2 million curves/hour) on one GPU. On this 32-thread CPU the process pool keeps pace for the numba-tier methods, so on wide CPU nodes `device="cpu"` is a legitimate alternative; expect the GPU margin to widen on narrower CPUs and larger batches.
 4. **AMD, Intel or Apple GPUs.** Use `backend="torch"` — the portable path validated to the same parity standard. On NVIDIA hardware the native CUDA backend is usually at least as fast (Table 6), so treat torch as the portability path, not the speed path.
-5. **Strict double-precision requirements.** The GLS and MHAOV CUDA kernels are single precision (parity ≈1e-6/1e-7; Table 1). The selected best period was unaffected on all 126 validation stars, but if statistic values matter beyond ~6 significant digits (e.g. FAP tail comparisons), use the CPU backend, which is double precision throughout.
-6. **Minimal installations (no numba).** `backend="cpu"` falls back to numpy — numerically identical but much slower for the box methods (the pure-numpy BLS parity reference takes ~18 s vs 0.19 s with numba). Install the `[fast]` extra, or use `backend="astropy"` for BLS.
+5. **Strict double-precision requirements.** The GLS and MHAOV CUDA kernels are single precision (parity ≈1e-6 / ≈1e-5; Table 1). The selected best period was unaffected on all 126 validation stars, but if statistic values matter beyond ~6 significant digits (e.g. FAP tail comparisons), use the CPU backend, which is double precision throughout.
+6. **Minimal installations (no numba).** `backend="cpu"` falls back to numpy — numerically identical but much slower for the box methods (the pure-numpy BLS parity reference takes ~18 s vs 0.17 s with numba). Install the `[fast]` extra, or use `backend="astropy"` for BLS.
 
 ## 9 — Limitations
 

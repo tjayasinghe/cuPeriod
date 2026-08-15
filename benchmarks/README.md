@@ -6,10 +6,10 @@ other and against established third-party implementations.
 
 The rendered results are in **[REPORT.md](REPORT.md)** with figures in `figures/`.
 
-The single-band validation and benchmark sections cover seven methods.
-SuperSmoother, added in v1.2, is pinned against the reference `supersmoother`
-package and `gatspy` in the unit tests (`tests/test_supersmoother.py`), and is
-exercised on real data in the multi-band validation below.
+The single-band *validation* sections cover seven methods; the performance sweep
+covers all eight. SuperSmoother, added in v1.2, is pinned against the reference
+`supersmoother` package and `gatspy` in the unit tests (`tests/test_supersmoother.py`),
+and is exercised on real data in the multi-band validation below.
 
 ## What it checks
 
@@ -21,13 +21,13 @@ exercised on real data in the multi-band validation below.
 | | CE, String-Length, MHAOV | independent textbook impl. | match the original paper? |
 | | TLS | `transitleastsquares` | recover known Kepler periods? |
 | Period recovery | all 7 | VSX literature period | find the real period? |
-| Performance | all 7 | astropy / PyAstronomy | how much faster, and how does it scale? |
+| Performance | all 8 | astropy / PyAstronomy | how much faster, and how does it scale? |
 | Multi-band recovery (simulated) | GLS | single-band GLS | does a joint fit beat per-band searching? |
 | Multi-band recovery (real) | all 7 multi-band methods + 3 GLS models | Sesar 2010 literature periods | recover known periods on real ugriz data? |
 
 The performance benchmark also times the **portable `torch` backend** (`backend="torch"`;
-the resolved device is shown in the `torch_backend` column) for the ported methods — GLS
-and BLS — alongside the CPU and CUDA paths, so the cross-vendor path (AMD/Intel/Mac/CPU) is
+the resolved device is shown in the `torch_backend` column) for every method — all eight
+now have one — alongside the CPU and CUDA paths, so the cross-vendor path (AMD/Intel/Mac/CPU) is
 tracked. A backend absent on the host (no CUDA GPU, or no torch) is recorded blank rather
 than failing the sweep.
 
@@ -113,15 +113,15 @@ python multiband_real.py                   # -> results/multiband_real.parquet
 
 | model | strict | harmonic-aware | median CPU s/star |
 |---|---|---|---|
-| GLS `offsets` (1,0) | 76% | 80% | 0.067 |
-| GLS `perband` (0,1) | 78% | 81% | 0.107 |
-| GLS `flex` (1,1) | 78% | 81% | 0.348 |
+| GLS `offsets` (1,0) | 76% | 80% | 0.070 |
+| GLS `perband` (0,1) | 78% | 81% | 0.112 |
+| GLS `flex` (1,1) | 78% | 81% | 0.367 |
 | PDM | **93%** | 94% | 0.011 |
-| CE | 85% | 90% | 0.024 |
-| String-Length | **93%** | **97%** | 0.039 |
-| MHAOV | 83% | 84% | 0.539 |
-| SuperSmoother | 85% | 96% | 0.293 |
-| BLS | 22% | 34% | 3.044 |
+| CE | 85% | 90% | 0.023 |
+| String-Length | **93%** | **97%** | 0.036 |
+| MHAOV | 83% | 84% | 0.538 |
+| SuperSmoother | 85% | 96% | 0.296 |
+| BLS | 22% | 34% | 3.024 |
 
 Single-band GLS on one filter at a time is the baseline the joint methods have to beat: 72–78%
 strict per band (*z* worst, *r* best), and 92% if you count a star as recovered when **any** of

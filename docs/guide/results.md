@@ -72,7 +72,7 @@ The `extra` dict carries quantities a method computes at each peak:
 | Method | `extra` keys |
 | --- | --- |
 | GLS | `fap` (false-alarm probability) |
-| BLS | `depth`, `duration`, `transit_time`, `depth_snr`, `sde` |
+| BLS | `depth`, `duration`, `t0` (mid-transit time), `depth_snr`, `sde` |
 | TLS | transit shape scalars (depth, duration, …) |
 | others | method-specific where applicable |
 

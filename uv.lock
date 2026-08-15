@@ -790,7 +790,7 @@ wheels = [
 
 [[package]]
 name = "cuperiod"
-version = "1.2.0.dev0"
+version = "1.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "array-api-compat" },

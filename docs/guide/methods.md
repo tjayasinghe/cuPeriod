@@ -91,8 +91,8 @@ within-band bootstrap ({func}`~cuperiod.multiband_fap`, or `mb_fap_bootstrap`).
 For eclipsing binaries and box-shaped transits. Searches log-spaced period segments so the
 box-duration grid tracks the period, exactly as a transit's duration scales. **Works in
 flux** (magnitudes are converted automatically), because an eclipse is a dip. Each peak
-carries the box parameters: `depth`, `duration`, `transit_time` (t0), `depth_snr`, and the
-signal-detection efficiency `sde`. Supports {doc}`multi-band <multiband>`.
+carries the box parameters: `depth`, `duration`, `t0` (mid-transit time), `depth_snr`, and
+the signal-detection efficiency `sde`. Supports {doc}`multi-band <multiband>`.
 
 ```python
 pg = cup.periodogram(lc, "BLS")
@@ -185,8 +185,8 @@ several smooths per trial period) and a soft spectrum.
 **Integer multiples score nearly as high.** A fold at `2P`, `3P`, … is still a coherent
 repeating curve — it just draws the shape twice — so the smoother fits it about as well as
 `P` itself. Read the *shortest* period of a high-scoring family as the candidate, bound
-the search from above with `maximum_frequency`, or let
-{func}`~cuperiod.alias_diagnostics` arbitrate.
+the trial periods from above by raising `minimum_frequency` (the longest period searched
+is `1/minimum_frequency`), or let {func}`~cuperiod.alias_diagnostics` arbitrate.
 
 ```python
 pg = cup.periodogram(lc, "SuperSmoother")     # or "super-smoother"

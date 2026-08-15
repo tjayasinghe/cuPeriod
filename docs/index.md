@@ -99,7 +99,7 @@ g-mode period-spacing tools — over the same inputs and backends. See
 pip install cuperiod            # CPU (numpy, scipy, astropy, finufft)
 pip install "cuperiod[gpu]"     # + CUDA 12 GPU backends (cupy, cufinufft)
 pip install "cuperiod[torch]"   # + portable PyTorch backend (AMD/Intel/Apple GPUs + CPU)
-pip install "cuperiod[fast]"    # + numba multicore CPU kernels (all methods, 20-300×)
+pip install "cuperiod[fast]"    # + numba multicore CPU kernels (all but GLS, 20-300×)
 pip install "cuperiod[gui]"     # + interactive desktop GUI (cuperiod-gui)
 ```
 

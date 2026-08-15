@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cuperiod"
-version = "1.2.0.dev0"
+version = "1.2.0"
 description = "Optimized, GPU-accelerated periodograms for astronomy"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -75,9 +75,10 @@ nested = ["nested-pandas>=0.6.10", "pyarrow>=16"]
 # The same adapter against an lsdb HATS catalog (lazy, dask-partitioned). lsdb pins
 # nested-pandas itself; the [nested] extra keeps the floor consistent.
 lsdb = ["cuperiod[nested]", "lsdb>=0.10.0"]
-# Multicore CPU acceleration for the box search: a numba-parallel BLS that beats
-# astropy's compiled BoxLeastSquares by ~20x and is auto-selected on the CPU when
-# present (otherwise BLS falls back to astropy).
+# Multicore CPU acceleration: numba-parallel kernels for BLS, PDM, CE, String-Length,
+# MHAOV, TLS and SuperSmoother, auto-selected as the "cpu"/"auto" backend when present
+# (otherwise those methods fall back to numpy / astropy's BoxLeastSquares). GLS is
+# unaffected — its CPU path is finufft.
 fast = ["numba>=0.59"]
 # Portable accelerator reaching AMD (ROCm), Intel (XPU), Apple (MPS), and a fast CPU
 # path. Install the wheel matching your accelerator from https://pytorch.org/ — the
@@ -164,9 +165,6 @@ src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "NPY"]
-# UP038 (use `X | Y` in isinstance) is deprecated upstream: the tuple form
-# `isinstance(x, (A, B))` is faster at runtime, so we keep it.
-ignore = ["UP038"]
 
 [tool.ruff.lint.per-file-ignores]
 # typer's API requires function calls (Option/Argument) in parameter defaults.

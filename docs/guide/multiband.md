@@ -301,8 +301,9 @@ The smallest resolvable false-alarm probability is `1 / (n_bootstrap + 1)`; aski
 {meth}`~cuperiod.MultibandFAP.level` for anything below it raises rather than
 extrapolating. `meta["fap_level_1pct"]` appears only from `n_bootstrap >= 99`. Because the
 level of a *maximum* depends on the grid that maximum was taken over, calibrate on the
-same grid you searched (the default does) — and with the same `mb_model`, which
-`multiband_fap` takes as its second argument.
+same grid you searched (the default does) — and with the same `mb_model`: pass the same
+{class}`~cuperiod.GLSSettings` as `multiband_fap`'s second argument, e.g.
+`cup.multiband_fap(mb, cup.GLSSettings(mb_model="flex"))`.
 :::
 
 For the `"offsets"` model on a NUFFT backend the bootstrap is nearly free: the times never

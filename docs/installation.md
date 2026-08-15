@@ -93,7 +93,7 @@ cufinufft/cupy fast paths. See {doc}`guide/backends`.
 :::{note}
 **Apple MPS** cannot compute in float64 (a Metal limitation), so the Mac-GPU path uses
 float32. `precision="auto"` (the default) keeps float64 everywhere it is supported and
-drops to float32 only where the device forces it (MPS, and some Intel GPUs); an explicit
+drops to float32 only where the device forces it (MPS); an explicit
 `precision="float64"` on MPS raises rather than silently downgrading.
 :::
 
@@ -109,7 +109,7 @@ probe.)
 
 ## Verifying the install
 
-List the registered methods and the backends available in your environment:
+List the registered methods and every backend each one can run:
 
 ```bash
 cuperiod methods

@@ -2,9 +2,9 @@ cff-version: 1.2.0
 message: "If you use cuPeriod in your research, please cite it as below."
 title: cuPeriod
 abstract: >-
-  Optimized, GPU-accelerated periodograms for astronomy: seven period-search methods
-  (GLS, BLS, PDM, CE, String-Length, MHAOV, TLS) with fast CPU and CUDA backends, scaling
-  from a single light curve to millions. A portable PyTorch backend extends GPU
+  Optimized, GPU-accelerated periodograms for astronomy: eight period-search methods (GLS,
+  BLS, PDM, CE, String-Length, MHAOV, TLS, SuperSmoother) with fast CPU and CUDA backends,
+  scaling from a single light curve to millions. A portable PyTorch backend extends GPU
   acceleration beyond NVIDIA to AMD (ROCm), Intel (XPU), and Apple (MPS) hardware, and a
   multi-threaded numba CPU tier gives every method a fast backend even without a GPU. An
   optional PySide6 desktop GUI provides an interactive periodogram explorer over the same
@@ -17,8 +17,8 @@ authors:
     family-names: Jayasinghe
     # Add your ORCID here to make the citation unambiguous, e.g.:
     # orcid: "https://orcid.org/0000-0000-0000-0000"
-version: 1.1.0
-date-released: "2026-07-08"
+version: 1.2.0
+date-released: "2026-08-14"
 license: GPL-3.0-or-later
 repository-code: "https://github.com/tjayasinghe/cuPeriod"
 url: "https://cuperiod.readthedocs.io"

@@ -44,12 +44,12 @@ Every implementation is validated against the standard reference (astropy
   literature periods — the pooled fold statistics recover up to 93% of periods strictly
   (97% harmonic-aware) on real five-band data.
 - **A fast CPU tier, no GPU required.** The `[fast]` extra's multicore `numba` kernels
-  make `backend="cpu"` 18x faster than astropy's `BoxLeastSquares` and 2106x faster than
+  make `backend="cpu"` 20x faster than astropy's `BoxLeastSquares` and 2177x faster than
   PyAstronomy's PDM on a representative light curve, while recovering the same periods.
 - **GPU acceleration beyond NVIDIA.** The portable PyTorch backend runs every method on
   AMD (ROCm), Intel (XPU), and Apple (MPS) GPUs, in addition to the NVIDIA CUDA fast
   paths — so the accelerated code isn't locked to one vendor.
-- **Built for catalogue scale.** `batch_periodograms` sustains up to 587 light curves/s
+- **Built for catalogue scale.** `batch_periodograms` sustains up to 574 light curves/s
   (>2 million/hour) on a single GPU, with a resumable batch sink for runs spanning
   millions of curves.
 - **Eight methods, one API.** GLS, BLS, PDM, CE, String-Length, MHAOV, TLS, and
@@ -99,7 +99,7 @@ All eight methods have CPU and GPU backends, plus the full single/batch/CLI mach
 pip install cuperiod            # CPU (numpy, scipy, astropy, finufft)
 pip install "cuperiod[gpu]"     # + CUDA 12 GPU backends (cupy, cufinufft)
 pip install "cuperiod[torch]"   # + portable PyTorch backend (AMD/Intel/Apple GPUs + CPU)
-pip install "cuperiod[fast]"    # + numba multicore CPU kernels (all 8 methods, 20-300x)
+pip install "cuperiod[fast]"    # + numba multicore CPU kernels (7 methods, no GLS, 20-300x)
 pip install "cuperiod[gui]"     # + interactive desktop GUI (cuperiod-gui)
 pip install "cuperiod[pandas]"  # + pandas DataFrame ingestion
 pip install "cuperiod[nested]"  # + nested-pandas light curves (cuperiod.interop)
@@ -112,9 +112,9 @@ backend that reaches AMD (ROCm), Intel (XPU), and Apple-Silicon (MPS) GPUs — a
 everywhere — so the accelerated code runs beyond NVIDIA (install the wheel matching your
 accelerator from [pytorch.org](https://pytorch.org/get-started/locally/); the default is
 CPU-only). The `[fast]` extra adds multicore `numba` CPU kernels that become the default
-`"cpu"`/`"auto"` backend for **every** method — BLS, PDM, CE, String-Length, MHAOV, TLS,
-and SuperSmoother — one to two orders of magnitude faster than the fallback CPU paths and
-matching them to floating point.
+`"cpu"`/`"auto"` backend for **every method but GLS** — BLS, PDM, CE, String-Length,
+MHAOV, TLS, and SuperSmoother — one to two orders of magnitude faster than the fallback
+CPU paths and matching them to floating point.
 
 Not sure what will run where? `cuperiod doctor` reports every installed backend, the torch
 devices it sees and the precision each uses, and what `backend="auto"` resolves to.
@@ -266,10 +266,11 @@ cuperiod doctor                  # backends, torch devices, precision, auto-reso
 cuperiod grid-info star.fits -m GLS
 ```
 
-`run` accepts `--time/--value/--error/--band` overrides and `--domain magnitude|flux`, and
+`run` accepts `--time/--value/--error` column overrides and `--domain magnitude|flux`, and
 can write JSON (`--out`) and the raw spectrum (`--save-periodogram`). `--band` splits a
-long-format file on its filter column and runs a **joint** multi-band fit; `batch` takes
-the same via `band_column`.
+long-format file on its filter column and runs a **joint** multi-band fit; the Python API's
+`batch_periodograms(..., band_column=...)` takes the same (the `batch` command has no band
+option yet).
 
 ## Desktop GUI
 
@@ -285,8 +286,9 @@ pip install "cuperiod[gui]"      # add [gpu] or [torch] for accelerated backends
 cuperiod-gui                     # or:  python -m cuperiod.gui
 ```
 
-It opens with bundled demo light curves (a *Kepler* transit, six ASAS-SN variables, a
-synthetic multi-band curve), so there's something to explore on first launch.
+The toolbar's **Load demo** menu always offers a synthetic multi-band curve, so there's
+something to explore on first launch. In a source checkout (or with `CUPERIOD_EXAMPLE_DATA`
+pointed at `examples/data`) it also lists a *Kepler* transit and six ASAS-SN variables.
 
 ## Light-curve inputs
 
@@ -303,8 +305,8 @@ for the machine-readable record (also picked up by GitHub's "Cite this repositor
 @software{jayasinghe_cuperiod,
   author  = {Jayasinghe, Tharindu},
   title   = {cuPeriod},
-  version = {1.1.0},
-  date    = {2026-07-08},
+  version = {1.2.0},
+  date    = {2026-08-14},
   url     = {https://github.com/tjayasinghe/cuPeriod}
 }
 ```

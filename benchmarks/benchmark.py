@@ -229,8 +229,9 @@ def bench_batch(t, y, e):
     rng = np.random.default_rng(1)
     rows = []
     cpu_cap = 1024
-    # warm up the GPU worker pool + CUDA context so the timed runs measure
-    # steady-state throughput, not one-off device initialisation.
+    # warm up the parent process (imports, JIT/kernel compilation). The pool itself is
+    # rebuilt per call, so each timed run still pays its own spawn + CUDA-context cost —
+    # see the single-shot note below.
     warm = [(f"w{i}", cup.LightCurve.from_arrays(t, y, e)) for i in range(64)]
     for method in ["GLS", "PDM"]:
         cup.batch_periodograms(warm, method, device="gpu", grid=grid,

@@ -93,7 +93,7 @@ etc.). Set `store_raw=True` to also store the peak-preserving downsampled spectr
 summary.n_inputs     # total inputs discovered
 summary.n_done       # results produced
 summary.n_failed     # light curves that errored (one bad curve never kills the batch)
-summary.n_skipped    # chunks skipped on resume
+summary.n_skipped    # light curves in chunks skipped on resume
 summary.methods      # methods run
 summary.errors       # list of (key, message) for failures
 summary.rows         # the rows, when sink is None
@@ -104,12 +104,12 @@ the batch continues.
 
 ## Throughput
 
-On one GPU, batch GLS peaks at **~590 light curves/second** for short survey curves
+On one GPU, batch GLS peaks at **~574 light curves/second** for short survey curves
 (>2 million/hour) — GLS is the method with the most consistent GPU edge, at both single-
 curve and batch scale. With the `[fast]` extra's multicore `numba` CPU tier, the CPU
-process pool now keeps pace with the GPU for several other methods (PDM, CE) at the batch
-sizes and curve lengths benchmarked so far — see {doc}`../benchmarks` for the current
-breakdown before assuming the GPU wins by default.
+process pool now keeps pace with the GPU for PDM at the batch sizes and curve lengths
+benchmarked so far — see {doc}`../benchmarks` for the current breakdown before assuming
+the GPU wins by default.
 
 ---
 

@@ -39,8 +39,11 @@ periods for each.
   - Comma-separated method names (default `GLS`).
 * - `--backend`
   - `auto` | `cpu` | `gpu` | a concrete backend name.
-* - `--time` / `--value` / `--error` / `--band`
+* - `--time` / `--value` / `--error`
   - Override column names (otherwise auto-detected).
+* - `--band`
+  - Band/filter column of a long-format file. Passing it runs a **joint** multi-band fit;
+    without it the file is read as a single-band light curve. See {doc}`multiband`.
 * - `--domain`
   - `magnitude` | `flux`.
 * - `--n-best`
@@ -99,9 +102,9 @@ A directory sink is resumable — re-running skips finished chunks. See {doc}`ba
 cuperiod prewhiten star.csv --snr 4.6 -n 30 --spacing --csv modes.csv
 ```
 
-Runs the automated extraction loop of {doc}`prewhitening` and prints the ranked
-components with their uncertainties and signal-to-noise, followed by the reason the run
-stopped.
+Runs the automated extraction loop of {doc}`prewhitening` and prints a header with the
+reason the run stopped and the fit statistics, followed by the ranked components with
+their uncertainties and signal-to-noise.
 
 ```{list-table}
 :header-rows: 1
@@ -116,7 +119,7 @@ stopped.
 * - `--stop`
   - Comma-separated criteria: `snr`, `fap`, `bic`, `amplitude`.
 * - `--fmin` / `--fmax`
-  - Search band in cycles/day (default `1/T` to pseudo-Nyquist).
+  - Search band in cycles/day (default `1/T` to `max(nyquist_factor × pseudo-Nyquist, 50)`).
 * - `--uncertainty`
   - `covariance` | `analytic` | `bootstrap`.
 * - `--combinations / --no-combinations`
