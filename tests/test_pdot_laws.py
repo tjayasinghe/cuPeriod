@@ -217,3 +217,66 @@ def test_unknown_law_names_the_alternatives() -> None:
 def test_mismatched_lengths_raise() -> None:
     with pytest.raises(ValueError, match="same length"):
         fit_period_law(np.arange(5.0), np.arange(4.0))
+
+
+# --- boundary-pinned fits -----------------------------------------------------
+
+
+def flat_track_with_one_outlier() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """A constant period, but the first (most precise) point sits 4 sigma low.
+
+    This is the shape a real null looks like — a track whose scatter exceeds its
+    formal errors — and it is exactly what a finite-time singularity will chase:
+    push ``t0`` up against the data and ``b/(t - t0)`` becomes a spike on that
+    one point.
+    """
+    t = np.linspace(2456900.0, 2461200.0, 19)
+    period = np.full(t.size, 0.3034290)
+    sigma = np.full(t.size, 3.0e-6)
+    sigma[:3] = 8.0e-7  # the early points are far more precise
+    rng = np.random.default_rng(5)
+    period = period + rng.normal(0.0, sigma)
+    period[0] -= 4.0 * sigma[0]
+    return t, period, sigma
+
+
+def test_singular_epoch_keeps_its_distance_from_the_data() -> None:
+    t, period, sigma = flat_track_with_one_outlier()
+    fit = fit_period_law(t, period, sigma, law="singular")
+    gap = min(abs(fit.params["t0"] - t.min()), abs(fit.params["t0"] - t.max()))
+    spacing = float(np.median(np.diff(np.sort(t))))
+    assert gap >= spacing * (1.0 - 1e-6)
+
+
+def test_a_pinned_fit_is_flagged() -> None:
+    t, period, sigma = flat_track_with_one_outlier()
+    assert fit_period_law(t, period, sigma, law="singular").at_bound
+    assert not fit_period_law(t, period, sigma, law="constant").at_bound
+
+
+def test_a_pinned_fit_never_wins_the_comparison() -> None:
+    """Even at a lower BIC: a fit on its constraint has no interior optimum."""
+    t, period, sigma = flat_track_with_one_outlier()
+    ranked = compare_period_laws(t, period, sigma, laws=available_laws())
+    assert ranked[0].law == "constant"
+    assert not ranked[0].at_bound
+    pinned = [f for f in ranked if f.at_bound]
+    assert pinned, "this track is built to pin the singular law"
+    # ...and demotion is on the flag, not on the BIC, which still favours them.
+    assert min(f.bic for f in pinned) < ranked[0].bic
+    assert all(ranked.index(f) > ranked.index(ranked[0]) for f in pinned)
+    assert fit_period_law(t, period, sigma, law="auto").law == "constant"
+
+
+def test_a_real_singularity_is_not_demoted() -> None:
+    """The floor must not block the case the law exists for."""
+    t, period, sigma = singular_track()
+    fit = fit_period_law(t, period, sigma, law="singular")
+    assert not fit.at_bound
+    assert compare_period_laws(t, period, sigma, laws=AUTO_LAWS)[0].law == "singular"
+
+
+def test_at_bound_is_serialized() -> None:
+    t, period, sigma = flat_track_with_one_outlier()
+    row = fit_period_law(t, period, sigma, law="singular").to_dict()
+    assert row["at_bound"] is True

@@ -195,6 +195,7 @@ def pdot_to_rows(
         "profile_at_window_edge": False,
         "law": "",
         "law_runner_up": "",
+        "law_at_bound": False,
         "implied_model": "",
         "figure": figure,
     }
@@ -311,6 +312,7 @@ def pdot_to_rows(
     if laws:
         best_law = laws[0]
         row["law"] = best_law.law
+        row["law_at_bound"] = bool(best_law.at_bound)
         row["law_bic"] = best_law.bic
         row["law_chi2_reduced"] = best_law.chi2_reduced
         row["law_rms"] = best_law.rms

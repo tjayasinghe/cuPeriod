@@ -34,11 +34,13 @@ Registered laws, all with ``dt = t - t_ref`` except where ``t0`` appears:
     contains ``singular`` as the ``delta = 2`` case (``amplitude = b``) and lets
     the exponent float instead.
 
-``t0`` is constrained to lie *outside* the observed span — a singularity inside
-the data would mean the period passed through zero or infinity mid-run — and is
-fitted in log-offset form so the optimizer cannot walk into it. Both branches
-(``t0`` after the data, the inspiral case; and before it) are tried and the
-better chi-squared kept.
+``t0`` is constrained to lie *outside* the observed span, and no closer to it
+than the median spacing of the period points — a singularity inside the data
+would mean the period passed through zero or infinity mid-run, and one within a
+spacing of the edge is a spike on a single measurement rather than a trend the
+track can resolve. It is fitted as the log of that standoff, so the optimizer
+can reach neither. Both branches (``t0`` after the data, the inspiral case; and
+before it) are tried and the better chi-squared kept.
 
 Fits are weighted least squares on the periods themselves, with inverse-error
 weights, which is the convention these published fits use.
@@ -278,6 +280,16 @@ class PeriodLawFit:
         Number of period points and free parameters.
     converged : bool
         Whether the optimizer reported success.
+    at_bound : bool
+        The fit ran onto a constraint instead of finding a trend: its variation
+        is dominated by a single step at one end of the track (a singular epoch
+        parked just outside the data, absorbing one discrepant point), or
+        ``pejcha``'s exponent reached an end of its numerical guard range. Such
+        a fit has not found an interior optimum, and neither its parameters nor
+        its BIC mean what they normally would — a three-parameter spike will
+        happily out-score a constant on a track that is not changing at all.
+        :func:`compare_period_laws` ranks these below every fit that is not
+        pinned, whatever their BIC.
     """
 
     law: str
@@ -293,6 +305,7 @@ class PeriodLawFit:
     n_used: int
     n_params: int
     converged: bool
+    at_bound: bool = False
     _vector: FloatArray = field(repr=False, default_factory=lambda: np.zeros(0))
 
     # -- evaluation ---------------------------------------------------------------
@@ -359,6 +372,7 @@ class PeriodLawFit:
             "n_used": self.n_used,
             "n_params": self.n_params,
             "converged": self.converged,
+            "at_bound": self.at_bound,
             "t_ref": self.t_ref,
         }
         for name, value in self.params.items():
@@ -375,8 +389,9 @@ def _pack(law: _Law, vec: FloatArray, t: FloatArray) -> FloatArray:
 
     Two reconditionings, both undone by :func:`_unpack`:
 
-    * ``t0`` becomes ``log`` of its offset beyond the nearer data edge, so the
-      optimizer cannot step the singularity inside the observed span.
+    * ``t0`` becomes ``log`` of its *standoff* beyond the nearer data edge — the
+      offset less :func:`_epoch_floor` — so the optimizer can reach neither the
+      inside of the observed span nor its immediate edge.
     * ``pejcha``'s ``amplitude`` carries units of ``day**(delta-1)``, so its magnitude
       swings by many orders as ``delta`` moves and the Jacobian becomes
       hopelessly scaled. Fitting ``amplitude * T**(1-delta)`` — the same coefficient
@@ -391,7 +406,7 @@ def _pack(law: _Law, vec: FloatArray, t: FloatArray) -> FloatArray:
     gap = out[i] - hi if out[i] > hi else lo - out[i]
     if "delta" in law.param_names:
         out[1] = out[1] * _span(t) ** (1.0 - out[law.param_names.index("delta")])
-    out[i] = math.log(max(gap, 1e-6))
+    out[i] = math.log(max(gap - _epoch_floor(t), 1e-6))
     return out
 
 
@@ -401,7 +416,7 @@ def _unpack(law: _Law, vec: FloatArray, t: FloatArray, after: bool) -> FloatArra
         return np.array(vec, dtype=np.float64)
     out = np.array(vec, dtype=np.float64)
     i = law.param_names.index("t0")
-    gap = math.exp(min(float(out[i]), 700.0))
+    gap = _epoch_floor(t) + math.exp(min(float(out[i]), 700.0))
     out[i] = (float(t.max()) + gap) if after else (float(t.min()) - gap)
     if "delta" in law.param_names:
         out[1] = out[1] * _span(t) ** (out[law.param_names.index("delta")] - 1.0)
@@ -410,6 +425,72 @@ def _unpack(law: _Law, vec: FloatArray, t: FloatArray, after: bool) -> FloatArra
 
 def _span(t: FloatArray) -> float:
     return max(float(t.max() - t.min()), 1e-6)
+
+
+def _epoch_floor(t: FloatArray) -> float:
+    """Closest a singular epoch may sit to the data: the median point spacing.
+
+    Keeping ``t0`` merely *outside* the observed span is not enough. Nothing
+    stops it converging to within a hair of the nearest point, and there the
+    divergence is confined between that point and its neighbour: ``b/(t - t0)``
+    becomes a spike on one measurement, which buys a large chi-squared drop for
+    no describable behaviour. That is not a period law, it is an outlier
+    absorber with two free parameters, and left unchecked it lets ``singular``
+    beat ``constant`` on a track that is not changing at all.
+
+    The median spacing of the points is the shortest interval the track can
+    resolve, so a singularity closer than that to the data is unmeasurable by
+    construction. It is a floor, not a prior: a genuinely imminent singularity
+    — the case this law exists for — sits many spacings away and is untouched.
+    """
+    if t.size < 2:
+        return _span(t)
+    return max(float(np.median(np.diff(np.sort(t)))), 1e-9)
+
+
+def _at_bound(
+    law: _Law, vector: FloatArray, err: FloatArray, model: FloatArray, t: FloatArray
+) -> bool:
+    """Has the fit run onto a constraint instead of finding a trend?
+
+    Two independent checks, because a singular law fails in two ways.
+
+    *Edge domination.* A finite-time singularity placed just outside the data
+    puts almost all of its variation into the first (or last) step of the
+    track: ``b/(t - t0)`` becomes a spike on one measurement, which buys a large
+    chi-squared drop while describing nothing. The test is scale-free and needs
+    no tolerance — if a single end step moves the model further than the whole
+    rest of the track does, it is not a trend. A genuine inspiral fails this
+    test comfortably: its steepening is spread over many points, and the largest
+    single step is a small fraction of the total swing.
+
+    *Exponent at its guard.* ``pejcha``'s exponent range has no physical
+    meaning, it only keeps the optimizer away from the ``delta = 1`` pole and
+    out of the numerically hopeless tail, so a fit that reaches an end of it has
+    been carried there rather than measured.
+    """
+    if not law.singular_epoch:
+        return False
+    m = np.asarray(model, dtype=np.float64)
+    if m.size >= 3 and np.all(np.isfinite(m)):
+        swing = float(m.max() - m.min())
+        edge = max(abs(float(m[1] - m[0])), abs(float(m[-1] - m[-2])))
+        if swing > 0.0 and edge > 0.5 * swing:
+            return True
+    if "delta" in law.param_names:
+        lo, hi = _fit_bounds(law, len(law.param_names))
+        j = law.param_names.index("delta")
+        delta, sigma = float(vector[j]), float(err[j])
+        margin = max(sigma if np.isfinite(sigma) else 0.0,
+                     1e-2 * float(hi[j] - lo[j]))
+        if delta - margin <= lo[j] or delta + margin >= hi[j]:
+            return True
+    return False
+
+
+def _rank_key(fit: PeriodLawFit) -> tuple[bool, float]:
+    """Sort key: fits pinned against a constraint rank below every free fit."""
+    return (fit.at_bound, fit.bic)
 
 
 def _fit_bounds(law: _Law, n: int) -> tuple[FloatArray, FloatArray]:
@@ -501,7 +582,7 @@ def fit_period_law(
             raise InsufficientDataError(
                 "fit_period_law: no law could be fitted to these period points"
             )
-        return min(fits, key=lambda f: f.bic)
+        return min(fits, key=_rank_key)
 
     fit = _try_fit(law, t, p, sigma, ref, scale_errors)
     if fit is None:
@@ -593,13 +674,14 @@ def _try_fit(
     if spec.singular_epoch:
         i = spec.param_names.index("t0")
         gap = abs(float(vector[i]) - (t.max() if vector[i] > t.max() else t.min()))
-        err[i] = err[i] * gap
+        err[i] = err[i] * max(gap - _epoch_floor(t), 0.0)
         if "delta" in spec.param_names:
             delta = float(vector[spec.param_names.index("delta")])
             err[1] = err[1] * _span(t) ** (delta - 1.0)
 
     with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-        resid = np.asarray(spec.predict(shifted, vector), dtype=np.float64) - p
+        model = np.asarray(spec.predict(shifted, vector), dtype=np.float64)
+    resid = model - p
     return PeriodLawFit(
         law=name,
         description=spec.description,
@@ -614,6 +696,7 @@ def _try_fit(
         n_used=int(t.size),
         n_params=k,
         converged=bool(sol.success),
+        at_bound=_at_bound(spec, vector, err, model, t),
         _vector=vector,
     )
 
@@ -642,7 +725,9 @@ def compare_period_laws(
     Returns
     -------
     list of PeriodLawFit
-        Best (lowest BIC) first. A ``bic`` gap above ~10 over the runner-up is
+        Best first: fits whose parameters sit on a constraint (``at_bound``) are
+        ranked below every fit that is free, whatever their BIC, and the rest are
+        ordered by BIC. A ``bic`` gap above ~10 over the runner-up is
         conventionally decisive; a gap of 2 is not worth reporting as a
         preference.
     """
@@ -661,7 +746,7 @@ def compare_period_laws(
             )
         except (InsufficientDataError, ValueError):
             continue
-    return sorted(fits, key=lambda f: f.bic)
+    return sorted(fits, key=_rank_key)
 
 
 __all__ = [

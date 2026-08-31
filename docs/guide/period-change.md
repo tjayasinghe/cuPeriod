@@ -187,8 +187,24 @@ finite-time singularity, the description Tylenda et al. (2011) fitted to V1309
 Scorpii's orbital decay through its merger — and `pejcha`, which lets the
 exponent of that singularity float (Pejcha 2014). BIC ranks them;
 `law="auto"` picks the best of all but `pejcha`, which needs an exceptionally
-well-sampled track and can otherwise win with its exponent pinned at a bound
-and entirely unconstrained.
+well-sampled track.
+
+:::{admonition} A singularity will chase your worst point
+:class: warning
+A finite-time singularity parked just outside the data puts nearly all of its
+variation into the first or last step of the track: `b/(t - t0)` becomes a spike
+on one measurement, which buys a large χ² drop while describing nothing. On a
+track that is not changing at all, that three-parameter spike will out-score
+`constant` on BIC.
+
+Two things stop it. `t0` is held at least one median point-spacing away from the
+data — closer than that, the divergence is unresolvable by construction — and
+any fit whose variation is still dominated by a single end step is flagged
+`at_bound` and ranked *below* every unpinned fit, whatever its BIC. Check that
+flag before believing a singular law, and read
+{attr}`~cuperiod.PeriodLawFit.at_bound` in the batch table as
+`law_at_bound`.
+:::
 
 :::{admonition} What the track's error bars mean
 :class: note
@@ -324,6 +340,7 @@ Useful cuts on the summary table:
 | `ladder_curvature_ratio` | O−C residual, cubic over quadratic. Near 1: a constant rate is adequate. Well below: the rate is evolving. |
 | `implied_model` | Which law the fitted `pddot` favours. |
 | `law`, `law_delta_bic` | The winning P(t) law and its margin over the runner-up. |
+| `law_at_bound` | The winning law ran onto a constraint — treat its parameters and its BIC as meaningless. |
 | `search_ridge_correlation` | How strongly P and dP/dt trade off at the peak. |
 | `wrap_risk`, `profile_at_window_edge` | Cycle-count slip, and periods clipped by the search window. |
 

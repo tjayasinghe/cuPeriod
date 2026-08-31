@@ -198,6 +198,20 @@ All notable changes to cuPeriod are documented here. The format is based on
   GPU path before selecting it and falls back to the CPU backend, instead of choosing a
   backend it cannot load. This made 46 tests fail on any CPU-only machine, and would
   have made `batch_pdot` fail on every star at its own defaults.
+- **A finite-time singularity would chase the worst point on a flat track.** Keeping
+  `singular`'s `t0` merely *outside* the observed span is not enough: nothing stopped it
+  converging to within a hair of the nearest point, where `b/(t - t0)` becomes a spike
+  on that one measurement — a three-parameter outlier absorber that beat `constant` on
+  BIC on a track with no period change in it at all. Found on a 12.7-year ASAS-SN EW
+  binary whose period is constant to 5 parts in 10^8 per year, where `singular` was
+  buying Δχ² = 21 from a single 3.8σ point. Two guards now: `t0` is held at least one
+  median point-spacing from the data (closer than that the divergence is unresolvable by
+  construction), and any fit whose variation is still dominated by a single end step is
+  flagged `PeriodLawFit.at_bound` and ranked *below* every unpinned fit by
+  `compare_period_laws` and `law="auto"`, whatever its BIC. The same check retires the
+  manual caveat about `pejcha` winning with its exponent pinned at a bound — it is now
+  detected rather than described. V1309 Sco's genuine singular fit is untouched, and the
+  batch summary carries the flag as `law_at_bound`.
 - **Harmonic-order selection over-fitted whenever the quoted errors were optimistic.**
   Weighted BIC (`chi2 + k*ln(n)`) is right when the errors are right and catastrophic
   when they are not — every harmonic looks like a bargain and the selection runs to

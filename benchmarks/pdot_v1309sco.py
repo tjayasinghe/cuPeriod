@@ -145,11 +145,13 @@ def main() -> None:
             f"{f.law:<12} {f.bic:10.1f} {f.bic - best.bic:9.1f} {f.rms:9.5f}  {params}"
         )
     print(
-        "\n(The singular law's b and t0 are individually degenerate -- they trade"
-        " off strongly --\n while the P(t) they predict over the observed span is"
-        " not, which is the comparison below.\n 'pejcha' can edge it on BIC with"
-        " its exponent pinned at a bound and unconstrained\n (delta = 8 +- 360"
-        " here); that is why it is not in AUTO_LAWS.)"
+        "\n(The singular law's b and t0 are individually degenerate -- they"
+        " trade off strongly -- while the P(t) they predict over the observed"
+        " span is not,\n which is the comparison below. 'pejcha' reaches a"
+        " lower BIC here but with its exponent pinned against a bound and"
+        " unconstrained\n (delta = 8 +- 360), so it is ranked last: a fit"
+        " sitting on a constraint has not found an interior optimum, and its"
+        " BIC\n does not mean what it normally would.)"
     )
 
     # -- the headline comparison ---------------------------------------------------
