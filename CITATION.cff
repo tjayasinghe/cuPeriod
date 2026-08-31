@@ -1,5 +1,5 @@
 cff-version: 1.2.0
-message: "If you use cuPeriod in your research, please cite it as below."
+message: "If you use cuPeriod in your research, please cite the Research Note below."
 title: cuPeriod
 abstract: >-
   Optimized, GPU-accelerated periodograms for astronomy: eight period-search methods (GLS,
@@ -18,7 +18,7 @@ authors:
     # Add your ORCID here to make the citation unambiguous, e.g.:
     # orcid: "https://orcid.org/0000-0000-0000-0000"
 version: 1.2.0
-date-released: "2026-08-14"
+date-released: "2026-08-30"
 license: GPL-3.0-or-later
 repository-code: "https://github.com/tjayasinghe/cuPeriod"
 url: "https://cuperiod.readthedocs.io"
@@ -31,3 +31,20 @@ keywords:
   - time-series
   - gpu
   - cuda
+
+# Cite the peer-reviewed Research Note in preference to the software record above;
+# GitHub, Zenodo and cffconvert all honour `preferred-citation`.
+preferred-citation:
+  type: article
+  title: "cuPeriod: Seven Validated Periodograms for CPUs and Any GPU"
+  authors:
+    - given-names: Tharindu
+      family-names: Jayasinghe
+  journal: "Research Notes of the American Astronomical Society"
+  year: 2026
+  month: 8
+  volume: 10
+  issue: 8
+  start: 244
+  doi: "10.3847/2515-5172/ae9b06"
+  url: "https://ui.adsabs.harvard.edu/abs/2026RNAAS..10..244J"

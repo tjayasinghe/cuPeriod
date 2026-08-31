@@ -298,18 +298,33 @@ methods (BLS, TLS) work in flux — magnitudes are converted automatically.
 
 ## Citing cuPeriod
 
-If you use cuPeriod in your research, please cite it — see [`CITATION.cff`](CITATION.cff)
-for the machine-readable record (also picked up by GitHub's "Cite this repository").
+If you use cuPeriod in your research, please cite the Research Note
+([ADS](https://ui.adsabs.harvard.edu/abs/2026RNAAS..10..244J),
+[doi:10.3847/2515-5172/ae9b06](https://doi.org/10.3847/2515-5172/ae9b06)). It is also the
+`preferred-citation` in [`CITATION.cff`](CITATION.cff), so GitHub's "Cite this repository"
+button and `cffconvert` both hand it back.
 
 ```bibtex
-@software{jayasinghe_cuperiod,
-  author  = {Jayasinghe, Tharindu},
-  title   = {cuPeriod},
-  version = {1.2.0},
-  date    = {2026-08-14},
-  url     = {https://github.com/tjayasinghe/cuPeriod}
+@ARTICLE{2026RNAAS..10..244J,
+       author = {{Jayasinghe}, Tharindu},
+        title = "{cuPeriod: Seven Validated Periodograms for CPUs and Any GPU}",
+      journal = {Research Notes of the American Astronomical Society},
+     keywords = {Stellar astronomy, Time domain astronomy, Variable stars, Astronomy software, 1583, 2109, 1761, 1855},
+         year = 2026,
+        month = aug,
+       volume = {10},
+       number = {8},
+          eid = {244},
+        pages = {244},
+          doi = {10.3847/2515-5172/ae9b06},
+       adsurl = {https://ui.adsabs.harvard.edu/abs/2026RNAAS..10..244J},
+      adsnote = {Provided by the SAO/NASA Astrophysics Data System}
 }
 ```
+
+The Note describes the v1.1 release (the seven methods of its title); multi-band, SuperSmoother
+and pre-whitening arrived in v1.2. Cite the version you ran alongside it if that matters for
+reproducibility — `cuperiod.__version__` reports it.
 
 ## License
 

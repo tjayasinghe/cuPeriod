@@ -6,7 +6,7 @@ All notable changes to cuPeriod are documented here. The format is based on
 
 ## [Unreleased]
 
-## [1.2.0] - 2026-08-14
+## [1.2.0] - 2026-08-30
 
 ### Added
 
