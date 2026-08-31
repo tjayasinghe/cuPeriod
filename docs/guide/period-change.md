@@ -52,9 +52,14 @@ A constant dP/dt means the phase in cycles is exactly
 a = \frac{\dot P}{P},
 ```
 
-with {math}`\Delta t` measured from the weighted mean epoch (the one point
-where frequency and drift decouple exactly) and {math}`a` the fractional rate
-in 1/day. The warp {math}`\tau` does not depend on {math}`f` — so evaluating
+with {math}`\Delta t` measured from the weighted mean epoch and {math}`a` the
+fractional rate in 1/day. That epoch zeroes the first moment of the times,
+which decouples phase from frequency and removes the leading frequency–drift
+correlation; what remains is set by the sampling's third central moment, so the
+two axes are exactly orthogonal only for observations symmetric about the
+epoch. A run whose cadence densifies sharply at one end leaves a visibly
+tilted ridge in the map — it widens the joint uncertainty without biasing the
+best cell. The warp {math}`\tau` does not depend on {math}`f` — so evaluating
 an *ordinary* periodogram on warped times turns it into a drifting-period
 search at zero algorithmic cost. {func}`~cuperiod.pdot_search` steps a uniform
 {math}`a` axis, re-runs the method per row (reusing its engine — on the GPU

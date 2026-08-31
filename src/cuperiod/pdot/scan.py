@@ -34,9 +34,15 @@ baseline-independent (``4 * samples_per_drift * max_cycle_drift *
 harmonic_scale + 1``) while reaching every drift large enough to defocus a
 constant-period search.
 
-The reference epoch is the weighted mean epoch of the finite points, where the
-frequency and drift estimates decouple exactly (their metric is diagonal
-there); the reported frequency is the instantaneous frequency at that epoch.
+The reference epoch is the weighted mean epoch of the finite points, and the
+reported frequency is the instantaneous frequency there. That choice zeroes the
+first moment of the times, which decouples the *phase* from the frequency and
+removes the leading frequency-drift correlation. It does not by itself make the
+two axes orthogonal: the residual correlation is set by the third central moment
+of the sampling, so it vanishes only when the observations are symmetric about
+the reference epoch. Sampling that thins or densifies strongly across the run
+leaves a tilted ridge in the map — it widens the joint uncertainty but does not
+bias the best cell.
 
 ``pdot_search`` localizes a drifting signal; for a *measurement* with honest
 uncertainties, follow with :func:`cuperiod.phase_track` at the found period.

@@ -82,6 +82,34 @@ All notable changes to cuPeriod are documented here. The format is based on
   at p < 1e-3 with **0/60** false detections on the nulls, and the pull distributions
   are calibrated (null rms 1.07, injected 0.8–1.3). Median cost per star on one CPU
   core: 4.1 s for the 201×601 search, 0.06 s for the tracking measurement.
+- **Blind real-data check against a published period derivative**
+  (`benchmarks/pdot_v1309sco.py`, `download_v1309sco.py`): V1309 Sco, the contact
+  binary OGLE watched spiral in until it merged as a red nova in 2008 — the one merger
+  with dense photometry of the *progenitor*, and a deliberately hostile test (the drift
+  reaches ~7 days of accumulated O−C, several orbital cycles; the star brightens 0.8 mag
+  as it inspirals; the light-curve shape itself evolves; and the true decay is
+  exponential, so a constant-rate model is knowingly wrong). On the authors' own
+  supplementary photometry, after removing the secular brightening, `pdot_search`
+  recovers P = 1.4301 d against the published 1.43 d, with the dominant peak at
+  0.70 c/d, the secondary at 1.40 c/d, and 1 c/d aliases — reproducing the paper's own
+  description of its periodograms. Letting each half of the baseline carry its own rate
+  gives a total period decrease of **−1.08% over six years against the published
+  −1.2%**, and the decay timescale P/|dP/dt| shortens from ~1240 yr to ~330 yr across
+  the baseline, the spiral-in the paper reports. A single constant rate over the whole
+  baseline instead returns −1.87%, and the tools say why: the F-test is decisive
+  (p = 1e-8) while the O−C residuals fall 169 → 81 → 14 minutes from a quadratic to a
+  quartic ephemeris — the accelerating decay refusing to be a parabola.
+
+### Fixed
+
+- **The (period, dP/dt) axes are not orthogonal for skewed sampling**, contrary to what
+  the module and guide claimed. Referencing to the weighted mean epoch zeroes the first
+  moment of the times — which is what decouples phase from frequency — but the residual
+  frequency–drift correlation is set by the sampling's *third* central moment and
+  vanishes only for observations symmetric about that epoch. V1309 Sco (skew −1.29, its
+  cadence densifying steeply toward the merger) shows the resulting tilted ridge plainly
+  in its search map. The claim is now stated correctly: the tilt widens the joint
+  uncertainty without biasing the best cell.
 
 ### Known limitations
 
