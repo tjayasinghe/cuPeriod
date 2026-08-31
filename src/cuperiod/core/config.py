@@ -800,6 +800,121 @@ class SpacingSettings(BaseSettings):
     )
 
 
+class PdotSettings(BaseSettings):
+    """Settings for the period-change (dP/dt) tools.
+
+    Governs the joint (period, dP/dt) grid search of
+    :func:`cuperiod.pdot_search` and the segmented phase tracking of
+    :func:`cuperiod.phase_track`. The wrapped periodogram method keeps its own
+    settings model (pass it as ``method_settings=``); this model only shapes the
+    search axes and the tracking.
+
+    The dP/dt axis is parameterized as the fractional rate ``pdot_over_p`` =
+    (dP/dt)/P in 1/day — the (sign-flipped) fractional frequency drift. Its
+    default extent is set by ``max_cycle_drift``: the largest accumulated phase
+    drift, in cycles at the half-baseline, that the search should reach. That
+    makes the grid size baseline-independent (``4 * samples_per_drift *
+    max_cycle_drift + 1`` rows) while covering every signal whose period change
+    is large enough to matter over the observed span.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="CUPERIOD_PDOT_", extra="forbid")
+
+    @model_validator(mode="after")
+    def _check_bounds(self) -> Self:
+        if self.pdot_over_p_range is not None:
+            lo, hi = self.pdot_over_p_range
+            if not lo < hi:
+                raise ValueError(f"pdot_over_p_range: need lo < hi, got ({lo}, {hi})")
+        return self
+
+    # -- frequency window (pdot_search) ------------------------------------------
+    window_rayleigh: float = Field(
+        default=30.0,
+        gt=0.0,
+        description=(
+            "Half-width of the frequency window around the center period, in "
+            "Rayleigh widths (1/baseline)."
+        ),
+    )
+    samples_per_peak: int = Field(
+        default=10, ge=1, description="Frequency oversampling inside the window."
+    )
+    # -- dP/dt axis ---------------------------------------------------------------
+    max_cycle_drift: float = Field(
+        default=10.0,
+        gt=0.0,
+        description=(
+            "Half-range of the (dP/dt)/P axis, expressed as the largest "
+            "accumulated phase drift (cycles) at the half-baseline."
+        ),
+    )
+    samples_per_drift: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            "Oversampling of the (dP/dt)/P axis: the step keeps the residual "
+            "phase smear under 1/(2*samples_per_drift) cycles."
+        ),
+    )
+    pdot_over_p_range: tuple[float, float] | None = Field(
+        default=None,
+        description=(
+            "Explicit (low, high) bounds of the (dP/dt)/P axis in 1/day; "
+            "overrides max_cycle_drift."
+        ),
+    )
+    max_grid_cells: int = Field(
+        default=20_000_000,
+        ge=1,
+        description="Guard on the 2-D grid size (frequencies x dP/dt rows).",
+    )
+    # -- phase tracking (phase_track) ---------------------------------------------
+    n_segments: int | None = Field(
+        default=None,
+        ge=2,
+        description="Target number of time segments; None -> auto from the data.",
+    )
+    min_segment_points: int = Field(
+        default=20, ge=5, description="Fewest points a usable segment may hold."
+    )
+    min_segment_cycles: float = Field(
+        default=3.0,
+        gt=0.0,
+        description="Shortest usable segment, in cycles of the tracked period.",
+    )
+    harmonics: int | None = Field(
+        default=None,
+        ge=1,
+        description="Template harmonic count; None -> BIC-selected automatically.",
+    )
+    max_harmonics: int = Field(
+        default=10,
+        ge=1,
+        description="Largest harmonic count the automatic selection may pick.",
+    )
+    segment_offsets: bool = Field(
+        default=True,
+        description=(
+            "Fit a free magnitude offset per segment alongside the time shift "
+            "(robust to calibration drift; costs a little timing precision)."
+        ),
+    )
+    template_iterations: int = Field(
+        default=1,
+        ge=0,
+        description=(
+            "Re-derive the template on drift-corrected times this many times "
+            "after the first pass (0 = single pass). Keeps the template sharp "
+            "when the drift itself smears the initial fold."
+        ),
+    )
+    # -- execution ----------------------------------------------------------------
+    min_detections: int = Field(
+        default=20, ge=5, description="Skip if fewer finite points."
+    )
+
+
 class BatchSettings(BaseSettings):
     """Settings for batch processing of many light curves."""
 
@@ -829,6 +944,7 @@ __all__ = [
     "GLSSettings",
     "MHAOVSettings",
     "PDMSettings",
+    "PdotSettings",
     "PreWhitenSettings",
     "SpacingSettings",
     "StringLengthSettings",

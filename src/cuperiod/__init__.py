@@ -29,6 +29,7 @@ from cuperiod.core.config import (
     GLSSettings,
     MHAOVSettings,
     PDMSettings,
+    PdotSettings,
     PreWhitenSettings,
     SpacingSettings,
     StringLengthSettings,
@@ -54,6 +55,18 @@ from cuperiod.diagnostics import (
 )
 from cuperiod.methods.base import MethodInfo, get_method, list_methods, method_names
 from cuperiod.multiband.fap_mb import MultibandFAP, multiband_fap
+from cuperiod.pdot import (
+    EphemerisFit,
+    PdotBest,
+    PdotSearchResult,
+    PhaseTemplate,
+    PhaseTrackResult,
+    SegmentShift,
+    fit_ephemeris,
+    pdot_search,
+    phase_track,
+    weighted_epoch,
+)
 from cuperiod.prewhiten import (
     AmplitudeSpectrum,
     Combination,
@@ -79,7 +92,7 @@ from cuperiod.prewhiten import (
 try:
     __version__ = _version("cuperiod")
 except PackageNotFoundError:  # pragma: no cover - source tree, no metadata
-    __version__ = "1.2.0"
+    __version__ = "1.3.0"
 
 __all__ = [
     "AliasCandidate",
@@ -95,6 +108,7 @@ __all__ = [
     "Combination",
     "CuPeriodError",
     "Domain",
+    "EphemerisFit",
     "GLSSettings",
     "GpuInfo",
     "GridSpec",
@@ -107,11 +121,17 @@ __all__ = [
     "MultiSineFit",
     "MultibandFAP",
     "PDMSettings",
+    "PdotBest",
+    "PdotSearchResult",
+    "PdotSettings",
     "Peak",
     "Periodogram",
     "PeriodSpacingSeries",
+    "PhaseTemplate",
+    "PhaseTrackResult",
     "PreWhitenResult",
     "PreWhitenSettings",
+    "SegmentShift",
     "Sinusoid",
     "SpacingSettings",
     "SpacingSpectrum",
@@ -131,6 +151,7 @@ __all__ = [
     "buoyancy_radius",
     "echelle",
     "find_period_spacing",
+    "fit_ephemeris",
     "fit_multisine",
     "free_gpu_memory",
     "get_method",
@@ -140,11 +161,14 @@ __all__ = [
     "log_period_grid",
     "method_names",
     "multiband_fap",
+    "pdot_search",
     "periodogram",
+    "phase_track",
     "prewhiten",
     "spacing_spectrum",
     "spectral_window",
     "suggest_gpu_workers",
     "to_input",
     "uniform_frequency_grid",
+    "weighted_epoch",
 ]
