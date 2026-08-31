@@ -66,3 +66,66 @@ def test_resolve_gpu_without_device_raises() -> None:
 def test_resolve_unknown_backend_raises() -> None:
     with pytest.raises(BackendUnavailableError):
         get_method("GLS").resolve_backend("nonsense")
+
+
+def _fake_env(
+    monkeypatch: pytest.MonkeyPatch, *, backends: set[str], cuda: bool, torch_gpu: bool
+) -> None:
+    """Pretend this machine has exactly ``backends`` and these device kinds."""
+    import cuperiod.methods.base as base
+
+    monkeypatch.setattr(base, "available_backends", lambda: set(backends))
+    monkeypatch.setattr(base, "cuda_available", lambda: cuda)
+    monkeypatch.setattr(base, "torch_gpu_available", lambda: torch_gpu)
+
+
+def test_auto_skips_cuda_path_when_its_package_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # cupy sees a GPU, but GLS's fast path (cufinufft) is not installed: "auto"
+    # must fall through to the CPU rather than pick a backend that will raise
+    # ImportError once it actually runs.
+    _fake_env(
+        monkeypatch,
+        backends={"numpy", "finufft", "astropy", "cupy"},
+        cuda=True,
+        torch_gpu=False,
+    )
+    assert get_method("GLS").resolve_backend("auto") == "finufft"
+
+
+def test_auto_prefers_torch_gpu_over_cpu_when_cuda_path_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_env(
+        monkeypatch,
+        backends={"numpy", "finufft", "astropy", "cupy", "torch"},
+        cuda=True,
+        torch_gpu=True,
+    )
+    assert get_method("GLS").resolve_backend("auto") == "torch"
+
+
+def test_auto_takes_cuda_path_when_fully_installed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_env(
+        monkeypatch,
+        backends={"numpy", "finufft", "astropy", "cupy", "cufinufft"},
+        cuda=True,
+        torch_gpu=False,
+    )
+    assert get_method("GLS").resolve_backend("auto") == "cufinufft"
+
+
+def test_gpu_request_names_the_missing_package(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_env(
+        monkeypatch,
+        backends={"numpy", "finufft", "astropy", "cupy"},
+        cuda=True,
+        torch_gpu=False,
+    )
+    with pytest.raises(BackendUnavailableError, match="cufinufft"):
+        get_method("GLS").resolve_backend("gpu")

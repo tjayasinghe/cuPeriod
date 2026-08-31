@@ -84,10 +84,17 @@ class PeriodogramMethod(ABC):
         """Resolve ``auto``/``cpu``/``gpu``/concrete to a runnable backend name.
 
         ``"auto"`` prefers the NVIDIA fast-path (``gpu_backend``) when a CUDA device is
-        present, then the portable ``torch`` backend when torch sees a non-CPU device
-        (AMD/Intel/Mac), and otherwise the proven CPU path. ``"gpu"`` is the same but
-        raises when no GPU is available. A concrete ``"torch"`` / ``"torch:<device>"``
-        request selects the portable path explicitly.
+        present *and* that backend's package is installed, then the portable ``torch``
+        backend when torch sees a non-CPU device (AMD/Intel/Mac), and otherwise the
+        proven CPU path. ``"gpu"`` is the same but raises when no GPU is available. A
+        concrete ``"torch"`` / ``"torch:<device>"`` request selects the portable path
+        explicitly.
+
+        The installed-package check matters: ``cuda_available()`` only reports that
+        cupy sees a device, while a method's fast path may need another library
+        (GLS needs cufinufft). Without it, an environment with cupy and a GPU but no
+        cufinufft would resolve ``"auto"`` to a backend that raises ``ImportError``
+        deep in the compute path instead of quietly using the CPU.
 
         Parameters
         ----------
@@ -108,21 +115,28 @@ class PeriodogramMethod(ABC):
         """
         available = available_backends()
         if requested == "auto":
-            if self.gpu_backend is not None and cuda_available():
-                return self.gpu_backend
+            if self._cuda_path_ready(available):
+                return str(self.gpu_backend)
             if self.portable_gpu_backend is not None and torch_gpu_available():
                 return self.portable_gpu_backend
             return self._best_cpu_backend(available)
         if requested == "cpu":
             return self._best_cpu_backend(available)
         if requested == "gpu":
-            if self.gpu_backend is not None and cuda_available():
-                return self.gpu_backend
+            if self._cuda_path_ready(available):
+                return str(self.gpu_backend)
             if self.portable_gpu_backend is not None and torch_gpu_available():
                 return self.portable_gpu_backend
+            extra = ""
+            if self.gpu_backend is not None and cuda_available():
+                extra = (
+                    f" (a CUDA device is present, but {self.gpu_backend!r} is not "
+                    "installed)"
+                )
             raise BackendUnavailableError(
-                f"{self.name}: no GPU backend available (need the [gpu] extra and a "
-                "CUDA device, or the [torch] extra and a CUDA/ROCm/MPS/XPU device)"
+                f"{self.name}: no GPU backend available{extra} (need the [gpu] extra "
+                "and a CUDA device, or the [torch] extra and a CUDA/ROCm/MPS/XPU "
+                "device)"
             )
         if requested == "torch" or requested.startswith("torch:"):
             return self._resolve_torch(requested)
@@ -142,6 +156,16 @@ class PeriodogramMethod(ABC):
                 f"{self.name}: backend {requested!r} is not installed"
             )
         return requested
+
+    def _cuda_path_ready(self, available: set[str]) -> bool:
+        """Whether this method's NVIDIA fast path can actually run here.
+
+        Both halves are needed: a CUDA device (``cuda_available``) *and* the
+        backend's own package in ``available_backends()``.
+        """
+        if self.gpu_backend is None:
+            return False
+        return self.gpu_backend in available and cuda_available()
 
     def _best_cpu_backend(self, available: set[str]) -> str:
         """``fast_cpu_backend`` when its dependency is present, else ``cpu_backend``."""
