@@ -56,15 +56,19 @@ from cuperiod.diagnostics import (
 from cuperiod.methods.base import MethodInfo, get_method, list_methods, method_names
 from cuperiod.multiband.fap_mb import MultibandFAP, multiband_fap
 from cuperiod.pdot import (
+    EddingtonPlakidisResult,
     EphemerisFit,
     PdotBest,
     PdotSearchResult,
     PhaseTemplate,
     PhaseTrackResult,
     SegmentShift,
+    SlidingPeriodogram,
+    eddington_plakidis,
     fit_ephemeris,
     pdot_search,
     phase_track,
+    sliding_periodogram,
     weighted_epoch,
 )
 from cuperiod.prewhiten import (
@@ -108,6 +112,7 @@ __all__ = [
     "Combination",
     "CuPeriodError",
     "Domain",
+    "EddingtonPlakidisResult",
     "EphemerisFit",
     "GLSSettings",
     "GpuInfo",
@@ -133,6 +138,7 @@ __all__ = [
     "PreWhitenSettings",
     "SegmentShift",
     "Sinusoid",
+    "SlidingPeriodogram",
     "SpacingSettings",
     "SpacingSpectrum",
     "SpectrumEngine",
@@ -150,6 +156,7 @@ __all__ = [
     "best_periods",
     "buoyancy_radius",
     "echelle",
+    "eddington_plakidis",
     "find_period_spacing",
     "fit_ephemeris",
     "fit_multisine",
@@ -165,6 +172,7 @@ __all__ = [
     "periodogram",
     "phase_track",
     "prewhiten",
+    "sliding_periodogram",
     "spacing_spectrum",
     "spectral_window",
     "suggest_gpu_workers",

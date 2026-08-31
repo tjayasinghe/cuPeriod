@@ -118,6 +118,52 @@ def synthetic_multiband_sine(
     return out
 
 
+def synthetic_period_change(
+    *,
+    n: int = 2000,
+    span: float = 1500.0,
+    period: float = 0.5,
+    pdot: float = 1.0e-7,
+    amp: float = 0.30,
+    amp2: float = 0.10,
+    noise: float = 0.05,
+    base_jd: float = 2457000.0,
+    seed: int = 0,
+) -> tuple[FloatArray, FloatArray, FloatArray, dict[str, float]]:
+    """A two-harmonic sine whose period drifts linearly: ``(t, mag, err, truth)``.
+
+    The phase is the exact constant-dP/dt model about the mean epoch:
+    ``phi = f0 * tau`` with ``tau = ln(1 + a*dt)/a``, ``a = pdot/period`` (the
+    logarithmic phase of Mikulasek et al. 2012, written out independently here
+    so the tests do not share code with the implementation under test).
+    Recovery tests compare against the planted ``truth`` dict (``period``,
+    ``pdot``, ``pdot_over_p``, ``t_ref``) without re-deriving conventions.
+    Positive ``pdot`` = lengthening period = late arrivals (upward O-C
+    parabola).
+    """
+    rng = np.random.default_rng(seed)
+    t = np.sort(rng.uniform(0.0, span, n)) + base_jd
+    t_ref = float(t.mean())
+    a = pdot / period
+    dt = t - t_ref
+    tau = np.log1p(a * dt) / a if pdot != 0.0 else dt
+    f0 = 1.0 / period
+    mag = (
+        13.0
+        + amp * np.sin(2 * np.pi * f0 * tau)
+        + amp2 * np.sin(4 * np.pi * f0 * tau + 1.0)
+        + rng.normal(0.0, noise, n)
+    )
+    err = np.full(n, noise)
+    truth = {
+        "period": period,
+        "pdot": pdot,
+        "pdot_over_p": a,
+        "t_ref": t_ref,
+    }
+    return t, mag, err, truth
+
+
 def synthetic_eclipser(
     *,
     n: int = 800,

@@ -854,7 +854,19 @@ class PdotSettings(BaseSettings):
         ge=1,
         description=(
             "Oversampling of the (dP/dt)/P axis: the step keeps the residual "
-            "phase smear under 1/(2*samples_per_drift) cycles."
+            "phase smear under 1/(2*samples_per_drift) cycles (worst-case "
+            "template mismatch ~0.9/s^2: ~3.5% at 5; 2 matches the pulsar-"
+            "search convention at ~22% for survey speed)."
+        ),
+    )
+    harmonic_scale: float | None = Field(
+        default=None,
+        ge=1.0,
+        description=(
+            "Extra refinement of the (dP/dt)/P step for methods resolving "
+            "structure sharper than a sinusoid; None -> automatic per method "
+            "(1 for GLS; the harmonic count for MHAOV; half the phase-bin "
+            "count for PDM/CE; from the smallest span for SuperSmoother)."
         ),
     )
     pdot_over_p_range: tuple[float, float] | None = Field(

@@ -8,6 +8,10 @@ The v1.3 subsystem for measuring period *derivatives*:
   an automated O-C diagram with per-segment uncertainties (measurement).
 - :func:`fit_ephemeris` — quadratic-ephemeris fits to O-C style timing data,
   including user-supplied times of minimum/maximum.
+- :func:`sliding_periodogram` — the ordinary periodogram on a sliding window: a
+  time-frequency map for period wander, glitches, and drift sanity checks.
+- :func:`eddington_plakidis` — the classical test separating random
+  cycle-to-cycle period fluctuation from a genuine secular change.
 """
 
 from cuperiod.pdot.result import (
@@ -17,6 +21,8 @@ from cuperiod.pdot.result import (
     PdotSearchResult,
 )
 from cuperiod.pdot.scan import pdot_search, weighted_epoch
+from cuperiod.pdot.sliding import SlidingPeriodogram, sliding_periodogram
+from cuperiod.pdot.stability import EddingtonPlakidisResult, eddington_plakidis
 from cuperiod.pdot.track import (
     EphemerisFit,
     PhaseTemplate,
@@ -30,15 +36,19 @@ from cuperiod.pdot.track import (
 __all__ = [
     "DAYS_PER_MYR",
     "SECONDS_PER_YEAR",
+    "EddingtonPlakidisResult",
     "EphemerisFit",
     "PdotBest",
     "PdotSearchResult",
     "PhaseTemplate",
     "PhaseTrackResult",
     "SegmentShift",
+    "SlidingPeriodogram",
+    "eddington_plakidis",
     "fit_ephemeris",
     "fit_template",
     "pdot_search",
     "phase_track",
+    "sliding_periodogram",
     "weighted_epoch",
 ]

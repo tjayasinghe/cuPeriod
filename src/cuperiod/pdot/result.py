@@ -65,13 +65,23 @@ class PdotBest:
 
     @property
     def pdot_s_per_yr(self) -> float:
-        """dP/dt in seconds per year (the hot-Jupiter / eclipse-timing unit)."""
+        """dP/dt in seconds per year (the eclipse-timing unit)."""
         return self.pdot * SECONDS_PER_YEAR
+
+    @property
+    def pdot_ms_per_yr(self) -> float:
+        """dP/dt in milliseconds per year (the hot-Jupiter decay unit)."""
+        return self.pdot * SECONDS_PER_YEAR * 1e3
 
     @property
     def pdot_d_per_myr(self) -> float:
         """dP/dt in days per megayear (the classical-pulsator unit)."""
         return self.pdot * DAYS_PER_MYR
+
+    @property
+    def dlnp_dt_per_yr(self) -> float:
+        """Fractional rate d(ln P)/dt per year (the Mira / delta Sct unit)."""
+        return self.pdot_over_p * 365.25
 
     @property
     def timescale_yr(self) -> float:
@@ -86,7 +96,9 @@ class PdotBest:
             "period": self.period,
             "pdot": self.pdot,
             "pdot_s_per_yr": self.pdot_s_per_yr,
+            "pdot_ms_per_yr": self.pdot_ms_per_yr,
             "pdot_d_per_myr": self.pdot_d_per_myr,
+            "dlnp_dt_per_yr": self.dlnp_dt_per_yr,
             "frequency": self.frequency,
             "fdot": self.fdot,
             "pdot_over_p": self.pdot_over_p,

@@ -1,35 +1,42 @@
 """Joint (period, dP/dt) grid search via time warping: :func:`pdot_search`.
 
-A signal whose period drifts linearly, ``P(t) = P0 + Pdot*(t - t_ref)``, has the
-quadratic phase (in cycles)
+A constant period derivative means ``P`` grows linearly in *time*; the phase
+(in cycles) is then exactly
 
-    phi(t) = f*dt + (1/2)*fdot*dt**2,        dt = t - t_ref,  fdot = -Pdot*f**2.
+    phi(t) = f * tau,     tau = ln(1 + a*dt) / a,     a = Pdot/P,
 
-Writing ``a = Pdot/P`` (the fractional rate, 1/day), the phase factorizes as
-``phi = f * tau`` with the *warped time*
-
-    tau = dt * (1 - (a/2)*dt),
-
-which does not depend on ``f``. So for each trial ``a`` the whole frequency axis
-of the quadratic-phase model is exactly an *ordinary* periodogram of the warped
-light curve — any registered method, any backend, unchanged. :func:`pdot_search`
-steps a uniform ``a`` grid, re-evaluates the method on the warped times (reusing
-its batch engine, e.g. the cached cufinufft plans), and stacks the rows into a
-``(n_pdot, n_frequency)`` map whose refined best cell is the joint (P, dP/dt)
-estimate.
+with ``dt = t - t_ref`` and ``a`` the fractional rate in 1/day (Mikulasek et
+al. 2012; the same logarithmic phase PHOEBE integrates for its ``dpdt``). The
+warp ``tau`` does not depend on ``f``, so for each trial ``a`` the whole
+frequency axis of the drifting-period model is exactly an *ordinary*
+periodogram of the warped light curve — any registered method, any backend,
+unchanged. To second order ``tau ~ dt*(1 - (a/2)*dt)``, the familiar quadratic
+ephemeris; the exact form matters at the edges of the search range for light
+curves spanning few hundred cycles, where the truncated warp mis-phases by
+whole cycles. :func:`pdot_search` steps a uniform ``a`` grid, re-evaluates the
+method on the warped times (reusing its batch engine, e.g. the cached
+cufinufft plans), and stacks the rows into a ``(n_pdot, n_frequency)`` map
+whose refined best cell is the joint (P, dP/dt) estimate.
 
 Resolution and range follow the same phase-coherence logic as the frequency
 grid: a frequency step ``1/(s*T)`` mis-phases the edges of the baseline by
 ``1/(2s)`` cycles, and an ``a`` step of ``4/(s*f*T**2)`` does the same through
-the quadratic term, so both axes are sampled to equal phase smear. The default
-extent of the ``a`` axis is set in accumulated drift cycles (``max_cycle_drift``)
-rather than physical units, which keeps the row count baseline-independent
-(``4 * samples_per_drift * max_cycle_drift + 1``) while reaching every drift
-large enough to defocus a constant-period search.
+the quadratic term, so both axes are sampled to equal phase smear (the
+template-bank mismatch of the default ``s = 5`` is ~3.5%; ``s = 2`` matches
+the pulsar-search convention at ~22% for survey speed). Methods that resolve
+structure *sharper* than a sinusoid need a proportionally finer step — a phase
+feature of width ``1/h`` cycles smears ``h`` times sooner — so the step is
+divided by a per-method harmonic scale (MHAOV: its harmonic count; PDM and
+conditional entropy: half the phase-bin count; SuperSmoother: half the inverse
+of its smallest span). The default extent is set in accumulated drift cycles
+(``max_cycle_drift``) rather than physical units, which keeps the row count
+baseline-independent (``4 * samples_per_drift * max_cycle_drift *
+harmonic_scale + 1``) while reaching every drift large enough to defocus a
+constant-period search.
 
 The reference epoch is the weighted mean epoch of the finite points, where the
-frequency and drift estimates decouple; the reported frequency is the
-instantaneous frequency at that epoch.
+frequency and drift estimates decouple exactly (their metric is diagonal
+there); the reported frequency is the instantaneous frequency at that epoch.
 
 ``pdot_search`` localizes a drifting signal; for a *measurement* with honest
 uncertainties, follow with :func:`cuperiod.phase_track` at the found period.
@@ -82,17 +89,47 @@ def weighted_epoch(lc: LightCurve | MultiBandLightCurve) -> float:
     return float(np.dot(w, time) / w.sum())
 
 
+def _harmonic_scale(m: PeriodogramMethod, settings: BaseSettings) -> float:
+    """How much sharper than a sinusoid the method's phase structure is.
+
+    A feature of width ``1/h`` cycles loses coherence ``h`` times sooner under
+    a drift-step error, so the (dP/dt)/P step must shrink by this factor
+    (the criterion of Katz et al. 2021 for their conditional-entropy dP/dt
+    search, generalized per method).
+    """
+    key = "".join(ch for ch in m.name if ch.isalnum()).upper()
+    if key == "MHAOV":
+        return float(max(1, int(getattr(settings, "n_harmonics", 3))))
+    if key in {"PDM", "CE"}:
+        bins = getattr(settings, "n_bins", None)
+        if bins is None:
+            bins = getattr(settings, "n_phase_bins", 10)
+        return max(1.0, 0.5 * float(bins if bins is not None else 10))
+    if key == "STRINGLENGTH":
+        return 4.0
+    if key == "SUPERSMOOTHER":
+        spans = getattr(settings, "primary_spans", None)
+        if spans:
+            return max(1.0, 0.5 / float(min(spans)))
+        return 10.0
+    return 1.0
+
+
 def _pdot_axis(
-    settings: PdotSettings, f_center: float, baseline: float
+    settings: PdotSettings, f_center: float, baseline: float, h_scale: float
 ) -> FloatArray:
     """The (dP/dt)/P axis: uniform, and containing an exact 0 by default."""
-    step = 4.0 / (settings.samples_per_drift * f_center * baseline * baseline)
+    scale = h_scale if settings.harmonic_scale is None else settings.harmonic_scale
+    scale = max(1.0, float(scale))
+    step = 4.0 / (
+        settings.samples_per_drift * f_center * baseline * baseline * scale
+    )
     if settings.pdot_over_p_range is not None:
         lo, hi = settings.pdot_over_p_range
         n = int(math.floor((hi - lo) / step)) + 1
         return lo + step * np.arange(n, dtype=np.float64)
     a_max = 8.0 * settings.max_cycle_drift / (f_center * baseline * baseline)
-    # Keep the warp monotonic over the span: |a| * (T/2) must stay below 1.
+    # Keep the warp well inside its domain: |a| * (T/2) must stay below 1.
     a_max = min(a_max, 1.0 / baseline)
     n_side = max(1, int(math.ceil(a_max / step)))
     return step * np.arange(-n_side, n_side + 1, dtype=np.float64)
@@ -176,8 +213,19 @@ def _warp(
 
 
 def _warp_times(time: FloatArray, t_ref: float, a: float) -> FloatArray:
-    dt = time - t_ref
-    return dt * (1.0 - (0.5 * a) * dt)
+    return warp_dt(time - t_ref, a)
+
+
+def warp_dt(dt: FloatArray, a: float) -> FloatArray:
+    """Exact constant-dP/dt time warp: ``tau = ln(1 + a*dt)/a`` (``dt`` at 0).
+
+    The phase of a linearly drifting period is ``f * tau`` exactly (module
+    docstring); ``log1p`` keeps precision as ``a*dt -> 0``. The caller must
+    ensure ``1 + a*dt > 0`` for every point (the period stays positive).
+    """
+    if a == 0.0:
+        return dt
+    return np.log1p(a * dt) / a
 
 
 def _parabolic_offset(sm: float, s0: float, sp: float) -> float:
@@ -266,11 +314,15 @@ def pdot_search(
         time, _, _, _ = work.stacked()
         n_samples = int(time.size)
         baseline = float(time.max() - time.min()) if n_samples else 0.0
+        t_lo = float(time.min()) if n_samples else 0.0
+        t_hi = float(time.max()) if n_samples else 0.0
     else:
         single = lc.in_domain(m.natural_domain) if m.natural_domain else lc
         work = single.finite()
         n_samples = work.n
         baseline = work.baseline
+        t_lo = float(work.time.min()) if n_samples else 0.0
+        t_hi = float(work.time.max()) if n_samples else 0.0
     if n_samples < psettings.min_detections:
         raise InsufficientDataError(
             f"pdot_search: {n_samples} finite points < min_detections "
@@ -278,6 +330,7 @@ def pdot_search(
         )
     if baseline <= 0.0:
         raise InsufficientDataError("pdot_search: no usable time baseline")
+    t_ref = weighted_epoch(work)
 
     row_settings = _row_settings(msettings)
 
@@ -295,7 +348,7 @@ def pdot_search(
         f_center, baseline, psettings
     )
     frequency = fgrid.frequency
-    axis = _pdot_axis(psettings, f_center, baseline)
+    axis = _pdot_axis(psettings, f_center, baseline, _harmonic_scale(m, msettings))
     n_cells = int(axis.size) * int(frequency.size)
     if n_cells > psettings.max_grid_cells:
         raise ValueError(
@@ -303,9 +356,16 @@ def pdot_search(
             f"exceeds max_grid_cells={psettings.max_grid_cells}; narrow "
             "pdot_over_p_range / window_rayleigh or raise the guard"
         )
+    dt_extent = max(t_hi - t_ref, t_ref - t_lo)
+    a_worst = float(max(abs(axis[0]), abs(axis[-1])))
+    if a_worst * dt_extent >= 1.0:
+        raise ValueError(
+            "pdot_search: the (dP/dt)/P range reaches |a|*dt >= 1 at the span "
+            "edge — outside the constant-dP/dt model's domain (the period "
+            "would pass through zero); narrow pdot_over_p_range"
+        )
 
     # -- scan ---------------------------------------------------------------------
-    t_ref = weighted_epoch(work)
     engine = m.make_engine(resolved, row_settings)
     power = np.empty((axis.size, frequency.size), dtype=np.float64)
     backend_actual = resolved
@@ -327,7 +387,13 @@ def pdot_search(
     flat = int(np.nanargmax(score))
     j0_raw, i0_raw = np.unravel_index(flat, score.shape)
     j0, i0 = int(j0_raw), int(i0_raw)
-    df = float(frequency[1] - frequency[0]) if frequency.size > 1 else 0.0
+    # Local spacing: exact on the uniform default grid, and still sensible on
+    # a non-uniform user-supplied grid (e.g. a log period grid).
+    if frequency.size > 1:
+        lo, hi = max(i0 - 1, 0), min(i0 + 1, frequency.size - 1)
+        df = float(frequency[hi] - frequency[lo]) / (hi - lo)
+    else:
+        df = 0.0
     da = float(axis[1] - axis[0]) if axis.size > 1 else 0.0
     f_best = float(frequency[i0])
     if 0 < i0 < frequency.size - 1:
@@ -377,4 +443,4 @@ def pdot_search(
     )
 
 
-__all__ = ["pdot_search", "weighted_epoch"]
+__all__ = ["pdot_search", "warp_dt", "weighted_epoch"]

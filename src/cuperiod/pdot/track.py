@@ -26,7 +26,7 @@ measure the residual).
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
@@ -37,6 +37,7 @@ from cuperiod.core.config import PdotSettings
 from cuperiod.core.errors import InsufficientDataError
 from cuperiod.core.lightcurve import LightCurve
 from cuperiod.pdot.result import SECONDS_PER_YEAR
+from cuperiod.pdot.scan import warp_dt
 
 #: Shift-scan sampling: the coarse grid must resolve the sharpest template
 #: feature (scale P / (2 * harmonics)), with margin.
@@ -272,11 +273,20 @@ class EphemerisFit:
         ``c0``: the epoch offset (days).
     chi2, chi2_reduced : float
         Weighted chi-squared and per-dof value.
+    aic, bic : float
+        Information criteria ``chi2 + 2k`` and ``chi2 + k*ln(n)``. Model
+        comparison convention: ``linear.bic - quadratic.bic`` positive favors
+        the quadratic (dP/dt) model; > 10 is conventionally strong.
     n_used : int
         Number of O-C points.
     f_test_p : float
         p-value of the quadratic term against the linear model (NaN for the
         linear fit itself, or when dof does not allow the test).
+    worst_phase_residual : float
+        Largest |O-C|/period seen during cycle assignment (NaN when the fit
+        was built from delays rather than event times). Values approaching
+        0.5 mean the nearest-integer cycle count is at risk (Sterken 2005's
+        classic O-C ambiguity).
     """
 
     period_ref: float
@@ -289,8 +299,11 @@ class EphemerisFit:
     t0_correction: float
     chi2: float
     chi2_reduced: float
+    aic: float
+    bic: float
     n_used: int
     f_test_p: float
+    worst_phase_residual: float = float("nan")
 
     @property
     def degree(self) -> int:
@@ -301,6 +314,16 @@ class EphemerisFit:
     def pdot_s_per_yr(self) -> float:
         """dP/dt in seconds per year."""
         return self.pdot * SECONDS_PER_YEAR
+
+    @property
+    def pdot_ms_per_yr(self) -> float:
+        """dP/dt in milliseconds per year (the transit-timing unit)."""
+        return self.pdot * SECONDS_PER_YEAR * 1e3
+
+    @property
+    def dlnp_dt_per_yr(self) -> float:
+        """Fractional rate d(ln P)/dt per year (the Mira / delta Sct unit)."""
+        return (self.pdot / self.period_ref) * 365.25
 
     def predict(self, time: FloatArray) -> FloatArray:
         """The fitted O-C (days) at ``time`` (same time system as the input)."""
@@ -317,11 +340,16 @@ class EphemerisFit:
             "pdot": self.pdot,
             "pdot_err": self.pdot_err,
             "pdot_s_per_yr": self.pdot_s_per_yr,
+            "pdot_ms_per_yr": self.pdot_ms_per_yr,
+            "dlnp_dt_per_yr": self.dlnp_dt_per_yr,
             "period_correction": self.period_correction,
             "t0_correction": self.t0_correction,
             "chi2_reduced": self.chi2_reduced,
+            "aic": self.aic,
+            "bic": self.bic,
             "n_used": self.n_used,
             "f_test_p": self.f_test_p,
+            "worst_phase_residual": self.worst_phase_residual,
             "period_ref": self.period_ref,
             "t_ref": self.t_ref,
         }
@@ -355,7 +383,8 @@ def _ephemeris_from_delays(
 
     def build(degree: int, f_test_p: float) -> EphemerisFit:
         coef, cov, chi2 = _poly_fit(dt, oc, sigma, degree)
-        dof = max(1, t.size - (degree + 1))
+        k = degree + 1
+        dof = max(1, t.size - k)
         c2 = float(coef[2]) if degree == 2 else 0.0
         c2_err = float(np.sqrt(cov[2, 2])) if degree == 2 else 0.0
         return EphemerisFit(
@@ -369,6 +398,8 @@ def _ephemeris_from_delays(
             t0_correction=float(coef[0]),
             chi2=chi2,
             chi2_reduced=chi2 / dof,
+            aic=chi2 + 2.0 * k,
+            bic=chi2 + k * float(np.log(t.size)),
             n_used=int(t.size),
             f_test_p=f_test_p,
         )
@@ -448,7 +479,9 @@ def fit_ephemeris(
         if np.any(~np.isfinite(sigma) | (sigma <= 0.0)):
             raise ValueError("errors must be finite and positive")
     _, quad = _ephemeris_from_delays(t, oc, sigma, period)
-    return quad
+    return replace(
+        quad, worst_phase_residual=float(np.max(np.abs(oc)) / period)
+    )
 
 
 # --- phase_track -------------------------------------------------------------
@@ -668,7 +701,9 @@ def phase_track(
     linear, quad = result.linear, result.quadratic
     if delta != 0.0:
         dt_mid = result.t_mid - t_ref
-        delay = result.delay + (0.5 * delta / period) * dt_mid * dt_mid
+        # The delay the removed drift would itself have produced against the
+        # caller's ephemeris: dt - tau(dt) (exactly (delta/2P)*dt^2 + h.o.t.).
+        delay = result.delay + (dt_mid - warp_dt(dt_mid, delta / period))
         linear, quad = _ephemeris_from_delays(
             result.t_mid, delay, result.delay_err, period
         )
@@ -724,8 +759,7 @@ def _track_pass(
 ) -> _TrackPass:
     # Remove the bulk drift: on these warped times the reference model is a
     # strictly periodic signal at `period` (see the scan module docstring).
-    a_ref = bulk_pdot / period
-    dtw = dt * (1.0 - (0.5 * a_ref) * dt)
+    dtw = warp_dt(dt, bulk_pdot / period)
 
     template = fit_template(
         dtw,
