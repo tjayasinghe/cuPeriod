@@ -58,6 +58,34 @@ follow it (see {doc}`../guide/prewhitening`).
    buoyancy_radius
 ```
 
+## Period change
+
+Joint (period, dP/dt) searching, automated O−C phase tracking, ephemeris fitting,
+time-resolved maps, and the random-wander test (see {doc}`../guide/period-change`).
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   pdot_search
+   PdotSearchResult
+   PdotBest
+   phase_track
+   PhaseTrackResult
+   PhaseTemplate
+   SegmentShift
+   fit_ephemeris
+   EphemerisFit
+   sliding_periodogram
+   SlidingPeriodogram
+   wwz
+   WWZResult
+   eddington_plakidis
+   EddingtonPlakidisResult
+   weighted_epoch
+```
+
 ## Multi-band
 
 Joint multi-band false-alarm calibration (see {doc}`../guide/multiband`). The multi-band
@@ -135,6 +163,7 @@ Per-method tuning models (see {doc}`../guide/tuning`).
    SuperSmootherSettings
    TLSSettings
    PreWhitenSettings
+   PdotSettings
    SpacingSettings
    BatchSettings
 ```

@@ -6,6 +6,92 @@ All notable changes to cuPeriod are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Joint (period, dP/dt) searching for every method** (`cuperiod.pdot_search`,
+  `cuperiod.PdotSettings`): a drifting period defocuses a constant-period search, and a
+  constant dP/dt has exactly the phase `f * ln(1 + (Pdot/P) * dt) / (Pdot/P)` (Mikulášek
+  et al. 2012 — the same logarithmic phase PHOEBE integrates for its `dpdt`), so
+  evaluating an *ordinary* periodogram on warped times scans a dP/dt axis with no new
+  kernels: GLS, PDM, CE, String-Length, MHAOV, and SuperSmoother — single- and
+  multi-band, every backend — all become period-derivative searches, with the cached
+  cufinufft plans serving every row of a GPU scan (cupy and CPU rows agree to 1e-7).
+  Both axes are stepped to equal phase smear, the dP/dt step additionally refines by a
+  per-method harmonic scale (sharp phase structure smears sooner — the criterion of the
+  one prior art, Katz et al. 2021's conditional-entropy GPU search), and the default
+  range is set in accumulated drift *cycles*, making the row count baseline-independent
+  (201 at the defaults). On a planted 1.1-cycle drift the constant-period row keeps GLS
+  power 0.19 where the correct cell shows 0.95; the refined best cell recovers the
+  planted (P, dP/dt) to grid precision (`tests/test_pdot_scan.py`, including sign
+  conventions, the 160-cycle exact-warp regression, and CPU/GPU/torch parity).
+- **Automated O−C analysis** (`cuperiod.phase_track`, `cuperiod.fit_ephemeris`): the
+  classical observed-minus-calculated method (Sterken 2005) without hand-collected
+  minima — one BIC-order multi-harmonic template at a fixed period, per-segment rigid
+  template time shifts with Fisher-information uncertainties (timing precision comes
+  from the light curve's *slopes*, so eclipses and sawtooths time better than sines),
+  sequential cycle-count unwrapping with a `wrap_risk` flag, and weighted linear-vs-
+  quadratic ephemeris fits reporting `Pdot = 2 P c2` with its formal error, the Pringle
+  (1975) F-test, and AIC/BIC (convention documented). The template is re-derived on
+  drift-corrected times until self-consistent, so an uncorrected drift cannot smear its
+  own measurement, and results are always referenced to the constant-period ephemeris.
+  A 25-realization Monte Carlo calibrates the reported sigma (pull scatter 0.72–0.93,
+  i.e. mildly conservative); `fit_ephemeris` accepts plain event-time lists (nearest-
+  integer cycles, `worst_phase_residual` ambiguity diagnostic) and its unit conversions
+  are pinned against WASP-12b's published −29 ms/yr — guarding the exact
+  multiply-vs-divide mistake that reached a refereed decay claim
+  (`tests/test_pdot_track.py`).
+- **The Eddington–Plakidis wander test** (`cuperiod.eddington_plakidis`): a smooth O−C
+  is not evidence of a smooth period change — random cycle-to-cycle fluctuations
+  accumulate a random walk that fits a parabola beautifully (Sterken's dice), and most
+  Miras plus a third of Cepheids wander non-secularly. The 1929 test separates the two
+  through the growth of accumulated delays with cycle lag, here with two corrections:
+  the secular quadratic is removed first, and — because polynomial detrending absorbs
+  part of the walk itself — the fit uses *exact* expectations (the detrending projector
+  propagated through the walk covariance) rather than the classical line, recovering a
+  planted per-cycle fluctuation at 93% ± 20% where the naive recipe returns half
+  (`tests/test_pdot_stability.py`).
+- **Sliding-window periodograms** (`cuperiod.sliding_periodogram`): any registered
+  method on stepped windows over a shared frequency grid — a (time × frequency) map
+  with per-window refined peaks, `window_periodogram(i)` slices that are ordinary
+  `Periodogram` objects, and a `period_trend()` diagnostic — for the period *wander*
+  regime (Miras, spotted binaries) where a single quadratic is the wrong model, and as
+  a visual sanity check on any `pdot_search` detection (`tests/test_pdot_sliding.py`).
+- **The Weighted Wavelet Z-transform** (`cuperiod.wwz`): Foster's (1996) WWZ, the
+  long-period-variable community's standard for period *wander* — the date-compensated
+  three-function projection under Gaussian weights whose window is a constant number of
+  *periods* wide at every trial frequency (`sigma_t = P` exactly at the default
+  `c = 1/(8*pi^2)`; the Templeton et al. 2005 Mira convention `c = 0.001` is
+  documented). Returns the Z and semi-amplitude maps with the per-cell effective point
+  count, a parabolically refined ridge, and a `period_trend()` diagnostic; cells below
+  `min_neff` are masked rather than reported. The docstrings carry Foster's own health
+  warning verbatim in spirit: `N_eff` is not an integer, the nominal F-distribution
+  does not hold, and no p-value should ever be read off a WWZ map. The implementation
+  is pinned cell-by-cell against a transparent loop-and-lstsq reference in
+  `tests/test_pdot_wwz.py`.
+- **CLI: `cuperiod pdot`** — the search + track chain from the command line: window
+  and drift-axis flags mapping onto `PdotSettings`, `--track/--no-track`, JSON output
+  (`--out`) and the 2-D map as `.npz` (`--save-map`), with the same column-override
+  and domain options as `run` (`tests/test_cli_pdot.py`).
+
+### Validated
+
+- **End-to-end injection-recovery of the dP/dt chain**
+  (`benchmarks/pdot_recovery.py`): 60 two-harmonic stars over 1500 days with drifts
+  spanning 0.5–8 accumulated cycles, plus 60 drift-free nulls. The search localized
+  the planted (P, dP/dt) in **60/60** stars, the tracker's F-test detected **60/60**
+  at p < 1e-3 with **0/60** false detections on the nulls, and the pull distributions
+  are calibrated (null rms 1.07, injected 0.8–1.3). Median cost per star on one CPU
+  core: 4.1 s for the 201×601 search, 0.06 s for the tracking measurement.
+
+### Known limitations
+
+- The (P, dP/dt) map is a localization tool, not an inference tool: the wrapped
+  statistic's false-alarm calibration on a 2-D grid over irregular sampling is an
+  open problem (the independent-trials count is unknown), so significance always
+  comes from `phase_track`'s F-test. The GUI does not yet expose the period-change
+  tools, and `batch_periodograms` has no dP/dt sibling; both are v1.3.x candidates.
+  Constant dP/dt is the only drift model searched — for wander, use the maps.
+
 ## [1.2.0] - 2026-08-30
 
 ### Added

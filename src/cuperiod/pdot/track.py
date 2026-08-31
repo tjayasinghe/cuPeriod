@@ -18,9 +18,12 @@ lists (times of minima/maxima from the literature or from dense follow-up).
 
 Unlike :func:`cuperiod.pdot_search` (detection over a grid), this is the
 *measurement* tool: it propagates per-point uncertainties into ``dP/dt``. Chain
-them: search first, then track at the found period (passing ``pdot=`` from the
-search removes the bulk drift so the template stays sharp and the segments only
-measure the residual).
+them: search first, then track at the found period. A drift left in the fold
+would smear the template, so the tracker re-derives it on drift-corrected
+times until self-consistent (``template_iterations``); when the accumulated
+drift exceeds a cycle or so, start it at the search's value (``pdot=``) so the
+first template is already sharp. Either way the delays and fits are reported
+against the constant-period ephemeris.
 """
 
 from __future__ import annotations
@@ -283,8 +286,8 @@ class EphemerisFit:
         p-value of the quadratic term against the linear model (NaN for the
         linear fit itself, or when dof does not allow the test).
     worst_phase_residual : float
-        Largest |O-C|/period seen during cycle assignment (NaN when the fit
-        was built from delays rather than event times). Values approaching
+        Largest ``|O-C| / period`` seen during cycle assignment (NaN when the
+        fit was built from delays rather than event times). Values approaching
         0.5 mean the nearest-integer cycle count is at risk (Sterken 2005's
         classic O-C ambiguity).
     """
@@ -495,10 +498,10 @@ class PhaseTrackResult:
     ----------
     period : float
         The reference period the delays are measured against (days).
-    pdot_reference : float
-        The reference dP/dt (day/day) the delays are relative to (the ``pdot=``
-        argument); the total measured rate adds the quadratic term back (see
-        ``pdot``).
+    pdot_seed : float
+        The starting guess for the bulk drift (the ``pdot=`` argument). Only
+        an initialization: the delays and fits are always reported against
+        the *constant-period* ephemeris, whatever the seed.
     t_ref : float
         Reference epoch of the phase model (weighted mean epoch).
     template : PhaseTemplate
@@ -519,7 +522,7 @@ class PhaseTrackResult:
     """
 
     period: float
-    pdot_reference: float
+    pdot_seed: float
     t_ref: float
     template: PhaseTemplate
     t_mid: FloatArray
@@ -533,8 +536,8 @@ class PhaseTrackResult:
 
     @property
     def pdot(self) -> float:
-        """Total measured dP/dt (day/day): reference rate + quadratic term."""
-        return self.pdot_reference + self.quadratic_fit.pdot
+        """Measured dP/dt (day/day), against the constant-period ephemeris."""
+        return self.quadratic_fit.pdot
 
     @property
     def pdot_err(self) -> float:
@@ -563,7 +566,7 @@ class PhaseTrackResult:
             "pdot": self.pdot,
             "pdot_err": self.pdot_err,
             "pdot_s_per_yr": self.pdot_s_per_yr,
-            "pdot_reference": self.pdot_reference,
+            "pdot_seed": self.pdot_seed,
             "f_test_p": self.f_test_p,
             "wrap_risk": self.wrap_risk,
             "t_ref": self.t_ref,
@@ -623,10 +626,11 @@ def phase_track(
     period : float
         Reference period in days (from a periodogram or the literature).
     pdot : float, default 0.0
-        A bulk dP/dt (day/day) to remove before tracking — pass the value found
-        by :func:`cuperiod.pdot_search` so the template is built on a sharp,
-        drift-corrected fold and the segments measure only the residual. The
-        reported total adds it back.
+        Starting guess for the bulk dP/dt (day/day). Purely an initialization
+        for the template — pass :func:`cuperiod.pdot_search`'s ``best.pdot``
+        when the accumulated drift is large enough (roughly a cycle) that a
+        zero-start template would wash out. The delays, fits, and F-test are
+        always reported against the constant-period ephemeris.
     settings : PdotSettings, optional
         Tracking knobs (segmentation, harmonics, per-segment offsets).
     columns, domain
@@ -690,20 +694,18 @@ def phase_track(
         result = _track_pass(dt, time, y, w, weighted, period, bulk, psettings)
         passes += 1
 
-    # Report the delays in the *caller's* reference frame: the drift the
-    # template iterations folded into the warp is deterministic, so add its
-    # parabola back and refit. The O-C then shows the classical parabola, and
-    # the F-test measures the significance of the total drift beyond `pdot=`
-    # — while the delays themselves were still measured against the sharp,
-    # drift-corrected template.
-    delta = bulk - pdot
+    # Report against the *constant-period* ephemeris, whatever bulk drift
+    # ended up in the warp: the removed drift is deterministic, so add its
+    # delay back and refit. The O-C then shows the classical parabola, and
+    # the F-test always answers "is the drift real?" — while the delays
+    # themselves were measured against the sharp, drift-corrected template.
     delay = result.delay
     linear, quad = result.linear, result.quadratic
-    if delta != 0.0:
+    if bulk != 0.0:
         dt_mid = result.t_mid - t_ref
-        # The delay the removed drift would itself have produced against the
-        # caller's ephemeris: dt - tau(dt) (exactly (delta/2P)*dt^2 + h.o.t.).
-        delay = result.delay + (dt_mid - warp_dt(dt_mid, delta / period))
+        # The delay the removed drift itself produces against a constant
+        # period: dt - tau(dt) (exactly (bulk/2P)*dt^2 + h.o.t.).
+        delay = result.delay + (dt_mid - warp_dt(dt_mid, bulk / period))
         linear, quad = _ephemeris_from_delays(
             result.t_mid, delay, result.delay_err, period
         )
@@ -719,7 +721,7 @@ def phase_track(
     }
     return PhaseTrackResult(
         period=period,
-        pdot_reference=pdot,
+        pdot_seed=pdot,
         t_ref=t_ref,
         template=result.template,
         t_mid=result.t_mid,

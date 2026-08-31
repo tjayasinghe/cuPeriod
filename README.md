@@ -75,6 +75,14 @@ Every implementation is validated against the standard reference (astropy
   simultaneous re-fitting, principled stopping criteria, propagated uncertainties,
   combination-frequency identification, and g-mode period-spacing tools — for one star or
   a million.
+- **Period *changes*, not just periods.** `pdot_search` turns any of the methods into a
+  joint (P, dP/dt) search by evaluating it on exactly time-warped data — a drift that
+  buries a signal in an ordinary periodogram (GLS power 0.19) stands out at the correct
+  cell (0.95) — and `phase_track` measures the derivative with an automated O−C analysis:
+  template timing per segment, quadratic ephemeris fits with honest uncertainties, an
+  F-test for the drift, plus the Eddington–Plakidis test that separates a real secular
+  change from random cycle-to-cycle wander. `fit_ephemeris` runs the same fits on your
+  own times-of-minimum lists.
 
 ## Status
 

@@ -64,12 +64,14 @@ from cuperiod.pdot import (
     PhaseTrackResult,
     SegmentShift,
     SlidingPeriodogram,
+    WWZResult,
     eddington_plakidis,
     fit_ephemeris,
     pdot_search,
     phase_track,
     sliding_periodogram,
     weighted_epoch,
+    wwz,
 )
 from cuperiod.prewhiten import (
     AmplitudeSpectrum,
@@ -146,6 +148,7 @@ __all__ = [
     "SuperSmootherSettings",
     "TLSSettings",
     "UnknownMethodError",
+    "WWZResult",
     "WindowPeak",
     "__version__",
     "alias_diagnostics",
@@ -179,4 +182,5 @@ __all__ = [
     "to_input",
     "uniform_frequency_grid",
     "weighted_epoch",
+    "wwz",
 ]

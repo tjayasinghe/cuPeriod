@@ -12,6 +12,9 @@ The v1.3 subsystem for measuring period *derivatives*:
   time-frequency map for period wander, glitches, and drift sanity checks.
 - :func:`eddington_plakidis` — the classical test separating random
   cycle-to-cycle period fluctuation from a genuine secular change.
+- :func:`wwz` — the Weighted Wavelet Z-transform: a time-frequency map whose
+  window scales with the trial frequency, the standard tool for the period
+  wander of Miras and semi-regulars.
 """
 
 from cuperiod.pdot.result import (
@@ -32,6 +35,7 @@ from cuperiod.pdot.track import (
     fit_template,
     phase_track,
 )
+from cuperiod.pdot.wwz import WWZResult, wwz
 
 __all__ = [
     "DAYS_PER_MYR",
@@ -44,6 +48,7 @@ __all__ = [
     "PhaseTrackResult",
     "SegmentShift",
     "SlidingPeriodogram",
+    "WWZResult",
     "eddington_plakidis",
     "fit_ephemeris",
     "fit_template",
@@ -51,4 +56,5 @@ __all__ = [
     "phase_track",
     "sliding_periodogram",
     "weighted_epoch",
+    "wwz",
 ]

@@ -133,6 +133,42 @@ their uncertainties and signal-to-noise.
     amplitude spectra as `.npz` (data, residual, and the spectral window).
 ```
 
+## `pdot` — is the period changing?
+
+```bash
+cuperiod pdot star.csv --period 0.5168 --out drift.json
+```
+
+Runs the joint (period, dP/dt) search of {doc}`period-change` and, by default, follows
+with the phase-tracking measurement at the found period: the printed summary gives the
+best cell of the search map (with the dP/dt = 0 comparison), then the measured dP/dt
+with its uncertainty and the F-test against a constant period.
+
+```{list-table}
+:header-rows: 1
+:widths: 30 70
+
+* - Option
+  - Meaning
+* - `--period`
+  - Center of the search window in days (omit to seed from a standard run).
+* - `--method`, `-m`
+  - Wrapped periodogram method (default GLS; BLS/TLS are not searchable).
+* - `--max-cycle-drift` / `--samples-per-drift` / `--pdot-range`
+  - The dP/dt axis: half-range in accumulated drift cycles, its oversampling,
+    or explicit `(dP/dt)/P` bounds as `lo,hi` in 1/day.
+* - `--window-rayleigh` / `--samples-per-peak`
+  - The frequency window around the center period.
+* - `--harmonics` / `--segments`
+  - Tracking template order (default BIC-selected) and segment count.
+* - `--track / --no-track`
+  - Follow the search with the phase-tracking measurement (default on).
+* - `--backend`
+  - `auto` | `cpu` | `gpu` | a concrete backend name.
+* - `--out` / `--save-map`
+  - Write the results as JSON, and/or the 2-D search map as `.npz`.
+```
+
 ## `batch-prewhiten` — many pulsators
 
 ```bash

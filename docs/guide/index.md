@@ -37,6 +37,11 @@ Automated, uncertainty-aware frequency extraction for δ Scuti, γ Dor, and SPB
 pulsators — with combination frequencies and g-mode period spacings.
 :::
 
+:::{grid-item-card} {doc}`period-change`
+Detect and measure period derivatives: the joint (P, dP/dt) search, automated O−C
+tracking, dynamic maps, and the random-wander test.
+:::
+
 :::{grid-item-card} {doc}`multiband`
 Jointly model several filters of the same star: three GLS models, pooled fold statistics,
 bootstrap false-alarm probabilities, and alias checks.
@@ -53,8 +58,8 @@ output.
 :::
 
 :::{grid-item-card} {doc}`cli`
-The `cuperiod` command line: `run`, `batch`, `prewhiten`, `batch-prewhiten`, `methods`,
-`doctor`, and more.
+The `cuperiod` command line: `run`, `batch`, `pdot`, `prewhiten`, `batch-prewhiten`,
+`methods`, `doctor`, and more.
 :::
 
 :::{grid-item-card} {doc}`gui`

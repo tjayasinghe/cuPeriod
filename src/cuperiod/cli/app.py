@@ -7,6 +7,7 @@ code path. Commands:
 * ``batch`` — many light curves with CPU or GPU workers, written to Parquet/CSV.
 * ``prewhiten`` — automated iterative frequency extraction for a pulsator.
 * ``batch-prewhiten`` — the same over many light curves, written to Parquet/CSV.
+* ``pdot`` — joint (period, dP/dt) search, then a phase-tracking dP/dt measurement.
 * ``methods`` — list registered methods and their backends.
 * ``gpu-info`` — show the CUDA GPU and suggested worker counts.
 * ``doctor`` — diagnose available backends, torch devices, and the precision each uses.
@@ -18,7 +19,7 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import typer
@@ -27,13 +28,21 @@ from pydantic import ValidationError
 from cuperiod.api import periodogram
 from cuperiod.batch.runner import batch_periodograms
 from cuperiod.core.columns import ColumnMap, Domain
-from cuperiod.core.config import PreWhitenSettings
+from cuperiod.core.config import PdotSettings, PreWhitenSettings
 from cuperiod.core.device import gpu_info as _gpu_info
 from cuperiod.core.device import suggest_gpu_workers
+from cuperiod.core.errors import InsufficientDataError
 from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
 from cuperiod.core.result import MultiResult, Periodogram
 from cuperiod.methods.base import get_method, list_methods
 from cuperiod.prewhiten.result import PreWhitenResult
+
+if TYPE_CHECKING:  # annotations only — the pdot modules load inside the command.
+    from cuperiod import PdotSearchResult, PhaseTrackResult
+
+#: Seconds per Julian year, for reporting a dP/dt error in the eclipse-timing unit
+#: (the canonical definition lives in :mod:`cuperiod.pdot.result`).
+_SECONDS_PER_YEAR: float = 86400.0 * 365.25
 
 app = typer.Typer(
     add_completion=False,
@@ -380,6 +389,192 @@ def batch_prewhiten_cmd(
     )
     for key, msg in summary.errors[:10]:
         typer.echo(f"  ! {key}: {msg}")
+
+
+def _pdot_range(value: str | None) -> tuple[float, float] | None:
+    """Parse ``--pdot-range "lo,hi"`` into explicit (dP/dt)/P bounds (1/day)."""
+    if value is None:
+        return None
+    parts = [p.strip() for p in value.split(",")]
+    if len(parts) != 2:
+        raise typer.BadParameter(
+            f"pdot-range must be two comma-separated numbers 'lo,hi', got {value!r}"
+        )
+    try:
+        return float(parts[0]), float(parts[1])
+    except ValueError as exc:
+        raise typer.BadParameter(
+            f"pdot-range: {value!r} is not a pair of numbers"
+        ) from exc
+
+
+def _pdot_settings(
+    *,
+    max_cycle_drift: float,
+    samples_per_drift: int,
+    samples_per_peak: int,
+    window_rayleigh: float,
+    pdot_range: str | None,
+    harmonics: int | None,
+    segments: int | None,
+    harmonic_scale: float | None,
+) -> PdotSettings:
+    """Build a :class:`PdotSettings` from CLI options (validated by pydantic)."""
+    try:
+        return PdotSettings(
+            max_cycle_drift=max_cycle_drift,
+            samples_per_drift=samples_per_drift,
+            samples_per_peak=samples_per_peak,
+            window_rayleigh=window_rayleigh,
+            pdot_over_p_range=_pdot_range(pdot_range),
+            harmonics=harmonics,
+            n_segments=segments,
+            harmonic_scale=harmonic_scale,
+        )
+    except ValidationError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+@app.command()
+def pdot(
+    path: Path = typer.Argument(..., help="Light-curve file (CSV/ECSV/FITS/Parquet)."),
+    period: float | None = typer.Option(
+        None, "--period", help="Window center in days (None = seed from a first run)."
+    ),
+    method: str = typer.Option("GLS", "--method", "-m", help="Wrapped method (one)."),
+    backend: str = typer.Option("auto", help="auto | cpu | gpu | concrete backend."),
+    max_cycle_drift: float = typer.Option(
+        10.0, "--max-cycle-drift", help="dP/dt half-range, in accumulated cycles."
+    ),
+    samples_per_drift: int = typer.Option(
+        5, "--samples-per-drift", help="Oversampling of the (dP/dt)/P axis."
+    ),
+    samples_per_peak: int = typer.Option(
+        10, "--samples-per-peak", help="Frequency oversampling inside the window."
+    ),
+    window_rayleigh: float = typer.Option(
+        30.0, "--window-rayleigh", help="Frequency half-window in Rayleigh widths."
+    ),
+    pdot_range: str | None = typer.Option(
+        None, "--pdot-range", help="Explicit (dP/dt)/P bounds 'lo,hi' in 1/day."
+    ),
+    harmonics: int | None = typer.Option(
+        None, "--harmonics", help="Tracking template order (None = BIC-selected)."
+    ),
+    segments: int | None = typer.Option(
+        None, "--segments", help="Target tracking segment count (None = auto)."
+    ),
+    harmonic_scale: float | None = typer.Option(
+        None, "--harmonic-scale", help="Extra (dP/dt)/P refinement (None = per method)."
+    ),
+    track: bool = typer.Option(
+        True, "--track/--no-track", help="Measure dP/dt by segmented phase tracking."
+    ),
+    time: str | None = typer.Option(None, help="Time column name override."),
+    value: str | None = typer.Option(None, help="Value column name override."),
+    error: str | None = typer.Option(None, help="Error column name override."),
+    domain: str | None = typer.Option(None, help="magnitude | flux."),
+    out: Path | None = typer.Option(None, help="Write the results as JSON here."),
+    save_map: Path | None = typer.Option(
+        None, "--save-map", help="Write the 2-D search map to this .npz."
+    ),
+) -> None:
+    """Search a light curve jointly over (period, dP/dt) and measure the drift.
+
+    The search localizes the drifting signal on a (dP/dt)/P x frequency grid; the
+    phase-tracking pass then measures dP/dt at that period with an uncertainty.
+    """
+    from cuperiod.pdot.scan import pdot_search
+    from cuperiod.pdot.track import phase_track
+
+    columns = _column_map(time, value, error, None)
+    lc = LightCurve.from_file(path, columns=columns, domain=_domain(domain))
+    settings = _pdot_settings(
+        max_cycle_drift=max_cycle_drift,
+        samples_per_drift=samples_per_drift,
+        samples_per_peak=samples_per_peak,
+        window_rayleigh=window_rayleigh,
+        pdot_range=pdot_range,
+        harmonics=harmonics,
+        segments=segments,
+        harmonic_scale=harmonic_scale,
+    )
+    result = pdot_search(
+        lc, period=period, method=method, settings=settings, backend=backend
+    )
+    _print_pdot_search(result)
+
+    tracked: PhaseTrackResult | None = None
+    if track:
+        try:
+            tracked = phase_track(
+                lc, period=result.best.period, pdot=result.best.pdot, settings=settings
+            )
+        except InsufficientDataError as exc:
+            typer.echo(f"\nphase tracking skipped: {exc}")
+        else:
+            _print_phase_track(tracked)
+
+    if out is not None:
+        payload = result.to_dict()
+        if tracked is not None:
+            payload["track"] = tracked.to_dict()
+        out.write_text(
+            json.dumps(_json_safe(payload), indent=2, allow_nan=False),
+            encoding="utf-8",
+        )
+        typer.echo(f"\nWrote {out}")
+    if save_map is not None:
+        arrays: dict[str, np.ndarray] = {
+            "frequency": result.frequency,
+            "pdot_over_p": result.pdot_over_p,
+            "power": result.power,
+        }
+        # numpy's stub collides **kwargs with the bool allow_pickle keyword.
+        np.savez_compressed(save_map, **arrays)  # type: ignore[arg-type]
+        typer.echo(f"Wrote {save_map}")
+
+
+def _print_pdot_search(res: PdotSearchResult) -> None:
+    """The joint-search block: the best cell and what the extra axis bought."""
+    best = res.best
+    n_pdot, n_freq = res.shape
+    typer.echo(
+        f"\n{res.method} dP/dt search  (backend={res.backend}, n={res.n_samples}, "
+        f"baseline={res.baseline:.6g} d)"
+    )
+    typer.echo(f"  {'grid':<15} {n_pdot} x {n_freq}  ((dP/dt)/P x frequency)")
+    typer.echo(f"  {'period (d)':<15} {best.period:.8f}   at t_ref={best.t_ref:.6f}")
+    typer.echo(f"  {'dP/dt (d/d)':<15} {best.pdot:.6g}")
+    typer.echo(f"  {'dP/dt (s/yr)':<15} {best.pdot_s_per_yr:.6g}")
+    typer.echo(f"  {'dP/dt (ms/yr)':<15} {best.pdot_ms_per_yr:.6g}")
+    typer.echo(
+        f"  {'power':<15} {best.power:.6g}   (dP/dt=0: {best.zero_pdot_power:.6g}, "
+        f"sense={res.objective_sense})"
+    )
+
+
+def _print_phase_track(res: PhaseTrackResult) -> None:
+    """The segmented phase-tracking (O-C) measurement block."""
+    typer.echo(f"\nphase tracking at P = {res.period:.8f} d")
+    typer.echo(f"  {'dP/dt (d/d)':<15} {res.pdot:.6g} +- {res.pdot_err:.3g}")
+    typer.echo(
+        f"  {'dP/dt (s/yr)':<15} {res.pdot_s_per_yr:.6g} +- "
+        f"{res.pdot_err * _SECONDS_PER_YEAR:.3g}"
+    )
+    typer.echo(
+        f"  {'F-test p':<15} {res.f_test_p:.4g}   "
+        "(the drift against the constant-period model)"
+    )
+    typer.echo(
+        f"  {'segments':<15} {res.n_segments}   "
+        f"(template harmonics: {res.template.n_harmonics})"
+    )
+    if res.wrap_risk:
+        typer.echo(
+            "  ! wrap risk: consecutive segment delays jump by more than 0.3 period; "
+            "the cycle count may have slipped (retry with fewer --segments)"
+        )
 
 
 @app.command()

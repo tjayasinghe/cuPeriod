@@ -59,6 +59,11 @@ resumable across runs.
 frequency solution with uncertainties, combination frequencies, and period spacings.
 :::
 
+:::{grid-item-card} ⏱️ Measure period changes
+{doc}`Period-change tools <guide/period-change>` search jointly over (P, dP/dt),
+automate the O−C diagram, and test drift against random wander.
+:::
+
 :::{grid-item-card} 🔬 Trust the numbers
 The {doc}`benchmarks` page shows parity, period recovery, and speedups on real
 survey data.
@@ -93,6 +98,12 @@ stopping criteria, propagated uncertainties, combination-frequency identificatio
 g-mode period-spacing tools — over the same inputs and backends. See
 {doc}`guide/prewhitening`.
 
+And a periodogram assumes the period is *constant*. When it is not — mass-transfer
+binaries, decaying hot-Jupiter orbits, evolving pulsators, wandering Miras —
+{func}`cuperiod.pdot_search` turns any of the eight methods into a joint (P, dP/dt)
+search by time-warping, and {func}`cuperiod.phase_track` measures the derivative with an
+automated O−C analysis. See {doc}`guide/period-change`.
+
 ## Install
 
 ```bash
@@ -124,6 +135,7 @@ guide/results
 guide/backends
 guide/tuning
 guide/prewhitening
+guide/period-change
 guide/multiband
 guide/interop
 guide/batch
