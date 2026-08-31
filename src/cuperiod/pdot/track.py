@@ -39,8 +39,8 @@ from cuperiod.core.columns import ColumnMap, Domain
 from cuperiod.core.config import PdotSettings
 from cuperiod.core.errors import InsufficientDataError
 from cuperiod.core.lightcurve import LightCurve
+from cuperiod.pdot.models import PeriodModel, get_model
 from cuperiod.pdot.result import SECONDS_PER_YEAR
-from cuperiod.pdot.scan import warp_dt
 
 #: Shift-scan sampling: the coarse grid must resolve the sharpest template
 #: feature (scale P / (2 * harmonics)), with margin.
@@ -253,7 +253,14 @@ def _fit_segment_shift(
 
 @dataclass(frozen=True)
 class EphemerisFit:
-    """A weighted polynomial (degree <= 2) fit to O-C delays.
+    """A weighted polynomial fit to O-C delays.
+
+    Degree 1 is the constant-period ephemeris and degree 2 the classical
+    quadratic (constant ``dP/dt``). Degree 3 and above add no new *rate* — the
+    instantaneous ``pdot`` is still ``2*period_ref*c2`` because higher terms
+    vanish from the second derivative at ``t_ref`` — but they absorb curvature
+    that a changing rate puts into the O-C, which both de-biases ``pdot`` and,
+    through :attr:`pddot`, measures the change itself.
 
     Attributes
     ----------
@@ -262,14 +269,22 @@ class EphemerisFit:
     t_ref : float
         Expansion epoch of the polynomial (same time system as the input).
     coefficients : numpy.ndarray
-        ``(c0, c1[, c2])`` of ``O-C = c0 + c1*dt + c2*dt**2`` (days, dt in days).
+        ``(c0, c1, c2, ...)`` of ``O-C = sum_k c_k * dt**k`` (days, dt in days).
     covariance : numpy.ndarray
         Covariance of the coefficients (from the formal input errors).
     pdot : float
         ``2 * period_ref * c2`` (0 for a linear fit), day/day.
     pdot_err : float
         Formal 1-sigma on ``pdot``; multiply by ``sqrt(chi2_reduced)`` when the
-        fit is poor (documented, not applied silently).
+        fit is poor (documented, not applied silently — see
+        :attr:`pdot_err_scaled`).
+    pddot : float
+        Second period derivative ``d2P/dt2`` at ``t_ref`` in 1/day, from
+        ``period_ref * (6*c3 + 8*c2**2)``; NaN below degree 3. Nonzero means the
+        rate itself is evolving: ``pddot = 0`` is the constant-dP/dt model and
+        ``pddot = pdot**2/period_ref`` the exponential one.
+    pddot_err : float
+        Formal 1-sigma on :attr:`pddot` (NaN below degree 3).
     period_correction : float
         ``period_ref * c1``: the linear-term period offset (days).
     t0_correction : float
@@ -307,11 +322,47 @@ class EphemerisFit:
     n_used: int
     f_test_p: float
     worst_phase_residual: float = float("nan")
+    pddot: float = float("nan")
+    pddot_err: float = float("nan")
 
     @property
     def degree(self) -> int:
         """Polynomial degree (1 = linear, 2 = quadratic)."""
         return int(self.coefficients.size - 1)
+
+    @property
+    def pdot_err_scaled(self) -> float:
+        """:attr:`pdot_err` inflated by ``sqrt(chi2_reduced)`` when > 1.
+
+        The honest error bar whenever the O-C scatter exceeds the formal timing
+        errors — which is the norm rather than the exception on real data, where
+        the light-curve shape evolves, spots migrate, or the drift is not
+        actually the model being fitted. Equal to :attr:`pdot_err` for a fit
+        that already matches its errors.
+        """
+        return self.pdot_err * float(np.sqrt(max(1.0, self.chi2_reduced)))
+
+    @property
+    def implied_model(self) -> str:
+        """Which period law the fitted ``pddot`` favours (degree >= 3 only).
+
+        ``"constant-pdot"`` when ``pddot`` is consistent with 0,
+        ``"exponential"`` when it is consistent with ``pdot**2/period_ref``,
+        ``"neither"`` when it is more than 1 sigma from both, and ``"unknown"``
+        below degree 3 or without a usable error.
+        """
+        if not np.isfinite(self.pddot) or not np.isfinite(self.pddot_err):
+            return "unknown"
+        if self.pddot_err <= 0.0:
+            return "unknown"
+        expected = self.pdot * self.pdot / self.period_ref
+        d_const = abs(self.pddot) / self.pddot_err
+        d_exp = abs(self.pddot - expected) / self.pddot_err
+        if d_const <= 1.0 and d_const <= d_exp:
+            return "constant-pdot"
+        if d_exp <= 1.0:
+            return "exponential"
+        return "neither"
 
     @property
     def pdot_s_per_yr(self) -> float:
@@ -336,15 +387,18 @@ class EphemerisFit:
             out += c * dt**k
         return out
 
-    def to_dict(self) -> dict[str, float | int]:
+    def to_dict(self) -> dict[str, Any]:
         """Flatten the scalars to a plain dict."""
         return {
             "degree": self.degree,
             "pdot": self.pdot,
             "pdot_err": self.pdot_err,
+            "pdot_err_scaled": self.pdot_err_scaled,
             "pdot_s_per_yr": self.pdot_s_per_yr,
             "pdot_ms_per_yr": self.pdot_ms_per_yr,
             "dlnp_dt_per_yr": self.dlnp_dt_per_yr,
+            "pddot": self.pddot,
+            "pddot_err": self.pddot_err,
             "period_correction": self.period_correction,
             "t0_correction": self.t0_correction,
             "chi2_reduced": self.chi2_reduced,
@@ -353,6 +407,7 @@ class EphemerisFit:
             "n_used": self.n_used,
             "f_test_p": self.f_test_p,
             "worst_phase_residual": self.worst_phase_residual,
+            "implied_model": self.implied_model,
             "period_ref": self.period_ref,
             "t_ref": self.t_ref,
         }
@@ -372,6 +427,63 @@ def _poly_fit(
     return np.asarray(coef, dtype=np.float64), np.asarray(cov, dtype=np.float64), chi2
 
 
+def _build_ephemeris(
+    dt: FloatArray,
+    oc: FloatArray,
+    sigma: FloatArray,
+    *,
+    period_ref: float,
+    t_ref: float,
+    degree: int,
+    f_test_p: float = float("nan"),
+) -> EphemerisFit:
+    """One weighted polynomial ephemeris fit of any degree >= 1.
+
+    ``pdot`` reads the quadratic coefficient (degree >= 2) and ``pddot`` the
+    cubic (degree >= 3): expanding ``O-C = dt - tau(dt)`` for a period with
+    ``P(dt) = P0 + Pdot*dt + Pddot*dt**2/2`` gives ``c2 = Pdot/(2*P0)`` and
+    ``c3 = Pddot/(6*P0) - Pdot**2/(3*P0**2)``, which invert to the expressions
+    below. Higher terms are fitted but not interpreted.
+    """
+    coef, cov, chi2 = _poly_fit(dt, oc, sigma, degree)
+    k = degree + 1
+    n = int(dt.size)
+    dof = max(1, n - k)
+    c2 = float(coef[2]) if degree >= 2 else 0.0
+    c2_err = float(np.sqrt(cov[2, 2])) if degree >= 2 else 0.0
+    pddot = float("nan")
+    pddot_err = float("nan")
+    if degree >= 3:
+        c3 = float(coef[3])
+        # Pddot/P = 6*c3 + 8*c2**2; propagate through the (c2, c3) block.
+        pddot = period_ref * (6.0 * c3 + 8.0 * c2 * c2)
+        g2, g3 = 16.0 * c2, 6.0
+        var = (
+            g2 * g2 * float(cov[2, 2])
+            + g3 * g3 * float(cov[3, 3])
+            + 2.0 * g2 * g3 * float(cov[2, 3])
+        )
+        pddot_err = period_ref * float(np.sqrt(max(0.0, var)))
+    return EphemerisFit(
+        period_ref=period_ref,
+        t_ref=t_ref,
+        coefficients=coef,
+        covariance=cov,
+        pdot=2.0 * period_ref * c2,
+        pdot_err=2.0 * period_ref * c2_err,
+        period_correction=period_ref * float(coef[1]),
+        t0_correction=float(coef[0]),
+        chi2=chi2,
+        chi2_reduced=chi2 / dof,
+        aic=chi2 + 2.0 * k,
+        bic=chi2 + k * float(np.log(n)),
+        n_used=n,
+        f_test_p=f_test_p,
+        pddot=pddot,
+        pddot_err=pddot_err,
+    )
+
+
 def _ephemeris_from_delays(
     t: FloatArray, oc: FloatArray, sigma: FloatArray, period_ref: float
 ) -> tuple[EphemerisFit, EphemerisFit]:
@@ -385,25 +497,13 @@ def _ephemeris_from_delays(
     dt = t - t_ref
 
     def build(degree: int, f_test_p: float) -> EphemerisFit:
-        coef, cov, chi2 = _poly_fit(dt, oc, sigma, degree)
-        k = degree + 1
-        dof = max(1, t.size - k)
-        c2 = float(coef[2]) if degree == 2 else 0.0
-        c2_err = float(np.sqrt(cov[2, 2])) if degree == 2 else 0.0
-        return EphemerisFit(
+        return _build_ephemeris(
+            dt,
+            oc,
+            sigma,
             period_ref=period_ref,
             t_ref=t_ref,
-            coefficients=coef,
-            covariance=cov,
-            pdot=2.0 * period_ref * c2,
-            pdot_err=2.0 * period_ref * c2_err,
-            period_correction=period_ref * float(coef[1]),
-            t0_correction=float(coef[0]),
-            chi2=chi2,
-            chi2_reduced=chi2 / dof,
-            aic=chi2 + 2.0 * k,
-            bic=chi2 + k * float(np.log(t.size)),
-            n_used=int(t.size),
+            degree=degree,
             f_test_p=f_test_p,
         )
 
@@ -502,6 +602,8 @@ class PhaseTrackResult:
         The starting guess for the bulk drift (the ``pdot=`` argument). Only
         an initialization: the delays and fits are always reported against
         the *constant-period* ephemeris, whatever the seed.
+    model : str
+        Period law used to unwind the seed drift before templating.
     t_ref : float
         Reference epoch of the phase model (weighted mean epoch).
     template : PhaseTemplate
@@ -523,6 +625,7 @@ class PhaseTrackResult:
 
     period: float
     pdot_seed: float
+    model: str
     t_ref: float
     template: PhaseTemplate
     t_mid: FloatArray
@@ -545,6 +648,15 @@ class PhaseTrackResult:
         return self.quadratic_fit.pdot_err
 
     @property
+    def pdot_err_scaled(self) -> float:
+        """:attr:`pdot_err` inflated by ``sqrt(chi2_reduced)`` when > 1.
+
+        Prefer this on real data: an evolving light-curve shape leaves the O-C
+        scattered well beyond the formal per-segment timing errors.
+        """
+        return self.quadratic_fit.pdot_err_scaled
+
+    @property
     def pdot_s_per_yr(self) -> float:
         """Total dP/dt in seconds per year."""
         return self.pdot * SECONDS_PER_YEAR
@@ -565,8 +677,10 @@ class PhaseTrackResult:
             "period": self.period,
             "pdot": self.pdot,
             "pdot_err": self.pdot_err,
+            "pdot_err_scaled": self.pdot_err_scaled,
             "pdot_s_per_yr": self.pdot_s_per_yr,
             "pdot_seed": self.pdot_seed,
+            "model": self.model,
             "f_test_p": self.f_test_p,
             "wrap_risk": self.wrap_risk,
             "t_ref": self.t_ref,
@@ -606,6 +720,7 @@ def phase_track(
     *,
     period: float,
     pdot: float = 0.0,
+    model: str | PeriodModel | None = None,
     settings: PdotSettings | None = None,
     columns: ColumnMap | None = None,
     domain: Domain | None = None,
@@ -631,6 +746,12 @@ def phase_track(
         when the accumulated drift is large enough (roughly a cycle) that a
         zero-start template would wash out. The delays, fits, and F-test are
         always reported against the constant-period ephemeris.
+    model : str, optional
+        Period law used to remove the bulk drift before templating
+        (:mod:`cuperiod.pdot.models`); match it to the ``model=`` of the
+        :func:`cuperiod.pdot_search` that produced ``pdot``. It affects only how
+        the seed drift is unwound — the reported O-C is always measured against
+        a constant period, so the returned delays stay model-independent.
     settings : PdotSettings, optional
         Tracking knobs (segmentation, harmonics, per-segment offsets).
     columns, domain
@@ -650,6 +771,7 @@ def phase_track(
     from cuperiod.pdot.scan import weighted_epoch
 
     psettings = settings or PdotSettings()
+    pmodel = get_model(model)
     if period <= 0.0:
         raise ValueError(f"period must be positive, got {period}")
     lc = to_input(data, columns=columns, domain=domain)
@@ -685,13 +807,15 @@ def phase_track(
     # Passing pdot= from pdot_search starts it at (or near) the fixed point.
     bulk = pdot
     passes = 1
-    result = _track_pass(dt, time, y, w, weighted, period, bulk, psettings)
+    result = _track_pass(dt, time, y, w, weighted, period, bulk, psettings, pmodel)
     for _ in range(psettings.template_iterations):
         correction = result.quadratic.pdot
         if abs(correction) <= 0.1 * result.quadratic.pdot_err:
             break
         bulk += correction
-        result = _track_pass(dt, time, y, w, weighted, period, bulk, psettings)
+        result = _track_pass(
+            dt, time, y, w, weighted, period, bulk, psettings, pmodel
+        )
         passes += 1
 
     # Report against the *constant-period* ephemeris, whatever bulk drift
@@ -705,7 +829,7 @@ def phase_track(
         dt_mid = result.t_mid - t_ref
         # The delay the removed drift itself produces against a constant
         # period: dt - tau(dt) (exactly (bulk/2P)*dt^2 + h.o.t.).
-        delay = result.delay + (dt_mid - warp_dt(dt_mid, bulk / period))
+        delay = result.delay + pmodel.delay(dt_mid, bulk / period)
         linear, quad = _ephemeris_from_delays(
             result.t_mid, delay, result.delay_err, period
         )
@@ -716,12 +840,14 @@ def phase_track(
             "segment_offsets": psettings.segment_offsets,
             "pdot_bulk_removed": bulk,
             "template_passes": passes,
+            "model": pmodel.name,
         },
         **dict(finite.meta),
     }
     return PhaseTrackResult(
         period=period,
         pdot_seed=pdot,
+        model=pmodel.name,
         t_ref=t_ref,
         template=result.template,
         t_mid=result.t_mid,
@@ -758,10 +884,11 @@ def _track_pass(
     period: float,
     bulk_pdot: float,
     psettings: PdotSettings,
+    pmodel: PeriodModel,
 ) -> _TrackPass:
     # Remove the bulk drift: on these warped times the reference model is a
     # strictly periodic signal at `period` (see the scan module docstring).
-    dtw = warp_dt(dt, bulk_pdot / period)
+    dtw = pmodel.warp(dt, bulk_pdot / period)
 
     template = fit_template(
         dtw,

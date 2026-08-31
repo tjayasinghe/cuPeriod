@@ -90,6 +90,10 @@ torch = ["torch>=2.2"]
 # panels at interactive speed; pandas backs the demo-data adapters and grouped-batch
 # input. Purely a presentation layer over the existing API — no core dependency.
 gui = ["PySide6>=6.6", "pyqtgraph>=0.13", "pandas>=2.0"]
+# Static diagnostic figures for the period-change tools (cuperiod.pdot.plots, and
+# the --plots option of `cuperiod pdot-batch`). Imported lazily, so everything
+# else works without it. 3.6 is the floor for Figure(layout="constrained").
+plot = ["matplotlib>=3.6"]
 # Documentation toolchain (Sphinx + Furo theme). pandas is included so the
 # DataFrame-ingestion examples and the autodoc of from_dataframe build cleanly.
 docs = [
@@ -123,6 +127,8 @@ dev = [
     "PySide6>=6.6",
     "pyqtgraph>=0.13",
     "pytest-qt>=4",
+    # Render the period-change diagnostic figures (cuperiod.pdot.plots).
+    "matplotlib>=3.6",
 ]
 
 [project.scripts]

@@ -921,6 +921,29 @@ class PdotSettings(BaseSettings):
             "when the drift itself smears the initial fold."
         ),
     )
+    # -- interval profiling (period_profile) --------------------------------------
+    profile_points_per_interval: int = Field(
+        default=50,
+        ge=10,
+        description=(
+            "Target points per interval when measuring a P(t) track. 50 is the "
+            "subsample size of the published V1309 Sco analysis."
+        ),
+    )
+    profile_min_points: int = Field(
+        default=15,
+        ge=5,
+        description="Fewest points an interval may hold and still be measured.",
+    )
+    profile_period_window: float = Field(
+        default=0.05,
+        gt=0.0,
+        lt=1.0,
+        description=(
+            "Fractional half-width of each interval's period search window. Must "
+            "exceed the total period change; too wide invites 1 c/d aliases."
+        ),
+    )
     # -- execution ----------------------------------------------------------------
     min_detections: int = Field(
         default=20, ge=5, description="Skip if fewer finite points."

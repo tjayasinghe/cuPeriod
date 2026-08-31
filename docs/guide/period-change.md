@@ -6,8 +6,7 @@ evolution slides pulsation periods, and Miras wander for no secular reason at
 all. Measuring the *derivative* is traditionally a hand-built O−C (observed
 minus calculated) analysis — collect times of minimum for decades, count
 cycles, fit a parabola (Sterken 2005) — or, at the other extreme, a
-pulsar-style coherent search. cuPeriod v1.3 covers the ground in between with
-four complementary tools:
+pulsar-style coherent search. cuPeriod v1.3 covers the ground in between:
 
 - {func}`cuperiod.pdot_search` — **detect and localize**: a joint (period,
   dP/dt) grid search that makes *any* registered periodogram sensitive to a
@@ -15,10 +14,15 @@ four complementary tools:
 - {func}`cuperiod.phase_track` / {func}`cuperiod.fit_ephemeris` — **measure**:
   an automated O−C with per-segment uncertainties, and the same quadratic
   ephemeris fit for your own timing lists.
+- {func}`cuperiod.period_profile` / {func}`cuperiod.fit_period_law` —
+  **when one rate will not do**: the period measured independently in
+  consecutive intervals, and parametric P(t) laws fitted to that track.
 - {func}`cuperiod.sliding_periodogram` / {func}`cuperiod.wwz` — **explore**:
   time-resolved maps for period wander that is not a clean secular trend.
 - {func}`cuperiod.eddington_plakidis` — **vet**: the classical test that a
   smooth-looking O−C is not just an accumulating random walk.
+- {func}`cuperiod.batch_pdot` — **scale**: the whole chain over a catalogue,
+  with per-star tables and optional diagnostic figures.
 
 ```python
 import cuperiod as cup
@@ -138,6 +142,89 @@ instead of divided). cuPeriod reports all of them:
 | dP/dE | per cycle: {math}`P \dot P` | eclipse-timing ephemerides, `T_0 + PE + QE^2` with {math}`Q = \tfrac{1}{2} P \dot P` | `2 * quadratic term` — tested as {math}`\dot P = 2Q/P` |
 | {math}`\dot P / P` | fractional rate, 1/time | theory; the search's own axis | `pdot_over_p`, `dlnp_dt_per_yr` |
 
+## When one rate is not enough
+
+Everything above fits a *single* rate over the whole baseline. When the rate
+itself evolves — an inspiralling binary, a runaway mass-transfer episode — that
+number is a baseline-weighted average of a moving quantity, and neither it nor
+its error bar means what it appears to. The give-away is not the F-test, which
+will happily confirm the drift is real; it is that the O−C keeps shedding
+residual when the ephemeris is allowed to curve further:
+
+```python
+ladder = {d: np.polyfit(dt, track.delay, d, w=1/track.delay_err) for d in (2, 3, 4)}
+```
+
+A quadratic *is* constant dP/dt, so a cubic that removes most of what remains
+means the rate is changing. {attr}`~cuperiod.EphemerisFit.pddot` measures that
+directly from a degree-3 fit, and {attr}`~cuperiod.EphemerisFit.implied_model`
+reports which law it favours (`pddot = 0` is constant dP/dt;
+`pddot = pdot²/P` is exponential).
+
+The model-free answer is to stop assuming a shape. {func}`~cuperiod.period_profile`
+chops the light curve into intervals short enough that the period is constant
+within each, measures it independently in every one by minimizing a
+fixed-order harmonic χ² over frequency, and returns the P(t) track;
+{func}`~cuperiod.fit_period_law` then fits laws to *that*. This two-step recipe
+is how period changes are actually published for systems whose rate is not
+constant, and reproducing a published number usually means reproducing both
+steps.
+
+```python
+flat = cup.detrend(time, mag, 40.0)          # see below — real data needs it
+prof = cup.period_profile((time, flat, err), period=1.4456,
+                          points_per_interval=50)
+for fit in prof.compare():
+    print(fit.law, fit.bic, fit.params)
+best = prof.fit("singular")
+print(best.fractional_change(time[0], time[-1]))    # total change over the run
+print(best.timescale_yr_at([time[0], time[-1]]))    # P/|dP/dt|, start and end
+```
+
+The registered laws are `constant`, `linear` (constant dP/dt), `exponential`
+(constant d ln P/dt), `singular` — {math}`P = P_0 \exp(b/(t - t_0))`, a
+finite-time singularity, the description Tylenda et al. (2011) fitted to V1309
+Scorpii's orbital decay through its merger — and `pejcha`, which lets the
+exponent of that singularity float (Pejcha 2014). BIC ranks them;
+`law="auto"` picks the best of all but `pejcha`, which needs an exceptionally
+well-sampled track and can otherwise win with its exponent pinned at a bound
+and entirely unconstrained.
+
+:::{admonition} What the track's error bars mean
+:class: note
+`period_err` is the formal precision of one interval's measurement. On real
+stars the track scatters about any smooth law by considerably more — the
+light-curve shape evolves, spots migrate, and many period-changing systems
+genuinely wander on timescales shorter than the baseline. That excess is also
+correlated between neighbouring intervals, which a per-interval error cannot
+express. Use these errors for relative weighting, and let
+{func}`~cuperiod.fit_period_law` rescale them by `sqrt(chi2_reduced)` (its
+default) before quoting a law parameter.
+:::
+
+## Detrending
+
+Survey photometry of a period-changing star usually carries a brightness trend
+far slower than the period and far larger than the variability. A periodogram
+sees it as power at very low frequency, and the sampling window scatters that
+straight onto the 1 c/d alias comb — where it competes with the signal. On the
+OGLE photometry of V1309 Sco the 0.8 mag secular brightening does exactly this,
+and an undetrended search returns a one-day alias instead of the orbital period.
+
+{func}`cuperiod.detrend` removes it with a running *median* — eclipses and
+outliers are one-sided and would drag a running mean into the feature being
+measured. Pick a width several times the period and a small fraction of the
+trend's own timescale:
+
+```python
+flat = cup.detrend(time, mag, 40.0)              # 40-day window
+trend = cup.running_median(time, mag, 40.0)      # or the trend itself
+```
+
+Nothing detrends automatically: the width is a physical judgement about a
+particular star, too narrow a window eats the signal, and silently reshaping a
+light curve before measuring its period is not a library's decision to make.
+
 ## Time-resolved views
 
 When the period *wanders* rather than drifts — Miras, semi-regulars, spotted
@@ -194,6 +281,59 @@ and combining century-old visual maxima with TESS BJD_TDB without a uniform
 conversion injects a spurious ~minute-scale drift. Convert everything to one
 barycentric dynamical standard first (Eastman et al. 2010).
 
+## Whole catalogues
+
+{func}`cuperiod.batch_pdot` runs the entire chain — detrend, search, track,
+ephemeris ladder, P(t) profile, law ranking — over many light curves on the same
+worker machinery as {func}`~cuperiod.batch_periodograms`, and writes **three**
+tables, because a period-change catalogue is genuinely three-shaped:
+
+| Sink | One row per | Holds |
+| --- | --- | --- |
+| `sink` | light curve | Everything a survey-scale cut needs: search, O−C measurement and its significance, the curvature ladder, and the winning period law with its parameters. |
+| `oc_sink` | O−C segment | The timing points behind each star's dP/dt — what you plot, refit, or hand to a referee. |
+| `profile_sink` | P(t) interval | The model-free track: period, error, χ², and the window-edge flag. |
+
+```python
+summary = cup.batch_pdot(
+    "lightcurves/*.csv",
+    period=known_periods,          # a float, or a {key: period} mapping
+    detrend_width=40.0,
+    sink="pdot.parquet",
+    oc_sink="oc.parquet",
+    profile_sink="profile.parquet",
+    plots="figures/", plot_keys=candidates,
+    workers=8,
+)
+print(summary.n_done, summary.n_failed)
+```
+
+Sinks accept `.parquet`/`.csv` files or directories (resumable, one part per
+chunk — the three must be *different* directories). Every stage is wrapped so
+one pathological star cannot kill a survey run: a failure still contributes a
+summary row whose `status` carries the reason, so nothing disappears from the
+catalogue, and every law's parameter columns are present and NaN-filled in
+every part so a directory sink reads back with one schema.
+
+Useful cuts on the summary table:
+
+| Column | Meaning |
+| --- | --- |
+| `track_f_test_p` | Is the drift real at all? |
+| `track_pdot_snr` | `|dP/dt|` over its χ²-inflated error — the honest significance. |
+| `ladder_curvature_ratio` | O−C residual, cubic over quadratic. Near 1: a constant rate is adequate. Well below: the rate is evolving. |
+| `implied_model` | Which law the fitted `pddot` favours. |
+| `law`, `law_delta_bic` | The winning P(t) law and its margin over the runner-up. |
+| `search_ridge_correlation` | How strongly P and dP/dt trade off at the peak. |
+| `wrap_risk`, `profile_at_window_edge` | Cycle-count slip, and periods clipped by the search window. |
+
+`plots=` writes a six-panel diagnostic per star (light curve, drift-corrected
+fold, search map, O−C, P(t) track with the fitted law, and the decay
+timescale). It needs matplotlib — `pip install "cuperiod[plot]"` — and is slow
+enough at catalogue scale that it is worth pairing with `plot_keys`. The same
+figure is available directly as {func}`cuperiod.pdot.plots.pdot_figure`, and
+its panel helpers can be composed into your own layout.
+
 ## Settings
 
 All the knobs live on {class}`~cuperiod.PdotSettings`
@@ -213,6 +353,9 @@ keeps its own settings via `method_settings=`.
 | `harmonics`, `max_harmonics` | auto, 10 | Template order, or the cap on its BIC selection. |
 | `segment_offsets` | on | Free magnitude offset per segment (calibration-drift protection). |
 | `template_iterations` | 1 | Template re-derivations on drift-corrected times. |
+| `profile_points_per_interval` | 50 | Target points per P(t) interval (the subsample size of the published V1309 Sco analysis). |
+| `profile_min_points` | 15 | Fewest points an interval may hold and still be measured. |
+| `profile_period_window` | 0.05 | Fractional half-width of each interval's period search. Must exceed the total period change; too wide invites 1 c/d aliases. |
 
 ## References
 
@@ -222,6 +365,10 @@ keeps its own settings via `method_settings=`.
 - Foster, G. 1996, AJ 112, 1709 — the Weighted Wavelet Z-transform.
 - Templeton, M. R., Mattei, J. A., & Willson, L. A. 2005, AJ 130, 776 — Mira period wander with the WWZ.
 - Katz, M. L., et al. 2021, MNRAS 503, 2665 — the GPU (P, dP/dt) conditional-entropy search.
+- Schwarzenberg-Czerny, A. 1996, ApJ 460, L107 — multi-harmonic AOV, the statistic behind the interval fits.
+- Tylenda, R., et al. 2011, A&A 528, A114 — V1309 Sco's orbital decay; the `singular` law is their Eq. (1).
+- Pejcha, O. 2014, ApJ 788, 22 — the `pejcha` law (their Eq. 12), and the quoted V1309 Sco decay timescales.
+- Montgomery, M. H., & O'Donoghue, D. 1999, DSSN 13, 28 — the fallback analytic frequency error.
 - Murphy, S. J., et al. 2014, MNRAS 441, 2515 — segment phase tracking as time delays.
 - Patra, K. C., et al. 2017, AJ 154, 4; Yee, S. W., et al. 2020, ApJ 888, L5 — WASP-12b's orbital decay.
 - Winn, J. N., & Stefánsson, G. 2025, PSJ 6, 300 — light-travel time masquerading as decay.

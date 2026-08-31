@@ -72,6 +72,76 @@ All notable changes to cuPeriod are documented here. The format is based on
   and drift-axis flags mapping onto `PdotSettings`, `--track/--no-track`, JSON output
   (`--out`) and the 2-D map as `.npz` (`--save-map`), with the same column-override
   and domain options as `run` (`tests/test_cli_pdot.py`).
+- **Period-evolution models for the search** (`model=` on `pdot_search` and
+  `phase_track`; `cuperiod.pdot.models`): the frequency-independence of the time warp
+  is a property of a *family* of period laws, not of one law, so the same machinery
+  scans either. `"constant-pdot"` is the classical quadratic ephemeris
+  (`tau = ln(1 + a*dt)/a`); `"exponential"` holds `d(ln P)/dt` constant
+  (`tau = (1 - exp(-a*dt))/a`), the accelerating decay of an inspiralling or
+  mass-transferring binary, and has no singular epoch so it can be scanned over a wider
+  range. Both are parameterized by the same `a = (dP/dt)/P` at the reference epoch, so
+  their `period` and `pdot` are directly comparable and they agree to first order,
+  differing in the *cubic* term of the O−C (`-a²/3` vs `-a²/6`) — which is exactly what
+  the residual ladder below measures (`tests/test_pdot_models.py`).
+- **Model-free P(t) tracks** (`cuperiod.period_profile`, `PeriodProfile`,
+  `PeriodPoint`): the period measured independently in consecutive intervals, by
+  minimizing a fixed-order harmonic chi-squared over frequency (multi-harmonic AOV —
+  Schwarzenberg-Czerny 1996) with the uncertainty read off its curvature. This is the
+  data product the period-change literature actually publishes when the rate is not
+  constant, and it assumes nothing about the shape of the evolution. The harmonic order
+  is chosen once and held fixed so intervals stay comparable, and each interval's search
+  is confined to a narrow window around the reference period because an interval holding
+  a few tens of cycles has a rich alias comb — periods pushed to that window's edge are
+  flagged (`at_window_edge`) rather than reported as measurements. Interval period
+  errors are calibrated on synthetic data (pull rms 0.98) and are honest about what they
+  are not on real data (`tests/test_pdot_profile.py`).
+- **Parametric period laws** (`cuperiod.fit_period_law`, `compare_period_laws`,
+  `PeriodLawFit`): `constant`, `linear` (constant dP/dt), `exponential`, `singular`
+  — `P = P0 exp(b/(t - t0))`, a finite-time singularity, which is Tylenda et al.
+  (2011) Eq. (1) for V1309 Scorpii — and `pejcha`, which lets that singularity's
+  exponent float (Pejcha 2014 Eq. 12; `singular` is its `delta = 2` case). Fitted by
+  weighted least squares on the periods, with `t0` constrained outside the observed span
+  and fitted as a log offset so the optimizer cannot walk into the singularity, and both
+  branches (`t0` after the data, and before) tried. BIC ranks them; `law="auto"` skips
+  `pejcha`, which needs an exceptionally well-sampled track and can otherwise win with
+  its exponent pinned at a bound and wholly unconstrained. `fractional_change` and
+  `timescale_yr_at` integrate the law rather than multiplying a rate by a baseline
+  (`tests/test_pdot_laws.py`).
+- **Higher-order ephemerides and the curvature ladder**: `EphemerisFit` now fits any
+  degree and reports `pddot` (the second period derivative, from
+  `P*(6*c3 + 8*c2²)`) with its error, plus `implied_model` — whether the fitted
+  curvature favours a constant rate (`pddot = 0`) or an exponential one
+  (`pddot = pdot²/P`). `pdot` from a cubic fit is still the instantaneous rate at the
+  reference epoch but is de-biased against a rate that is itself changing.
+  `pdot_err_scaled` exposes the `sqrt(chi2_reduced)` inflation the docs already
+  recommended, instead of leaving every caller to apply it by hand.
+- **Trend removal** (`cuperiod.detrend`, `cuperiod.running_median`): a running median —
+  not a mean, since eclipses are one-sided — with an `O(N log N)` binned variant for
+  very long light curves. Survey photometry of a period-changing star routinely carries
+  a slow brightness trend that the sampling window scatters onto the 1 c/d alias comb;
+  on V1309 Sco an undetrended search returns a one-day alias rather than the orbital
+  period. Nothing detrends automatically: the width is a physical judgement about a
+  particular star.
+- **`PdotBest.ridge_correlation`**: the frequency/rate correlation at the search peak,
+  from the local curvature — a number for the tilted ridge the v1.2→v1.3 audit found
+  the docs denying. It is the peak's own error ellipse and can differ in sign from the
+  visually dominant tilt of the alias comb crossing the whole map, which is documented
+  because the figures invite exactly that confusion.
+- **Batch period-change measurement** (`cuperiod.batch_pdot`, `pdot_to_rows`): the whole
+  chain over many light curves on the same spawned worker pool as
+  `batch_periodograms`, writing three tables — one row per light curve (search, O−C,
+  curvature ladder, winning law and its parameters), one row per O−C segment, and one
+  row per P(t) interval — to Parquet/CSV files or resumable directory sinks. Every stage
+  is wrapped so one pathological star cannot kill a survey run: a failure still
+  contributes a summary row carrying the reason in `status`, and every law's parameter
+  columns are present and NaN-filled in every part so a directory sink reads back with a
+  single Arrow schema (`tests/test_pdot_batch.py`).
+- **Diagnostic figures** (`cuperiod.pdot.plots`, new `cuperiod[plot]` extra): a
+  six-panel per-star figure — light curve, drift-corrected fold coloured by epoch,
+  search map, O−C, P(t) track with the fitted law, and the decay timescale — plus the
+  panel helpers to compose your own. Built on `Figure` + `FigureCanvasAgg` rather than
+  pyplot, so it is safe to call from batch workers, and matplotlib is imported lazily so
+  everything else works without it.
 
 ### Validated
 
@@ -82,23 +152,35 @@ All notable changes to cuPeriod are documented here. The format is based on
   at p < 1e-3 with **0/60** false detections on the nulls, and the pull distributions
   are calibrated (null rms 1.07, injected 0.8–1.3). Median cost per star on one CPU
   core: 4.1 s for the 201×601 search, 0.06 s for the tracking measurement.
-- **Blind real-data check against a published period derivative**
-  (`benchmarks/pdot_v1309sco.py`, `download_v1309sco.py`): V1309 Sco, the contact
-  binary OGLE watched spiral in until it merged as a red nova in 2008 — the one merger
-  with dense photometry of the *progenitor*, and a deliberately hostile test (the drift
-  reaches ~7 days of accumulated O−C, several orbital cycles; the star brightens 0.8 mag
-  as it inspirals; the light-curve shape itself evolves; and the true decay is
-  exponential, so a constant-rate model is knowingly wrong). On the authors' own
-  supplementary photometry, after removing the secular brightening, `pdot_search`
-  recovers P = 1.4301 d against the published 1.43 d, with the dominant peak at
-  0.70 c/d, the secondary at 1.40 c/d, and 1 c/d aliases — reproducing the paper's own
-  description of its periodograms. Letting each half of the baseline carry its own rate
-  gives a total period decrease of **−1.08% over six years against the published
-  −1.2%**, and the decay timescale P/|dP/dt| shortens from ~1240 yr to ~330 yr across
-  the baseline, the spiral-in the paper reports. A single constant rate over the whole
-  baseline instead returns −1.87%, and the tools say why: the F-test is decisive
-  (p = 1e-8) while the O−C residuals fall 169 → 81 → 14 minutes from a quadratic to a
-  quartic ephemeris — the accelerating decay refusing to be a parabola.
+- **Reproducing a published period-decay law on real data**
+  (`benchmarks/pdot_v1309sco.py`, `download_v1309sco.py`): V1309 Sco, the contact binary
+  OGLE watched spiral in until it merged as a red nova in 2008 — the one merger with
+  dense photometry of the *progenitor*, and a deliberately hostile test (the decay is
+  singular, so a constant rate is knowingly wrong; the star brightens 0.8 mag as it
+  inspirals; OGLE's formal errors understate the scatter about tenfold; and the
+  light-curve shape itself evolves). Tylenda et al. (2011) fitted
+  `P = 1.4456 exp(15.29/(t - 2455233.5))` d to periods measured in subsamples of ~50
+  observations, and state (their Sect. 6.2) that the period decreased by 1.2% over six
+  years; Pejcha (2014) — not Tylenda et al., who quote no rate — is the source of the
+  widely repeated decay timescale falling from ~1000 yr to ~170 yr.
+
+  Running the same two-step recipe on the authors' own photometry (detrend,
+  `period_profile` at 50 points per interval, `compare_period_laws`): BIC picks
+  `singular` over a constant rate by **ΔBIC = 198**, the measured P(t) points scatter
+  about the published Eq. (1) by **0.21% of P** with a +0.055% mean offset, and the two
+  fitted P(t) curves differ by at most **0.33% of P** anywhere in the observed span. The
+  total change is **−1.47%** from the law and −1.06% from the endpoint intervals against
+  the published −1.2% (and −1.14% from integrating Eq. (1) over this exact window); the
+  decay timescale runs **869 → 185 yr** against Eq. (1)'s 1730 → 156 and the quoted
+  ~1000 → ~170. Repeating at 35/40/50/60 points per interval spans −1.06% to −1.47%,
+  which is the method's own systematic and is reported rather than hidden. Forcing a
+  single constant rate instead returns −1.91%, and the tools say why: the F-test is
+  decisive (p = 3e-8) while the O−C residuals fall 194 → 89 → 16 minutes from a
+  quadratic to a quartic ephemeris.
+
+  The `singular` law's `b` and `t0` are individually degenerate here (they trade off
+  strongly, and the fit reports errors that say so) while the P(t) they predict over the
+  observed span is not — which is why the comparison above is made on the predictions.
 
 ### Fixed
 
@@ -109,7 +191,22 @@ All notable changes to cuPeriod are documented here. The format is based on
   vanishes only for observations symmetric about that epoch. V1309 Sco (skew −1.29, its
   cadence densifying steeply toward the merger) shows the resulting tilted ridge plainly
   in its search map. The claim is now stated correctly: the tilt widens the joint
-  uncertainty without biasing the best cell.
+  uncertainty without biasing the best cell, and `PdotBest.ridge_correlation` now
+  measures it.
+- **`backend="auto"` raised `ModuleNotFoundError` when the CUDA fast path was
+  half-installed** — cupy present but cufinufft unimportable. Resolution now probes the
+  GPU path before selecting it and falls back to the CPU backend, instead of choosing a
+  backend it cannot load. This made 46 tests fail on any CPU-only machine, and would
+  have made `batch_pdot` fail on every star at its own defaults.
+- **Harmonic-order selection over-fitted whenever the quoted errors were optimistic.**
+  Weighted BIC (`chi2 + k*ln(n)`) is right when the errors are right and catastrophic
+  when they are not — every harmonic looks like a bargain and the selection runs to
+  `max_harmonics`. On OGLE's V1309 Sco photometry (chi2_reduced ≈ 115 against the stated
+  errors) that produced a 10-harmonic template on 50-point intervals, whose jagged
+  chi-squared then locked onto sampling aliases and scattered the P(t) track beyond use.
+  `period_profile` now selects on the scale-free criterion `n*ln(chi2/n) + k*ln(n)`,
+  against a frequency refined inside the interval, and takes the median over five
+  intervals — which is stable at 2 harmonics across every interval size tried.
 
 ### Known limitations
 
@@ -117,8 +214,11 @@ All notable changes to cuPeriod are documented here. The format is based on
   statistic's false-alarm calibration on a 2-D grid over irregular sampling is an
   open problem (the independent-trials count is unknown), so significance always
   comes from `phase_track`'s F-test. The GUI does not yet expose the period-change
-  tools, and `batch_periodograms` has no dP/dt sibling; both are v1.3.x candidates.
-  Constant dP/dt is the only drift model searched — for wander, use the maps.
+  tools. The *search* scans one rate parameter at a time (constant dP/dt or constant
+  d ln P/dt); laws with a characteristic epoch, such as `singular`, are fitted to a
+  measured P(t) track rather than searched, and for wander the right tool is still a
+  time-resolved map. Period-law parameters can be strongly degenerate on short
+  baselines even where their predictions are not — read the reported errors.
 
 ## [1.2.0] - 2026-08-30
 

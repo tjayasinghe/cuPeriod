@@ -61,7 +61,9 @@ follow it (see {doc}`../guide/prewhitening`).
 ## Period change
 
 Joint (period, dP/dt) searching, automated O−C phase tracking, ephemeris fitting,
-time-resolved maps, and the random-wander test (see {doc}`../guide/period-change`).
+model-free P(t) tracks and the laws fitted to them, time-resolved maps, the
+random-wander test, and the catalogue-scale driver
+(see {doc}`../guide/period-change`).
 
 ```{eval-rst}
 .. autosummary::
@@ -77,13 +79,41 @@ time-resolved maps, and the random-wander test (see {doc}`../guide/period-change
    SegmentShift
    fit_ephemeris
    EphemerisFit
+   period_profile
+   PeriodProfile
+   PeriodPoint
+   fit_period_law
+   compare_period_laws
+   PeriodLawFit
+   available_laws
+   available_models
+   detrend
+   running_median
    sliding_periodogram
    SlidingPeriodogram
    wwz
    WWZResult
    eddington_plakidis
    EddingtonPlakidisResult
+   batch_pdot
    weighted_epoch
+```
+
+Diagnostic figures live in {mod}`cuperiod.pdot.plots`, which needs matplotlib
+(`pip install "cuperiod[plot]"`) and so is imported on demand:
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   pdot.plots.pdot_figure
+   pdot.plots.plot_light_curve
+   pdot.plots.plot_phase_fold
+   pdot.plots.plot_search_map
+   pdot.plots.plot_oc
+   pdot.plots.plot_period_profile
+   pdot.plots.plot_timescale
 ```
 
 ## Multi-band

@@ -414,8 +414,10 @@ def _run_pool(
     # native thread pools (numba / OpenBLAS / OpenMP, plus any CUDA context for the
     # GPU pool) into the child and deadlocks the workers. Spawn starts fresh,
     # thread-pinned workers (the Windows/macOS default) — see pin_worker_threads.
-    # ``worker`` lets a sibling batch driver (pre-whitening) reuse this pool with its
-    # own per-chunk function; it must be a module-level callable so spawn can pickle it.
+    # ``worker`` lets a sibling batch driver (pre-whitening, period change) reuse this
+    # pool with its own per-chunk function; it must be a module-level callable so spawn
+    # can pickle it. Its return value is splatted into ``absorb`` rather than unpacked
+    # here, so a driver emitting several tables per chunk needs no pool of its own.
     task = worker or _process_chunk
     ctx = multiprocessing.get_context("spawn")
     with ProcessPoolExecutor(
@@ -424,9 +426,7 @@ def _run_pool(
     ) as pool:
         futures = {pool.submit(task, chunks[idx], cfg): idx for idx in pending}
         for future in as_completed(futures):
-            idx = futures[future]
-            rows, errs = future.result()
-            absorb(idx, rows, errs)
+            absorb(futures[future], *future.result())
 
 
 def _finalize_file(rows: list[dict[str, Any]], path: Path, resume: bool) -> None:

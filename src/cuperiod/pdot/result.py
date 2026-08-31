@@ -52,6 +52,26 @@ class PdotBest:
     t_ref : float
         Reference epoch (same time system as the input, e.g. JD): the epoch at
         which ``period`` holds and around which the quadratic drift is expanded.
+    model : str
+        Period-evolution model the warp used (:mod:`cuperiod.pdot.models`).
+    ridge_correlation : float
+        Correlation between the frequency and rate axes *at the peak*, from the
+        curvature of the statistic there: 0 for a peak aligned with the axes,
+        ``+-1`` for a fully degenerate ridge. Referencing to the weighted mean
+        epoch removes the *leading* correlation, but a residual one survives
+        whenever the sampling is asymmetric about that epoch (it is set by the
+        third central moment of the times). A large value means the two
+        parameters trade off — the joint uncertainty is wider than either
+        marginal error suggests — not that the best cell is biased. NaN when the
+        peak sits on the grid edge or the curvature is not negative-definite.
+
+        This is the local error ellipse, which is what a confidence region on
+        the solution needs. It is *not* the tilt of the bright comb crossing the
+        whole map: those stripes are the sampling aliases, they are separate
+        candidate solutions rather than part of this peak's uncertainty, and
+        their slope can have the opposite sign to this number. Plots of the map
+        show the comb far more prominently than the peak, so the two readings
+        disagreeing is normal rather than a symptom.
     """
 
     period: float
@@ -62,6 +82,8 @@ class PdotBest:
     power: float
     zero_pdot_power: float
     t_ref: float
+    model: str = "constant-pdot"
+    ridge_correlation: float = float("nan")
 
     @property
     def pdot_s_per_yr(self) -> float:
@@ -105,6 +127,8 @@ class PdotBest:
             "power": self.power,
             "zero_pdot_power": self.zero_pdot_power,
             "t_ref": self.t_ref,
+            "timescale_yr": self.timescale_yr,
+            "ridge_correlation": self.ridge_correlation,
         }
 
 
@@ -213,6 +237,7 @@ class PdotSearchResult:
         out: dict[str, Any] = {
             "method": self.method,
             "backend": self.backend,
+            "model": self.best.model,
             "objective_sense": self.objective_sense,
             "n_samples": self.n_samples,
             "baseline": self.baseline,

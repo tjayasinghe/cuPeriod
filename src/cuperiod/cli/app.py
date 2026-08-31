@@ -8,6 +8,8 @@ code path. Commands:
 * ``prewhiten`` — automated iterative frequency extraction for a pulsator.
 * ``batch-prewhiten`` — the same over many light curves, written to Parquet/CSV.
 * ``pdot`` — joint (period, dP/dt) search, then a phase-tracking dP/dt measurement.
+* ``pdot-batch`` — the whole period-change chain over many light curves, written to
+  Parquet/CSV as up to three tables (summary / O-C / P(t) profile).
 * ``methods`` — list registered methods and their backends.
 * ``gpu-info`` — show the CUDA GPU and suggested worker counts.
 * ``doctor`` — diagnose available backends, torch devices, and the precision each uses.
@@ -18,6 +20,8 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -38,7 +42,13 @@ from cuperiod.methods.base import get_method, list_methods
 from cuperiod.prewhiten.result import PreWhitenResult
 
 if TYPE_CHECKING:  # annotations only — the pdot modules load inside the command.
-    from cuperiod import PdotSearchResult, PhaseTrackResult
+    from cuperiod import (
+        PdotSearchResult,
+        PeriodLawFit,
+        PeriodProfile,
+        PhaseTrackResult,
+    )
+    from cuperiod.pdot.detrend import TrendMethod
 
 #: Seconds per Julian year, for reporting a dP/dt error in the eclipse-timing unit
 #: (the canonical definition lives in :mod:`cuperiod.pdot.result`).
@@ -435,6 +445,91 @@ def _pdot_settings(
         raise typer.BadParameter(str(exc)) from exc
 
 
+def _detrend_width(value: float | None) -> float | None:
+    """Validate ``--detrend-width`` up front, so a bad one is a usage error."""
+    if value is None:
+        return None
+    if not (math.isfinite(value) and value > 0.0):
+        raise typer.BadParameter(
+            f"detrend-width must be positive and finite, got {value}"
+        )
+    return float(value)
+
+
+def _trend_method(value: str) -> TrendMethod:
+    """Validate ``--detrend-method`` against the two registered filter kernels."""
+    key = value.strip().lower()
+    if key == "median":
+        return "median"
+    if key == "binned":
+        return "binned"
+    raise typer.BadParameter(
+        f"detrend-method must be 'median' or 'binned', got {value!r}"
+    )
+
+
+def _period_model(value: str | None) -> str | None:
+    """Resolve ``--model`` to a registered period-evolution model name."""
+    if value is None:
+        return None
+    from cuperiod.pdot.models import get_model
+
+    try:
+        return get_model(value).name
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+def _period_laws(value: str) -> tuple[str, ...] | None:
+    """Parse ``--laws``: ``auto``, ``none``, or a comma-separated selection.
+
+    Unknown names are rejected here rather than in the workers, where
+    :func:`cuperiod.compare_period_laws` would simply skip them and leave a
+    whole catalogue silently without a fitted law.
+    """
+    from cuperiod.pdot.laws import AUTO_LAWS, available_laws
+
+    key = value.strip().lower()
+    if key in {"", "auto"}:
+        return tuple(AUTO_LAWS)
+    if key in {"none", "off"}:
+        return None
+    known = available_laws()
+    names = tuple(n.strip().lower() for n in value.split(",") if n.strip())
+    unknown = [n for n in names if n not in known]
+    if unknown:
+        raise typer.BadParameter(
+            f"unknown period law(s) {', '.join(unknown)}; choose from "
+            f"{', '.join(known)}, or 'auto' / 'none'"
+        )
+    return names
+
+
+def _comma_list(value: str | None) -> tuple[str, ...] | None:
+    """Split a comma-separated option into keys; ``None`` stays ``None``."""
+    if value is None:
+        return None
+    return tuple(item.strip() for item in value.split(",") if item.strip())
+
+
+def _require_matplotlib(option: str) -> None:
+    """Fail before a long run when a figure option cannot possibly work.
+
+    :func:`cuperiod.batch_pdot` swallows per-star plotting failures by design —
+    one unplottable star must not fail a survey — so a missing matplotlib would
+    otherwise surface only as thousands of empty ``figure`` cells at the end.
+    """
+    try:
+        import matplotlib  # noqa: F401  (importability probe only)
+    except ImportError:
+        typer.echo(
+            f"{option} needs matplotlib, which is not installed.\n"
+            '  install it with:  pip install "cuperiod[plot]"',
+            err=True,
+        )
+        raise typer.Exit(code=1) from None
+
+
 @app.command()
 def pdot(
     path: Path = typer.Argument(..., help="Light-curve file (CSV/ECSV/FITS/Parquet)."),
@@ -442,6 +537,9 @@ def pdot(
         None, "--period", help="Window center in days (None = seed from a first run)."
     ),
     method: str = typer.Option("GLS", "--method", "-m", help="Wrapped method (one)."),
+    model: str | None = typer.Option(
+        None, "--model", help="Period law: constant-pdot (default) | exponential."
+    ),
     backend: str = typer.Option("auto", help="auto | cpu | gpu | concrete backend."),
     max_cycle_drift: float = typer.Option(
         10.0, "--max-cycle-drift", help="dP/dt half-range, in accumulated cycles."
@@ -467,8 +565,16 @@ def pdot(
     harmonic_scale: float | None = typer.Option(
         None, "--harmonic-scale", help="Extra (dP/dt)/P refinement (None = per method)."
     ),
+    detrend_width: float | None = typer.Option(
+        None, "--detrend-width", help="Running-median window (days) removed first."
+    ),
     track: bool = typer.Option(
         True, "--track/--no-track", help="Measure dP/dt by segmented phase tracking."
+    ),
+    profile: bool = typer.Option(
+        False,
+        "--profile",
+        help="Also measure the model-free P(t) track and rank period laws on it.",
     ),
     time: str | None = typer.Option(None, help="Time column name override."),
     value: str | None = typer.Option(None, help="Value column name override."),
@@ -482,13 +588,23 @@ def pdot(
     """Search a light curve jointly over (period, dP/dt) and measure the drift.
 
     The search localizes the drifting signal on a (dP/dt)/P x frequency grid; the
-    phase-tracking pass then measures dP/dt at that period with an uncertainty.
+    phase-tracking pass then measures dP/dt at that period with an uncertainty, and
+    --profile adds the model-free P(t) track that neither of them assumes.
     """
     from cuperiod.pdot.scan import pdot_search
     from cuperiod.pdot.track import phase_track
 
     columns = _column_map(time, value, error, None)
     lc = LightCurve.from_file(path, columns=columns, domain=_domain(domain))
+    width = _detrend_width(detrend_width)
+    if width is not None:
+        from cuperiod.pdot.detrend import detrend as _detrend
+
+        # replace() rather than a fresh LightCurve: the domain and metadata must
+        # survive, and detrending changes only the values.
+        lc = replace(lc, value=_detrend(lc.time, lc.value, width))
+        typer.echo(f"detrended with a {width:g} d running median")
+    model_name = _period_model(model)
     settings = _pdot_settings(
         max_cycle_drift=max_cycle_drift,
         samples_per_drift=samples_per_drift,
@@ -500,7 +616,12 @@ def pdot(
         harmonic_scale=harmonic_scale,
     )
     result = pdot_search(
-        lc, period=period, method=method, settings=settings, backend=backend
+        lc,
+        period=period,
+        method=method,
+        model=model_name,
+        settings=settings,
+        backend=backend,
     )
     _print_pdot_search(result)
 
@@ -508,17 +629,40 @@ def pdot(
     if track:
         try:
             tracked = phase_track(
-                lc, period=result.best.period, pdot=result.best.pdot, settings=settings
+                lc,
+                period=result.best.period,
+                pdot=result.best.pdot,
+                model=model_name,
+                settings=settings,
             )
         except InsufficientDataError as exc:
             typer.echo(f"\nphase tracking skipped: {exc}")
         else:
             _print_phase_track(tracked)
 
+    prof: PeriodProfile | None = None
+    laws: list[PeriodLawFit] = []
+    if profile:
+        from cuperiod.pdot.laws import compare_period_laws
+        from cuperiod.pdot.profile import period_profile
+
+        try:
+            prof = period_profile(
+                lc, period=result.best.period, settings=settings, backend=backend
+            )
+        except (InsufficientDataError, ValueError) as exc:
+            typer.echo(f"\nperiod profile skipped: {exc}")
+        else:
+            laws = compare_period_laws(prof.t_mid, prof.period, prof.period_err)
+            _print_period_profile(prof, laws)
+
     if out is not None:
         payload = result.to_dict()
         if tracked is not None:
             payload["track"] = tracked.to_dict()
+        if prof is not None:
+            payload["profile"] = prof.to_dict()
+            payload["laws"] = [fit.to_dict() for fit in laws]
         out.write_text(
             json.dumps(_json_safe(payload), indent=2, allow_nan=False),
             encoding="utf-8",
@@ -575,6 +719,184 @@ def _print_phase_track(res: PhaseTrackResult) -> None:
             "  ! wrap risk: consecutive segment delays jump by more than 0.3 period; "
             "the cycle count may have slipped (retry with fewer --segments)"
         )
+
+
+def _print_period_profile(prof: PeriodProfile, laws: Sequence[PeriodLawFit]) -> None:
+    """The model-free P(t) track, then the period laws ranked over it by BIC."""
+    first, last = prof.points[0], prof.points[-1]
+    typer.echo(
+        f"\nperiod profile  ({prof.n_intervals} intervals, "
+        f"{prof.n_harmonics} harmonics, window=+-{prof.period_window:.3g})"
+    )
+    typer.echo(f"  {'P first (d)':<15} {first.period:.8f} +- {first.period_err:.3g}")
+    typer.echo(f"  {'P last (d)':<15} {last.period:.8f} +- {last.period_err:.3g}")
+    typer.echo(
+        f"  {'dP/P total':<15} {prof.total_fractional_change():+.6g}   "
+        "(end intervals, no model assumed)"
+    )
+    if prof.any_at_window_edge:
+        typer.echo(
+            "  ! an interval's period sits at the edge of its search window; the "
+            "track may be clipped (widen the profile window)"
+        )
+
+    if not laws:
+        typer.echo("\nno period law could be fitted to this track")
+        return
+    typer.echo(f"\nperiod laws over P(t)  (ranked by BIC, {len(laws)} fitted)")
+    typer.echo(f"  {'law':<12} {'BIC':>10} {'dBIC':>9} {'dP/P':>12}  parameters")
+    best_bic = laws[0].bic
+    for fit in laws:
+        params = ", ".join(f"{k}={v:.6g}" for k, v in fit.params.items())
+        typer.echo(
+            f"  {fit.law:<12} {fit.bic:>10.4g} {fit.bic - best_bic:>9.3g} "
+            f"{fit.fractional_change(first.t_start, last.t_end):>+12.4g}  {params}"
+        )
+
+
+@app.command(name="pdot-batch")
+def pdot_batch_cmd(
+    inputs: str = typer.Argument(..., help="Glob, directory, or file of light curves."),
+    sink: Path = typer.Option(
+        ...,
+        "--sink",
+        "--out",
+        help="Summary table: .parquet/.csv file or dir (one row per star).",
+    ),
+    period: float | None = typer.Option(
+        None, "--period", help="Seed period in days for every star (None = search)."
+    ),
+    method: str = typer.Option("GLS", "--method", "-m", help="Wrapped method (one)."),
+    model: str | None = typer.Option(
+        None, "--model", help="Period law: constant-pdot (default) | exponential."
+    ),
+    device: str = typer.Option("cpu", help="cpu | gpu."),
+    backend: str = typer.Option("auto", help="auto | cpu | gpu | concrete backend."),
+    workers: int | None = typer.Option(None, help="Worker count (None = auto)."),
+    chunk_size: int = typer.Option(
+        32, "--chunk-size", help="Light curves per chunk/task."
+    ),
+    max_cycle_drift: float = typer.Option(
+        10.0, "--max-cycle-drift", help="dP/dt half-range, in accumulated cycles."
+    ),
+    samples_per_drift: int = typer.Option(
+        5, "--samples-per-drift", help="Oversampling of the (dP/dt)/P axis."
+    ),
+    samples_per_peak: int = typer.Option(
+        10, "--samples-per-peak", help="Frequency oversampling inside the window."
+    ),
+    window_rayleigh: float = typer.Option(
+        30.0, "--window-rayleigh", help="Frequency half-window in Rayleigh widths."
+    ),
+    pdot_range: str | None = typer.Option(
+        None, "--pdot-range", help="Explicit (dP/dt)/P bounds 'lo,hi' in 1/day."
+    ),
+    harmonics: int | None = typer.Option(
+        None, "--harmonics", help="Tracking template order (None = BIC-selected)."
+    ),
+    segments: int | None = typer.Option(
+        None, "--segments", help="Target tracking segment count (None = auto)."
+    ),
+    harmonic_scale: float | None = typer.Option(
+        None, "--harmonic-scale", help="Extra (dP/dt)/P refinement (None = per method)."
+    ),
+    detrend_width: float | None = typer.Option(
+        None, "--detrend-width", help="Running-median window (days) removed first."
+    ),
+    detrend_method: str = typer.Option(
+        "median", "--detrend-method", help="Detrend kernel: median | binned."
+    ),
+    profile: bool = typer.Option(
+        True, "--profile/--no-profile", help="Measure the model-free P(t) track."
+    ),
+    laws: str = typer.Option(
+        "auto",
+        "--laws",
+        help="Period laws ranked on each track (comma-sep), 'auto', or 'none'.",
+    ),
+    points_per_interval: int | None = typer.Option(
+        None, "--points-per-interval", help="Target points per profile interval."
+    ),
+    period_window: float | None = typer.Option(
+        None, "--period-window", help="Fractional half-width of an interval's search."
+    ),
+    oc_sink: Path | None = typer.Option(
+        None, "--oc-sink", help="Per-segment O-C table (its own file or directory)."
+    ),
+    profile_sink: Path | None = typer.Option(
+        None, "--profile-sink", help="Per-interval P(t) table (its own file or dir)."
+    ),
+    plots: Path | None = typer.Option(
+        None, "--plots", help="Directory for per-star figures (needs the [plot] extra)."
+    ),
+    plot_keys: str | None = typer.Option(
+        None, "--plot-keys", help="Restrict figures to these keys (comma-sep)."
+    ),
+    time: str | None = typer.Option(None, help="Time column name override."),
+    value: str | None = typer.Option(None, help="Value column name override."),
+    error: str | None = typer.Option(None, help="Error column name override."),
+    domain: str | None = typer.Option(None, help="magnitude | flux."),
+    resume: bool = typer.Option(True, "--resume/--no-resume", help="Skip done chunks."),
+) -> None:
+    """Measure period changes for many light curves; writes up to three tables.
+
+    --sink takes the per-star summary; --oc-sink and --profile-sink add the
+    per-segment O-C points and the per-interval P(t) track behind it. A light curve
+    that fails still gets a summary row, with the reason in its status column.
+    """
+    from cuperiod.pdot.batch import batch_pdot as _batch_pdot
+
+    # batch_pdot swallows plotting failures per star, so an unusable --plots must
+    # be caught before a survey-scale run, not discovered from empty cells after.
+    if plots is not None:
+        _require_matplotlib("--plots")
+    settings = _pdot_settings(
+        max_cycle_drift=max_cycle_drift,
+        samples_per_drift=samples_per_drift,
+        samples_per_peak=samples_per_peak,
+        window_rayleigh=window_rayleigh,
+        pdot_range=pdot_range,
+        harmonics=harmonics,
+        segments=segments,
+        harmonic_scale=harmonic_scale,
+    )
+    summary = _batch_pdot(
+        inputs,
+        period=period,
+        method=method,
+        model=_period_model(model),
+        settings=settings,
+        detrend_width=_detrend_width(detrend_width),
+        detrend_method=_trend_method(detrend_method),
+        profile=profile,
+        laws=_period_laws(laws),
+        points_per_interval=points_per_interval,
+        period_window=period_window,
+        backend=backend,
+        device=device,
+        workers=workers,
+        columns=_column_map(time, value, error, None),
+        domain=_domain(domain),
+        sink=sink,
+        oc_sink=oc_sink,
+        profile_sink=profile_sink,
+        plots=plots,
+        plot_keys=_comma_list(plot_keys),
+        resume=resume,
+        chunk_size=chunk_size,
+    )
+    typer.echo(
+        f"Measured {summary.n_done} light curves from {summary.n_inputs} inputs "
+        f"({summary.n_skipped} skipped, {summary.n_failed} failed) -> {summary.sink}"
+    )
+    if oc_sink is not None:
+        typer.echo(f"  O-C segments -> {oc_sink}")
+    if profile_sink is not None:
+        typer.echo(f"  P(t) profile -> {profile_sink}")
+    if plots is not None:
+        typer.echo(f"  figures      -> {plots}")
+    for key, msg in summary.errors[:10]:
+        typer.echo(f"  ! {key}: {msg}")
 
 
 @app.command()

@@ -18,6 +18,15 @@ method on the warped times (reusing its batch engine, e.g. the cached
 cufinufft plans), and stacks the rows into a ``(n_pdot, n_frequency)`` map
 whose refined best cell is the joint (P, dP/dt) estimate.
 
+The frequency-independence of ``tau`` is a property of the *family* of period
+laws, not of this one law, so ``model=`` selects which is searched:
+``"constant-pdot"`` above, or ``"exponential"`` (``P = P0*exp(a*dt)``, warp
+``tau = (1 - exp(-a*dt))/a``), the accelerating decay of an inspiralling or
+mass-transferring binary. Both are parameterized by the same ``a`` at
+``t_ref``, so their ``period`` and ``pdot`` are directly comparable and only
+their behaviour away from the reference epoch differs. See
+:mod:`cuperiod.pdot.models`.
+
 Resolution and range follow the same phase-coherence logic as the frequency
 grid: a frequency step ``1/(s*T)`` mis-phases the edges of the baseline by
 ``1/(2s)`` cycles, and an ``a`` step of ``4/(s*f*T**2)`` does the same through
@@ -65,6 +74,7 @@ from cuperiod.core.grid import GridSpec
 from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
 from cuperiod.core.result import Periodogram
 from cuperiod.methods.base import PeriodogramMethod, get_method
+from cuperiod.pdot.models import PeriodModel, get_model
 from cuperiod.pdot.result import PdotBest, PdotSearchResult
 
 #: Methods whose trial grids carry method-specific structure (box durations /
@@ -122,7 +132,11 @@ def _harmonic_scale(m: PeriodogramMethod, settings: BaseSettings) -> float:
 
 
 def _pdot_axis(
-    settings: PdotSettings, f_center: float, baseline: float, h_scale: float
+    settings: PdotSettings,
+    f_center: float,
+    baseline: float,
+    h_scale: float,
+    model: PeriodModel | None = None,
 ) -> FloatArray:
     """The (dP/dt)/P axis: uniform, and containing an exact 0 by default."""
     scale = h_scale if settings.harmonic_scale is None else settings.harmonic_scale
@@ -135,8 +149,9 @@ def _pdot_axis(
         n = int(math.floor((hi - lo) / step)) + 1
         return lo + step * np.arange(n, dtype=np.float64)
     a_max = 8.0 * settings.max_cycle_drift / (f_center * baseline * baseline)
-    # Keep the warp well inside its domain: |a| * (T/2) must stay below 1.
-    a_max = min(a_max, 1.0 / baseline)
+    # Stay inside the model's domain — for the singular constant-dP/dt warp
+    # that means the period must not reach zero within the span.
+    a_max = min(a_max, get_model(model).max_abs_rate(baseline))
     n_side = max(1, int(math.ceil(a_max / step)))
     return step * np.arange(-n_side, n_side + 1, dtype=np.float64)
 
@@ -206,32 +221,32 @@ def _row_power(
 
 
 def _warp(
-    work: LightCurve | MultiBandLightCurve, t_ref: float, a: float
+    work: LightCurve | MultiBandLightCurve,
+    t_ref: float,
+    a: float,
+    model: PeriodModel,
 ) -> LightCurve | MultiBandLightCurve:
-    """The light curve on warped times ``tau = dt*(1 - (a/2)*dt)``, origin t_ref."""
+    """The light curve on ``model``-warped times, origin ``t_ref``."""
     if isinstance(work, MultiBandLightCurve):
         bands = {
-            name: replace(b, time=_warp_times(b.time, t_ref, a))
+            name: replace(b, time=model.warp(b.time - t_ref, a))
             for name, b in work.bands.items()
         }
         return MultiBandLightCurve.from_light_curves(bands, meta=work.meta)
-    return replace(work, time=_warp_times(work.time, t_ref, a))
+    return replace(work, time=model.warp(work.time - t_ref, a))
 
 
-def _warp_times(time: FloatArray, t_ref: float, a: float) -> FloatArray:
-    return warp_dt(time - t_ref, a)
+def warp_dt(
+    dt: FloatArray, a: float, model: str | PeriodModel | None = None
+) -> FloatArray:
+    """Exact period-drift time warp for ``dt`` measured from the reference epoch.
 
-
-def warp_dt(dt: FloatArray, a: float) -> FloatArray:
-    """Exact constant-dP/dt time warp: ``tau = ln(1 + a*dt)/a`` (``dt`` at 0).
-
-    The phase of a linearly drifting period is ``f * tau`` exactly (module
-    docstring); ``log1p`` keeps precision as ``a*dt -> 0``. The caller must
-    ensure ``1 + a*dt > 0`` for every point (the period stays positive).
+    The phase of a drifting period is ``f * tau`` exactly, whatever the model
+    (see :mod:`cuperiod.pdot.models`). Defaults to ``"constant-pdot"``, whose
+    warp is ``tau = ln(1 + a*dt)/a``; ``log1p`` keeps precision as ``a*dt -> 0``,
+    and the caller must keep ``1 + a*dt > 0`` (the period stays positive).
     """
-    if a == 0.0:
-        return dt
-    return np.log1p(a * dt) / a
+    return get_model(model).warp(np.asarray(dt, dtype=np.float64), a)
 
 
 def _parabolic_offset(sm: float, s0: float, sp: float) -> float:
@@ -243,11 +258,35 @@ def _parabolic_offset(sm: float, s0: float, sp: float) -> float:
     return float(np.clip(off, -0.5, 0.5))
 
 
+def _ridge_correlation(score: FloatArray, j0: int, i0: int) -> float:
+    """Frequency/rate correlation at the peak from the local curvature.
+
+    Fits the 3x3 stencil's second derivatives and reads the correlation of the
+    implied covariance ``-H^-1``. Scale-free, so the grid steps cancel: the
+    value is the same in physical units. See :attr:`PdotBest.ridge_correlation`.
+    """
+    ny, nx = score.shape
+    if not (0 < j0 < ny - 1 and 0 < i0 < nx - 1):
+        return float("nan")
+    block = np.asarray(score[j0 - 1 : j0 + 2, i0 - 1 : i0 + 2], dtype=np.float64)
+    if not np.all(np.isfinite(block)):
+        return float("nan")
+    s_ff = block[1, 2] - 2.0 * block[1, 1] + block[1, 0]
+    s_aa = block[2, 1] - 2.0 * block[1, 1] + block[0, 1]
+    s_fa = 0.25 * (block[2, 2] - block[2, 0] - block[0, 2] + block[0, 0])
+    if s_ff >= 0.0 or s_aa >= 0.0:  # not a peak along both axes
+        return float("nan")
+    if s_ff * s_aa - s_fa * s_fa <= 0.0:  # degenerate/saddle: no finite ellipse
+        return float("nan")
+    return float(np.clip(s_fa / math.sqrt(s_ff * s_aa), -1.0, 1.0))
+
+
 def pdot_search(
     data: Any,
     *,
     period: float | None = None,
     method: str = "GLS",
+    model: str | PeriodModel | None = None,
     settings: PdotSettings | None = None,
     method_settings: BaseSettings | None = None,
     grid: GridSpec | None = None,
@@ -276,6 +315,14 @@ def pdot_search(
         carry box/transit structure a plain window cannot represent); use
         :func:`cuperiod.phase_track` / :func:`cuperiod.fit_ephemeris` for
         transit-timing style dP/dt work.
+    model : str, optional
+        Period-evolution law: ``"constant-pdot"`` (default; ``dP/dt`` constant,
+        the classical quadratic ephemeris) or ``"exponential"``
+        (``d(ln P)/dt`` constant, the accelerating decay of a mass-transferring
+        or inspiralling binary). Both are parameterized by the same
+        ``a = (dP/dt)/P`` at ``t_ref`` and so return directly comparable
+        ``best.period`` / ``best.pdot``; they differ in how the rate evolves
+        away from that epoch. See :mod:`cuperiod.pdot.models`.
     settings : PdotSettings, optional
         Search-axis settings (window width, oversampling, drift range).
     method_settings : pydantic settings, optional
@@ -308,6 +355,7 @@ def pdot_search(
             "transit-timing dP/dt with phase_track / fit_ephemeris"
         )
     psettings = settings or PdotSettings()
+    pmodel = get_model(model)
     msettings = m.coerce_settings(method_settings)
     resolved = m.resolve_backend(backend)
 
@@ -354,7 +402,9 @@ def pdot_search(
         f_center, baseline, psettings
     )
     frequency = fgrid.frequency
-    axis = _pdot_axis(psettings, f_center, baseline, _harmonic_scale(m, msettings))
+    axis = _pdot_axis(
+        psettings, f_center, baseline, _harmonic_scale(m, msettings), pmodel
+    )
     n_cells = int(axis.size) * int(frequency.size)
     if n_cells > psettings.max_grid_cells:
         raise ValueError(
@@ -364,11 +414,18 @@ def pdot_search(
         )
     dt_extent = max(t_hi - t_ref, t_ref - t_lo)
     a_worst = float(max(abs(axis[0]), abs(axis[-1])))
-    if a_worst * dt_extent >= 1.0:
+    if a_worst >= pmodel.max_abs_rate(dt_extent):
         raise ValueError(
-            "pdot_search: the (dP/dt)/P range reaches |a|*dt >= 1 at the span "
-            "edge — outside the constant-dP/dt model's domain (the period "
-            "would pass through zero); narrow pdot_over_p_range"
+            f"pdot_search: the (dP/dt)/P range is outside the {pmodel.name} "
+            f"model's domain at the span edge (|a| = {a_worst:.3e} 1/day over "
+            f"{dt_extent:.1f} d)"
+            + (
+                " — the period would pass through zero; narrow "
+                "pdot_over_p_range or use model='exponential', which has no "
+                "singular epoch"
+                if pmodel.singular
+                else "; narrow pdot_over_p_range"
+            )
         )
 
     # -- scan ---------------------------------------------------------------------
@@ -377,7 +434,12 @@ def pdot_search(
     backend_actual = resolved
     for j, a in enumerate(axis):
         pg = _row_power(
-            m, fgrid, _warp(work, t_ref, float(a)), row_settings, resolved, engine
+            m,
+            fgrid,
+            _warp(work, t_ref, float(a), pmodel),
+            row_settings,
+            resolved,
+            engine,
         )
         if pg.power.size != frequency.size:
             raise RuntimeError(
@@ -422,10 +484,13 @@ def pdot_search(
         power=float(power[j0, i0]),
         zero_pdot_power=zero_power,
         t_ref=t_ref,
+        model=pmodel.name,
+        ridge_correlation=_ridge_correlation(score, j0, i0),
     )
     meta = {
         "pdot_search": {
             "f_center": f_center,
+            "model": pmodel.name,
             "window_rayleigh": psettings.window_rayleigh,
             "samples_per_peak": psettings.samples_per_peak,
             "max_cycle_drift": psettings.max_cycle_drift,

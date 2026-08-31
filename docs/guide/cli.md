@@ -161,12 +161,61 @@ with its uncertainty and the F-test against a constant period.
   - The frequency window around the center period.
 * - `--harmonics` / `--segments`
   - Tracking template order (default BIC-selected) and segment count.
+* - `--model`
+  - Period law the search warps by: `constant-pdot` (default) or `exponential`.
+* - `--detrend-width`
+  - Running-median window in days, applied before anything else. Real survey
+    photometry usually needs one — see {doc}`period-change`.
 * - `--track / --no-track`
   - Follow the search with the phase-tracking measurement (default on).
+* - `--profile`
+  - Also measure the model-free P(t) track and rank the period laws over it —
+    the check on whether one constant rate is enough.
 * - `--backend`
   - `auto` | `cpu` | `gpu` | a concrete backend name.
 * - `--out` / `--save-map`
   - Write the results as JSON, and/or the 2-D search map as `.npz`.
+```
+
+## `pdot-batch` — period changes for a catalogue
+
+```bash
+cuperiod pdot-batch "lcs/*.csv" --out pdot.parquet --detrend-width 40 --workers 8
+```
+
+Runs the whole chain of {doc}`period-change` over many light curves, with the same
+inputs and worker options as `batch` and the same search knobs as `pdot`. It writes up
+to three tables — the summary (one row per light curve), and optionally the O−C
+segments and the P(t) intervals, which are large and are only written when asked for.
+A light curve that fails still gets a summary row carrying the reason in `status`.
+
+```{list-table}
+:header-rows: 1
+:widths: 30 70
+
+* - Option
+  - Meaning
+* - `--out` / `--sink`
+  - The summary table: `.parquet`/`.csv`, or a directory (resumable).
+* - `--oc-sink` / `--profile-sink`
+  - The per-segment O−C and per-interval P(t) tables. Directory sinks must
+    differ from each other and from `--out`.
+* - `--period`
+  - Seed period in days for every light curve (omit to seed each search).
+* - `--detrend-width` / `--detrend-method`
+  - Running-median trend removal: window in days, and `median` or `binned`.
+* - `--profile / --no-profile`
+  - Measure the model-free P(t) track and fit period laws to it (default on).
+* - `--laws`
+  - `auto`, `none`, or a comma-separated subset of the registered laws.
+* - `--points-per-interval` / `--period-window`
+  - Interval size for the P(t) track, and the fractional half-width of each
+    interval's period search.
+* - `--plots` / `--plot-keys`
+  - Directory for per-star diagnostic figures, optionally restricted to
+    listed keys. Needs `pip install "cuperiod[plot]"`.
+* - `--workers` / `--chunk-size` / `--resume / --no-resume`
+  - As `batch`. One light curve costs a whole grid search, so chunks are small.
 ```
 
 ## `batch-prewhiten` — many pulsators
