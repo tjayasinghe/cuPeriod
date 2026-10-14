@@ -228,6 +228,23 @@ All notable changes to cuPeriod are documented here. The format is based on
   tracker now measures the template's fold symmetry (harmonics outside the multiples
   of `m` below 5% of the power) and unwraps consecutive delays by `period / m`;
   `wrap_risk` is scaled the same way. Found on real data by the OGLE benchmark below.
+- **Light-time orbits on real OGLE triples** (`benchmarks/pdot_ogle_triples.py`,
+  `download_ogle_triples.py`; write-up with figures in
+  `benchmarks/REPORT_ogle_triples.md`): six of Hong et al. (2022)'s sinusoidal contact
+  binaries, 14.3 yr of OGLE-III + IV photometry each, run through detrend →
+  `phase_track` (40 segments) → `ltte_search` with no per-season binary modelling.
+  **6/6** recovered outer periods agree with the published ones within 2σ (median
+  offset 4%; e.g. 6.43 ± 0.09 yr vs 6.2 ± 0.2 for OGLE-BLG-ECL-289126, amplitude
+  660 ± 17 s, ΔBIC +2085), while the parabola alone claimed a ≥ 3σ dP/dt on **3/6**
+  and the joint fit's secular rate on 1/6.
+- **Injection-recovery of the cyclic O−C** (`benchmarks/pdot_ltte_recovery.py`): 80
+  planted 120–600 s orbits at outer periods of 0.25–1.5 baselines plus 40 nulls. With
+  the cycle covered (≤ 1 baseline), the outer period is recovered within 10% in 81%
+  and the amplitude within 3σ in 98%; the parabola alone reports a ≥ 3σ "dP/dt" on
+  41% of stars that have no secular rate at all (64% when the cycle is 0.75–1
+  baselines long) against 20% for the joint fit, and there are no false cycles and
+  no false rates on the nulls. Beyond one baseline the cycle is detected in 12%: the
+  degenerate regime, stated as such.
 
 ### Fixed
 

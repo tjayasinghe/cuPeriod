@@ -149,6 +149,18 @@ recommended for RR Lyrae.
 A GPU pass runs alongside the scored CPU pass to record agreement and timing. The step needs
 no network access — the light curves are committed.
 
+## Period-change benchmarks
+
+The v1.3 dP/dt tools have their own scripts, each self-describing in its module
+docstring and each writing a parquet under `results/`:
+
+| Script | Question | Data |
+|---|---|---|
+| `pdot_recovery.py` | does the joint (P, dP/dt) search localize a planted drift, and is the tracker's error honest? | synthetic |
+| `pdot_v1309sco.py` (+ `download_v1309sco.py`) | is Tylenda et al. (2011)'s singular decay law reproduced on the merger progenitor's own photometry? | OGLE-III V1309 Sco |
+| `pdot_ltte_recovery.py` | how often does a parabola alone turn a light-time cycle into a spurious dP/dt, and does `ltte_search` recover the planted orbit? | synthetic |
+| `pdot_ogle_triples.py` (+ `download_ogle_triples.py`) | are Hong et al. (2022)'s published outer periods recovered from raw survey photometry? | OGLE-III+IV bulge contact binaries; figure `figures/ogle_triples_oc.png`; full write-up with figures in [`REPORT_ogle_triples.md`](REPORT_ogle_triples.md) (`report_ogle_triples.py` renders it) |
+
 ## Environments
 
 Two venvs, because `transitleastsquares` pins an old numba:
