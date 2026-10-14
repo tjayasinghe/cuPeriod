@@ -14,10 +14,16 @@ hundreds of thousands of periods at once.
 * ``cupy``  — GPU; a one-CUDA-block-per-period kernel that bins into shared memory and
   block-reduces to the best box with no global intermediates. Compiled at runtime by
   cupy/NVRTC, so no host C++ compiler is needed.
+
+Like astropy, the flux is centred on its median before the search (every box statistic
+is invariant to a constant offset, and centring keeps the cumulative sums from
+carrying the flux level), and an empty or all-swallowing box is recognised by a
+*relative* floor on its inverse-variance sum (see :func:`_ivar_floor`).
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, Final, Literal
@@ -38,15 +44,70 @@ from cuperiod.core._typing import FloatArray
 #: ``"torch:cpu"``, so backend strings are typed as ``str`` where torch is accepted).
 BLSBackend = Literal["numpy", "cupy", "numba"]
 
-#: Inverse-variance floor: an empty in/out side (ivar sum 0) is skipped, not divided by.
-_IVAR_EPS: Final = float(np.finfo(np.float64).eps)
+_F64_EPS: Final = float(np.finfo(np.float64).eps)
+_F32_EPS: Final = float(np.finfo(np.float32).eps)
+
+#: Kept for backward compatibility; the searches use the relative :func:`_ivar_floor`.
+_IVAR_EPS: Final = _F64_EPS
 
 #: Default trial periods per vectorized batch; bounds the transient (batch, n_bins)
 #: work arrays while amortizing GPU launch overhead.
 DEFAULT_BATCH: Final = 2048
 
+#: Byte budgets for one batch of the array-API search's transient work arrays (about
+#: ``4*N + 14*width`` float64 values per trial period, see :func:`_resolve_batch`).
+#: The host budget keeps the default 2048-period batch for ordinary curves.
+_HOST_BATCH_BYTES: Final = 1 << 29
+_DEVICE_BATCH_BYTES: Final = 1 << 30
+
 #: CUDA threads per block (one block per trial period).
 CUDA_BLOCK: Final = 128
+
+#: Screen slack of the numba sweep, in units of eps * sum|y*ivar| (see the kernel).
+_SCREEN_SLACK_EPS: Final = 256.0
+
+#: The numba screen runs only while sum|y*ivar| and sum(ivar) lie in this range, so
+#: every intermediate of both passes is a normal float; outside it every box is
+#: evaluated exactly, as without the screen.
+_SCREEN_SCALE_RANGE: Final = (1e-150, 1e150)
+
+
+def _ivar_floor(n_points: int, sum_ivar: float, *, float32: bool = False) -> float:
+    """Smallest admissible inverse-variance sum on either side of a box.
+
+    A box is skipped when its in-box or out-of-box inverse-variance sum falls below
+    this. Both sums come from cumulative sums, so a side holding *no* points is not
+    exactly zero but rounding noise of order ``N * eps * sum(ivar)``; an absolute
+    floor (astropy uses ``DBL_EPSILON``) admits such a box whenever ``sum(ivar)``
+    is large -- a box swallowing every point then reports a fabricated depth of order
+    the flux level, a likelihood of ~1e6 on pure noise -- and rejects every box when
+    the errors are large (``sum(ivar) < 2e-16``). ``4 * N * eps * sum(ivar)`` bounds
+    that round-off and is scale-invariant; the cumulative sums of a float32 device
+    pass also need ``8 * eps32 * sum(ivar)``. Never below the smallest normal float,
+    so an all-zero weight vector admits nothing.
+    """
+    floor = 4.0 * n_points * _F64_EPS * sum_ivar
+    if float32:
+        floor = max(floor, 8.0 * _F32_EPS * sum_ivar)
+    if not floor > 0.0:  # also NaN
+        return float(np.finfo(np.float64).tiny)
+    return floor
+
+
+def _resolve_batch(
+    batch: int, n_points: int, width: int, *, on_device: bool
+) -> int:
+    """Trial periods per array-API batch: ``batch``, capped by the byte budget.
+
+    One batch materialises the phase-binning temporaries (``(batch, N)`` phases,
+    bin indices and weights, about ``4*N`` values per period) and the
+    ``(batch, width)`` bin sums, cumulative sums and box-objective arrays (about
+    ``14*width``). Without a cap, long light curves or wide period ranges need
+    gigabytes per batch. The result does not depend on the batch length.
+    """
+    per_period = 8 * (4 * max(1, n_points) + 14 * max(1, width))
+    budget = _DEVICE_BATCH_BYTES if on_device else _HOST_BATCH_BYTES
+    return max(1, min(int(batch), budget // per_period))
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,11 +132,17 @@ class BLSPower:
 
 
 def _duration_bins(durations: FloatArray, bin_duration: float) -> list[int]:
-    """Box widths in bins, deduped in first-seen order (astropy's loop order)."""
+    """Box widths in bins, deduped in first-seen order (astropy's loop order).
+
+    Rounded half away from zero, like the C ``round()`` of astropy's ``run_bls``
+    (Python's ``round`` goes half to even: 2.5 bins became 2, so a trial duration
+    could vanish into its neighbour and the search differ from astropy's). The
+    ratio is at least ``oversample >= 1``, so ``floor(x + 0.5)`` is exact here.
+    """
     seen: set[int] = set()
     out: list[int] = []
     for d in np.asarray(durations, dtype=np.float64).tolist():
-        kd = round(d / bin_duration)
+        kd = math.floor(d / bin_duration + 0.5)
         if kd >= 1 and kd not in seen:
             seen.add(kd)
             out.append(kd)
@@ -122,6 +189,7 @@ def _bls_search(
     width: int,
     obj_flag: int,
     batch: int,
+    ivar_floor: float | None = None,
 ) -> dict[str, Any]:
     """Vectorized port of astropy ``run_bls`` for one duration-homogeneous call.
 
@@ -129,6 +197,7 @@ def _bls_search(
     body runs on numpy (CPU) and torch (CPU/CUDA/ROCm/MPS/XPU). The working float dtype
     follows ``periods`` (float64, or float32 on a float32 device); index/bin arrays are
     int64. The cupy ``RawKernel`` fast path (NVIDIA) is separate and not this code.
+    ``ivar_floor`` defaults to :func:`_ivar_floor` for the working dtype.
     """
     fdtype = periods.dtype
     idtype = xp.int64
@@ -136,6 +205,10 @@ def _bls_search(
     yw = y * ivar
     sum_y = float(xp.sum(yw))
     sum_ivar = float(xp.sum(ivar))
+    if ivar_floor is None:
+        ivar_floor = _ivar_floor(
+            int(t.shape[0]), sum_ivar, float32=fdtype == xp.float32
+        )
     t_min = float(xp.min(t))
     tau = t - t_min
 
@@ -189,8 +262,8 @@ def _bls_search(
             cols = cols_full[: width - kd]
             valid = (
                 (cols[None, :] <= (n_bins[:, None] - kd))
-                & (ivar_in >= _IVAR_EPS)
-                & (ivar_out >= _IVAR_EPS)
+                & (ivar_in >= ivar_floor)
+                & (ivar_out >= ivar_floor)
             )
             obj = _objective(xp, y_in, ivar_in, sum_y, ivar_out, obj_flag, valid)
             cand_n = xp.argmax(obj, axis=1)
@@ -204,8 +277,8 @@ def _bls_search(
         y_in = cy[rows, best_n + best_d] - cy[rows, best_n]
         ivar_in = cw[rows, best_n + best_d] - cw[rows, best_n]
         ivar_out = sum_ivar - ivar_in
-        safe_in = xp.where(finite & (ivar_in >= _IVAR_EPS), ivar_in, 1.0)
-        safe_out = xp.where(finite & (ivar_out >= _IVAR_EPS), ivar_out, 1.0)
+        safe_in = xp.where(finite & (ivar_in >= ivar_floor), ivar_in, 1.0)
+        safe_out = xp.where(finite & (ivar_out >= ivar_floor), ivar_out, 1.0)
         y_in_n = y_in / safe_in
         y_out_n = (sum_y - y_in) / safe_out
         depth = y_out_n - y_in_n
@@ -238,6 +311,22 @@ def _bls_search(
 # the kernel cached, so this is pure opt-in: nothing imports numba unless the
 # ``numba`` backend actually runs. Matches astropy ``run_bls`` to round-off, like
 # the numpy and cupy backends, but is the fast CPU product path.
+#
+# The box sweep is screened. A sparse light curve bins a few hundred points into
+# thousands of phase bins, so nearly all the time goes into evaluating boxes (five
+# divisions and a square root each) that cannot beat the best box found so far. With
+# t = y_in - ybar*iv_in (ybar = sum_y/sum_ivar), the box is a dip iff t <= 0 and
+#     snr^2 = sum_ivar * t^2 / (iv_in*iv_out),
+#     2*loglike = sum_ivar^2 * t^2 / (iv_in*iv_out^2),
+# so a first, division-free pass over each duration stores an optimistic bound
+# (|t| + slack)^2 / den on every box, and the second pass evaluates the original
+# expressions only where that bound can reach the incumbent's pessimistic bound
+# (|t| - slack)^2 / den. The slack (256 eps of sum|y*ivar|, ~30x the worst rounding of
+# t and of the exact objective) makes every skip a proof: the chosen box, its
+# statistics and the first-wins tie-break are exactly those of the unscreened sweep.
+# t and the denominators are normalised by sum|y*ivar| and sum_ivar so neither
+# product can over- or underflow; for data so extreme that the normalisation itself
+# is not exact (sums outside 1e+-150) the slack is infinite and nothing is skipped.
 
 _NUMBA_BLS_KERNEL: Any = None
 
@@ -249,15 +338,14 @@ def _numba_bls_kernel() -> Any:
         return _NUMBA_BLS_KERNEL
     from numba import njit, prange
 
-    eps = _IVAR_EPS
-
     @njit(parallel=True, cache=True, fastmath=False)  # pragma: no cover - njit
     def _kernel(tau, yw, wv, periods, dur_bins, bin_duration, oversample, width,  # type: ignore[no-untyped-def]
-                sum_y, sum_ivar, t_min, obj_flag):
+                sum_y, sum_ivar, t_min, obj_flag, ivar_floor, inv_a, inv_s, slack):
         n_periods = periods.shape[0]
         n_points = tau.shape[0]
         n_dur = dur_bins.shape[0]
         neg = -np.inf
+        ybar = sum_y / sum_ivar if sum_ivar > 0.0 else 0.0
         o_power = np.full(n_periods, neg)
         o_depth = np.zeros(n_periods)
         o_depth_err = np.zeros(n_periods)
@@ -300,18 +388,39 @@ def _numba_bls_kernel() -> Any:
                 my[i] = ay
                 ai += mi[i]
                 mi[i] = ai
+            num = np.empty(width)
+            den = np.empty(width)
             loc = neg
             ln = 0
             ld = 0
+            best_t2 = 0.0
+            best_den = 1.0
             for di in range(n_dur):
                 d = dur_bins[di]
                 if d < 1 or d >= n_bins:
                     continue
-                for n in range(n_bins - d + 1):
+                m = n_bins - d + 1
+                # Pass 1: division-free optimistic bound on every box (-1 = never).
+                for n in range(m):
                     y_in = my[n + d] - my[n]
                     iv_in = mi[n + d] - mi[n]
                     iv_out = sum_ivar - iv_in
-                    if iv_in < eps or iv_out < eps:
+                    t = (y_in - ybar * iv_in) * inv_a
+                    t_hi = abs(t) + slack
+                    dn = (iv_in * inv_s) * (iv_out * inv_s)
+                    if obj_flag != 0:
+                        dn = dn * (iv_out * inv_s)
+                    ok = (iv_in >= ivar_floor) & (iv_out >= ivar_floor) & (t <= slack)
+                    num[n] = t_hi * t_hi if ok else -1.0
+                    den[n] = dn if ok else 1.0
+                # Pass 2: the original box evaluation, where the bound can win.
+                for n in range(m):
+                    if num[n] * best_den < best_t2 * den[n]:
+                        continue
+                    y_in = my[n + d] - my[n]
+                    iv_in = mi[n + d] - mi[n]
+                    iv_out = sum_ivar - iv_in
+                    if iv_in < ivar_floor or iv_out < ivar_floor:
                         continue
                     yin = y_in / iv_in
                     yout = (sum_y - y_in) / iv_out
@@ -326,6 +435,11 @@ def _numba_bls_kernel() -> Any:
                         loc = obj
                         ln = n
                         ld = d
+                        t_lo = abs((y_in - ybar * iv_in) * inv_a) - slack
+                        if not (t_lo > 0.0):
+                            t_lo = 0.0
+                        best_t2 = t_lo * t_lo
+                        best_den = den[n]
             if loc <= neg:
                 continue
             y_in = my[ln + ld] - my[ln]
@@ -354,19 +468,33 @@ def _numba_bls_kernel() -> Any:
 def _bls_search_numba(
     t: Any, y: Any, ivar: Any, periods: Any, *,
     bin_duration: float, dur_bins: list[int], oversample: int, width: int,
-    obj_flag: int,
+    obj_flag: int, screen: bool = True,
 ) -> dict[str, Any]:
-    """Numba CPU box search; same output dict as :func:`_bls_search`."""
+    """Numba CPU box search; same output dict as :func:`_bls_search`.
+
+    ``screen=False`` evaluates every box exactly (the reference the screened sweep
+    must reproduce bit for bit; for tests and diagnostics).
+    """
     kernel = _numba_bls_kernel()
     yw = np.ascontiguousarray(y * ivar, dtype=np.float64)
     t_min = float(t.min())
     tau = np.ascontiguousarray(t - t_min, dtype=np.float64)
     db = np.ascontiguousarray(dur_bins, dtype=np.int64)
+    sum_y = float(yw.sum())
+    sum_ivar = float(ivar.sum())
+    sum_abs = float(np.abs(yw).sum())
+    lo, hi = _SCREEN_SCALE_RANGE
+    if screen and lo <= sum_abs <= hi and lo <= sum_ivar <= hi:
+        inv_a, inv_s = 1.0 / sum_abs, 1.0 / sum_ivar
+        slack = _SCREEN_SLACK_EPS * _F64_EPS
+    else:
+        inv_a, inv_s, slack = 0.0, 0.0, math.inf
     pw, dep, de, ds, du, tt, ll = kernel(
         tau, yw, np.ascontiguousarray(ivar, dtype=np.float64),
         np.ascontiguousarray(periods, dtype=np.float64), db,
         float(bin_duration), int(oversample), int(width),
-        float(yw.sum()), float(ivar.sum()), t_min, int(obj_flag),
+        sum_y, sum_ivar, t_min, int(obj_flag),
+        _ivar_floor(int(tau.shape[0]), sum_ivar), inv_a, inv_s, slack,
     )
     return {"power": pw, "depth": dep, "depth_err": de, "depth_snr": ds,
             "duration": du, "transit_time": tt, "log_likelihood": ll}
@@ -628,15 +756,17 @@ def _bls_search_cuda(
             np.float64(data["t_min"]),
             np.int32(obj_flag),
             rdtype(-np.inf),
-            # In float64 an empty box window's ivar_in is exactly 0, so the absolute
-            # eps floor suffices. In float32 the cumsum difference of an empty window
-            # is cancellation *noise* of order sum_ivar*eps_f32 — an absolute 2.2e-16
-            # floor would admit garbage boxes — so the floor scales with the total.
+            # The relative floor of _ivar_floor: an empty side of a box (or the
+            # outside of a box holding every point) is cumulative-sum *noise* of
+            # order N*eps*sum_ivar (sum_ivar*eps_f32 in float32), never exactly 0.
             rdtype(
-                max(_IVAR_EPS, data["sum_ivar"] * 8.0 * float(np.finfo(np.float32).eps))
-            )
-            if precision == "float32"
-            else np.float64(_IVAR_EPS),
+                max(
+                    _ivar_floor(
+                        data["n"], data["sum_ivar"], float32=precision == "float32"
+                    ),
+                    float(np.finfo(rdtype).tiny),
+                )
+            ),
             out["power"],
             out["depth"],
             out["depth_err"],
@@ -669,10 +799,14 @@ def bls_power(
     """BLS box search over ``periods`` via numpy/torch (portable), cupy, or numba.
 
     Equivalent to ``BoxLeastSquares(t, y, dy).power(periods, durations,
-    objective=objective, oversample=oversample)`` — same binning and objective. ``y``
+    objective=objective, oversample=oversample)`` — same binning, objective, median
+    centring of ``y`` and half-away-from-zero rounding of the durations to bins. ``y``
     must be in the transit-as-dip convention (a flux decrease). Inverse variances are
     ``1/dy**2``; ``durations`` are absolute (same units as ``t``); ``oversample`` is the
-    number of bins per the shortest duration.
+    number of bins per the shortest duration. One deliberate difference: a box whose
+    inside or outside holds less than a rounding-level share of the total inverse
+    variance (:func:`_ivar_floor`) is never admitted, where astropy's absolute floor
+    lets a box that swallows every point report a fabricated depth.
 
     Parameters
     ----------
@@ -689,7 +823,9 @@ def bls_power(
         (portable array-API path, any torch device), ``"cupy"`` (NVIDIA RawKernel), or
         ``"numba"`` (multicore CPU).
     batch : int, default 2048
-        Trial periods per vectorized batch (numpy/torch backends).
+        Trial periods per vectorized batch (numpy/torch backends), capped so one
+        batch's work arrays stay within a byte budget (512 MiB on the host, 1 GiB on
+        a device; see :func:`_resolve_batch`). Does not affect the result.
     precision : {"auto", "float64", "float32"}, default "auto"
         Device-side compute precision for the torch and cupy backends (float64
         except on MPS; ``"float32"`` is an opt-in speedup on consumer GPUs).
@@ -721,7 +857,13 @@ def bls_power(
     width = max_n_bins + 1
 
     t_host = np.ascontiguousarray(t, dtype=np.float64)
+    # Centred on the median in float64, before any device cast, as astropy does: every
+    # box statistic is offset-invariant, but uncentred cumulative sums of y*ivar carry
+    # the whole flux level -- in float32 (forced on Apple MPS) its 6e-8 rounding swamps
+    # ppm-level transits, and even in float64 it costs parity digits.
     y_host = np.ascontiguousarray(y, dtype=np.float64)
+    if y_host.size:
+        y_host = y_host - float(np.median(y_host))
     ivar_host = 1.0 / (np.ascontiguousarray(dy, dtype=np.float64) ** 2)
 
     # Time origin subtracted before any (possibly float32) device cast; restored
@@ -788,13 +930,17 @@ def bls_power(
         out = _bls_search(
             array_namespace(periods_d), data["t"], data["y"], data["ivar"], periods_d,
             bin_duration=bin_duration, dur_bins=dur_bins,
-            oversample=oversample, width=width, obj_flag=obj_flag, batch=batch,
+            oversample=oversample, width=width, obj_flag=obj_flag,
+            batch=_resolve_batch(
+                batch, int(t_host.shape[0]), width, on_device=device != "cpu"
+            ),
         )
     else:  # numpy, through the array-API compat namespace
         out = _bls_search(
             array_namespace(periods_host), t_host, y_host, ivar_host, periods_host,
             bin_duration=bin_duration, dur_bins=dur_bins,
-            oversample=oversample, width=width, obj_flag=obj_flag, batch=batch,
+            oversample=oversample, width=width, obj_flag=obj_flag,
+            batch=_resolve_batch(batch, int(t_host.shape[0]), width, on_device=False),
         )
 
     return BLSPower(

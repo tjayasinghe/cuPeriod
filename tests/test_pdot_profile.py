@@ -186,7 +186,7 @@ def test_multiband_input_is_refused() -> None:
         period_profile(lc, period=V1309[0])
 
 
-@pytest.mark.parametrize("window", [0.0, 1.0, -0.1])
+@pytest.mark.parametrize("window", [0.0, 1.0, -0.1, np.nan])
 def test_bad_period_window_raises(window: float) -> None:
     t, mag, err = singular_light_curve(n=200)
     with pytest.raises(ValueError, match="period_window"):
@@ -198,6 +198,146 @@ def test_unweighted_input_still_measures() -> None:
     prof = period_profile((t, mag), period=V1309[0], points_per_interval=50)
     assert np.all(np.isfinite(prof.period_err))
     assert np.all(prof.period_err > 0.0)
+
+
+# --- the interval measurement converges on the chi-squared minimum -------------
+
+#: A 6-harmonic, RRab-like template (amplitudes, phases).
+RRAB = (
+    np.array([0.30, 0.15, 0.10, 0.065, 0.04, 0.025]),
+    np.array([0.0, 0.9, 2.1, 3.4, 4.8, 0.1]),
+)
+
+
+def constant_star(
+    kind: str, seed: int, noise: float, n: int = 1500, span: float = 1500.0
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """A constant-period (0.7 d) star: two harmonics, or six (RRab-like)."""
+    rng = np.random.default_rng(seed)
+    t = np.sort(rng.uniform(0.0, span, n)) + 2455000.0
+    phi = 2.0 * np.pi * (t - 2455000.0) / 0.7
+    if kind == "sine2":
+        y = 0.30 * np.sin(phi) + 0.12 * np.sin(2.0 * phi + 0.7)
+    else:
+        amps, phases = RRAB
+        y = sum(
+            a * np.sin((m + 1) * phi + p)
+            for m, (a, p) in enumerate(zip(amps, phases, strict=True))
+        )
+    y = 12.0 + y + rng.normal(0.0, noise, n)
+    return t, y, np.full(n, noise)
+
+
+@pytest.mark.parametrize(("kind", "noise"), [("sine2", 0.002), ("rrab6", 0.02)])
+def test_errors_are_calibrated_at_high_signal_to_noise(kind: str, noise: float) -> None:
+    """One parabolic vertex on the scan stencil is not the minimum.
+
+    The chi-squared is asymmetric at the scale of the scan step, so its vertex
+    missed the true minimum by several curvature sigmas whenever that sigma is
+    small -- many harmonics, or high signal-to-noise -- and the periods
+    scattered 3-4x beyond their own error bars.
+    """
+    pulls, laws = [], []
+    for seed in range(3):
+        t, y, err = constant_star(kind, 2000 + seed, noise)
+        prof = period_profile((t, y, err), period=0.7)
+        free = np.array([not p.at_window_edge for p in prof.points])
+        pulls.append(((prof.period - 0.7) / prof.period_err)[free])
+        laws.append(prof.compare()[0].law)
+    pull = np.concatenate(pulls)
+    assert 0.7 < float(np.std(pull)) < 1.4
+    assert laws.count("constant") >= 2
+
+
+def test_interval_frequency_sits_on_the_chi2_minimum() -> None:
+    from cuperiod.pdot.profile import _harmonic_chi2, _refine_frequency
+
+    t, y, err = constant_star("sine2", 2001, 0.002, n=60, span=60.0)
+    dt = t - t.mean()
+    w = 1.0 / err**2
+    f_ref = 1.0 / 0.7
+    f, sigma, chi2_min, _ = _refine_frequency(
+        dt, y, w, f_ref / 1.05, f_ref / 0.95, 2, 5
+    )
+    fine = np.linspace(f - 3 * sigma, f + 3 * sigma, 601)
+    best = min(_harmonic_chi2(dt, y, w, float(g), 2) for g in fine)
+    assert chi2_min == pytest.approx(_harmonic_chi2(dt, y, w, f, 2), rel=1e-12)
+    assert chi2_min - best < 1e-3
+
+
+@pytest.mark.parametrize("harmonics", [2, 3, None])
+def test_amplitude_is_the_fundamentals(harmonics: int | None) -> None:
+    """The fundamental's sine coefficient is coef[1 + H], not coef[2]."""
+    t, mag, err = singular_light_curve(noise=0.01)
+    prof = period_profile(
+        (t, mag, err), period=V1309[0], points_per_interval=60, harmonics=harmonics
+    )
+    amps = np.array([p.amplitude for p in prof.points])
+    assert np.all(np.abs(amps - 0.30) < 0.03)
+    assert [row["amplitude"] for row in prof.to_table()] == list(amps)
+
+
+def test_unweighted_errors_do_not_depend_on_the_units() -> None:
+    """Magnitudes and the same light curve in millimagnitudes: same errors."""
+    t, mag, err = constant_star("rrab6", 7, 0.05, n=900, span=900.0)
+    plain = period_profile((t, mag), period=0.7, harmonics=4, points_per_interval=60)
+    small = period_profile(
+        (t, 1e-3 * mag), period=0.7, harmonics=4, points_per_interval=60
+    )
+    assert np.allclose(small.period, plain.period, rtol=1e-12)
+    assert np.allclose(small.period_err, plain.period_err, rtol=1e-6)
+    weighted = period_profile(
+        (t, mag, err), period=0.7, harmonics=4, points_per_interval=60
+    )
+    ratio = np.median(plain.period_err / weighted.period_err)
+    assert ratio == pytest.approx(1.0, abs=0.1)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"harmonics": 0}, "harmonics must be"),
+        ({"harmonics": -1}, "harmonics must be"),
+        ({"period": np.nan}, "period must be finite"),
+        ({"period": np.inf}, "period must be finite"),
+        ({"period_window": np.nan}, "period_window must be"),
+        ({"points_per_interval": 0}, "points_per_interval must be"),
+        ({"n_intervals": 0}, "n_intervals must be"),
+    ],
+)
+def test_bad_scalars_raise_value_errors(kwargs: dict, match: str) -> None:
+    t, mag, err = singular_light_curve(n=300)
+    args = {"period": V1309[0], **kwargs}
+    with pytest.raises(ValueError, match=match):
+        period_profile((t, mag, err), **args)
+
+
+@pytest.mark.parametrize("weighted", [True, False])
+def test_constant_light_curve_is_not_measured(weighted: bool) -> None:
+    t = np.sort(np.random.default_rng(1).uniform(0.0, 1500.0, 900)) + 2455000.0
+    flat = np.full(t.size, 12.0)
+    data = (t, flat, np.full(t.size, 0.02)) if weighted else (t, flat)
+    with pytest.raises(InsufficientDataError):
+        period_profile(data, period=0.7)
+
+
+@pytest.mark.parametrize("weighted", [True, False])
+@pytest.mark.parametrize("harmonics", [1, 3, 10])
+def test_batched_chi2_matches_the_scalar_one(weighted: bool, harmonics: int) -> None:
+    from cuperiod.pdot.profile import _harmonic_chi2, _harmonic_chi2_many
+
+    rng = np.random.default_rng(harmonics)
+    dt = np.sort(rng.uniform(-40.0, 40.0, 70))
+    y = np.sin(2 * np.pi * dt / 0.7) + rng.normal(0.0, 0.05, dt.size)
+    w = 1.0 / rng.uniform(0.03, 0.08, dt.size) ** 2 if weighted else np.ones(dt.size)
+    freqs = np.linspace(1.3, 1.55, 333)
+    many = _harmonic_chi2_many(dt, y, w, freqs, harmonics)
+    one = np.array([_harmonic_chi2(dt, y, w, float(f), harmonics) for f in freqs])
+    assert np.allclose(many, one, rtol=1e-10)
+    # A degenerate trial (f = 0 repeats the constant column) is inf in both.
+    both = _harmonic_chi2_many(dt, y, w, np.array([0.0, 1.4]), harmonics)
+    assert np.isinf(both[0]) and np.isfinite(both[1])
+    assert both[1] == pytest.approx(_harmonic_chi2(dt, y, w, 1.4, harmonics), rel=1e-10)
 
 
 # --- detrending ---------------------------------------------------------------

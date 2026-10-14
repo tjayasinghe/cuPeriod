@@ -12,8 +12,16 @@ baseline-error weights,
 with ``mu_k`` band ``k``'s inverse-variance weighted mean. ``B_k`` is band ``k``'s
 mean absolute standardized deviation about its own mean — the denominator of that
 band's score — so the combined statistic is exactly the *total* fractional reduction
-in mean absolute deviation across all bands: a noisy or flat band contributes little
-weight, and with one band the combination collapses to the single-band score.
+in mean absolute deviation across all bands: a band that varies little (relative to
+its errors, when it has them) carries proportionally little weight, and with one band
+the combination collapses to the single-band score.
+
+Errors are used only when *every* contributing band has them (the rule of the
+multi-band GLS); otherwise every band runs unweighted (``dy = 1``). With a mix, an
+error-less band's ``B_k`` would be in magnitudes and the others' in sigmas, which
+effectively drops the error-less band. Unweighted, ``B_k`` is the band's mean
+absolute deviation in its own units, as in gatspy with ``dy = 1``. An exactly
+constant band has nothing to reduce and is left out of the combination.
 """
 
 from __future__ import annotations
@@ -25,7 +33,7 @@ from cuperiod.core.errors import InsufficientDataError
 from cuperiod.core.grid import GridSpec
 from cuperiod.core.lightcurve import MultiBandLightCurve
 from cuperiod.core.result import Periodogram
-from cuperiod.methods.supersmoother import supersmoother_score
+from cuperiod.methods.supersmoother import _is_constant, supersmoother_score
 
 #: A band needs this many finite points for its smallest (3-point) span windows.
 _MIN_BAND_POINTS = 3
@@ -55,7 +63,7 @@ def supersmoother_multiband(
     -------
     Periodogram
         Baseline-error-weighted mean of the per-band scores (maximized at the
-        true period).
+        true period). ``meta["bands"]`` lists the participating bands.
 
     Raises
     ------
@@ -64,9 +72,11 @@ def supersmoother_multiband(
         baseline is empty.
     """
     finite = mblc.finite()
-    bands = [lc for lc in finite.bands.values() if lc.n >= _MIN_BAND_POINTS]
-    n_total = sum(lc.n for lc in bands)
-    if not bands or n_total < settings.min_detections:
+    used = [
+        (name, lc) for name, lc in finite.bands.items() if lc.n >= _MIN_BAND_POINTS
+    ]
+    n_total = sum(lc.n for _, lc in used)
+    if not used or n_total < settings.min_detections:
         raise InsufficientDataError(
             f"SUPERSMOOTHER multiband: {n_total} finite points across usable "
             f"bands < min_detections {settings.min_detections}"
@@ -75,24 +85,30 @@ def supersmoother_multiband(
     baseline = float(stacked_time.max() - stacked_time.min())
     if baseline <= 0.0:
         raise InsufficientDataError("SUPERSMOOTHER multiband: no usable time baseline")
+    use_errors = all(lc.error is not None for _, lc in used)
 
     periods = grid.period
     combined = np.zeros(periods.size, dtype=np.float64)
     weight_total = 0.0
-    for lc in bands:
-        if lc.error is None:
-            inv_dy = np.ones(lc.n, dtype=np.float64)
-        else:
-            inv_dy = 1.0 / np.asarray(lc.error, dtype=np.float64)
+    for _, lc in used:
+        if _is_constant(lc.value):
+            # A constant band carries no deviation to reduce. Test the data, not
+            # B_k: the weighted mean of a constant is rarely bit-equal to it, which
+            # leaves a rounding-level B_k > 0 on a meaningless score. The test is
+            # the score's own (relative, a few ulps), so a band constant only to
+            # rounding is left out of the weight sum too, not just scored zero.
+            continue
+        dy = np.asarray(lc.error, dtype=np.float64) if use_errors else None
+        inv_dy = np.ones(lc.n, dtype=np.float64) if dy is None else 1.0 / dy
         w = inv_dy * inv_dy
         mu = float(np.dot(w, lc.value) / w.sum())
         b_k = float(np.mean(np.abs(lc.value - mu) * inv_dy))
         if not np.isfinite(b_k) or b_k <= 0.0:
-            continue  # a constant band carries no deviation to reduce
+            continue
         score = supersmoother_score(
             lc.time,
             lc.value,
-            lc.error,
+            dy,
             periods,
             primary_spans=settings.primary_spans,
             middle_span=settings.middle_span,
@@ -114,7 +130,7 @@ def supersmoother_multiband(
         objective_sense="max",
         n_samples=n_total,
         baseline=baseline,
-        meta={**dict(finite.meta), "bands": finite.band_names},
+        meta={**dict(finite.meta), "bands": tuple(name for name, _ in used)},
     )
 
 

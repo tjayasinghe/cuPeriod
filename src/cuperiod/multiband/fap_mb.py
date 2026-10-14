@@ -16,8 +16,11 @@ For the default ``offsets`` model on a NUFFT backend the bootstrap is nearly
 free: the times never change, so every resample reuses the same nonuniform
 points and the whole batch runs as multi-transform NUFFTs — the same ``K + 2``
 transforms as one power evaluation, each carrying a stack of bootstrap
-strengths. The ``perband``/``flex`` models and the torch backend fall back to an
-explicit loop over resamples (still native-speed per iteration).
+strengths. The resamples are drawn batch by batch, so memory stays bounded for
+long light curves. The ``perband``/``flex`` models and the torch backend fall
+back to an explicit loop over resamples (still native-speed per iteration); the
+astropy backend and non-uniform grids loop through astropy, which costs
+``n_bootstrap`` astropy evaluations.
 """
 
 from __future__ import annotations
@@ -72,64 +75,124 @@ class MultibandFAP:
 
         ``FAP(z) = (1 + #{null_max >= z}) / (n_bootstrap + 1)`` — the add-one
         rank estimate, whose smallest resolvable value is
-        ``1 / (n_bootstrap + 1)``. Accepts a scalar or an array.
+        ``1 / (n_bootstrap + 1)``. Accepts a scalar or an array; a NaN power has
+        a NaN FAP (it is not a detection, and must not rank as the most
+        significant one).
         """
         z = np.asarray(power, dtype=np.float64)
         sorted_null = np.sort(self.null_max)
         below = np.searchsorted(sorted_null, z, side="left")
         out = (1.0 + (sorted_null.size - below)) / (self.n_bootstrap + 1.0)
+        out = np.where(np.isnan(z), np.nan, out)
         return float(out) if np.ndim(power) == 0 else out
 
     def level(self, fap: float) -> float:
-        """Power threshold whose false-alarm probability is ``fap``.
+        """Power threshold for false-alarm probability ``fap``.
 
-        The ``1 - fap`` quantile of the null maxima. Requires
-        ``fap >= 1 / (n_bootstrap + 1)`` — below that the bootstrap cannot
-        resolve the tail and more resamples are needed.
+        The ``k``-th largest null maximum with ``k = floor(fap * (n_bootstrap +
+        1))``, so any power *above* the level has ``self.fap(power) <= fap`` —
+        the order statistic that :meth:`fap` implies (an interpolated quantile
+        sits up to one order statistic lower, where the FAP can be twice
+        ``fap``). Requires ``fap >= 1 / (n_bootstrap + 1)`` — below that the
+        bootstrap cannot resolve the tail and more resamples are needed.
         """
         if not 0.0 < fap <= 1.0:
             raise ValueError(f"fap must be in (0, 1], got {fap}")
-        if fap * (self.n_bootstrap + 1) < 1.0:
+        n_null = int(self.null_max.size)
+        # The 1e-9 absorbs rounding in fap * (R + 1) (e.g. (1/49) * 49 < 1).
+        k = int(np.floor(fap * (self.n_bootstrap + 1) + 1e-9))
+        if k < 1 or n_null == 0:
             raise ValueError(
                 f"fap={fap} is below the bootstrap resolution "
                 f"1/(n_bootstrap+1) = {1.0 / (self.n_bootstrap + 1):.2e}; "
                 "increase n_bootstrap"
             )
-        return float(np.quantile(self.null_max, 1.0 - fap))
+        k = min(k, n_null)
+        return float(np.sort(self.null_max)[n_null - k])
 
 
-#: Device-memory budget for one bootstrap batch of trig-sum outputs (bytes).
+#: Memory budget (bytes) for one bootstrap batch: it bounds both the trig-sum
+#: outputs (device) and the resampled ``(rows, N)`` host arrays.
 _FAP_CHUNK_BYTES = 1 << 28
 
+#: Host bytes one resample row costs per point while a batch is built: the
+#: resampled weights, values, normalized weights and strengths plus their
+#: temporaries (measured ~6.4 float64 arrays), with headroom.
+_RESAMPLE_ROW_BYTES = 8 * 12
 
-def _resample_arrays(
+#: Elements per discarded draw when advancing the stream past a band's block.
+_SKIP_CHUNK_ELEMS = 1 << 20
+
+
+def _validate_n_bootstrap(n_bootstrap: int) -> None:
+    """Refuse an empty (or negative) bootstrap: its null would be meaningless."""
+    if int(n_bootstrap) < 1:
+        raise ValueError(f"n_bootstrap must be at least 1, got {n_bootstrap}")
+
+
+def _band_generators(
     prep: _MBPrep, n_bootstrap: int, seed: int
-) -> tuple[FloatArray, FloatArray, list[FloatArray], FloatArray]:
-    """Within-band pair resampling, vectorized over all resamples.
+) -> list[np.random.Generator]:
+    """One generator per band, each positioned where that band's draws begin.
 
-    Returns the globally re-normalized weights ``(R, N)``, the band-centered
-    resampled values' strengths ``w * y`` ``(R, N)``, the per-band total weights
-    (each ``(R, 1)``), and the per-resample reference chi-squared ``(R, 1)``.
+    The resamples were defined as one block draw per band in turn,
+    ``rng.integers(0, n_k, size=(n_bootstrap, n_k))``, from a single stream. To
+    build them a few rows at a time without changing a single draw (so every
+    calibrated FAP stays reproducible for its seed), each band gets a copy of
+    the stream at the start of its block, and the shared stream is advanced past
+    the block by discarded draws (bounded integers consume a variable number of
+    raw words, so it cannot be advanced arithmetically). Row-major draws in
+    chunks are bit-identical to the block draw.
     """
     rng = np.random.default_rng(seed)
+    generators: list[np.random.Generator] = []
+    last = len(prep.slices) - 1
+    for index, sl in enumerate(prep.slices):
+        n_k = sl.stop - sl.start
+        bit_generator = type(rng.bit_generator)()
+        bit_generator.state = rng.bit_generator.state
+        generators.append(np.random.Generator(bit_generator))
+        if index < last:
+            rows = max(1, _SKIP_CHUNK_ELEMS // n_k)
+            for start in range(0, n_bootstrap, rows):
+                rng.integers(0, n_k, size=(min(rows, n_bootstrap - start), n_k))
+    return generators
+
+
+def _resample_chunk(
+    prep: _MBPrep, generators: list[np.random.Generator], n_rows: int
+) -> tuple[FloatArray, FloatArray, list[FloatArray], FloatArray]:
+    """The next ``n_rows`` within-band pair resamples, vectorized over rows.
+
+    Returns the globally re-normalized weights ``(rows, N)``, the band-centered
+    resampled values' strengths ``w * y`` ``(rows, N)``, the per-band total
+    weights (each ``(rows, 1)``), and the per-resample reference chi-squared
+    ``(rows, 1)``. A band whose resampled values are all equal is centered to
+    exact zeros, as :func:`~cuperiod.multiband.gls_mb._prep_multiband` does.
+    """
     n = prep.tau.size
     u_raw = prep.w * prep.w_scale
-    u = np.empty((n_bootstrap, n), dtype=np.float64)
-    y = np.empty((n_bootstrap, n), dtype=np.float64)
-    for sl in prep.slices:
+    u = np.empty((n_rows, n), dtype=np.float64)
+    y = np.empty((n_rows, n), dtype=np.float64)
+    for sl, generator in zip(prep.slices, generators, strict=True):
         n_k = sl.stop - sl.start
-        idx = rng.integers(0, n_k, size=(n_bootstrap, n_k))
+        idx = generator.integers(0, n_k, size=(n_rows, n_k))
         u[:, sl] = u_raw[sl][idx]
         y[:, sl] = prep.value[sl][idx]
     w = u / u.sum(axis=1, keepdims=True)
+    del u
     band_weight: list[FloatArray] = []
     for sl in prep.slices:
         w_k = w[:, sl].sum(axis=1, keepdims=True)
+        constant = y[:, sl].max(axis=1) == y[:, sl].min(axis=1)
         mean_k = (w[:, sl] * y[:, sl]).sum(axis=1, keepdims=True) / w_k
         y[:, sl] -= mean_k
+        if constant.any():
+            y[constant, sl] = 0.0
         band_weight.append(w_k)
     chi2_ref = (w * y * y).sum(axis=1, keepdims=True)
-    return w, w * y, band_weight, chi2_ref
+    y *= w
+    return w, y, band_weight, chi2_ref
 
 
 def _null_max_offsets_nufft(
@@ -147,9 +210,11 @@ def _null_max_offsets_nufft(
     All resamples share the observation times, so each batch runs the same
     ``K + 2`` transforms as a single power evaluation with the bootstrap
     strengths stacked along ``n_trans``; only the per-batch maxima return to
-    the host.
+    the host. The resamples themselves are drawn batch by batch
+    (:func:`_band_generators`), so host memory is bounded by
+    :data:`_FAP_CHUNK_BYTES` whatever ``n_bootstrap`` and the curve length.
     """
-    w, wy, band_weight, chi2_ref = _resample_arrays(prep, n_bootstrap, seed)
+    generators = _band_generators(prep, n_bootstrap, seed)
 
     tau: Any = prep.tau
     if backend == "cufinufft":
@@ -162,23 +227,28 @@ def _null_max_offsets_nufft(
         xp = np
 
     n_bands = len(prep.slices)
-    denom = 16 * max(nf, 1) * (n_bands + 6)
-    r_chunk = max(1, _FAP_CHUNK_BYTES // denom)
+    by_modes = _FAP_CHUNK_BYTES // (16 * max(nf, 1) * (n_bands + 6))
+    by_points = _FAP_CHUNK_BYTES // (_RESAMPLE_ROW_BYTES * max(prep.n, 1))
+    r_chunk = max(1, min(by_modes, by_points))
     null_max = np.empty(n_bootstrap, dtype=np.float64)
     for start in range(0, n_bootstrap, r_chunk):
         stop = min(start + r_chunk, n_bootstrap)
         rows = slice(start, stop)
-        w_c: Any = xp.asarray(w[rows])
-        wy_c: Any = xp.asarray(wy[rows])
+        w_h, wy_h, band_weight, chi2_ref = _resample_chunk(
+            prep, generators, stop - start
+        )
+        w_c: Any = xp.asarray(w_h)
+        wy_c: Any = xp.asarray(wy_h)
+        del w_h, wy_h
         band_cs = []
         weights = []
         for sl, w_k in zip(prep.slices, band_weight, strict=True):
             sw_k = _trig_sums(tau[sl], w_c[:, sl], f0, df, nf, backend, eps)  # type: ignore[arg-type]
             band_cs.append((sw_k.real, sw_k.imag))
-            weights.append(xp.asarray(w_k[rows]))
+            weights.append(xp.asarray(w_k))
         swy = _trig_sums(tau, wy_c, f0, df, nf, backend, eps)  # type: ignore[arg-type]
         sw2 = _trig_sums(tau, w_c, 2.0 * f0, 2.0 * df, nf, backend, eps)  # type: ignore[arg-type]
-        chi2_c = xp.asarray(chi2_ref[rows])
+        chi2_c = xp.asarray(chi2_ref)
         if xp is np:
             with np.errstate(divide="ignore", invalid="ignore"):
                 power = _offsets_assemble(
@@ -243,9 +313,17 @@ def bootstrap_null_max(
 ) -> FloatArray:
     """Null distribution of the multi-band peak power on ``grid``.
 
-    Dispatches to the batched-NUFFT fast path (offsets model on
-    finufft/cufinufft) or the explicit loop (everything else).
+    Dispatches to the batched-NUFFT fast path (offsets model on a uniform grid
+    with finufft/cufinufft) or the explicit loop (everything else, including
+    the astropy backend and non-uniform grids, which rerun the astropy route
+    per resample).
+
+    Raises
+    ------
+    ValueError
+        If ``n_bootstrap`` is below 1.
     """
+    _validate_n_bootstrap(n_bootstrap)
     if (
         settings.mb_model == "offsets"
         and backend in ("finufft", "cufinufft")
@@ -283,10 +361,15 @@ def multiband_fap(
         The false-alarm level of the *maximum* depends on the searched grid, so
         pass the same grid used for the search.
     backend : str, default "auto"
-        Backend selector, as :func:`cuperiod.periodogram`.
+        Backend selector, as :func:`cuperiod.periodogram` (``"auto"`` defers to
+        ``settings.backend``). The astropy backend is refused here: rerunning
+        astropy per resample is very slow, and a native backend calibrates the
+        same models (the offsets and flex powers match astropy closely). A
+        non-uniform grid is still evaluated through astropy, per resample, and
+        the result's ``backend`` then says ``"astropy"``.
     n_bootstrap : int, default 500
-        Number of within-band resamples (the smallest resolvable FAP is
-        ``1 / (n_bootstrap + 1)``).
+        Number of within-band resamples, at least 1 (the smallest resolvable
+        FAP is ``1 / (n_bootstrap + 1)``).
     seed : int, default 0
         Resampling seed.
 
@@ -294,6 +377,11 @@ def multiband_fap(
     -------
     MultibandFAP
         The null sample with ``fap(power)`` and ``level(fap)`` accessors.
+
+    Raises
+    ------
+    ValueError
+        If the backend resolves to astropy or ``n_bootstrap`` is below 1.
 
     Examples
     --------
@@ -305,13 +393,14 @@ def multiband_fap(
     from cuperiod.api import to_input
     from cuperiod.methods.gls import GLSMethod
 
+    _validate_n_bootstrap(n_bootstrap)
     lc = to_input(data)
     if isinstance(lc, LightCurve):
         lc = MultiBandLightCurve.from_light_curves({"band": lc}, meta=lc.meta)
     method = GLSMethod()
     coerced = method.coerce_settings(settings)
     assert isinstance(coerced, GLSSettings)
-    resolved = method.resolve_backend(backend)
+    resolved = method.resolve_backend_for(backend, coerced)
     if resolved == "astropy":
         raise ValueError(
             "multiband_fap needs a native backend (finufft/cufinufft/torch)"
@@ -328,7 +417,8 @@ def multiband_fap(
         n_bootstrap=n_bootstrap,
         seed=seed,
         model=coerced.mb_model,
-        backend=resolved,
+        # gls_multiband_power runs a non-uniform grid through astropy.
+        backend=resolved if grid.uniform else "astropy",
     )
 
 

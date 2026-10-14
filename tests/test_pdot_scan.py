@@ -98,7 +98,10 @@ def test_zero_row_is_the_standard_periodogram():
     zero = res.zero_pdot_periodogram()
     grid = cup.GridSpec(kind="frequency", values=res.frequency, uniform=True)
     direct = cup.periodogram((t, mag, err), "GLS", grid=grid, backend="cpu")
-    assert np.allclose(zero.power, direct.power, rtol=1e-9, atol=1e-12)
+    # Two NUFFT evaluations (the scan's cached engine and a one-off transform)
+    # agree to the transform tolerance (nufft_eps = 1e-9 of the sums), which off
+    # the peak is ~1e-8 of the small power values -- not bit for bit.
+    assert np.allclose(zero.power, direct.power, rtol=1e-7, atol=1e-12)
     assert zero.method == "GLS"
 
 
@@ -245,6 +248,132 @@ def test_bad_period():
     t, mag, err, _ = synthetic_period_change(n=400, span=400.0, seed=2)
     with pytest.raises(ValueError, match="positive"):
         cup.pdot_search((t, mag, err), period=-1.0)
+
+
+@pytest.mark.parametrize("bad", [np.nan, np.inf])
+def test_non_finite_period_rejected(bad: float):
+    # NaN and +inf pass a bare `period <= 0` test and used to surface as a
+    # ZeroDivisionError or a "frequency window collapsed" message.
+    t, mag, err, _ = synthetic_period_change(n=400, span=400.0, seed=2)
+    with pytest.raises(ValueError, match="positive and finite"):
+        cup.pdot_search((t, mag, err), period=bad, backend="cpu")
+
+
+def test_method_settings_backend_is_honoured():
+    # backend="auto" defers to the wrapped method's settings, as periodogram() does.
+    t, mag, err, truth = synthetic_period_change(n=300, span=300.0, seed=2)
+    res = cup.pdot_search(
+        (t, mag, err),
+        period=truth["period"],
+        method_settings=cup.GLSSettings(backend="astropy"),
+        settings=cup.PdotSettings(max_cycle_drift=0.5, window_rayleigh=3.0),
+    )
+    assert res.backend == "astropy"
+
+
+def test_unusable_errors_named_as_the_cause():
+    t, mag, _, truth = synthetic_period_change(n=400, span=400.0, seed=2)
+    with pytest.raises(InsufficientDataError, match="pdot_search: .*error"):
+        cup.pdot_search(
+            (t, mag, np.zeros(t.size)), period=truth["period"], backend="cpu"
+        )
+
+
+# --- regressions: the (dP/dt)/P axis ------------------------------------------
+
+
+def test_default_axis_has_the_documented_row_count():
+    # a_max/step is 2*max_cycle_drift*samples_per_drift*scale = 100 analytically;
+    # computing it as a float ratio rounded above 100 for ~30% of inputs (203
+    # rows instead of 201).
+    rng = np.random.default_rng(2)
+    sizes = set()
+    for _ in range(600):
+        f = 10 ** rng.uniform(-1.0, 1.5)
+        baseline = 10 ** rng.uniform(2.5, 4.0)
+        if f * baseline < 200.0:
+            continue
+        sizes.add(_pdot_axis(cup.PdotSettings(), f, baseline, 1.0).size)
+    assert sizes == {201}
+
+
+def _mira_like() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Visual estimates (err 0.3) over 2800 d, then precise CCD in the last 200 d."""
+    rng = np.random.default_rng(0)
+    t_vis = np.sort(rng.uniform(0.0, 2800.0, 500))
+    t_ccd = np.sort(rng.uniform(2800.0, 3000.0, 300))
+    t = np.concatenate([t_vis, t_ccd]) + 2450000.0
+    err = np.concatenate([np.full(500, 0.3), np.full(300, 0.01)])
+    mag = 8.0 + 2.5 * np.sin(2 * np.pi * (t - 2450000.0) / 330.0)
+    return t, mag + rng.normal(0.0, err), err
+
+
+def test_default_axis_stays_inside_the_model_domain_for_few_cycles():
+    # ~9 cycles with the weighted epoch near the end of the span: the default
+    # axis used to overshoot 1/T by a step and fail the domain guard at default
+    # settings, blaming a pdot_over_p_range the caller never set.
+    t, mag, err = _mira_like()
+    res = cup.pdot_search((t, mag, err), period=330.0, backend="cpu")
+    dt_extent = max(t.max() - res.t_ref, res.t_ref - t.min())
+    assert np.max(np.abs(res.pdot_over_p)) < 1.0 / dt_extent
+    assert np.max(np.abs(res.pdot_over_p)) < 1.0 / res.baseline
+    assert np.any(res.pdot_over_p == 0.0)
+
+
+def test_axis_under_a_cycle_is_insufficient_data():
+    with pytest.raises(InsufficientDataError, match="cycles"):
+        _pdot_axis(cup.PdotSettings(), 1.0, 0.5, 1.0)
+
+
+@pytest.mark.parametrize(
+    "bounds",
+    [(-3e-6, 3e-6), (-1e-6, 1e-6), (-1e-6, 4e-6), (0.0, 2e-6), (-2.5e-6, 0.0)],
+)
+def test_explicit_range_contains_an_exact_zero(bounds):
+    lo, hi = bounds
+    f, baseline = 2.0, 600.0
+    step = 4.0 / (5 * f * baseline**2)
+    axis = _pdot_axis(cup.PdotSettings(pdot_over_p_range=bounds), f, baseline, 1.0)
+    assert np.any(axis == 0.0)
+    steps = np.diff(axis)
+    assert np.allclose(steps, steps[0], rtol=1e-9)
+    assert steps[0] <= step * (1.0 + 1e-9)
+    tol = 1e-15
+    assert lo - tol <= axis[0] < lo + step
+    assert hi - step < axis[-1] <= hi + tol
+    # The wider bound is sampled exactly (to rounding).
+    reach = max(-lo, hi)
+    assert max(-axis[0], axis[-1]) == pytest.approx(reach, rel=1e-12)
+
+
+def test_explicit_range_excluding_zero_samples_both_bounds():
+    f, baseline = 2.0, 600.0
+    step = 4.0 / (5 * f * baseline**2)
+    settings = cup.PdotSettings(pdot_over_p_range=(1e-6, 4e-6))
+    axis = _pdot_axis(settings, f, baseline, 1.0)
+    assert axis[0] == pytest.approx(1e-6, rel=1e-12)
+    assert axis[-1] == pytest.approx(4e-6, rel=1e-12)
+    steps = np.diff(axis)
+    assert np.allclose(steps, steps[0], rtol=1e-9)
+    assert steps[0] <= step * (1.0 + 1e-9)
+
+
+def test_symmetric_explicit_range_reports_the_true_zero_row():
+    t, mag, err, truth = synthetic_period_change(n=600, span=600.0, seed=2)
+    default = cup.pdot_search((t, mag, err), period=truth["period"], backend="cpu")
+    settings = cup.PdotSettings(pdot_over_p_range=(-3e-6, 3e-6))
+    explicit = cup.pdot_search(
+        (t, mag, err), period=truth["period"], settings=settings, backend="cpu"
+    )
+    assert explicit.best.zero_pdot_power == pytest.approx(
+        default.best.zero_pdot_power, rel=1e-9
+    )
+    assert np.allclose(
+        explicit.zero_pdot_periodogram().power,
+        default.zero_pdot_periodogram().power,
+        rtol=1e-9,
+        atol=1e-12,
+    )
 
 
 # --- multiband ----------------------------------------------------------------

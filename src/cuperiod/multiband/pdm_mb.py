@@ -62,20 +62,28 @@ def pdm_multiband_theta(
     -------
     Periodogram
         Degrees-of-freedom-weighted mean of the per-band ``Theta`` (minimized at the
-        true period).
+        true period). ``meta["bands"]`` lists the participating bands.
 
     Raises
     ------
     InsufficientDataError
-        If no band has ``n_bins + 2`` finite points, or the stacked baseline is empty.
+        If no band has ``n_bins + 2`` finite points, the participating bands hold
+        fewer than ``min_detections`` points, or the stacked baseline is empty.
     """
     finite = mblc.finite()
     min_points = settings.n_bins + 2
-    bands = [lc for lc in finite.bands.values() if lc.n >= min_points]
-    if not bands:
+    used = [(name, lc) for name, lc in finite.bands.items() if lc.n >= min_points]
+    if not used:
         raise InsufficientDataError(
             f"PDM multiband: no band has {min_points} finite points "
             f"(n_bins {settings.n_bins} + 2)"
+        )
+    bands = [lc for _, lc in used]
+    n_usable = sum(lc.n for lc in bands)
+    if n_usable < settings.min_detections:
+        raise InsufficientDataError(
+            f"PDM multiband: {n_usable} finite points across usable bands "
+            f"< min_detections {settings.min_detections}"
         )
     stacked_time, _, _, _ = finite.stacked()
     baseline = float(stacked_time.max() - stacked_time.min())
@@ -111,7 +119,7 @@ def pdm_multiband_theta(
         objective_sense="min",
         n_samples=n_total,
         baseline=baseline,
-        meta={**dict(finite.meta), "bands": finite.band_names},
+        meta={**dict(finite.meta), "bands": tuple(name for name, _ in used)},
     )
 
 

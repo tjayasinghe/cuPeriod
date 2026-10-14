@@ -41,7 +41,9 @@ of its smallest span). The default extent is set in accumulated drift cycles
 (``max_cycle_drift``) rather than physical units, which keeps the row count
 baseline-independent (``4 * samples_per_drift * max_cycle_drift *
 harmonic_scale + 1``) while reaching every drift large enough to defocus a
-constant-period search.
+constant-period search. Only a baseline under ``8 * max_cycle_drift`` cycles
+(80 by default) has fewer rows: there the range is trimmed so the period stays
+positive across the span (the constant-dP/dt model's domain).
 
 The reference epoch is the weighted mean epoch of the finite points, and the
 reported frequency is the instantaneous frequency there. That choice zeroes the
@@ -71,7 +73,11 @@ from cuperiod.core.columns import ColumnMap, Domain
 from cuperiod.core.config import PdotSettings
 from cuperiod.core.errors import InsufficientDataError
 from cuperiod.core.grid import GridSpec
-from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
+from cuperiod.core.lightcurve import (
+    LightCurve,
+    MultiBandLightCurve,
+    raise_if_unusable,
+)
 from cuperiod.core.result import Periodogram
 from cuperiod.methods.base import PeriodogramMethod, get_method
 from cuperiod.pdot.models import PeriodModel, get_model
@@ -138,21 +144,64 @@ def _pdot_axis(
     h_scale: float,
     model: PeriodModel | None = None,
 ) -> FloatArray:
-    """The (dP/dt)/P axis: uniform, and containing an exact 0 by default."""
+    """The (dP/dt)/P axis: uniform, and containing an exact 0 whenever it can.
+
+    The default axis is symmetric with ``4 * samples_per_drift *
+    max_cycle_drift * scale + 1`` rows, trimmed (never extended) to stay inside
+    the period model's domain over the baseline. An explicit
+    ``pdot_over_p_range`` that spans zero is laid on a zero-anchored lattice
+    whose step divides the wider bound, so the ``dP/dt = 0`` row — the
+    constant-period comparison every caller reads — exists and that bound is
+    sampled exactly; a range excluding zero is sampled end to end. Either way
+    the step is never coarser than the derived one.
+    """
     scale = h_scale if settings.harmonic_scale is None else settings.harmonic_scale
     scale = max(1.0, float(scale))
     step = 4.0 / (
         settings.samples_per_drift * f_center * baseline * baseline * scale
     )
     if settings.pdot_over_p_range is not None:
-        lo, hi = settings.pdot_over_p_range
-        n = int(math.floor((hi - lo) / step)) + 1
-        return lo + step * np.arange(n, dtype=np.float64)
-    a_max = 8.0 * settings.max_cycle_drift / (f_center * baseline * baseline)
+        lo, hi = (float(v) for v in settings.pdot_over_p_range)
+        if not (math.isfinite(lo) and math.isfinite(hi)):
+            raise ValueError(
+                f"pdot_over_p_range must be finite, got ({lo}, {hi})"
+            )
+        if lo <= 0.0 <= hi:
+            reach = max(-lo, hi)
+            n_side = max(1, math.ceil(reach / step - 1e-9))
+            step = reach / n_side
+            k_lo = math.ceil(lo / step - 1e-9)
+            k_hi = math.floor(hi / step + 1e-9)
+            return step * np.arange(k_lo, k_hi + 1, dtype=np.float64)
+        n_steps = max(1, math.ceil((hi - lo) / step - 1e-9))
+        return np.linspace(lo, hi, n_steps + 1, dtype=np.float64)
+    # a_max / step is 2 * max_cycle_drift * samples_per_drift * scale exactly;
+    # computing it as that float ratio rounds above the integer for some (f, T)
+    # and added a row on each side.
+    n_side = max(
+        1,
+        math.ceil(
+            2.0 * settings.max_cycle_drift * settings.samples_per_drift * scale
+            - 1e-9
+        ),
+    )
     # Stay inside the model's domain — for the singular constant-dP/dt warp
-    # that means the period must not reach zero within the span.
-    a_max = min(a_max, get_model(model).max_abs_rate(baseline))
-    n_side = max(1, int(math.ceil(a_max / step)))
+    # that means the period must not reach zero within the span. The cap is
+    # taken over the whole baseline, which bounds the reach on either side of
+    # any reference epoch inside it; a ceil() here overshot it by up to a step.
+    pmodel = get_model(model)
+    limit = pmodel.max_abs_rate(baseline)
+    n_fit = n_side
+    if math.isfinite(limit):
+        n_fit = math.floor(limit * (1.0 - 1e-9) / step)
+    if n_fit < 1:
+        raise InsufficientDataError(
+            f"pdot_search: the baseline spans only {f_center * baseline:.2f} "
+            f"cycles, so even one (dP/dt)/P step ({step:.3e} 1/day) leaves the "
+            f"{pmodel.name} model's domain (|a| < {limit:.3e} 1/day over "
+            f"{baseline:.1f} d); too few cycles to measure a period change"
+        )
+    n_side = min(n_side, n_fit)
     return step * np.arange(-n_side, n_side + 1, dtype=np.float64)
 
 
@@ -292,7 +341,7 @@ def pdot_search(
     grid: GridSpec | None = None,
     backend: str = "auto",
     columns: ColumnMap | None = None,
-    domain: Domain | None = None,
+    domain: Domain | str | None = None,
 ) -> PdotSearchResult:
     """Search a light curve jointly over period and period derivative.
 
@@ -308,8 +357,9 @@ def pdot_search(
     data : various
         The light curve, in any form :func:`cuperiod.to_input` accepts.
     period : float, optional
-        Center of the frequency window (days). ``None`` runs the method once on
-        its default grid first and centers on the best peak.
+        Center of the frequency window (days; positive and finite). ``None``
+        runs the method once on its default grid first and centers on the best
+        peak.
     method : str, default "GLS"
         Wrapped periodogram method. BLS and TLS are not supported (their grids
         carry box/transit structure a plain window cannot represent); use
@@ -331,7 +381,10 @@ def pdot_search(
         Explicit frequency grid, overriding the window construction. A uniform
         frequency grid keeps the fast NUFFT path for GLS.
     backend : str, default "auto"
-        Backend request, resolved once and reused for every row.
+        Backend request, resolved once and reused for every row. ``"auto"``
+        defers to ``method_settings.backend`` (and so to its
+        ``CUPERIOD_<METHOD>_BACKEND`` override), as :func:`cuperiod.periodogram`
+        does.
     columns, domain
         Passed to :func:`cuperiod.to_input` for table inputs.
 
@@ -356,10 +409,15 @@ def pdot_search(
         )
     psettings = settings or PdotSettings()
     pmodel = get_model(model)
+    if period is not None and not (math.isfinite(period) and period > 0.0):
+        raise ValueError(f"period must be positive and finite, got {period}")
     msettings = m.coerce_settings(method_settings)
-    resolved = m.resolve_backend(backend)
+    resolved = m.resolve_backend_for(backend, msettings)
 
     lc = to_input(data, columns=columns, domain=domain)
+    # A placeholder error column (all 0, -1 or NaN) empties the curve; name that
+    # rather than the "no usable time baseline" the empty curve would produce.
+    raise_if_unusable(lc, "pdot_search")
     work: LightCurve | MultiBandLightCurve
     if isinstance(lc, MultiBandLightCurve):
         if not m.supports_multiband:
@@ -390,8 +448,6 @@ def pdot_search(
 
     # -- axes ---------------------------------------------------------------------
     if period is not None:
-        if period <= 0.0:
-            raise ValueError(f"period must be positive, got {period}")
         f_center = 1.0 / period
     elif grid is not None:
         freq = grid.frequency
@@ -401,7 +457,10 @@ def pdot_search(
     fgrid = grid if grid is not None else _frequency_window(
         f_center, baseline, psettings
     )
-    frequency = fgrid.frequency
+    # Every row comes back from Periodogram.from_spectrum sorted by ascending
+    # frequency, so that is the axis the rows live on (GridSpec refuses
+    # descending grids; sorting keeps the invariant local, as sliding does).
+    frequency = np.sort(np.asarray(fgrid.frequency, dtype=np.float64))
     axis = _pdot_axis(
         psettings, f_center, baseline, _harmonic_scale(m, msettings), pmodel
     )

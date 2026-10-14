@@ -10,17 +10,22 @@ the orchestration.
 
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import ClassVar, TypeVar, cast
 
 from pydantic_settings import BaseSettings
 
 from cuperiod.core._arrayapi import TORCH_DEVICES
 from cuperiod.core.backend import (
+    BACKEND_SELECTORS,
     available_backends,
+    cpu_backends,
     cuda_available,
+    normalize_backend,
+    requested_backend,
     torch_available,
     torch_devices,
     torch_gpu_available,
@@ -30,6 +35,47 @@ from cuperiod.core.errors import BackendUnavailableError, UnknownMethodError
 from cuperiod.core.grid import GridSpec
 from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
 from cuperiod.core.result import ObjectiveSense, Periodogram
+
+#: A single method's settings, a ``{method: settings}`` mapping, or ``None`` (defaults).
+SettingsInput = BaseSettings | Mapping[str, BaseSettings] | None
+
+_S = TypeVar("_S", bound=BaseSettings)
+
+#: Per-class default-settings template, keyed by the environment it was built under.
+_DEFAULT_SETTINGS: dict[
+    type[BaseSettings], tuple[tuple[tuple[str, str], ...], BaseSettings]
+] = {}
+
+#: Concrete CPU backend names, resolvable without probing for a GPU.
+_CPU_BACKEND_NAMES = frozenset({"finufft", "numba", "astropy", "numpy"})
+
+
+def default_settings(cls: type[_S]) -> _S:
+    """A default-constructed ``cls()``, without re-reading the environment every call.
+
+    pydantic-settings re-parses the environment and validates every field on each
+    construction (0.3-0.5 ms) — a visible share of a small periodogram when no
+    settings are passed. A template is cached per class together with the
+    ``<env_prefix>*`` variables it was built from, and a copy is returned while those
+    variables are unchanged, so ``CUPERIOD_<METHOD>_<FIELD>`` overrides set, changed
+    or removed mid-session still apply (and an invalid one still raises). Classes that
+    read a dotenv or secrets directory bypass the cache.
+    """
+    config = cls.model_config
+    if config.get("env_file") or config.get("secrets_dir"):
+        return cls()
+    prefix = str(config.get("env_prefix") or "").upper()
+    env_key = tuple(
+        sorted((k, v) for k, v in os.environ.items() if k.upper().startswith(prefix))
+    )
+    cached = _DEFAULT_SETTINGS.get(cls)
+    if cached is not None and cached[0] == env_key:
+        template = cast(_S, cached[1])
+    else:
+        template = cls()
+        _DEFAULT_SETTINGS[cls] = (env_key, template)
+    # Every settings field is a scalar or a tuple, so a shallow copy is independent.
+    return template.model_copy()
 
 
 class PeriodogramMethod(ABC):
@@ -71,7 +117,7 @@ class PeriodogramMethod(ABC):
     def coerce_settings(self, settings: BaseSettings | None) -> BaseSettings:
         """Return a settings instance of this method's type (default if ``None``)."""
         if settings is None:
-            return self.settings_cls()
+            return default_settings(self.settings_cls)
         if not isinstance(settings, self.settings_cls):
             raise TypeError(
                 f"{self.name} expects {self.settings_cls.__name__}, "
@@ -88,13 +134,18 @@ class PeriodogramMethod(ABC):
         backend when torch sees a non-CPU device (AMD/Intel/Mac), and otherwise the
         proven CPU path. ``"gpu"`` is the same but raises when no GPU is available. A
         concrete ``"torch"`` / ``"torch:<device>"`` request selects the portable path
-        explicitly.
+        explicitly. Selectors ignore case and surrounding whitespace (``"CPU"`` is
+        ``"cpu"``), like method names.
 
         The installed-package check matters: ``cuda_available()`` only reports that
         cupy sees a device, while a method's fast path may need another library
         (GLS needs cufinufft). Without it, an environment with cupy and a GPU but no
         cufinufft would resolve ``"auto"`` to a backend that raises ``ImportError``
         deep in the compute path instead of quietly using the CPU.
+
+        ``"cpu"`` and the concrete CPU names are answered from the CPU-only probe
+        (:func:`~cuperiod.core.backend.cpu_backends`), so an explicit CPU request never
+        imports cupy or touches the CUDA driver.
 
         Parameters
         ----------
@@ -105,7 +156,8 @@ class PeriodogramMethod(ABC):
         Returns
         -------
         str
-            A concrete, available backend name (``"torch:<device>"`` kept as given).
+            A concrete, available backend name (``"torch:<device>"`` kept as given,
+            lower-cased).
 
         Raises
         ------
@@ -113,14 +165,28 @@ class PeriodogramMethod(ABC):
             If GPU/torch was requested but is unavailable, or a named backend is unknown
             to this method or not importable here.
         """
+        requested = normalize_backend(requested)
+        if requested == "cpu":
+            return self._best_cpu_backend(cpu_backends())
+        if requested == "torch" or requested.startswith("torch:"):
+            return self._resolve_torch(requested)
+        if requested not in BACKEND_SELECTORS and requested not in self.all_backends:
+            raise BackendUnavailableError(
+                f"{self.name}: unknown backend {requested!r}; choose "
+                f"{self._selector_help()}"
+            )
+        if requested in _CPU_BACKEND_NAMES:
+            if requested != "numpy" and requested not in cpu_backends():
+                raise BackendUnavailableError(
+                    f"{self.name}: backend {requested!r} is not installed"
+                )
+            return requested
         available = available_backends()
         if requested == "auto":
             if self._cuda_path_ready(available):
                 return str(self.gpu_backend)
             if self.portable_gpu_backend is not None and torch_gpu_available():
                 return self.portable_gpu_backend
-            return self._best_cpu_backend(available)
-        if requested == "cpu":
             return self._best_cpu_backend(available)
         if requested == "gpu":
             if self._cuda_path_ready(available):
@@ -138,24 +204,48 @@ class PeriodogramMethod(ABC):
                 "and a CUDA device, or the [torch] extra and a CUDA/ROCm/MPS/XPU "
                 "device)"
             )
-        if requested == "torch" or requested.startswith("torch:"):
-            return self._resolve_torch(requested)
-        if requested not in self.all_backends:
-            raise BackendUnavailableError(
-                f"{self.name}: unknown backend {requested!r}; "
-                f"choose from {self.all_backends}"
-            )
         if requested == self.gpu_backend and not cuda_available():
             raise BackendUnavailableError(
                 f"{self.name}: backend {requested!r} needs a CUDA device"
             )
-        if requested in {"finufft", "cufinufft", "numba", "astropy"} and (
-            requested not in available
-        ):
+        if requested == "cufinufft" and requested not in available:
             raise BackendUnavailableError(
                 f"{self.name}: backend {requested!r} is not installed"
             )
         return requested
+
+    def _selector_help(self) -> str:
+        """The valid selectors, for an unknown-backend message."""
+        generic = ", ".join(repr(s) for s in BACKEND_SELECTORS)
+        if self.portable_gpu_backend == "torch":
+            generic += ", 'torch', 'torch:<device>'"
+        return f"{generic}, or one of this method's backends {self.all_backends}"
+
+    def resolve_backend_for(
+        self, requested: str | None, settings: BaseSettings | None
+    ) -> str:
+        """Resolve a run's backend: the explicit request, else ``settings.backend``.
+
+        The single place every driver (single-curve API, batch, period-change scans,
+        multi-band FAP, LINCC adapter) should resolve through, so the documented
+        ``backend`` settings field and its ``CUPERIOD_<METHOD>_BACKEND`` environment
+        override take effect. ``None`` or ``"auto"`` defers to ``settings.backend``;
+        any other request wins (see
+        :func:`~cuperiod.core.backend.requested_backend`).
+
+        Parameters
+        ----------
+        requested : str or None
+            The caller's ``backend=`` argument.
+        settings : settings model or None
+            This method's settings.
+
+        Returns
+        -------
+        str
+            A concrete, available backend name.
+        """
+        return self.resolve_backend(requested_backend(requested, settings))
 
     def _cuda_path_ready(self, available: set[str]) -> bool:
         """Whether this method's NVIDIA fast path can actually run here.
@@ -197,12 +287,26 @@ class PeriodogramMethod(ABC):
                 )
         return requested
 
-    def is_gpu_backend(self, backend: str) -> bool:
-        """Whether ``backend`` runs on a GPU (NVIDIA fast-path or non-CPU torch)."""
+    def is_gpu_backend(
+        self, backend: str, settings: BaseSettings | None = None
+    ) -> bool:
+        """Whether ``backend`` runs on a GPU (NVIDIA fast-path or non-CPU torch).
+
+        A device-qualified ``"torch:<device>"`` is a GPU unless the device is ``cpu``.
+        Bare ``"torch"`` runs on ``settings.device`` when that pins a device, else on
+        the best device torch sees — so it is a GPU only when torch actually has one
+        (a CPU-only torch install runs it on the CPU).
+        """
+        backend = normalize_backend(backend)
         if backend == self.gpu_backend:
             return True
-        if backend == "torch" or backend.startswith("torch:"):
+        if backend.startswith("torch:"):
             return backend != "torch:cpu"
+        if backend == "torch":
+            device = str(getattr(settings, "device", "auto"))
+            if device != "auto":
+                return device != "cpu"
+            return torch_gpu_available()
         return False
 
     # -- compute -----------------------------------------------------------------
@@ -237,7 +341,13 @@ class PeriodogramMethod(ABC):
         raise NotImplementedError(f"{self.name} does not support multi-band input")
 
     def make_engine(self, backend: str, settings: BaseSettings) -> object | None:
-        """Build a reusable plan/kernel engine for batch runs (``None`` for CPU)."""
+        """Build a reusable plan/kernel engine for repeated calls on ``backend``.
+
+        ``None`` when the method has none for that backend. GLS returns one for
+        ``"cufinufft"`` and also for the CPU ``"finufft"`` backend (plan reuse for
+        scans and batches). An engine is not thread-safe: use one per thread or
+        process.
+        """
         return None
 
     def estimate_device_bytes(self, n_points: int) -> int:
@@ -301,6 +411,85 @@ def method_names() -> list[str]:
     return sorted(_REGISTRY)
 
 
+def select_settings(
+    methods: Sequence[PeriodogramMethod], settings: SettingsInput
+) -> dict[str, BaseSettings]:
+    """Pick each requested method's settings from a ``settings=`` argument.
+
+    The one rule shared by :func:`cuperiod.periodogram` and the batch drivers:
+
+    * ``None`` — every method gets its defaults.
+    * A single settings object — the methods whose ``settings_cls`` it is use it and
+      the others take defaults (so ``periodogram(lc, ["GLS", "BLS"],
+      settings=GLSSettings(...))`` tunes GLS only). It must match at least one
+      requested method: silently running defaults for a mismatched object hid typos.
+    * A ``{method: settings}`` mapping — keys are matched like method names (case and
+      separators ignored: ``"String-Length"`` is ``STRINGLENGTH``). A key naming no
+      registered method raises, as do two keys naming the same method; keys for
+      registered methods not in this run are ignored, so one shared mapping can serve
+      several calls.
+
+    Parameters
+    ----------
+    methods : sequence of PeriodogramMethod
+        The methods of this run.
+    settings : settings model, mapping, or None
+        The caller's ``settings=`` argument.
+
+    Returns
+    -------
+    dict
+        ``{method.name: settings}`` for every requested method.
+
+    Raises
+    ------
+    TypeError
+        If a settings object (bare or a mapping value) is of the wrong class.
+    UnknownMethodError
+        If a mapping key names no registered method.
+    ValueError
+        If two mapping keys name the same method.
+    """
+    if settings is None:
+        return {m.name: m.coerce_settings(None) for m in methods}
+    if isinstance(settings, BaseSettings):
+        if not any(isinstance(settings, m.settings_cls) for m in methods):
+            expected = " or ".join(
+                dict.fromkeys(m.settings_cls.__name__ for m in methods)
+            )
+            names = ", ".join(dict.fromkeys(m.name for m in methods))
+            raise TypeError(
+                f"settings: {names} expects {expected}, got {type(settings).__name__}"
+                " (pass a {method: settings} mapping to tune several methods)"
+            )
+        return {
+            m.name: (
+                settings
+                if isinstance(settings, m.settings_cls)
+                else m.coerce_settings(None)
+            )
+            for m in methods
+        }
+    if not isinstance(settings, Mapping):
+        raise TypeError(
+            "settings must be a settings model, a {method: settings} mapping, or "
+            f"None; got {type(settings).__name__}"
+        )
+    by_method: dict[str, tuple[str, BaseSettings | None]] = {}
+    for key, value in settings.items():
+        method = get_method(str(key))
+        if method.name in by_method:
+            raise ValueError(
+                f"settings: keys {by_method[method.name][0]!r} and {key!r} both name "
+                f"method {method.name}"
+            )
+        by_method[method.name] = (str(key), value)
+    return {
+        m.name: m.coerce_settings(by_method[m.name][1] if m.name in by_method else None)
+        for m in methods
+    }
+
+
 def list_methods() -> list[MethodInfo]:
     """Introspection records for every registered method."""
     available = available_backends()
@@ -330,9 +519,12 @@ def registered_methods() -> Mapping[str, PeriodogramMethod]:
 __all__ = [
     "MethodInfo",
     "PeriodogramMethod",
+    "SettingsInput",
+    "default_settings",
     "get_method",
     "list_methods",
     "method_names",
     "register",
     "registered_methods",
+    "select_settings",
 ]

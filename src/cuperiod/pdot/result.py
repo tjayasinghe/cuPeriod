@@ -49,6 +49,11 @@ class PdotBest:
         The best statistic along the dP/dt = 0 row — what a constant-period
         search of the same window would have found. Comparing it with ``power``
         (in the method's objective sense) measures what the extra axis bought.
+        The axis always holds an exact zero row when its range spans zero
+        (the default, and any explicit ``pdot_over_p_range`` with
+        ``lo <= 0 <= hi``); only an explicit range that excludes zero falls
+        back to the row nearest it, which is then *not* a constant-period
+        search.
     t_ref : float
         Reference epoch (same time system as the input, e.g. JD): the epoch at
         which ``period`` holds and around which the quadratic drift is expanded.
@@ -149,8 +154,8 @@ class PdotSearchResult:
     frequency : numpy.ndarray
         Frequency axis (cycles/day), ascending, shared by every row.
     pdot_over_p : numpy.ndarray
-        (dP/dt)/P axis (1/day), ascending; contains an exact 0 row unless an
-        explicit range excluded it.
+        (dP/dt)/P axis (1/day), ascending and uniform; contains an exact 0 row
+        unless an explicit range excluded zero.
     power : numpy.ndarray
         The method's statistic, shape ``(pdot_over_p.size, frequency.size)``.
     objective_sense : {"max", "min"}

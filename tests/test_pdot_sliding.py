@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pytest
 
 import cuperiod as cup
+from cuperiod.core.config import GLSSettings
 from cuperiod.core.errors import InsufficientDataError, UnknownMethodError
 from cuperiod.core.grid import GridSpec
 from cuperiod.pdot.sliding import _MAX_GRID_POINTS, _shared_grid
@@ -98,6 +101,50 @@ def test_window_periodogram_matches_its_row() -> None:
     assert pg.meta["window_index"] == 0
     assert pg.meta["t_start"] == pytest.approx(float(res.t_start[0]))
     assert pg.meta["window"] == pytest.approx(res.window)
+    # The window's own resolution and point count; the run's are in meta.
+    assert pg.baseline == pytest.approx(res.window)
+    assert res.n_window_points is not None
+    assert pg.n_samples == int(res.n_window_points[0])
+    assert pg.meta["run_baseline"] == pytest.approx(res.baseline)
+    assert pg.meta["run_n_samples"] == res.n_samples
+
+
+def test_window_periodogram_peaks_are_separated_at_the_window_resolution() -> None:
+    """best_periods on a window row never returns the main peak's own sidelobes.
+
+    The row carried the run baseline, 12x the window, so the 3-Rayleigh peak
+    exclusion was 12x too narrow and first sidelobes (~1.4/window from the main
+    peak) came back as independent periods.
+    """
+    rng = np.random.default_rng(4)
+    t = np.sort(rng.uniform(0.0, 360.0, 1500)) + 2458000.0
+    mag = (
+        12.0
+        + 0.4 * np.sin(2.0 * np.pi * 1.604 * t)
+        + 0.25 * np.sin(2.0 * np.pi * 2.053 * t + 1.0)
+        + rng.normal(0.0, 0.02, t.size)
+    )
+    res = cup.sliding_periodogram((t, mag, np.full(t.size, 0.02)))
+    floor = 3.0 / res.window * (1.0 - 1e-9)
+    for i in range(res.n_windows):
+        peaks = res.window_periodogram(i).best_periods(5)
+        freqs = np.sort([p.frequency for p in peaks])
+        assert np.all(np.diff(freqs) >= floor), (i, freqs)
+
+
+def test_n_window_points_counts_each_row() -> None:
+    """Per-row point counts line up with the rows and sum the windows' contents."""
+    t, mag, err = steady()
+    res = cup.sliding_periodogram((t, mag, err), window=60.0, step=60.0)
+    assert res.n_window_points is not None
+    assert res.n_window_points.shape == (res.n_windows,)
+    for i, lo in enumerate(res.t_start):
+        # The final window is flush with t_max and closed on the right.
+        inside = (t >= lo) & (t < lo + res.window)
+        if i == res.n_windows - 1:
+            inside = t >= lo
+        assert int(res.n_window_points[i]) == int(np.count_nonzero(inside))
+    assert res.to_dict()["n_window_points"] == res.n_window_points.tolist()
 
 
 def test_to_dict_round_trip() -> None:
@@ -127,6 +174,36 @@ def test_explicit_grid_is_honored() -> None:
     assert np.array_equal(res.frequency, grid.frequency)
     assert res.power.shape[1] == 501
     assert res.meta["sliding_periodogram"]["explicit_grid"] is True
+
+
+def test_period_grid_runs_on_an_ascending_frequency_axis() -> None:
+    """A period grid is mapped onto the ascending frequency axis its rows use."""
+    t, mag, err = steady()
+    periods = np.sort(1.0 / np.linspace(1.0, 2.5, 301))
+    grid = GridSpec(kind="period", values=periods)
+    res = cup.sliding_periodogram((t, mag, err), grid=grid, method="PDM")
+    assert np.all(np.diff(res.frequency) > 0.0)
+    assert np.all(np.abs(res.peak_period / PERIOD - 1.0) < 2e-3)
+
+
+def test_descending_grid_cannot_mirror_the_map() -> None:
+    """The map's axis is the axis the rows were computed on, whatever the grid order.
+
+    Every row comes back from ``Periodogram.from_spectrum`` sorted by ascending
+    frequency, while the axis used to be the grid in its stored order: a
+    descending grid (the ``1/np.linspace(f_lo, f_hi)`` period idiom) mirrored
+    every row onto its axis and put the peaks at ``f_lo + f_hi - f_true``.
+    GridSpec now refuses such a grid outright; a grid whose stored order still
+    disagrees with the rows (forced past that check here) must not mirror.
+    """
+    with pytest.raises(ValueError, match="ascending"):
+        GridSpec(kind="period", values=1.0 / np.linspace(1.0, 2.5, 301))
+    t, mag, err = steady()
+    grid = GridSpec(kind="frequency", values=np.linspace(1.0, 2.5, 301))
+    object.__setattr__(grid, "values", grid.values[::-1].copy())
+    res = cup.sliding_periodogram((t, mag, err), grid=grid, method="PDM")
+    assert np.all(np.diff(res.frequency) > 0.0)
+    assert np.all(np.abs(res.peak_period / PERIOD - 1.0) < 2e-3)
 
 
 def test_shared_grid_step_and_coarsening() -> None:
@@ -181,6 +258,27 @@ def test_tail_window_is_flush_with_the_last_epoch() -> None:
     assert res.t_mid[-1] > res.t_start[-1]
 
 
+def test_last_observation_is_in_the_last_window() -> None:
+    """The closed right edge reaches t_max even when the sum rounds one ulp short.
+
+    At these JD epochs ``t_start[-1] + window`` lands 4.7e-10 d below t_max, so
+    ``time <= hi`` used to drop the final observation from every window (about
+    2% of light curves at the default window and step).
+    """
+    t_min, t_max = 2459318.454232642, 2460560.6198044573
+    rng = np.random.default_rng(7)
+    t = np.sort(rng.uniform(t_min, t_max, 2002))
+    t[0], t[-1] = t_min, t_max
+    mag = 12.0 + 0.4 * np.sin(2.0 * np.pi * t / PERIOD) + rng.normal(0.0, 0.02, t.size)
+    err = np.full(t.size, 0.02)
+    res = cup.sliding_periodogram((t, mag, err), period=PERIOD)
+    assert res.t_start[-1] + res.window < t_max  # the rounding hazard is present
+    tail = t >= res.t_start[-1]
+    assert res.n_window_points is not None
+    assert int(res.n_window_points[-1]) == int(np.count_nonzero(tail))
+    assert res.t_mid[-1] == pytest.approx(float(np.mean(t[tail])), abs=1e-6)
+
+
 # --- skipping and guards -----------------------------------------------------
 
 
@@ -226,14 +324,58 @@ def test_unknown_method_raises_registry_error() -> None:
         cup.sliding_periodogram((t, mag, err), method="NotAMethod")
 
 
-def test_bad_window_step_and_period() -> None:
+@pytest.mark.parametrize("bad", [0.0, -1.0, math.nan, math.inf])
+def test_bad_window_step_and_period(bad: float) -> None:
+    """Non-positive *and* non-finite values are refused by name, before any work."""
     t, mag, err = steady()
     with pytest.raises(ValueError, match="window must be positive"):
-        cup.sliding_periodogram((t, mag, err), window=-1.0)
+        cup.sliding_periodogram((t, mag, err), window=bad)
     with pytest.raises(ValueError, match="step must be positive"):
-        cup.sliding_periodogram((t, mag, err), step=0.0)
+        cup.sliding_periodogram((t, mag, err), step=bad)
     with pytest.raises(ValueError, match="period must be positive"):
-        cup.sliding_periodogram((t, mag, err), period=0.0)
+        cup.sliding_periodogram((t, mag, err), period=bad)
+
+
+def test_period_longer_than_the_window_is_refused() -> None:
+    """Under one cycle per window there is nothing to fit, and 1/period may not
+    even lie inside the band the map would show."""
+    t, mag, err = steady()
+    with pytest.raises(ValueError, match="too long for this window"):
+        cup.sliding_periodogram((t, mag, err), window=30.0, period=5000.0)
+    with pytest.raises(ValueError, match="too long for this window"):
+        cup.sliding_periodogram((t, mag, err), window=30.0, period=31.0)
+
+
+def test_settings_backend_is_honoured() -> None:
+    """``method_settings.backend`` is the default backend, as for cup.periodogram."""
+    t, mag, err = steady()
+    res = cup.sliding_periodogram(
+        (t, mag, err), period=PERIOD, method_settings=GLSSettings(backend="astropy")
+    )
+    assert res.backend == "astropy"
+    assert np.all(np.abs(res.peak_period / PERIOD - 1.0) < 2e-3)
+
+
+def test_masked_values_in_a_tuple_are_dropped() -> None:
+    """A numpy mask is honoured: placeholders under it never reach a window."""
+    t, mag, err = steady()
+    bad = np.zeros(t.size, dtype=bool)
+    bad[::10] = True
+    masked = np.ma.MaskedArray(np.where(bad, 99.99, mag), mask=bad)
+    res = cup.sliding_periodogram((t, masked, err), period=PERIOD)
+    assert res.n_samples == int(np.count_nonzero(~bad))
+    assert np.all(np.abs(res.peak_period / PERIOD - 1.0) < 2e-3)
+
+
+def test_an_unusable_error_column_is_named_as_the_cause() -> None:
+    """A placeholder error column (all zero) is reported as such.
+
+    finite() drops every point with a non-positive error, so the curve used to
+    reach the baseline check empty and was reported as having no finite points.
+    """
+    t, mag, _ = steady()
+    with pytest.raises(InsufficientDataError, match="usable error"):
+        cup.sliding_periodogram((t, mag, np.zeros_like(t)), period=PERIOD)
 
 
 def test_period_trend_needs_three_windows() -> None:

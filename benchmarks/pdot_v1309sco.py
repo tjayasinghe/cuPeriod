@@ -30,7 +30,7 @@ then fit a law to the track:
   timing errors are optimistic.
 
 Data: the authors' own supplementary photometry, mirrored by OGLE at
-ftp://ftp.astrouw.edu.pl/ogle/ogle3/V1309_SCO/ (I-band, 2001-2009). Run
+https://ftp.astrouw.edu.pl/ogle/ogle3/V1309_SCO/ (I-band, 2001-2009). Run
 ``download_v1309sco.py`` first. All analysis is restricted to the quiescent
 pre-merger window; the violent phase began in March 2008 (HJD ~2454527).
 

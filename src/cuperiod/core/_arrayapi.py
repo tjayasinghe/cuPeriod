@@ -243,12 +243,18 @@ def to_device_array(host: np.ndarray, *, device: str, dtype: Any) -> Any:
     Used by the portable torch paths. ``dtype`` is a torch dtype object. Returns a torch
     tensor; the caller obtains the matching array-API namespace via
     :func:`array_namespace`.
+
+    ``torch.as_tensor`` refuses negative strides, and ``np.ascontiguousarray`` does not
+    remove them from a one-element reversed view (numpy flags it C-contiguous, so it is
+    passed through unchanged), so such an input is copied; every other contiguous input
+    stays zero-copy.
     """
     import torch
 
-    return torch.as_tensor(
-        np.ascontiguousarray(host), dtype=dtype, device=torch.device(device)
-    )
+    arr = np.ascontiguousarray(host)
+    if any(stride < 0 for stride in arr.strides):
+        arr = arr.copy()
+    return torch.as_tensor(arr, dtype=dtype, device=torch.device(device))
 
 
 __all__ = [

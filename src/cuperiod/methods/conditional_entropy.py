@@ -30,19 +30,29 @@ from cuperiod.core._typing import FloatArray, IntArray
 from cuperiod.core.backend import ensure_cuda_dll_path
 from cuperiod.core.config import CESettings
 from cuperiod.core.errors import InsufficientDataError
-from cuperiod.core.grid import (
-    GridSpec,
-    pseudo_nyquist_frequency,
-    uniform_frequency_grid,
-)
-from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
+from cuperiod.core.grid import GridSpec, default_frequency_grid
+from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve, raise_if_unusable
 from cuperiod.core.result import Periodogram
+from cuperiod.methods._fold import (
+    check_backend,
+    evaluate_trials,
+    fold_batch,
+    fold_phase,
+    foldable_periods,
+    row_offsets,
+    usable_curve,
+)
 from cuperiod.methods.base import PeriodogramMethod, register
 
 CEBackend = Literal["numpy", "cupy"]
 
-#: Trial periods per vectorized batch.
+#: Trial periods per vectorized batch, lowered on long curves to a transient budget
+#: (see :func:`~cuperiod.methods._fold.fold_batch`).
 DEFAULT_BATCH: Final = 1024
+
+#: ``(batch, N)`` arrays alive at the peak of :func:`_entropy_batch` (fold, floor and
+#: cell index on numpy; a few more temporaries on torch).
+_WORKSPACES: Final = 6
 
 
 def _entropy_batch(
@@ -68,15 +78,31 @@ def _entropy_batch(
     n_periods = int(periods.shape[0])
     n_cells = n_phase * n_mag
     entropy = xp.empty(n_periods, dtype=fdtype, device=dev)
+    on_host = isinstance(periods, np.ndarray)
     for start in range(0, n_periods, batch):
         stop = min(start + batch, n_periods)
         pb = periods[start:stop]
         n_p = int(pb.shape[0])
-        phase = xp.remainder(tau[None, :] / pb[:, None], 1.0)
-        phase_bin = xp.clip(xp.astype(phase * n_phase, idtype), 0, n_phase - 1)
-        cell = phase_bin * n_mag + mag_bin[None, :]  # (P, N) in [0, n_cells)
-        count = xp.zeros((n_p, n_cells), dtype=fdtype, device=dev)
-        scatter_counts_rows(count, cell)
+        phase = fold_phase(xp, tau, pb)
+        if on_host:
+            # numpy: form the flat (row, cell) index in place and count it with one
+            # bincount; the same cells as the generic path below.
+            np.multiply(phase, n_phase, out=phase)
+            flat = phase.astype(np.int64)
+            del phase
+            np.clip(flat, 0, n_phase - 1, out=flat)
+            flat *= n_mag
+            flat += mag_bin[None, :]
+            flat += row_offsets(n_p, n_cells)
+            count = np.bincount(flat.reshape(-1), minlength=n_p * n_cells).astype(
+                fdtype
+            )
+            del flat
+        else:
+            phase_bin = xp.clip(xp.astype(phase * n_phase, idtype), 0, n_phase - 1)
+            cell = phase_bin * n_mag + mag_bin[None, :]  # (P, N) in [0, n_cells)
+            count = xp.zeros((n_p, n_cells), dtype=fdtype, device=dev)
+            scatter_counts_rows(count, cell)
         count = xp.reshape(count, (n_p, n_phase, n_mag))
 
         phase_total = xp.sum(count, axis=2, keepdims=True)  # (P, n_phase, 1)
@@ -284,13 +310,17 @@ def conditional_entropy(
     backend : {"numpy", "cupy"}, default "numpy"
         CPU or GPU.
     batch : int, default 1024
-        Trial periods per vectorized batch.
+        Trial periods per vectorized batch (numpy/torch), lowered on long curves so
+        the batch's transient arrays stay within ~128 MiB (512 MiB on a GPU); it
+        never changes the result.
 
     Returns
     -------
     numpy.ndarray
-        Conditional entropy per period.
+        Conditional entropy per period. A trial period that cannot be folded (0,
+        NaN, or so small that ``tau / period`` overflows) gives NaN.
     """
+    check_backend(backend)
     t = np.ascontiguousarray(t, dtype=np.float64)
     y = np.ascontiguousarray(y, dtype=np.float64)
     periods_host = np.ascontiguousarray(periods, dtype=np.float64)
@@ -304,6 +334,29 @@ def conditional_entropy(
         ((y - y.min()) / span * n_mag_bins).astype(np.int64), 0, n_mag_bins - 1
     )
 
+    def entropy_for(trials: FloatArray) -> FloatArray:
+        return _ce_dispatch(
+            tau, mag_bin, trials, n_phase_bins=n_phase_bins, n_mag_bins=n_mag_bins,
+            backend=backend, batch=batch, precision=precision,
+        )
+
+    ok = foldable_periods(float(tau.max()), periods_host)
+    return evaluate_trials(entropy_for, periods_host, ok)
+
+
+def _ce_dispatch(
+    tau: FloatArray,
+    mag_bin: IntArray,
+    periods_host: FloatArray,
+    *,
+    n_phase_bins: int,
+    n_mag_bins: int,
+    backend: str,
+    batch: int,
+    precision: str,
+) -> FloatArray:
+    """Run :func:`conditional_entropy` on one backend (valid periods only)."""
+    n = int(tau.size)
     if backend == "cupy":
         ensure_cuda_dll_path()
         return _ce_cuda(
@@ -325,15 +378,22 @@ def conditional_entropy(
         tau_d = to_device_array(tau, device=device, dtype=fdt)
         mag_d = to_device_array(mag_bin, device=device, dtype=torch.int64)
         per_d = to_device_array(periods_host, device=device, dtype=fdt)
+        chunk = fold_batch(
+            batch, n, workspaces=_WORKSPACES, on_device=device != "cpu",
+            default=DEFAULT_BATCH,
+        )
         return to_host(_entropy_batch(
             array_namespace(per_d), tau_d, mag_d, per_d,
-            n_phase=n_phase_bins, n_mag=n_mag_bins, batch=batch,
+            n_phase=n_phase_bins, n_mag=n_mag_bins, batch=chunk,
         ))
     if backend != "numpy":
         raise ValueError(f"unknown backend {backend!r}")
+    chunk = fold_batch(
+        batch, n, workspaces=_WORKSPACES, on_device=False, default=DEFAULT_BATCH
+    )
     return to_host(_entropy_batch(
         array_namespace(periods_host), tau, mag_bin, periods_host,
-        n_phase=n_phase_bins, n_mag=n_mag_bins, batch=batch,
+        n_phase=n_phase_bins, n_mag=n_mag_bins, batch=chunk,
     ))
 
 
@@ -351,18 +411,17 @@ class ConditionalEntropyMethod(PeriodogramMethod):
     all_backends: ClassVar[tuple[str, ...]] = ("numba", "numpy", "cupy", "torch")
 
     def default_grid(self, lc: LightCurve, settings: CESettings) -> GridSpec:  # type: ignore[override]
-        finite = lc.finite()
+        finite = usable_curve(lc, "CE")
         if finite.baseline <= 0.0:
             raise InsufficientDataError("CE: no usable time baseline")
-        minimum = settings.minimum_frequency or 1.0 / finite.baseline
-        maximum = settings.maximum_frequency or pseudo_nyquist_frequency(
-            finite.time, settings.nyquist_factor
-        )
-        return uniform_frequency_grid(
-            finite.baseline,
-            maximum_frequency=maximum,
-            minimum_frequency=minimum,
+        # The shared fold-method recipe, size-checked before allocation (see PDM).
+        return default_frequency_grid(
+            finite.time,
+            minimum_frequency=settings.minimum_frequency or None,
+            maximum_frequency=settings.maximum_frequency or None,
             samples_per_peak=settings.samples_per_peak,
+            nyquist_factor=settings.nyquist_factor,
+            context="CE default grid",
         )
 
     def power(  # type: ignore[override]
@@ -373,7 +432,7 @@ class ConditionalEntropyMethod(PeriodogramMethod):
         backend: str,
         engine: object | None = None,
     ) -> Periodogram:
-        finite = lc.finite()
+        finite = usable_curve(lc, "CE")
         n = finite.n
         if n < settings.min_detections:
             raise InsufficientDataError(
@@ -411,6 +470,7 @@ class ConditionalEntropyMethod(PeriodogramMethod):
     ) -> Periodogram:
         from cuperiod.multiband.conditional_entropy_mb import ce_multiband_entropy
 
+        raise_if_unusable(mblc, "CE")
         if backend == "torch" or backend.startswith("torch:"):
             backend = f"torch:{resolve_torch_device(backend, settings.device)}"
         return ce_multiband_entropy(grid, mblc, settings, backend)

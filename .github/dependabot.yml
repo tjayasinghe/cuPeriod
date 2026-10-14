@@ -1,0 +1,16 @@
+# The workflows pin every action to a full commit SHA with a "# vX.Y.Z" comment
+# (see .github/workflows/). Dependabot keeps those pins current: it opens one
+# grouped PR that moves each SHA and its comment to the newest release, after the
+# release has been public for two weeks. It does not touch the uv (version and
+# checksum), twine or hatchling pins in release.yml; those are bumped by hand.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 14
+    groups:
+      actions:
+        patterns: ["*"]

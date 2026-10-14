@@ -11,7 +11,9 @@ throughout, matching :meth:`cuperiod.Periodogram.best_periods`.
 
 from __future__ import annotations
 
-from typing import Literal, Self
+import sys
+import warnings
+from typing import Any, ClassVar, Literal, Self
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -26,6 +28,34 @@ def _require_lt(lo: float | None, hi: float | None, lo_name: str, hi_name: str) 
         raise ValueError(f"{lo_name} ({lo}) must be < {hi_name} ({hi})")
 
 
+def _caller_stacklevel() -> int:
+    """``stacklevel`` that points a warning at the code constructing the settings.
+
+    Settings validators run under pydantic's ``__init__``; skipping those frames (and
+    this module's) attributes a deprecation to the user's line, where Python's default
+    filters show it.
+    """
+    level = 1
+    frame = sys._getframe(1)
+    while frame is not None:
+        module = str(frame.f_globals.get("__name__", ""))
+        if not (module == __name__ or module.startswith("pydantic")):
+            break
+        frame = frame.f_back  # type: ignore[assignment]
+        level += 1
+    return level
+
+
+#: Upper bound of a box/transit duration as a fraction of the period (exclusive):
+#: a box at least as long as the period has no out-of-transit baseline.
+_MAX_DURATION_FRAC = 1.0
+
+# Trial-frequency bounds are finite with minimum_frequency >= 0 and
+# maximum_frequency > 0 throughout. Negative bounds used to yield negative-period
+# "peaks" and NaN/inf ones raw errors from deep inside the grid code; 0 stays a legal
+# minimum (it means "auto" for the fold methods and is a valid GLS grid start).
+
+
 class _DeviceSettings(BaseSettings):
     """Device and precision selectors shared by torch-capable methods.
 
@@ -35,7 +65,30 @@ class _DeviceSettings(BaseSettings):
     supported and float32 only where the device forces it (Apple MPS cannot do float64);
     an explicit ``"float64"`` on MPS raises rather than silently downgrading. Both
     are environment-overridable like every other setting (``CUPERIOD_<METHOD>_DEVICE``).
+
+    Subclasses list in ``_retired_fields`` names that used to be accepted but were
+    never read. Passing one still constructs (``extra="forbid"`` would otherwise turn
+    existing calls and saved configs into errors) but emits a ``DeprecationWarning``
+    and is dropped.
     """
+
+    _retired_fields: ClassVar[tuple[str, ...]] = ()
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_retired(cls, data: Any) -> Any:
+        if not cls._retired_fields or not isinstance(data, dict):
+            return data
+        retired = [name for name in cls._retired_fields if name in data]
+        if not retired:
+            return data
+        warnings.warn(
+            f"{cls.__name__}: {', '.join(retired)} had no effect and is deprecated; "
+            "it is ignored and will be removed in a future release.",
+            DeprecationWarning,
+            stacklevel=_caller_stacklevel(),
+        )
+        return {k: v for k, v in data.items() if k not in retired}
 
     device: Literal["auto", "cpu", "cuda", "mps", "xpu"] = Field(
         default="auto", description="Torch device when the torch backend is used."
@@ -70,10 +123,14 @@ class GLSSettings(_DeviceSettings):
 
     minimum_frequency: float | None = Field(
         default=None,
+        ge=0.0,
+        allow_inf_nan=False,
         description="Lowest trial frequency (cycles/day); None -> 1/baseline.",
     )
     maximum_frequency: float | None = Field(
         default=None,
+        gt=0.0,
+        allow_inf_nan=False,
         description="Highest trial frequency (cycles/day); None -> pseudo-Nyquist.",
     )
     nyquist_factor: int = Field(
@@ -102,10 +159,16 @@ class GLSSettings(_DeviceSettings):
         default=1, ge=0, description="Flex model: per-band harmonic terms."
     )
     mb_reg_base: float | None = Field(
-        default=None, description="Flex model: ridge on the base terms (None = 0)."
+        default=None,
+        ge=0.0,
+        allow_inf_nan=False,
+        description="Flex model: ridge on the base terms (None = 0).",
     )
     mb_reg_band: float | None = Field(
-        default=1e-6, description="Flex model: ridge on the per-band terms."
+        default=1e-6,
+        ge=0.0,
+        allow_inf_nan=False,
+        description="Flex model: ridge on the per-band terms.",
     )
     mb_regularize_by_trace: bool = Field(
         default=True,
@@ -117,7 +180,9 @@ class GLSSettings(_DeviceSettings):
         description=(
             "Within-band bootstrap resamples for multi-band false-alarm "
             "probabilities (0 disables; the smallest resolvable FAP is "
-            "1/(n+1))."
+            "1/(n+1)). Runs on every backend; on the astropy backend or a "
+            "non-uniform grid each resample reruns astropy (n_bootstrap astropy "
+            "evaluations, slow on large grids)."
         ),
     )
     mb_fap_seed: int = Field(
@@ -172,10 +237,16 @@ class BLSSettings(_DeviceSettings):
         default=2, ge=1, description="Cap max period at baseline/min_transits."
     )
     duration_min_frac: float = Field(
-        default=0.01, gt=0.0, description="Shortest box as a fraction of period."
+        default=0.01,
+        gt=0.0,
+        lt=_MAX_DURATION_FRAC,
+        description="Shortest box as a fraction of period.",
     )
     duration_max_frac: float = Field(
-        default=0.12, gt=0.0, description="Longest box as a fraction of period."
+        default=0.12,
+        gt=0.0,
+        lt=_MAX_DURATION_FRAC,
+        description="Longest box as a fraction of period (below 1).",
     )
     n_durations: int = Field(
         default=8, ge=1, description="Trial durations per period segment."
@@ -237,10 +308,14 @@ class PDMSettings(_DeviceSettings):
 
     minimum_frequency: float | None = Field(
         default=None,
+        ge=0.0,
+        allow_inf_nan=False,
         description="Lowest trial frequency (cycles/day); None -> 1/baseline.",
     )
     maximum_frequency: float | None = Field(
         default=None,
+        gt=0.0,
+        allow_inf_nan=False,
         description="Highest trial frequency (cycles/day); None -> pseudo-Nyquist.",
     )
     nyquist_factor: int = Field(
@@ -293,10 +368,14 @@ class SuperSmootherSettings(_DeviceSettings):
 
     minimum_frequency: float | None = Field(
         default=None,
+        ge=0.0,
+        allow_inf_nan=False,
         description="Lowest trial frequency (cycles/day); None -> 1/baseline.",
     )
     maximum_frequency: float | None = Field(
         default=None,
+        gt=0.0,
+        allow_inf_nan=False,
         description="Highest trial frequency (cycles/day); None -> pseudo-Nyquist.",
     )
     nyquist_factor: int = Field(
@@ -372,10 +451,14 @@ class MHAOVSettings(_DeviceSettings):
 
     minimum_frequency: float | None = Field(
         default=None,
+        ge=0.0,
+        allow_inf_nan=False,
         description="Lowest trial frequency (cycles/day); None -> 1/baseline.",
     )
     maximum_frequency: float | None = Field(
         default=None,
+        gt=0.0,
+        allow_inf_nan=False,
         description="Highest trial frequency (cycles/day); None -> pseudo-Nyquist.",
     )
     nyquist_factor: int = Field(
@@ -425,10 +508,14 @@ class CESettings(_DeviceSettings):
 
     minimum_frequency: float | None = Field(
         default=None,
+        ge=0.0,
+        allow_inf_nan=False,
         description="Lowest trial frequency (cycles/day); None -> 1/baseline.",
     )
     maximum_frequency: float | None = Field(
         default=None,
+        gt=0.0,
+        allow_inf_nan=False,
         description="Highest trial frequency (cycles/day); None -> pseudo-Nyquist.",
     )
     nyquist_factor: int = Field(
@@ -472,10 +559,14 @@ class StringLengthSettings(_DeviceSettings):
 
     minimum_frequency: float | None = Field(
         default=None,
+        ge=0.0,
+        allow_inf_nan=False,
         description="Lowest trial frequency (cycles/day); None -> 1/baseline.",
     )
     maximum_frequency: float | None = Field(
         default=None,
+        gt=0.0,
+        allow_inf_nan=False,
         description="Highest trial frequency (cycles/day); None -> pseudo-Nyquist.",
     )
     nyquist_factor: int = Field(
@@ -517,6 +608,15 @@ class TLSSettings(_DeviceSettings):
             self.duration_min_frac, self.duration_max_frac,
             "duration_min_frac", "duration_max_frac",
         )
+        # The quadratic law I(mu) = 1 - u1 (1 - mu) - u2 (1 - mu)^2 must stay
+        # non-negative at the limb (mu = 0); beyond that the transit template turns
+        # into a brightening and the fitted depth collapses. u2 alone may be negative
+        # (tabulated coefficients sometimes are), so only the sum is bounded.
+        if self.limb_dark_u1 + self.limb_dark_u2 > 1.0:
+            raise ValueError(
+                f"limb_dark_u1 + limb_dark_u2 ({self.limb_dark_u1} + "
+                f"{self.limb_dark_u2}) must be <= 1 (non-negative limb intensity)"
+            )
         return self
 
     min_period_days: float = Field(default=0.5, gt=0.0, description="Minimum period.")
@@ -530,25 +630,39 @@ class TLSSettings(_DeviceSettings):
     grid_duration_frac: float = Field(
         default=0.05,
         gt=0.0,
-        description="Period-grid spacing as a transit-width fraction (peak sampling).",
+        description=(
+            "Period-grid step as a phase-drift budget per oversample (a "
+            "transit-duration fraction); capped at 2 x duration_min_frac so the "
+            "shortest searched transit stays resolved."
+        ),
     )
     n_phase_bins: int = Field(
         default=256, ge=16, description="Phase bins for the folded matched filter."
     )
     duration_min_frac: float = Field(
-        default=0.01, gt=0.0, description="Shortest transit as a fraction of period."
+        default=0.01,
+        gt=0.0,
+        lt=_MAX_DURATION_FRAC,
+        description="Shortest transit as a fraction of period.",
     )
     duration_max_frac: float = Field(
-        default=0.10, gt=0.0, description="Longest transit as a fraction of period."
+        default=0.10,
+        gt=0.0,
+        lt=_MAX_DURATION_FRAC,
+        description="Longest transit as a fraction of period (below 1).",
     )
     n_durations: int = Field(
         default=5, ge=1, description="Trial transit durations."
     )
     limb_dark_u1: float = Field(
-        default=0.4, description="Quadratic limb-darkening coefficient u1."
+        default=0.4,
+        allow_inf_nan=False,
+        description="Quadratic limb-darkening coefficient u1 (u1 + u2 <= 1).",
     )
     limb_dark_u2: float = Field(
-        default=0.3, description="Quadratic limb-darkening coefficient u2."
+        default=0.3,
+        allow_inf_nan=False,
+        description="Quadratic limb-darkening coefficient u2 (u1 + u2 <= 1).",
     )
     n_peaks: int = Field(default=10, ge=1, description="Default stored peak count.")
     peak_separation_rayleigh: float = Field(
@@ -567,7 +681,12 @@ class TLSSettings(_DeviceSettings):
         "auto", "cpu", "gpu", "numba", "numpy", "cupy", "torch"
     ] = Field(default="auto", description="Compute backend.")
     period_batch: int = Field(
-        default=256, ge=1, description="Trial periods per vectorized batch."
+        default=256,
+        ge=1,
+        description=(
+            "Upper bound on trial periods per vectorized batch (numpy/torch "
+            "paths); capped by a memory budget for long light curves."
+        ),
     )
     downsample_points: int = Field(
         default=2000, ge=2, description="Stored downsampled-spectrum size."
@@ -599,10 +718,14 @@ class PreWhitenSettings(_DeviceSettings):
     # -- search grid -------------------------------------------------------------
     minimum_frequency: float | None = Field(
         default=None,
+        gt=0.0,
+        allow_inf_nan=False,
         description="Lowest trial frequency (cycles/day); None -> 1/baseline.",
     )
     maximum_frequency: float | None = Field(
         default=None,
+        gt=0.0,
+        allow_inf_nan=False,
         description=(
             "Highest trial frequency (cycles/day); "
             "None -> pseudo-Nyquist, floored at 50."
@@ -665,7 +788,10 @@ class PreWhitenSettings(_DeviceSettings):
         description="Minimum BIC improvement required of a new component.",
     )
     min_amplitude: float | None = Field(
-        default=None, description="Absolute amplitude floor; None disables the check."
+        default=None,
+        ge=0.0,
+        allow_inf_nan=False,
+        description="Absolute amplitude floor; None disables the check.",
     )
     prune: bool = Field(
         default=True,
@@ -726,7 +852,13 @@ class PreWhitenSettings(_DeviceSettings):
         default=True, description="Identify combination frequencies and harmonics."
     )
     combination_max_order: int = Field(
-        default=2, ge=1, description="Largest sum|n_i| considered."
+        default=2,
+        ge=1,
+        description=(
+            "Largest sum|n_i| considered. A combination has order >= 2 (a single "
+            "parent is a near-duplicate, not a combination), so 1 disables the "
+            "search."
+        ),
     )
     combination_parents: int = Field(
         default=5, ge=1, description="Highest-amplitude components usable as parents."
@@ -755,8 +887,77 @@ class PreWhitenSettings(_DeviceSettings):
         default=True,
         description="Keep the full initial and residual spectra in the result.",
     )
-    downsample_points: int = Field(
-        default=2000, ge=2, description="Stored downsampled-spectrum size."
+    # downsample_points was accepted but never read: pre-whitening stores the full
+    # spectra (store_spectra) and has no downsampled product. Retired.
+    _retired_fields: ClassVar[tuple[str, ...]] = ("downsample_points",)
+
+
+class SessionSettings(BaseSettings):
+    """Behaviour of an interactive pre-whitening session (not of its numerics).
+
+    :class:`PreWhitenSettings` decides what a fit and a stopping rule compute; these
+    decide how a :class:`~cuperiod.PreWhitenSession` reacts to edits, how much history
+    it keeps in memory, and the limits of what it reads and writes. None of them moves
+    a number of an automatic run.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="CUPERIOD_SESSION_", extra="forbid")
+
+    recalculate_on_edit: bool = Field(
+        default=True,
+        description=(
+            "Re-solve amplitudes, phases and zero points (frequencies held) after "
+            "every structural edit."
+        ),
+    )
+    protect_manual: bool = Field(
+        default=True,
+        description=(
+            "Prune never removes manual, fixed, tied or tie-parent components."
+        ),
+    )
+    undo_depth: int = Field(
+        default=200, ge=1, description="States kept in memory for undo."
+    )
+    derived_cache: int = Field(
+        default=8,
+        ge=1,
+        description="Fits and residual spectra kept for the newest states.",
+    )
+    engine_cache: int = Field(
+        default=2,
+        ge=1,
+        description=(
+            "Spectrum engines kept per session (one per sampling); 1 on GPU backends."
+        ),
+    )
+    collision_rayleigh: float = Field(
+        default=0.25,
+        ge=0.0,
+        allow_inf_nan=False,
+        description="A manual frequency closer than this to another one is refused.",
+    )
+    snap_rayleigh: float = Field(
+        default=1.0,
+        ge=0.0,
+        allow_inf_nan=False,
+        description="Search radius of a snapped manual frequency, in Rayleigh widths.",
+    )
+    min_subset_points: int = Field(
+        default=10, ge=1, description="Fewest points a variation subset may have."
+    )
+    embed_data_max_points: int = Field(
+        default=200_000,
+        ge=0,
+        description="Largest light curve a project file embeds automatically.",
+    )
+    max_actions: int = Field(
+        default=100_000, ge=1, description="Longest action log a project may hold."
+    )
+    max_project_bytes: int = Field(
+        default=67_108_864,
+        ge=1,
+        description="Largest project file read (checked before parsing).",
     )
 
 
@@ -767,10 +968,14 @@ class SpacingSettings(BaseSettings):
 
     minimum_spacing: float | None = Field(
         default=None,
+        gt=0.0,
+        allow_inf_nan=False,
         description="Shortest trial spacing (days); None -> half the smallest gap.",
     )
+    # An infinite maximum is a working "no cap", so only the sign is constrained.
     maximum_spacing: float | None = Field(
         default=None,
+        gt=0.0,
         description="Longest trial spacing (days); None -> the full period range.",
     )
     oversample: int = Field(
@@ -884,8 +1089,11 @@ class PdotSettings(BaseSettings):
     # -- phase tracking (phase_track) ---------------------------------------------
     n_segments: int | None = Field(
         default=None,
-        ge=2,
-        description="Target number of time segments; None -> auto from the data.",
+        ge=4,
+        description=(
+            "Target number of time segments (at least 4: the quadratic ephemeris "
+            "needs four O-C points); None -> auto from the data."
+        ),
     )
     min_segment_points: int = Field(
         default=20, ge=5, description="Fewest points a usable segment may hold."
@@ -983,7 +1191,15 @@ class PdotSettings(BaseSettings):
 
 
 class BatchSettings(BaseSettings):
-    """Settings for batch processing of many light curves."""
+    """Reserved: batch-processing defaults that nothing reads yet.
+
+    No batch driver consults this class, so building it, or setting any
+    ``CUPERIOD_BATCH_*`` variable, has no effect on a run. Pass ``device``,
+    ``workers``, ``n_best``, ``resume`` ... to :func:`cuperiod.batch_periodograms`
+    (and the other batch drivers) directly; their ``settings`` argument means the
+    per-method settings. The class is kept, and exported, so code that builds it
+    keeps importing until a later release wires it in or removes it.
+    """
 
     model_config = SettingsConfigDict(env_prefix="CUPERIOD_BATCH_", extra="forbid")
 
@@ -1013,6 +1229,7 @@ __all__ = [
     "PDMSettings",
     "PdotSettings",
     "PreWhitenSettings",
+    "SessionSettings",
     "SpacingSettings",
     "StringLengthSettings",
     "SuperSmootherSettings",

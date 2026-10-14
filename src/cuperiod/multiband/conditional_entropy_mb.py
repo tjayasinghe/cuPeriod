@@ -57,19 +57,27 @@ def ce_multiband_entropy(
     -------
     Periodogram
         Point-count-weighted mean of the per-band entropies (minimized at the true
-        period).
+        period). ``meta["bands"]`` lists the participating bands.
 
     Raises
     ------
     InsufficientDataError
-        If no band has enough finite points, or the stacked baseline is empty.
+        If no band has enough finite points, the participating bands hold fewer
+        than ``min_detections`` points, or the stacked baseline is empty.
     """
     finite = mblc.finite()
     min_points = max(settings.n_phase_bins, _MIN_BAND_POINTS)
-    bands = [lc for lc in finite.bands.values() if lc.n >= min_points]
-    if not bands:
+    used = [(name, lc) for name, lc in finite.bands.items() if lc.n >= min_points]
+    if not used:
         raise InsufficientDataError(
             f"CE multiband: no band has {min_points} finite points"
+        )
+    bands = [lc for _, lc in used]
+    n_usable = sum(lc.n for lc in bands)
+    if n_usable < settings.min_detections:
+        raise InsufficientDataError(
+            f"CE multiband: {n_usable} finite points across usable bands "
+            f"< min_detections {settings.min_detections}"
         )
     stacked_time, _, _, _ = finite.stacked()
     baseline = float(stacked_time.max() - stacked_time.min())
@@ -102,7 +110,7 @@ def ce_multiband_entropy(
         objective_sense="min",
         n_samples=n_total,
         baseline=baseline,
-        meta={**dict(finite.meta), "bands": finite.band_names},
+        meta={**dict(finite.meta), "bands": tuple(name for name, _ in used)},
     )
 
 

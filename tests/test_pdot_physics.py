@@ -138,6 +138,66 @@ def test_amplitude_floor_grows_toward_the_baseline():
     assert np.isnan(s.sigma_amplitude(-1.0))
 
 
+def test_amplitude_floor_is_infinite_where_the_cycle_is_unresolvable():
+    """A commensurate or absurdly long outer period has no finite floor.
+
+    Fifteen annual timings cannot see a one-year (or half-year) cycle at all:
+    its cosine and sine are constant over the sampling. The honest floor there
+    is infinite, not a LinAlgError that aborts a whole sweep -- and an outer
+    period far beyond the baseline, where the inverse used to come back as
+    garbage, NaN or 0.0, is unresolvable too.
+    """
+    s = cup.detectable_pdot(0.4, 0.001, n_timings=15, baseline=14 * 365.25)
+    got = s.sigma_amplitude([365.25, 1000.0])
+    assert np.isinf(got[0]) and np.isfinite(got[1]) and got[1] > 0.0
+    sweep = s.sigma_amplitude(np.arange(1, 15) * 365.25)  # must not raise
+    assert np.isinf(sweep[0]) and np.all(np.isfinite(sweep[2:]))
+    assert np.isinf(s.sigma_amplitude(1e12))
+    s3 = cup.detectable_pdot(0.4, 0.001, n_timings=15, baseline=14 * 365.25, degree=3)
+    assert np.isinf(s3.sigma_amplitude(1e12))
+    assert np.isnan(s.sigma_amplitude(np.nan))
+    # Ordinary values are untouched by the reconditioning (pinned from the
+    # previous unscaled inverse, and the user-guide example).
+    assert s.sigma_amplitude(6 * 365.25) == pytest.approx(3.87631e-4, rel=1e-5)
+    s15 = cup.detectable_pdot(0.4, 0.001, n_timings=15, baseline=15 * 365.25)
+    assert s15.sigma_amplitude(6 * 365.25) * 86400.0 == pytest.approx(32.753, abs=1e-3)
+
+
+def test_too_few_distinct_epochs_raise():
+    """Repeated timings of two eclipses cannot constrain a parabola."""
+    with pytest.raises(ValueError, match="distinct epochs"):
+        cup.detectable_pdot(0.4, 1e-3, times=np.repeat([0.0, 100.0], 4))
+    with pytest.raises(ValueError, match="distinct epochs"):
+        cup.detectable_pdot(0.4, 1e-3, times=np.repeat([2450000.3, 2455000.7], 4))
+    # Two distinct epochs are enough for a straight line.
+    s = cup.detectable_pdot(0.4, 1e-3, times=np.repeat([0.0, 100.0], 4), degree=1)
+    assert np.isfinite(s.sigma_period)
+
+
+def test_nan_epoch_drops_its_own_timing_error():
+    rng = np.random.default_rng(3)
+    t = np.sort(rng.uniform(0.0, 3000.0, 20)) + 2450000.0
+    sig = rng.uniform(5e-4, 2e-3, 20)
+    t_nan = t.copy()
+    t_nan[3] = np.nan
+    s = cup.detectable_pdot(0.4, sig, times=t_nan)
+    keep = np.isfinite(t_nan)
+    ref = cup.detectable_pdot(0.4, sig[keep], times=t[keep])
+    assert s.n_timings == 19
+    assert s.sigma_pdot == pytest.approx(ref.sigma_pdot, rel=1e-12)
+    # A NaN error drops its epoch the same way.
+    sig_nan = sig.copy()
+    sig_nan[3] = np.nan
+    assert cup.detectable_pdot(0.4, sig_nan, times=t).n_timings == 19
+    # 2-D times with matching 2-D errors are read point by point.
+    s2 = cup.detectable_pdot(0.4, sig.reshape(4, 5), times=t.reshape(4, 5))
+    assert s2.n_timings == 20
+    with pytest.raises(ValueError, match="timing_error"):
+        cup.detectable_pdot(0.4, sig[:-1], times=t)
+    with pytest.raises(ValueError, match="positive"):
+        cup.detectable_pdot(0.4, np.nan, times=t)
+
+
 def test_sensitivity_guards_and_dict():
     with pytest.raises(ValueError, match="times= or both"):
         cup.detectable_pdot(0.4, 0.001)

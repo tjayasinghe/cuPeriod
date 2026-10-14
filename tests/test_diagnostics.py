@@ -223,6 +223,102 @@ def test_multiband_input(nightly_gls: Periodogram) -> None:
     assert report.rayleigh == pytest.approx(1.0 / pg.baseline)
 
 
+def _triangular_sine(seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """A clean sine on centrally concentrated (triangular) coverage over 480 d."""
+    rng = np.random.default_rng(seed)
+    t = np.sort(rng.triangular(0.0, 240.0, 480.0, 500)) + 2458000.0
+    y = 12.0 + 0.2 * np.sin(2 * np.pi * 0.3731 * t) + rng.normal(0.0, 0.02, t.size)
+    return t, y, np.full(t.size, 0.02)
+
+
+@pytest.mark.parametrize("seed", [100, 101, 102, 103])
+def test_alias_is_never_matched_to_the_diagnosed_peak(seed: int) -> None:
+    """METH-C-4: a yearly alias 1.25 R from f0 with no sidelobe in between used to
+    'match' f0 itself, scoring exactly 1.0 and a false AMBIGUOUS."""
+    data = _triangular_sine(seed)
+    settings = cup.GLSSettings(minimum_frequency=0.05, maximum_frequency=1.5)
+    pg = cup.periodogram(data, "GLS", backend="cpu", settings=settings)
+    assert isinstance(pg, Periodogram)
+    report = alias_diagnostics(pg)
+    assert report.best_frequency == pytest.approx(0.3731, rel=1e-3)
+    for candidate in report.candidates:
+        if candidate.matched:
+            gap = abs(candidate.matched_frequency - report.best_frequency)
+            assert gap >= report.rayleigh
+    assert report.ambiguous is False
+
+
+@pytest.mark.parametrize("minutes", [10.0, 20.0])
+def test_short_baseline_with_data_has_no_window_peaks(minutes: float) -> None:
+    """METH-C-7: a 10-20 minute run cannot resolve a 5.5 c/d window; it must not
+    raise about a grid the caller never asked for."""
+    rng = np.random.default_rng(0)
+    t = 2458000.0 + np.sort(rng.uniform(0.0, minutes / 1440.0, 200))
+    y = 12.0 + 0.01 * np.sin(2 * np.pi * 150.0 * t) + rng.normal(0.0, 0.002, t.size)
+    data = (t, y, np.full(t.size, 0.002))
+    grid = GridSpec("frequency", np.linspace(5.0, 400.0, 2000), uniform=True)
+    no_fap = cup.GLSSettings(fap_method="none")
+    pg = cup.periodogram(data, "GLS", grid=grid, backend="cpu", settings=no_fap)
+    assert isinstance(pg, Periodogram)
+    report = alias_diagnostics(pg, data, backend="cpu")
+    assert report.window_peaks == ()
+    # A window grid that reaches above the DC lobe still measures peaks.
+    wide = alias_diagnostics(pg, data, window_max_frequency=2000.0, backend="cpu")
+    assert wide.window_peaks
+    assert all(p.frequency > 2.0 / pg.baseline for p in wide.window_peaks)
+
+
+def test_degenerate_sampling_has_no_window_peaks(nightly_gls: Periodogram) -> None:
+    same = (np.full(5, 2458000.0), np.ones(5), np.full(5, 0.1))
+    assert alias_diagnostics(nightly_gls, same, backend="cpu").window_peaks == ()
+    single = (np.array([2458000.0]), np.ones(1), np.full(1, 0.1))
+    assert alias_diagnostics(nightly_gls, single, backend="cpu").window_peaks == ()
+
+
+def test_window_max_frequency_must_be_positive(
+    nightly: tuple[np.ndarray, ...], nightly_gls: Periodogram
+) -> None:
+    with pytest.raises(ValueError, match="window_max_frequency"):
+        alias_diagnostics(nightly_gls, nightly, window_max_frequency=0.0, backend="cpu")
+
+
+@pytest.mark.parametrize("frequency", [50.0, 6.7, 0.001, -1.0])
+def test_frequency_outside_the_grid_raises(
+    nightly_gls: Periodogram, frequency: float
+) -> None:
+    """METH-C-13: an out-of-range request was scored with an edge sample's power."""
+    with pytest.raises(ValueError, match="outside"):
+        alias_diagnostics(nightly_gls, frequency=frequency)
+
+
+@pytest.mark.parametrize("frequency", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_frequency_raises(
+    nightly_gls: Periodogram, frequency: float
+) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        alias_diagnostics(nightly_gls, frequency=frequency)
+
+
+def test_frequency_just_beyond_the_grid_edge_is_still_diagnosed(
+    nightly_gls: Periodogram,
+) -> None:
+    rayleigh = 1.0 / nightly_gls.baseline
+    edge = float(nightly_gls.frequency[-1]) + 0.5 * rayleigh
+    report = alias_diagnostics(nightly_gls, frequency=edge)
+    assert np.isfinite(report.best_power)
+
+
+def test_in_range_frequency_on_a_coarse_grid_uses_the_nearest_sample(
+    nightly: tuple[np.ndarray, ...],
+) -> None:
+    coarse = make_grid(nf=60)
+    pg = cup.periodogram(nightly, "GLS", grid=coarse, backend="cpu")
+    assert isinstance(pg, Periodogram)
+    target = 0.5 * (float(pg.frequency[10]) + float(pg.frequency[11])) + 1e-9
+    report = alias_diagnostics(pg, frequency=target)
+    assert report.best_power == pytest.approx(float(pg.power[11]))
+
+
 def test_empty_periodogram_raises() -> None:
     empty = Periodogram.from_spectrum(
         method="GLS",

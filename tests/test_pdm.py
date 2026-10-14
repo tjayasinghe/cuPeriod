@@ -6,9 +6,17 @@ import numpy as np
 import pytest
 
 import cuperiod as cup
-from conftest import requires_gpu
+from conftest import requires_gpu, requires_numba, requires_torch
 from cuperiod.methods.pdm import pdm_theta
 from synth import synthetic_eclipser, synthetic_sine
+
+
+def _offset_curve(mean: float, *, n: int = 600) -> tuple[np.ndarray, np.ndarray]:
+    """A 0.1-amplitude sine with 0.02 scatter around ``mean`` (27 d, random cadence)."""
+    rng = np.random.default_rng(0)
+    t = np.sort(rng.uniform(0.0, 27.0, n))
+    y = mean + 0.1 * np.sin(2 * np.pi * t / 0.6234) + rng.normal(0.0, 0.02, n)
+    return t, y
 
 
 def _reference_theta(
@@ -69,6 +77,34 @@ def test_pdm_constant_signal_is_flat() -> None:
     t = np.linspace(0.0, 100.0, 200)
     theta = pdm_theta(t, np.full(200, 5.0), np.linspace(0.5, 5.0, 50))
     assert np.allclose(theta, 1.0)
+
+
+@requires_torch
+@pytest.mark.parametrize("mean", [15.0, 1e3, 1e5])
+def test_pdm_torch_float32_tracks_float64_at_any_mean(mean: float) -> None:
+    # Regression: the array-API path binned raw y and y^2 in the working dtype and
+    # formed sum(y^2) - sum(y)^2/n there; in float32 that cancellation swamped the
+    # within-bin variance (negative Theta, wrong period) once mean/scatter neared
+    # 1e3. The CUDA kernel keeps double accumulators; this path now centres instead.
+    t, y = _offset_curve(mean)
+    periods = np.linspace(0.4, 1.0, 300)
+    ref = pdm_theta(t, y, periods, backend="numpy")
+    f32 = pdm_theta(t, y, periods, backend="torch:cpu", precision="float32")
+    assert np.all(f32 >= 0.0)
+    assert float(np.max(np.abs(f32 - ref))) < 2e-3
+    best32 = float(periods[int(np.argmin(f32))])
+    assert best32 == pytest.approx(float(periods[int(np.argmin(ref))]), rel=5e-3)
+
+
+@pytest.mark.parametrize(
+    "backend", ["numpy", pytest.param("numba", marks=requires_numba)]
+)
+def test_pdm_is_offset_invariant(backend: str) -> None:
+    t, y = _offset_curve(0.0)
+    periods = np.linspace(0.4, 1.0, 200)
+    base = pdm_theta(t, y, periods, backend=backend)
+    shifted = pdm_theta(t, y + 1e6, periods, backend=backend)
+    assert float(np.max(np.abs(shifted - base))) < 1e-6
 
 
 @requires_gpu

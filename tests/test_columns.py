@@ -2,10 +2,19 @@
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pytest
 
-from cuperiod.core.columns import ColumnMap, Domain, infer_domain
+from cuperiod.core.columns import (
+    FLUX_NAMES,
+    MAG_NAMES,
+    ColumnMap,
+    Domain,
+    coerce_domain,
+    infer_domain,
+)
 from cuperiod.core.errors import ColumnResolutionError
 
 
@@ -131,3 +140,109 @@ def test_domain_aware_error_pairs_with_value() -> None:
     cols = ["MJD", "m", "dm", "uJy", "duJy"]
     assert ColumnMap(value="m").resolve(cols).error == "dm"
     assert ColumnMap(value="uJy").resolve(cols).error == "duJy"
+
+
+# --- the domain argument may be spelled as a string ---------------------------------
+
+
+def test_string_domain_selects_flux_errors() -> None:
+    # domain="flux" is a documented spelling: it must behave exactly like Domain.FLUX,
+    # pairing a non-name-derived flux error (norm_flux + flux_err) rather than
+    # searching the magnitude-error names and losing (or mis-pairing) the error.
+    resolved = ColumnMap().resolve(["time", "norm_flux", "flux_err"], domain="flux")
+    assert resolved.error == "flux_err"
+    assert resolved.domain is Domain.FLUX
+    cols = ["time", "counts", "flux_err", "magerr"]
+    pinned = ColumnMap(value="counts").resolve(cols, domain="flux")
+    assert pinned.error == "flux_err"
+
+
+@pytest.mark.parametrize("spelling", ["flux", "FLUX", " Flux ", Domain.FLUX])
+def test_domain_spellings_coerce(spelling: str) -> None:
+    assert Domain(spelling) is Domain.FLUX
+    assert coerce_domain(spelling) is Domain.FLUX
+
+
+def test_coerce_domain_none_and_invalid() -> None:
+    assert coerce_domain(None) is None
+    with pytest.raises(ValueError, match="not a valid Domain"):
+        coerce_domain("jansky")
+
+
+# --- an explicit domain decides which column is read --------------------------------
+
+
+def test_explicit_magnitude_reads_magnitude_column_of_dual_table() -> None:
+    # ASAS-SN / Gaia style: flux and magnitude side by side. domain=MAGNITUDE used to
+    # read the *flux* column and stamp it as magnitudes (BLS then inverted transits).
+    cols = ["jd", "flux", "flux_err", "mag", "mag_err"]
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        resolved = ColumnMap().resolve(cols, domain=Domain.MAGNITUDE)
+    assert (resolved.value, resolved.error) == ("mag", "mag_err")
+    assert resolved.domain is Domain.MAGNITUDE
+
+
+def test_explicit_magnitude_on_atlas_header() -> None:
+    cols = ["MJD", "m", "dm", "uJy", "duJy", "F", "err", "chi/N"]
+    resolved = ColumnMap().resolve(cols, domain="magnitude")
+    assert (resolved.value, resolved.error) == ("m", "dm")
+
+
+@pytest.mark.parametrize("domain", [None, Domain.FLUX])
+def test_flux_or_no_domain_keeps_flux_column(domain: Domain | None) -> None:
+    cols = ["jd", "flux", "flux_err", "mag", "mag_err"]
+    resolved = ColumnMap().resolve(cols, domain=domain)
+    assert (resolved.value, resolved.error) == ("flux", "flux_err")
+    assert resolved.domain is Domain.FLUX
+
+
+def test_contradicting_domain_warns_when_no_matching_column() -> None:
+    # Only a flux column exists: the override is honoured (deliberate relabelling
+    # keeps working) but the user is told the column name says otherwise.
+    with pytest.warns(UserWarning, match="looks like a flux"):
+        resolved = ColumnMap().resolve(
+            ["jd", "flux", "flux_err"], domain=Domain.MAGNITUDE
+        )
+    assert resolved.value == "flux"
+    assert resolved.domain is Domain.MAGNITUDE
+
+
+def test_pinned_value_never_warns_on_domain() -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        resolved = ColumnMap(value="flux").resolve(
+            ["jd", "flux", "flux_err"], domain=Domain.MAGNITUDE
+        )
+    assert resolved.domain is Domain.MAGNITUDE
+
+
+# --- the inferred domain agrees with the detection lists ----------------------------
+
+
+def test_bare_f_is_flux() -> None:
+    assert infer_domain("f") is Domain.FLUX
+    assert infer_domain("F") is Domain.FLUX
+    assert ColumnMap().resolve(["t", "f", "err"]).domain is Domain.FLUX
+
+
+@pytest.mark.parametrize("name", FLUX_NAMES)
+def test_every_flux_name_infers_flux(name: str) -> None:
+    assert infer_domain(name) is Domain.FLUX
+
+
+@pytest.mark.parametrize("name", MAG_NAMES)
+def test_every_mag_name_infers_magnitude(name: str) -> None:
+    assert infer_domain(name) is Domain.MAGNITUDE
+
+
+# --- non-string column labels -------------------------------------------------------
+
+
+def test_integer_labels_resolve() -> None:
+    # Headerless tables (pd.read_csv(header=None)) have integer labels; a ColumnMap
+    # spelled with ints or their strings must both work.
+    cmap = ColumnMap(time=0, value=1, error=2)  # type: ignore[arg-type]
+    assert (cmap.time, cmap.value, cmap.error) == ("0", "1", "2")
+    resolved = cmap.resolve([0, 1, 2])  # type: ignore[list-item]
+    assert (resolved.time, resolved.value, resolved.error) == ("0", "1", "2")

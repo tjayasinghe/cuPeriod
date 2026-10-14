@@ -130,6 +130,8 @@ class AliasCandidate:
         Frequency of the nearest local optimum of the periodogram within
         ``3/baseline`` of ``frequency``, or NaN when the periodogram has no optimum
         there (which is itself the informative outcome: the alias is not populated).
+        The examined peak itself, and any optimum within one Rayleigh width of it, is
+        never a match.
     power : float
         The periodogram statistic at ``matched_frequency`` (NaN when unmatched).
     score : float
@@ -291,11 +293,19 @@ def _measured_window_peaks(
     (``|W(0)| = 1`` by construction, and it is not an alias spacing) and is dropped.
     Reported peaks are additionally required to be two Rayleigh widths apart so that
     the fine structure of one lobe cannot fill the list.
+
+    A sampling with no positive baseline, or one so short that the whole window band
+    lies inside the DC lobe (``window_max_frequency <= 2/baseline``: about 26 minutes
+    at the default 5.5 c/d), has no measurable window peaks and returns ``()``.
     """
     from cuperiod.prewhiten.spectrum import spectral_window
 
     time, error = _sampling(data)
     baseline = float(time.max() - time.min()) if time.size else 0.0
+    if time.size < 2 or not baseline > 0.0:
+        return ()
+    if window_max_frequency <= _DC_RAYLEIGH / baseline:
+        return ()
     grid = uniform_frequency_grid(
         baseline,
         maximum_frequency=window_max_frequency,
@@ -421,7 +431,11 @@ def _reference(
     With no explicit frequency this is the periodogram's own best peak (which already
     accounts for the objective sense). With one, the reference statistic is the best
     value within a Rayleigh width of the request, so a frequency quoted to more digits
-    than the grid still gets its peak's power rather than a flank sample.
+    than the grid still gets its peak's power rather than a flank sample. When no
+    sample lies that close (a grid coarser than two Rayleigh widths) the nearest
+    sample stands in -- but only inside the grid: a request more than a Rayleigh width
+    beyond either end, or a non-finite one, would otherwise be scored with an edge
+    sample that belongs to a different frequency, and raises instead.
     """
     if frequency is None:
         peaks = pg.best_periods(1)
@@ -431,10 +445,20 @@ def _reference(
             )
         return float(peaks[0].frequency), float(peaks[0].power)
     f0 = float(frequency)
+    if not np.isfinite(f0):
+        raise ValueError(
+            f"alias_diagnostics: frequency must be finite, got {frequency}"
+        )
     score = _score_array(pg)
     low = int(np.searchsorted(pg.frequency, f0 - rayleigh, side="left"))
     high = int(np.searchsorted(pg.frequency, f0 + rayleigh, side="right"))
     if high <= low:
+        f_lo, f_hi = float(pg.frequency[0]), float(pg.frequency[-1])
+        if not f_lo <= f0 <= f_hi:
+            raise ValueError(
+                f"alias_diagnostics: frequency {f0} c/d is outside the periodogram's "
+                f"range [{f_lo}, {f_hi}] c/d"
+            )
         return f0, float(pg.power[_nearest_index(pg.frequency, f0)])
     local = np.where(np.isfinite(score[low:high]), score[low:high], -np.inf)
     return f0, float(pg.power[low + int(np.argmax(local))])
@@ -521,7 +545,10 @@ def alias_diagnostics(
         are ignored.
     window_max_frequency : float, default 5.5
         Upper limit of the spectral-window grid in cycles/day. The default covers the
-        daily comb through its fifth multiple.
+        daily comb through its fifth multiple. A run shorter than
+        ``2/window_max_frequency`` days (about 26 minutes at the default) has no
+        window peak above the DC lobe below this limit, and reports none: raise it
+        for fast photometry.
     backend : str, default "auto"
         Backend for the spectral window (see
         :func:`~cuperiod.prewhiten.spectrum.resolve_spectrum_backend`). Unused when
@@ -534,7 +561,10 @@ def alias_diagnostics(
     Raises
     ------
     ValueError
-        If the periodogram is empty or holds no finite samples.
+        If the periodogram is empty or holds no finite samples; if ``frequency`` is
+        not finite or lies more than one Rayleigh width outside the periodogram's
+        frequency range; or if ``data`` is given with a non-positive or non-finite
+        ``window_max_frequency``.
 
     Notes
     -----
@@ -553,6 +583,13 @@ def alias_diagnostics(
     """
     if pg.size == 0:
         raise ValueError("alias_diagnostics: the periodogram is empty")
+    if data is not None and not (
+        np.isfinite(window_max_frequency) and window_max_frequency > 0.0
+    ):
+        raise ValueError(
+            "alias_diagnostics: window_max_frequency must be a positive finite "
+            f"frequency, got {window_max_frequency}"
+        )
     rayleigh = 1.0 / pg.baseline if pg.baseline > 0.0 else float("inf")
     f0, best_power = _reference(pg, frequency, rayleigh)
 
@@ -570,6 +607,13 @@ def alias_diagnostics(
     bounds = (float(pg.frequency[0]), float(pg.frequency[-1]))
     predictions = _predicted_candidates(f0, window_peaks, harmonics, rayleigh, bounds)
     optimum_frequency, optimum_power = _optima(pg)
+    # The examined peak (and anything within one Rayleigh width of it) is not a
+    # distinguishable alternative, so it must not be available as a match: a
+    # prediction 1-3 Rayleigh widths away with no sidelobe in between would otherwise
+    # "match" f0 itself and score exactly 1.0.
+    distinct = np.abs(optimum_frequency - f0) >= rayleigh
+    optimum_frequency = optimum_frequency[distinct]
+    optimum_power = optimum_power[distinct]
     score_of = _scorer(pg, best_power)
     tolerance = _MATCH_RAYLEIGH * rayleigh
 

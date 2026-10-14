@@ -36,19 +36,31 @@ from cuperiod.core._typing import FloatArray
 from cuperiod.core.backend import ensure_cuda_dll_path
 from cuperiod.core.config import PDMSettings
 from cuperiod.core.errors import InsufficientDataError
-from cuperiod.core.grid import (
-    GridSpec,
-    pseudo_nyquist_frequency,
-    uniform_frequency_grid,
-)
-from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
+from cuperiod.core.grid import GridSpec, default_frequency_grid
+from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve, raise_if_unusable
 from cuperiod.core.result import Periodogram
+from cuperiod.methods._fold import (
+    check_backend,
+    evaluate_trials,
+    fold_batch,
+    fold_phase,
+    foldable_periods,
+    row_offsets,
+    usable_curve,
+)
 from cuperiod.methods.base import PeriodogramMethod, register
 
 PDMBackend = Literal["numpy", "cupy"]
 
-#: Trial periods processed per vectorized batch (bounds the (P, N) phase arrays).
+#: Trial periods processed per vectorized batch (bounds the (P, N) phase arrays). On
+#: long curves the batch is lowered further to a transient budget (see
+#: :func:`~cuperiod.methods._fold.fold_batch`).
 DEFAULT_BATCH: Final = 2048
+
+#: ``(batch, N)`` arrays alive at the peak of :func:`_theta_batch` (the fold and its
+#: floor, the bin index, the broadcast weights; a little more on torch), for the
+#: memory-budgeted batch length.
+_WORKSPACES: Final = 6
 
 
 def _cover_hists(xp: ModuleType, fine: Any, n_bins: int, n_covers: int) -> Any:
@@ -88,6 +100,10 @@ def _theta_batch(
     are binned once into ``n_bins*n_covers`` fine bins; every cover's bin statistics
     are exact regroups of that histogram (see :func:`_cover_hists`), which cuts the
     scatter work by ``n_covers``.
+
+    ``y`` must be centred (mean removed) by the caller: Theta is offset-invariant, and
+    the per-bin ``sum(y^2) - sum(y)^2/n`` cancels catastrophically on raw values in
+    float32.
     """
     fdtype = periods.dtype
     idtype = xp.int64
@@ -97,21 +113,45 @@ def _theta_batch(
     n_periods = int(periods.shape[0])
     n_global = n_bins * n_covers
     theta = xp.empty(n_periods, dtype=fdtype, device=dev)
+    on_host = isinstance(periods, np.ndarray)
 
     for start in range(0, n_periods, batch):
         stop = min(start + batch, n_periods)
         pb = periods[start:stop]
         n_p = int(pb.shape[0])
-        phase = xp.remainder(tau[None, :] / pb[:, None], 1.0)  # (P, N) in [0, 1)
-        fine = xp.clip(
-            xp.astype(phase * float(n_global), idtype), 0, n_global - 1
-        )
-        f_count = xp.zeros((n_p, n_global), dtype=fdtype, device=dev)
-        f_ysum = xp.zeros((n_p, n_global), dtype=fdtype, device=dev)
-        f_ysq = xp.zeros((n_p, n_global), dtype=fdtype, device=dev)
-        scatter_counts_rows(f_count, fine)
-        scatter_add_rows(f_ysum, fine, y)
-        scatter_add_rows(f_ysq, fine, y2)
+        phase = fold_phase(xp, tau, pb)  # (P, N) in [0, 1)
+        if on_host:
+            # numpy: bin in place and build the flat (row, bin) index once for the
+            # three bincounts (the generic scatter helpers rebuild it per call).
+            # Bit-identical to the generic path below.
+            np.multiply(phase, float(n_global), out=phase)
+            flat = phase.astype(np.int64)
+            del phase
+            np.clip(flat, 0, n_global - 1, out=flat)
+            flat += row_offsets(n_p, n_global)
+            flat = flat.reshape(-1)
+            size = n_p * n_global
+            shape = (n_p, n_global)
+            f_count = np.bincount(flat, minlength=size).astype(fdtype).reshape(shape)
+            f_ysum = np.bincount(
+                flat, weights=np.broadcast_to(y, (n_p, n_points)).reshape(-1),
+                minlength=size,
+            ).reshape(shape)
+            f_ysq = np.bincount(
+                flat, weights=np.broadcast_to(y2, (n_p, n_points)).reshape(-1),
+                minlength=size,
+            ).reshape(shape)
+            del flat
+        else:
+            fine = xp.clip(
+                xp.astype(phase * float(n_global), idtype), 0, n_global - 1
+            )
+            f_count = xp.zeros((n_p, n_global), dtype=fdtype, device=dev)
+            f_ysum = xp.zeros((n_p, n_global), dtype=fdtype, device=dev)
+            f_ysq = xp.zeros((n_p, n_global), dtype=fdtype, device=dev)
+            scatter_counts_rows(f_count, fine)
+            scatter_add_rows(f_ysum, fine, y)
+            scatter_add_rows(f_ysq, fine, y2)
 
         count = _cover_hists(xp, f_count, n_bins, n_covers)
         ysum = _cover_hists(xp, f_ysum, n_bins, n_covers)
@@ -351,14 +391,18 @@ def pdm_theta(
         ``"numpy"`` (vectorized CPU), ``"numba"`` (multicore CPU), ``"cupy"``
         (NVIDIA RawKernel), or ``"torch"`` / ``"torch:<device>"`` (portable).
     batch : int, default 2048
-        Trial periods per vectorized batch.
+        Trial periods per vectorized batch (numpy/torch), lowered on long curves so
+        the batch's transient arrays stay within ~128 MiB (512 MiB on a GPU); it
+        never changes the result.
 
     Returns
     -------
     numpy.ndarray
         ``Theta`` for each period (minimized at the true period). Returns all-ones for a
-        constant signal (no variance to reduce).
+        constant signal (no variance to reduce). A trial period that cannot be folded
+        (0, NaN, or so small that ``tau / period`` overflows) gives NaN.
     """
+    check_backend(backend)
     t = np.ascontiguousarray(t, dtype=np.float64)
     y = np.ascontiguousarray(y, dtype=np.float64)
     periods_host = np.ascontiguousarray(periods, dtype=np.float64)
@@ -370,7 +414,36 @@ def pdm_theta(
     sigma2 = float(((y - y_mean) ** 2).sum() / (n - 1)) if n > 1 else 0.0
     if sigma2 <= 0.0:
         return np.ones(periods_host.size, dtype=np.float64)
+    # Theta is offset-invariant, so every backend bins the centred values: the
+    # per-bin sum(y^2) - sum(y)^2/n then no longer cancels the mean level away (in
+    # float32 that cancellation used to swamp the within-bin variance once the mean
+    # was ~1000x the scatter -- magnitudes, normalised flux).
+    y = y - y_mean
 
+    def theta_for(trials: FloatArray) -> FloatArray:
+        return _pdm_dispatch(
+            tau, y, trials, n_bins=n_bins, n_covers=n_covers, sigma2=sigma2,
+            backend=backend, batch=batch, precision=precision,
+        )
+
+    ok = foldable_periods(float(tau.max()), periods_host)
+    return evaluate_trials(theta_for, periods_host, ok)
+
+
+def _pdm_dispatch(
+    tau: FloatArray,
+    y: FloatArray,
+    periods_host: FloatArray,
+    *,
+    n_bins: int,
+    n_covers: int,
+    sigma2: float,
+    backend: str,
+    batch: int,
+    precision: str,
+) -> FloatArray:
+    """Run :func:`pdm_theta` on one backend (centred ``y``, valid periods only)."""
+    n = int(tau.size)
     if backend == "cupy":
         ensure_cuda_dll_path()
         return _pdm_cuda(
@@ -392,15 +465,22 @@ def pdm_theta(
         y_d = to_device_array(y, device=device, dtype=fdt)
         y2_d = to_device_array(y * y, device=device, dtype=fdt)
         per_d = to_device_array(periods_host, device=device, dtype=fdt)
+        chunk = fold_batch(
+            batch, n, workspaces=_WORKSPACES, on_device=device != "cpu",
+            default=DEFAULT_BATCH,
+        )
         return to_host(_theta_batch(
             array_namespace(per_d), tau_d, y_d, y2_d, per_d,
-            n_bins=n_bins, n_covers=n_covers, sigma2=sigma2, batch=batch,
+            n_bins=n_bins, n_covers=n_covers, sigma2=sigma2, batch=chunk,
         ))
     if backend != "numpy":
         raise ValueError(f"unknown backend {backend!r}")
+    chunk = fold_batch(
+        batch, n, workspaces=_WORKSPACES, on_device=False, default=DEFAULT_BATCH
+    )
     theta = _theta_batch(
         array_namespace(periods_host), tau, y, y * y, periods_host,
-        n_bins=n_bins, n_covers=n_covers, sigma2=sigma2, batch=batch,
+        n_bins=n_bins, n_covers=n_covers, sigma2=sigma2, batch=chunk,
     )
     return np.asarray(theta, dtype=np.float64)
 
@@ -419,18 +499,19 @@ class PDMMethod(PeriodogramMethod):
     all_backends: ClassVar[tuple[str, ...]] = ("numba", "numpy", "cupy", "torch")
 
     def default_grid(self, lc: LightCurve, settings: PDMSettings) -> GridSpec:  # type: ignore[override]
-        finite = lc.finite()
+        finite = usable_curve(lc, "PDM")
         if finite.baseline <= 0.0:
             raise InsufficientDataError("PDM: no usable time baseline")
-        minimum = settings.minimum_frequency or 1.0 / finite.baseline
-        maximum = settings.maximum_frequency or pseudo_nyquist_frequency(
-            finite.time, settings.nyquist_factor
-        )
-        return uniform_frequency_grid(
-            finite.baseline,
-            maximum_frequency=maximum,
-            minimum_frequency=minimum,
+        # The shared fold-method recipe: 1/T .. pseudo-Nyquist (multi-exposure-visit
+        # aware), size-checked before allocation (warns above ~5e6 automatic samples).
+        # ``or None`` keeps 0 meaning "automatic", as before.
+        return default_frequency_grid(
+            finite.time,
+            minimum_frequency=settings.minimum_frequency or None,
+            maximum_frequency=settings.maximum_frequency or None,
             samples_per_peak=settings.samples_per_peak,
+            nyquist_factor=settings.nyquist_factor,
+            context="PDM default grid",
         )
 
     def power(  # type: ignore[override]
@@ -441,7 +522,7 @@ class PDMMethod(PeriodogramMethod):
         backend: str,
         engine: object | None = None,
     ) -> Periodogram:
-        finite = lc.finite()
+        finite = usable_curve(lc, "PDM")
         n = finite.n
         if n < settings.min_detections:
             raise InsufficientDataError(
@@ -483,6 +564,7 @@ class PDMMethod(PeriodogramMethod):
     ) -> Periodogram:
         from cuperiod.multiband.pdm_mb import pdm_multiband_theta
 
+        raise_if_unusable(mblc, "PDM")
         if backend == "torch" or backend.startswith("torch:"):
             backend = f"torch:{resolve_torch_device(backend, settings.device)}"
         return pdm_multiband_theta(grid, mblc, settings, backend)

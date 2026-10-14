@@ -68,26 +68,39 @@ a gap longer than the period in question is, in Foster's word, "folly"
 (Foster 1996, section 6); the ``min_neff`` mask exists to keep such cells out
 of the map rather than to rescue them.
 
-Implementation notes. Pure NumPy float64, vectorized over frequency for each
-``tau`` and chunked so the transient ``(chunk, n)`` matrices stay bounded. The
-per-point measurement errors are *not* used: Foster's weights are the wavelet
-window alone, and mixing the two would change the statistic's meaning. A
-GPU/array-API path (the arithmetic is a handful of ``(nf, n)`` reductions, so
-it maps well onto a device) is future work; correctness first.
+Implementation notes. float64 throughout, on one of two CPU tiers: a
+multicore numba kernel (one parallel iteration per ``(tau, frequency)`` cell,
+the ``[fast]`` extra) and a vectorized NumPy fallback that evaluates blocks of
+frequencies at once. Both make the same two simplifications, exact in exact
+arithmetic. The values are centred on their mean first: the constant trial
+function makes the statistic invariant to an offset, and the sums otherwise
+carry the squared mean, which ``<x|x> - y.b`` then has to cancel. And each
+cell only visits the points under its own Gaussian: times are sorted once, and
+a cell keeps the points whose weight is within ``exp(-45)`` of its *nearest*
+datum's, so a ``tau`` inside a gap (where every weight is tiny but the
+statistic is still defined) keeps the same mask and, to round-off, the same
+values and ``N_eff`` as the full sum. The per-point measurement errors are
+*not* used: Foster's weights are the wavelet window alone, and mixing the two
+would change the statistic's meaning. A GPU/array-API path (the arithmetic is
+a handful of ``(nf, n)`` reductions, so it maps well onto a device) is future
+work.
 """
 
 from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from functools import cached_property
 from typing import Any, Final
 
 import numpy as np
 
-from cuperiod.core._typing import FloatArray
+from cuperiod.core._coerce import as_float_array
+from cuperiod.core._typing import FloatArray, IntArray
+from cuperiod.core.backend import has_module, normalize_backend
 from cuperiod.core.columns import ColumnMap, Domain
-from cuperiod.core.errors import InsufficientDataError
+from cuperiod.core.errors import BackendUnavailableError, InsufficientDataError
 from cuperiod.core.grid import pseudo_nyquist_frequency
 from cuperiod.core.lightcurve import MultiBandLightCurve
 from cuperiod.pdot.scan import _parabolic_offset
@@ -103,16 +116,32 @@ _MIN_POINTS: Final[int] = 20
 #: to span the same range (recorded as ``grid_capped`` in ``meta``).
 _MAX_FREQUENCIES: Final[int] = 2000
 
-#: Elements per transient ``(chunk, n)`` matrix (64 MB float64), mirroring the
-#: direct GLS path: the frequency axis is chunked so a long light curve cannot
-#: blow up host memory.
-_CHUNK_ELEMS: Final[int] = 1 << 23
+#: Elements per transient ``(block, window)`` matrix of the NumPy path (512 KB
+#: float64). A block is a run of frequencies sharing one point window, sized so
+#: its half-dozen live matrices stay cache-resident (measured fastest of 2^16,
+#: 2^18 and 2^20 on 1e3-2e4 points); a single frequency whose window holds more
+#: points than this is evaluated on its own.
+_BLOCK_ELEMS: Final[int] = 1 << 16
+
+#: Dynamic range of the Gaussian weights a cell keeps, as ``-ln`` of the weight
+#: ratio to the cell's *nearest* datum: points beyond
+#: ``sqrt(d_min^2 + _WINDOW_CUT/(c*omega^2))`` of ``tau`` carry less than
+#: ``exp(-45) = 2.9e-20`` of that datum's weight, below float64 resolution of
+#: every sum they would join. Anchoring on the nearest datum rather than on a
+#: weight of 1 is what keeps a ``tau`` inside a gap exact: there all weights are
+#: tiny, but the statistic is ratio-invariant and still defined. ``inf`` sums
+#: every point (the tests compare the two).
+_WINDOW_CUT: Final[float] = 45.0
 
 #: Smallest usable determinant of the 3x3 normal matrix. The matrix has a unit
 #: leading entry and ``S_22 + S_33 = 1``, so its determinant lives in
 #: ``[0, 0.25]`` and a floor this far below 1 only catches genuinely collapsed
 #: cells (one point under the window, or a window holding less than a cycle).
 _DET_FLOOR: Final[float] = 1e-12
+
+#: Backend selectors :func:`wwz` accepts (``"cpu"`` and ``"auto"`` are the same:
+#: there is no GPU path).
+_BACKENDS: Final[tuple[str, ...]] = ("auto", "cpu", "numba", "numpy")
 
 
 def _wwz_block(
@@ -124,39 +153,51 @@ def _wwz_block(
 ) -> tuple[FloatArray, FloatArray, FloatArray]:
     """WWZ, WWA and N_eff for one ``tau`` over a block of angular frequencies.
 
-    ``dt`` is ``t - tau`` (days) and ``omega`` a block of angular frequencies;
+    ``dt`` is ``t - tau`` (days) and ``value`` the mean-centred data of the
+    points in the block's window, ``omega`` a block of angular frequencies;
     every quantity below is one of Foster's, evaluated for all frequencies of
     the block at once. Returns ``(wwz, wwa, n_eff)``, each of shape
     ``omega.shape``, with ``wwz``/``wwa`` set to NaN on degenerate cells and
     ``n_eff`` always finite (it is the diagnostic that explains the mask).
     """
-    arg = omega[:, None] * dt[None, :]
-    w = np.exp(-c * arg * arg)
+    arg = np.multiply.outer(omega, dt)
     cos_a = np.cos(arg)
     sin_a = np.sin(arg)
-    del arg
+    # The weights reuse the angle buffer: one (block, window) matrix fewer.
+    np.multiply(arg, arg, out=arg)
+    arg *= -c
+    w = np.exp(arg, out=arg)
     wc = w * cos_a
     ws = w * sin_a
 
-    sum_w = w.sum(axis=1)
-    sum_w2 = (w * w).sum(axis=1)
+    # Every value-weighted sum in one matrix product per weight matrix.
+    rhs = np.empty((dt.size, 3), dtype=np.float64)
+    rhs[:, 0] = 1.0
+    rhs[:, 1] = value
+    rhs[:, 2] = value * value
+    w_sums = w @ rhs  # sum w, sum w x, sum w x^2
+    c_sums = wc @ rhs[:, :2]  # sum w cos, sum w cos x
+    s_sums = ws @ rhs[:, :2]  # sum w sin, sum w sin x
+
+    sum_w = w_sums[:, 0]
+    sum_w2 = np.einsum("ij,ij->i", w, w)
     # Degenerate cells divide by zero otherwise; they are masked out below.
     safe_w = np.where(sum_w > 0.0, sum_w, 1.0)
     safe_w2 = np.where(sum_w2 > 0.0, sum_w2, 1.0)
     n_eff = np.where(sum_w2 > 0.0, sum_w * sum_w / safe_w2, 0.0)
 
     # The 3x3 Gram matrix S_ab = <phi_a|phi_b> (S_11 = <1|1> = 1 identically).
-    s12 = wc.sum(axis=1) / safe_w
-    s13 = ws.sum(axis=1) / safe_w
-    s22 = (wc * cos_a).sum(axis=1) / safe_w
-    s23 = (wc * sin_a).sum(axis=1) / safe_w
-    s33 = (ws * sin_a).sum(axis=1) / safe_w
+    s12 = c_sums[:, 0] / safe_w
+    s13 = s_sums[:, 0] / safe_w
+    s22 = np.einsum("ij,ij->i", wc, cos_a) / safe_w
+    s23 = np.einsum("ij,ij->i", wc, sin_a) / safe_w
+    s33 = np.einsum("ij,ij->i", ws, sin_a) / safe_w
 
     # The right-hand side <phi_a|x>, and <x|x> for the data variation.
-    b1 = (w @ value) / safe_w
-    b2 = (wc @ value) / safe_w
-    b3 = (ws @ value) / safe_w
-    xx = (w @ (value * value)) / safe_w
+    b1 = w_sums[:, 1] / safe_w
+    b2 = c_sums[:, 1] / safe_w
+    b3 = s_sums[:, 1] / safe_w
+    xx = w_sums[:, 2] / safe_w
 
     # Closed-form symmetric 3x3 solve (adjugate / determinant): no per-cell
     # linear-algebra call, and the determinant doubles as the singularity test.
@@ -173,10 +214,13 @@ def _wwz_block(
     y3 = (a13 * b1 + a23 * b2 + a33 * b3) / safe_det
 
     # <y|y> = y.S.y = y.b (the normal equations), and <1|y> = (S y)_1 = <1|x>,
-    # so V_y = y.b - <1|x>^2 and V_x - V_y = <x|x> - y.b with no cancellation
-    # of the (large) squared mean in the residual variation.
+    # so V_y = y.b - <1|x>^2 and V_x - V_y = <x|x> - y.b. Both are differences
+    # of terms of the size of the squared *mean*, which is why the values come
+    # in centred: on raw data far from zero (a flux of 1e6, a magnitude offset
+    # to 1e5) the cancellation decided the mask and the sign of the statistic.
+    # V_y is a weighted variance, so a negative value is round-off: clamp it.
     ydotb = y1 * b1 + y2 * b2 + y3 * b3
-    v_y = ydotb - b1 * b1
+    v_y = np.maximum(ydotb - b1 * b1, 0.0)
     v_resid = xx - ydotb
 
     good = (n_eff > min_neff) & (det > _DET_FLOOR) & (v_resid > 0.0)
@@ -187,6 +231,217 @@ def _wwz_block(
         np.asarray(wwz_block, dtype=np.float64),
         np.asarray(wwa_block, dtype=np.float64),
         np.asarray(n_eff, dtype=np.float64),
+    )
+
+
+def _nearest_distance(times: FloatArray, tau: FloatArray) -> FloatArray:
+    """Distance from each ``tau`` to the closest of the (sorted) ``times``."""
+    n = int(times.size)
+    idx = np.searchsorted(times, tau)
+    right = times[np.minimum(idx, n - 1)]
+    left = times[np.maximum(idx - 1, 0)]
+    return np.asarray(
+        np.minimum(np.abs(right - tau), np.abs(tau - left)), dtype=np.float64
+    )
+
+
+def _numpy_maps(
+    times: FloatArray,
+    value: FloatArray,
+    tau: FloatArray,
+    d_min: FloatArray,
+    omega: FloatArray,
+    c: float,
+    min_neff: float,
+    cut: float,
+    out: tuple[FloatArray, FloatArray, FloatArray],
+) -> None:
+    """Fill the three maps with the vectorized NumPy path.
+
+    For each ``tau`` the frequencies are visited in ascending order, so their
+    point windows (all centred on ``tau``, radius shrinking with ``omega``) are
+    nested: a block of consecutive frequencies is evaluated together on the
+    window of its lowest one, and grows until it reaches :data:`_BLOCK_ELEMS`.
+    ``times`` must be sorted.
+    """
+    wwz_map, wwa_map, neff_map = out
+    nf = int(omega.size)
+    order = np.argsort(omega, kind="stable")
+    reach2 = cut / (c * omega[order] * omega[order])
+    for i in range(int(tau.size)):
+        tau_i = float(tau[i])
+        radius = np.sqrt(float(d_min[i]) ** 2 + reach2)
+        lo = np.searchsorted(times, tau_i - radius, side="left")
+        hi = np.searchsorted(times, tau_i + radius, side="right")
+        p = 0
+        while p < nf:
+            a, b = int(lo[p]), int(hi[p])
+            k = max(1, min(nf - p, _BLOCK_ELEMS // max(1, b - a)))
+            cols = order[p : p + k]
+            z, amp, ne = _wwz_block(
+                times[a:b] - tau_i, value[a:b], omega[cols], c, min_neff
+            )
+            wwz_map[i, cols] = z
+            wwa_map[i, cols] = amp
+            neff_map[i, cols] = ne
+            p += k
+
+
+_NUMBA_WWZ_KERNEL: Any = None
+
+
+def _numba_wwz_kernel() -> Any:
+    """Lazily compile (once) and cache the numba WWZ kernel.
+
+    One ``prange`` iteration per ``(tau, frequency)`` cell: a binary search for
+    the cell's point window (the same nearest-datum-anchored radius as the
+    NumPy path), then a single pass accumulating the eleven weighted sums, then
+    Foster's closed-form 3x3 solve exactly as :func:`_wwz_block` does it. The
+    two CPU tiers therefore differ only in summation order (round-off).
+    """
+    global _NUMBA_WWZ_KERNEL
+    if _NUMBA_WWZ_KERNEL is not None:
+        return _NUMBA_WWZ_KERNEL
+    from numba import njit, prange
+
+    @njit(parallel=True, cache=True, fastmath=False)  # pragma: no cover - njit
+    def _kernel(  # type: ignore[no-untyped-def]
+        times,
+        value,
+        tau,
+        d_min,
+        omega,
+        c,
+        min_neff,
+        det_floor,
+        cut,
+        wwz_map,
+        wwa_map,
+        neff_map,
+    ):
+        n = times.shape[0]
+        nt = tau.shape[0]
+        nf = omega.shape[0]
+        for cell in prange(nt * nf):
+            i = cell // nf
+            j = cell - i * nf
+            om = omega[j]
+            tau_i = tau[i]
+            radius = math.sqrt(d_min[i] * d_min[i] + cut / (c * om * om))
+            # First index with times >= tau - radius ...
+            edge = tau_i - radius
+            lo = 0
+            hi = n
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if times[mid] < edge:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            start = lo
+            # ... and first index with times > tau + radius.
+            edge = tau_i + radius
+            hi = n
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if times[mid] <= edge:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            stop = lo
+
+            sw = 0.0
+            sw2 = 0.0
+            swc = 0.0
+            sws = 0.0
+            swcc = 0.0
+            swcs = 0.0
+            swss = 0.0
+            swx = 0.0
+            swcx = 0.0
+            swsx = 0.0
+            swxx = 0.0
+            for a in range(start, stop):
+                arg = om * (times[a] - tau_i)
+                w = math.exp(-c * arg * arg)
+                ca = math.cos(arg)
+                sa = math.sin(arg)
+                x = value[a]
+                wc = w * ca
+                ws = w * sa
+                wx = w * x
+                sw += w
+                sw2 += w * w
+                swc += wc
+                sws += ws
+                swcc += wc * ca
+                swcs += wc * sa
+                swss += ws * sa
+                swx += wx
+                swcx += wc * x
+                swsx += ws * x
+                swxx += wx * x
+
+            safe_w = sw if sw > 0.0 else 1.0
+            n_eff = sw * sw / sw2 if sw2 > 0.0 else 0.0
+            s12 = swc / safe_w
+            s13 = sws / safe_w
+            s22 = swcc / safe_w
+            s23 = swcs / safe_w
+            s33 = swss / safe_w
+            b1 = swx / safe_w
+            b2 = swcx / safe_w
+            b3 = swsx / safe_w
+            xx = swxx / safe_w
+            a11 = s22 * s33 - s23 * s23
+            a12 = s13 * s23 - s12 * s33
+            a13 = s12 * s23 - s13 * s22
+            a22 = s33 - s13 * s13
+            a23 = s12 * s13 - s23
+            a33 = s22 - s12 * s12
+            det = a11 + s12 * a12 + s13 * a13
+            safe_det = det if det > det_floor else 1.0
+            y1 = (a11 * b1 + a12 * b2 + a13 * b3) / safe_det
+            y2 = (a12 * b1 + a22 * b2 + a23 * b3) / safe_det
+            y3 = (a13 * b1 + a23 * b2 + a33 * b3) / safe_det
+            ydotb = y1 * b1 + y2 * b2 + y3 * b3
+            v_y = ydotb - b1 * b1
+            if v_y < 0.0:
+                v_y = 0.0
+            v_resid = xx - ydotb
+            neff_map[i, j] = n_eff
+            if n_eff > min_neff and det > det_floor and v_resid > 0.0:
+                wwz_map[i, j] = (n_eff - 3.0) * v_y / (2.0 * v_resid)
+                wwa_map[i, j] = math.hypot(y2, y3)
+            else:
+                wwz_map[i, j] = np.nan
+                wwa_map[i, j] = np.nan
+
+    _NUMBA_WWZ_KERNEL = _kernel
+    return _kernel
+
+
+def _numba_available() -> bool:
+    """Whether the multicore tier can run here (the ``[fast]`` extra)."""
+    return has_module("numba")
+
+
+def _resolve_backend(backend: str) -> str:
+    """``"auto"``/``"cpu"`` -> the fastest CPU tier; ``"numba"``/``"numpy"`` as is."""
+    name = normalize_backend(backend)
+    if name in ("auto", "cpu"):
+        return "numba" if _numba_available() else "numpy"
+    if name == "numpy":
+        return "numpy"
+    if name == "numba":
+        if not _numba_available():
+            raise BackendUnavailableError(
+                "wwz: backend 'numba' needs numba (pip install 'cuperiod[fast]')"
+            )
+        return "numba"
+    raise BackendUnavailableError(
+        f"wwz: unknown backend {backend!r}; choose from {_BACKENDS} (WWZ runs on "
+        "the CPU only)"
     )
 
 
@@ -248,14 +503,20 @@ class WWZResult:
         Time baseline in days.
     meta : Mapping
         Run provenance under the ``"wwz"`` key (``c``, ``min_neff``, ``n_tau``,
-        whether the automatic grid was capped, whether the axes were supplied)
-        plus metadata carried from the light curve.
+        the CPU ``backend`` that ran, whether the automatic grid was capped,
+        whether the axes were supplied) plus metadata carried from the light
+        curve.
 
     Notes
     -----
     Large ``wwz`` means "a coherent sinusoid of this frequency was present near
     this epoch", but *only* relative to the rest of the map — see the module
     docstring on why the nominal F-distribution does not apply.
+
+    The ridge is spelled as on :class:`cuperiod.SlidingPeriodogram`:
+    :attr:`peak_frequency`, :attr:`peak_period` (and :attr:`peak_wwa`) are
+    arrays, and ``to_dict(include_map=True)`` adds the 2-D maps, so code
+    written against one time-frequency map works on the other.
     """
 
     frequency: FloatArray
@@ -293,24 +554,28 @@ class WWZResult:
         """Fractional frequency resolution ``sqrt(2c)`` (15.9% by default)."""
         return math.sqrt(2.0 * self.c)
 
-    def _peak_indices(self) -> list[int]:
+    def _peak_indices(self) -> IntArray:
         """Column of the largest WWZ per ``tau``; ``-1`` for a fully masked row."""
-        out: list[int] = []
-        for row in self.wwz:
-            finite = np.isfinite(row)
-            out.append(int(np.nanargmax(row)) if finite.any() else -1)
-        return out
+        finite = np.isfinite(self.wwz)
+        score = np.where(finite, self.wwz, -np.inf)
+        idx = np.asarray(np.argmax(score, axis=1), dtype=np.int64)
+        idx[~finite.any(axis=1)] = -1
+        return idx
 
+    @cached_property
     def peak_frequency(self) -> FloatArray:
         """Per-``tau`` ridge frequency in cycles/day (NaN on a masked row).
 
         The largest WWZ cell of each row, parabolically refined against its two
         neighbours when the peak is interior. The refinement uses the *local*
-        grid spacing, which is what the geometric default frequency axis needs.
+        grid spacing, which is what the geometric default frequency axis needs,
+        and steps toward the neighbour the parabola leans to, so an axis given
+        in descending order (``frequency=1/periods``) refines the same way as
+        its ascending copy. Computed once and cached read-only.
         """
         nf = int(self.frequency.size)
         out = np.full(int(self.tau.size), np.nan, dtype=np.float64)
-        for i, j in enumerate(self._peak_indices()):
+        for i, j in enumerate(self._peak_indices().tolist()):
             if j < 0:
                 continue
             f_best = float(self.frequency[j])
@@ -320,34 +585,42 @@ class WWZResult:
                     float(self.wwz[i, j]),
                     float(self.wwz[i, j + 1]),
                 )
+                # ``offset`` counts index steps; the signed spacing to the
+                # neighbour it leans to converts it to cycles/day on either
+                # axis direction (an unsigned one moved a descending axis's
+                # ridge the wrong way).
                 neighbor = j + 1 if offset >= 0.0 else j - 1
-                step = abs(float(self.frequency[neighbor]) - float(self.frequency[j]))
-                f_best += offset * step
+                step = float(self.frequency[neighbor]) - float(self.frequency[j])
+                f_best += abs(offset) * step
             out[i] = f_best
+        out.setflags(write=False)
         return out
 
+    @property
     def peak_period(self) -> FloatArray:
-        """Per-``tau`` ridge period in days (``1/peak_frequency()``)."""
+        """Per-``tau`` ridge period in days (``1/peak_frequency``)."""
         with np.errstate(divide="ignore", invalid="ignore"):
-            return np.asarray(1.0 / self.peak_frequency(), dtype=np.float64)
+            return np.asarray(1.0 / self.peak_frequency, dtype=np.float64)
 
+    @cached_property
     def peak_wwa(self) -> FloatArray:
         """Semi-amplitude at each ``tau``'s ridge cell (NaN on a masked row).
 
         Read at the peak *cell*, not at the parabolically refined frequency —
         the amplitude varies far more slowly across the window's resolution
-        element than the statistic does.
+        element than the statistic does. Computed once and cached read-only.
         """
         out = np.full(int(self.tau.size), np.nan, dtype=np.float64)
-        for i, j in enumerate(self._peak_indices()):
+        for i, j in enumerate(self._peak_indices().tolist()):
             if j >= 0:
                 out[i] = float(self.wwa[i, j])
+        out.setflags(write=False)
         return out
 
     def period_trend(self) -> tuple[float, float]:
         """Rough fractional period drift from the ridge, ``((dP/dt)/P, error)``.
 
-        Fits an unweighted straight line to :meth:`peak_frequency` against
+        Fits an unweighted straight line to :attr:`peak_frequency` against
         ``tau - mean(tau)`` over the rows that produced a ridge at all. A slope
         ``s`` (cycles/day per day) is a fractional frequency drift ``s/f_bar``,
         so the fractional *period* rate is ``(dP/dt)/P = -s/f_bar`` in 1/day
@@ -359,7 +632,10 @@ class WWZResult:
         pdot_over_p : float
             Fractional period-change rate (dP/dt)/P in 1/day.
         pdot_over_p_err : float
-            Its standard error, from the scatter of the ridge about the line.
+            Its standard error, from the scatter of the ridge about the line
+            with the degrees of freedom counted in *independent windows*
+            rather than in taus (see Notes); ``inf`` when the ridge spans too
+            few windows to constrain a slope at all.
 
         Raises
         ------
@@ -369,16 +645,29 @@ class WWZResult:
         Notes
         -----
         A rough *exploratory diagnostic*, exactly as
-        :meth:`cuperiod.SlidingPeriodogram.period_trend` is, and with the same
-        caveats sharpened: WWZ windows at neighbouring ``tau`` overlap unless
-        the spacing exceeds a few ``sigma_t``, so consecutive ridge points are
-        positively correlated and the quoted error is optimistic; and a star
-        that *wanders* has no meaningful linear drift to fit in the first place
-        — which is usually the very thing the map was made to show. For a
-        number to publish, localize with :func:`cuperiod.pdot_search` and
-        measure with :func:`cuperiod.phase_track`.
+        :meth:`cuperiod.SlidingPeriodogram.period_trend` is. WWZ windows at
+        neighbouring ``tau`` overlap unless the spacing exceeds a few
+        ``sigma_t``, so consecutive ridge points are strongly correlated: at
+        the ``c = 0.001`` convention (``sigma_t = 3.56 P``) the default 50 taus
+        over a few-thousand-day run hold only a handful of independent windows.
+        Treating them as independent made the error fall as ``1/sqrt(n_tau)``
+        while the real scatter stayed put (about 4x too small on constant-period
+        light curves). The error therefore uses
+
+            n_ind = min(n, 1 + span / (2*sqrt(pi)*sigma_t)),
+            var(slope) = RSS / ((n_ind - 2) * sum(x^2)),
+
+        the integral scale of the overlap of two Gaussian windows
+        (``2*sqrt(pi)*sigma_t``, with ``sigma_t`` evaluated at the mean ridge
+        period) counting the independent windows along the ``span`` of the
+        taus. It is identical to the ordinary formula when the windows do not
+        overlap, and independent of ``n_tau`` when they do. A star that
+        *wanders* has no meaningful linear drift to fit in the first place —
+        which is usually the very thing the map was made to show. For a number
+        to publish, localize with :func:`cuperiod.pdot_search` and measure
+        with :func:`cuperiod.phase_track`.
         """
-        freq = self.peak_frequency()
+        freq = self.peak_frequency
         ok = np.isfinite(freq)
         n = int(np.count_nonzero(ok))
         if n < 3:
@@ -396,12 +685,21 @@ class WWZResult:
             )
         slope = float(np.dot(x, y - f_bar)) / sxx
         resid = y - (f_bar + slope * x)
-        variance = float(np.dot(resid, resid)) / (n - 2)
+        sigma_t = self.sigma_t_over_p / f_bar
+        span = float(np.max(x) - np.min(x))
+        n_ind = min(float(n), 1.0 + span / (2.0 * math.sqrt(math.pi) * sigma_t))
+        if n_ind <= 2.0:
+            return -slope / f_bar, math.inf
+        variance = float(np.dot(resid, resid)) / (n_ind - 2.0)
         slope_err = math.sqrt(variance / sxx)
         return -slope / f_bar, slope_err / f_bar
 
-    def to_dict(self, *, include_maps: bool = False) -> dict[str, Any]:
-        """Serialize to a plain dict (the ridge always; the 2-D maps optional)."""
+    def to_dict(self, *, include_map: bool = False) -> dict[str, Any]:
+        """Serialize to a plain dict (the ridge always; the 2-D maps optional).
+
+        ``include_map=True`` adds ``frequency`` and the ``wwz``/``wwa``/``n_eff``
+        maps, the same keyword as :meth:`cuperiod.SlidingPeriodogram.to_dict`.
+        """
         nt, nf = self.shape
         out: dict[str, Any] = {
             "c": self.c,
@@ -412,11 +710,11 @@ class WWZResult:
             "n_samples": self.n_samples,
             "baseline": self.baseline,
             "tau": self.tau.tolist(),
-            "peak_frequency": self.peak_frequency().tolist(),
-            "peak_period": self.peak_period().tolist(),
-            "peak_wwa": self.peak_wwa().tolist(),
+            "peak_frequency": self.peak_frequency.tolist(),
+            "peak_period": self.peak_period.tolist(),
+            "peak_wwa": self.peak_wwa.tolist(),
         }
-        if include_maps:
+        if include_map:
             out["frequency"] = self.frequency.tolist()
             out["wwz"] = self.wwz.tolist()
             out["wwa"] = self.wwa.tolist()
@@ -433,7 +731,8 @@ def wwz(
     c: float = _DEFAULT_C,
     min_neff: float = 3.0,
     columns: ColumnMap | None = None,
-    domain: Domain | None = None,
+    domain: Domain | str | None = None,
+    backend: str = "auto",
 ) -> WWZResult:
     """Weighted Wavelet Z-transform of a single-band light curve (Foster 1996).
 
@@ -451,15 +750,21 @@ def wwz(
     data : various
         The light curve, in any form :func:`cuperiod.to_input` accepts.
         Single-band only. Per-point errors are ignored (the weights are the
-        wavelet window).
+        wavelet window), so a row whose error is missing, zero or negative —
+        the visual estimates of AAVSO-style data — is *kept*, unlike in the
+        error-weighted periodograms; only rows with a non-finite time or value
+        are dropped.
     frequency : array-like, optional
-        Trial frequencies in cycles/day, used verbatim. ``None`` builds a
-        geometric grid from ``2/baseline`` to the pseudo-Nyquist frequency,
-        stepped at a quarter of the local resolution ``sqrt(2c)*f`` and capped
-        at 2000 samples (recorded as ``grid_capped`` in ``meta``).
+        Trial frequencies in cycles/day, used verbatim (copied) and in the
+        given order; an ascending or a descending axis (``1/periods``) both
+        work, while an unordered one leaves the ridge's parabolic refinement
+        meaningless. ``None`` builds a geometric grid from ``2/baseline`` to
+        the pseudo-Nyquist frequency, stepped at a quarter of the local
+        resolution ``sqrt(2c)*f`` and capped at 2000 samples (recorded as
+        ``grid_capped`` in ``meta``).
     tau : array-like, optional
-        Window centres, in the input's time system, used verbatim. ``None``
-        places ``n_tau`` of them uniformly over ``[t_min, t_max]``.
+        Window centres, in the input's time system, used verbatim (copied).
+        ``None`` places ``n_tau`` of them uniformly over ``[t_min, t_max]``.
     n_tau : int, default 50
         Number of automatic window centres (the "time divisions" of VStar and
         PERANSO). Ignored when ``tau`` is given.
@@ -470,11 +775,17 @@ def wwz(
     min_neff : float, default 3.0
         Cells whose ``N_eff`` does not exceed this are masked to NaN. 3.0 is
         the algebraic floor (the fit has three free parameters and ``N_eff-3``
-        appears in the numerator), not a sane analysis floor: 10-20 is a much
-        better practical choice, and the ``n_eff`` map is always returned so
-        the threshold can be revisited without recomputing.
+        appears in the numerator, so a lower value would let negative Z values
+        through), not a sane analysis floor: 10-20 is a much better practical
+        choice, and the ``n_eff`` map is always returned so the threshold can
+        be revisited without recomputing.
     columns, domain
         Passed to :func:`cuperiod.to_input` for table inputs.
+    backend : {"auto", "cpu", "numba", "numpy"}, default "auto"
+        CPU tier. ``"auto"``/``"cpu"`` take the multicore numba kernel when the
+        ``[fast]`` extra is installed and the vectorized NumPy path otherwise;
+        the two agree to round-off. The tier that ran is recorded as
+        ``meta["wwz"]["backend"]``.
 
     Returns
     -------
@@ -484,8 +795,11 @@ def wwz(
     Raises
     ------
     ValueError
-        For a multi-band input, a non-positive ``c``/``n_tau``, or non-finite /
+        For a multi-band input, a non-positive or non-finite ``c``, a
+        ``min_neff`` below 3, a non-positive ``n_tau``, or non-finite /
         non-positive explicit axes.
+    BackendUnavailableError
+        For an unknown ``backend``, or ``"numba"`` without numba installed.
     InsufficientDataError
         Fewer than 20 finite points, no usable baseline, or an automatic
         frequency range that collapsed.
@@ -494,13 +808,21 @@ def wwz(
     --------
     >>> res = cup.wwz((t, mag, err), c=0.001)          # doctest: +SKIP
     >>> res.shape                                      # doctest: +SKIP
-    >>> res.peak_period()[:3]                          # doctest: +SKIP
+    >>> res.peak_period[:3]                            # doctest: +SKIP
     >>> res.period_trend()   # rough (dP/dt)/P, 1/day  # doctest: +SKIP
     """
     from cuperiod.api import to_input
 
-    if c <= 0.0:
-        raise ValueError(f"c must be positive, got {c}")
+    c = float(c)
+    if not (math.isfinite(c) and c > 0.0):
+        raise ValueError(f"c must be positive and finite, got {c}")
+    min_neff = float(min_neff)
+    if not min_neff >= 3.0:  # written so that NaN fails too
+        raise ValueError(
+            f"min_neff must be >= 3 (the algebraic floor: the fit has three "
+            f"free parameters), got {min_neff}"
+        )
+    resolved = _resolve_backend(backend)
 
     lc = to_input(data, columns=columns, domain=domain)
     if isinstance(lc, MultiBandLightCurve):
@@ -508,7 +830,9 @@ def wwz(
             "wwz is single-band; pool or pick a band first (stack the bands "
             "into one LightCurve, or index lc.bands)"
         )
-    work = lc.finite()
+    # The errors are never used, so a missing or non-positive one must not cost
+    # its point: finite() on an error-free copy only drops non-finite time/value.
+    work = replace(lc, error=None).finite()
     n_samples = work.n
     if n_samples < _MIN_POINTS:
         raise InsufficientDataError(
@@ -525,7 +849,8 @@ def wwz(
     if frequency is None:
         freq_values, grid_capped = _auto_frequency(time, baseline, c)
     else:
-        freq_values = np.asarray(frequency, dtype=np.float64).ravel()
+        # A private copy: the frozen result must not alias the caller's array.
+        freq_values = as_float_array(frequency, name="wwz frequency").ravel().copy()
         if freq_values.size == 0:
             raise ValueError("wwz: frequency must hold at least one trial frequency")
         if not bool(np.all(np.isfinite(freq_values))) or bool(
@@ -539,7 +864,7 @@ def wwz(
             np.linspace(t_min, t_max, int(n_tau)), dtype=np.float64
         )
     else:
-        tau_values = np.asarray(tau, dtype=np.float64).ravel()
+        tau_values = as_float_array(tau, name="wwz tau", time=True).ravel().copy()
         if tau_values.size == 0:
             raise ValueError("wwz: tau must hold at least one window centre")
         if not bool(np.all(np.isfinite(tau_values))):
@@ -547,31 +872,43 @@ def wwz(
 
     # -- the map ------------------------------------------------------------------
     # Times are referenced to t_min before differencing: the subtraction is
-    # exact either way, but this keeps the (nf, n) angle matrix free of the
-    # large-absolute-JD magnitudes.
-    dt_all = time - t_min
-    tau_shift = tau_values - t_min
-    value = work.value
-    omega = 2.0 * np.pi * freq_values
+    # exact either way, but this keeps the angle arguments free of the
+    # large-absolute-JD magnitudes. Sorting once lets every cell find its own
+    # point window by binary search.
+    order = np.argsort(time, kind="stable")
+    times = np.ascontiguousarray(time[order] - t_min)
+    tau_shift = np.ascontiguousarray(tau_values - t_min)
+    # Centred: WWZ/WWA are exactly invariant to a constant offset (the constant
+    # trial function absorbs it), and the sums would otherwise carry the
+    # squared mean into the <x|x> - y.b cancellation. A constant series is made
+    # exactly zero, so round-off in its mean cannot fake a variation.
+    raw = work.value[order]
+    if float(np.ptp(raw)) == 0.0:
+        value = np.zeros_like(raw)
+    else:
+        value = np.ascontiguousarray(raw - float(np.mean(raw)))
+    omega = np.ascontiguousarray(2.0 * np.pi * freq_values)
+    d_min = _nearest_distance(times, tau_shift)
+    cut = float(_WINDOW_CUT)
     nt, nf = int(tau_values.size), int(freq_values.size)
     wwz_map = np.empty((nt, nf), dtype=np.float64)
     wwa_map = np.empty((nt, nf), dtype=np.float64)
     neff_map = np.empty((nt, nf), dtype=np.float64)
-    chunk = max(1, min(nf, _CHUNK_ELEMS // max(1, n_samples)))
-    for i in range(nt):
-        dt = dt_all - float(tau_shift[i])
-        for start in range(0, nf, chunk):
-            stop = min(start + chunk, nf)
-            z, a, ne = _wwz_block(dt, value, omega[start:stop], c, min_neff)
-            wwz_map[i, start:stop] = z
-            wwa_map[i, start:stop] = a
-            neff_map[i, start:stop] = ne
+    maps = (wwz_map, wwa_map, neff_map)
+    if resolved == "numba":
+        kernel = _numba_wwz_kernel()
+        kernel(
+            times, value, tau_shift, d_min, omega, c, min_neff, _DET_FLOOR, cut, *maps
+        )
+    else:
+        _numpy_maps(times, value, tau_shift, d_min, omega, c, min_neff, cut, maps)
 
     meta = {
         "wwz": {
             "c": c,
             "min_neff": min_neff,
             "n_tau": nt,
+            "backend": resolved,
             "grid_capped": grid_capped,
             "explicit_frequency": frequency is not None,
             "explicit_tau": tau is not None,
@@ -586,7 +923,7 @@ def wwz(
         wwz=wwz_map,
         wwa=wwa_map,
         n_eff=neff_map,
-        c=float(c),
+        c=c,
         n_samples=n_samples,
         baseline=baseline,
         meta=meta,

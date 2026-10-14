@@ -47,11 +47,15 @@ from typing import Any
 import numpy as np
 from pydantic_settings import BaseSettings
 
-from cuperiod.core._typing import FloatArray
+from cuperiod.core._typing import FloatArray, IntArray
 from cuperiod.core.columns import ColumnMap, Domain
 from cuperiod.core.errors import InsufficientDataError
 from cuperiod.core.grid import GridSpec
-from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
+from cuperiod.core.lightcurve import (
+    LightCurve,
+    MultiBandLightCurve,
+    raise_if_unusable,
+)
 from cuperiod.core.result import ObjectiveSense, Periodogram
 from cuperiod.methods.base import get_method
 from cuperiod.pdot.scan import (
@@ -89,8 +93,10 @@ def _window_starts(
 
     Windows start at ``t_min + k*step`` for as long as they fit inside the
     baseline. If that leaves more than half a step of the tail uncovered, one
-    final window ending exactly at ``t_max`` is appended, so the last epochs of
-    the light curve are never silently dropped.
+    final window ending exactly at ``t_max`` is appended, so at most half a
+    step of the last epochs is left out of the map (none when the windows tile
+    the baseline exactly, as the default window and step do; see
+    :func:`_window_end` for the rounding of that last edge).
     """
     span = t_max - t_min
     tiny = 1e-9 * max(window, 1.0)
@@ -116,8 +122,17 @@ def _band_grid(f_center: float, window: float) -> GridSpec:
 
     Mirrors the window construction of :func:`cuperiod.pdot_search` with the
     *window* (not the baseline) as the resolution scale: half-width
-    ``6/window`` cycles/day, step ``1/(10*window)``.
+    ``6/window`` cycles/day, step ``1/(10*window)``. A period longer than the
+    window (under one cycle per window) is refused: nothing can be fitted in
+    such a window, and past ``20*window`` the clipped band would not even
+    contain ``f_center`` any more.
     """
+    if not f_center * window >= 1.0 - 1e-12:  # period == window rounds either way
+        raise ValueError(
+            f"sliding_periodogram: period={1.0 / f_center} d is too long for this "
+            f"window ({window} d holds under one cycle); lengthen window= or drop "
+            "period="
+        )
     df = 1.0 / (_BAND_SAMPLES_PER_PEAK * window)
     k = max(1, int(math.ceil(_BAND_RAYLEIGH / window / df)))
     values = f_center + df * np.arange(-k, k + 1, dtype=np.float64)
@@ -149,6 +164,25 @@ def _shared_grid(f_lo: float, f_hi: float, window: float) -> tuple[GridSpec, boo
         df = (f_hi - f_lo) / (nf - 1)
     values = f_lo + df * np.arange(nf, dtype=np.float64)
     return GridSpec(kind="frequency", values=values, uniform=True), coarsened
+
+
+def _window_end(lo: float, window: float, t_max: float, last: bool) -> float:
+    """Right edge of the window starting at ``lo``.
+
+    ``lo + window``, except that the final window, which is meant to reach
+    ``t_max`` (it is closed on the right for exactly that reason), is snapped
+    onto ``t_max`` when the sum falls short of it by rounding alone: at JD
+    magnitudes ``t_min + k*step + window`` lands one ulp below ``t_max`` in
+    about 2% of light curves, which used to drop the final observation. A
+    genuine shortfall (the tail of at most half a step that the placement
+    leaves uncovered by design) is not stretched over.
+    """
+    hi = lo + window
+    if last and hi < t_max:
+        tol = max(1e-9 * max(window, 1.0), 4.0 * float(np.spacing(abs(t_max))))
+        if t_max - hi <= tol:
+            return t_max
+    return hi
 
 
 def _cut(lc: LightCurve, lo: float, hi: float, closed: bool) -> LightCurve:
@@ -223,6 +257,9 @@ class SlidingPeriodogram:
         Run provenance under the ``"sliding_periodogram"`` key (window/step, the
         skipped-window count, whether the grid was coarsened) plus metadata
         carried from the light curve.
+    n_window_points : numpy.ndarray or None
+        Points in each row's window (pooled across bands), aligned with
+        ``t_mid``. ``None`` only on a result built by hand without it.
     """
 
     method: str
@@ -239,6 +276,7 @@ class SlidingPeriodogram:
     n_samples: int
     baseline: float
     meta: Mapping[str, Any] = field(default_factory=dict)
+    n_window_points: IntArray | None = None
 
     @property
     def n_windows(self) -> int:
@@ -274,24 +312,36 @@ class SlidingPeriodogram:
         -------
         Periodogram
             The window's spectrum, so the usual peak finding, plotting and
-            serialization apply. ``n_samples``/``baseline`` are the *run's*
-            values; the window's identity is in ``meta`` (``window_index``,
-            ``t_start``, ``window``).
+            serialization apply. Its ``baseline`` is the *window* length and its
+            ``n_samples`` the window's point count: the Rayleigh resolution of
+            a window row is ``1/window``, and peak separation in
+            :meth:`~cuperiod.Periodogram.best_periods` is measured in it (with
+            the run's baseline, 12x longer by default, the main peak's own
+            sidelobes passed as independent periods). The window's identity is
+            in ``meta`` (``window_index``, ``t_start``, ``window``), with the
+            run's values as ``run_baseline`` and ``run_n_samples``.
         """
         meta = {
             **dict(self.meta),
             "window_index": int(i),
             "t_start": float(self.t_start[i]),
             "window": self.window,
+            "run_baseline": self.baseline,
+            "run_n_samples": self.n_samples,
         }
+        n_points = (
+            self.n_samples
+            if self.n_window_points is None
+            else int(self.n_window_points[i])
+        )
         return Periodogram.from_spectrum(
             method=self.method,
             backend=self.backend,
             frequency=self.frequency,
             power=self.power[i],
             objective_sense=self.objective_sense,
-            n_samples=self.n_samples,
-            baseline=self.baseline,
+            n_samples=n_points,
+            baseline=self.window,
             meta=meta,
         )
 
@@ -362,6 +412,8 @@ class SlidingPeriodogram:
             "peak_frequency": self.peak_frequency.tolist(),
             "peak_power": self.peak_power.tolist(),
         }
+        if self.n_window_points is not None:
+            out["n_window_points"] = self.n_window_points.tolist()
         if include_map:
             out["frequency"] = self.frequency.tolist()
             out["power"] = self.power.tolist()
@@ -380,7 +432,7 @@ def sliding_periodogram(
     backend: str = "auto",
     min_window_points: int = 20,
     columns: ColumnMap | None = None,
-    domain: Domain | None = None,
+    domain: Domain | str | None = None,
 ) -> SlidingPeriodogram:
     """Evaluate a periodogram on a window that slides along the light curve.
 
@@ -401,23 +453,31 @@ def sliding_periodogram(
         represent); use :func:`cuperiod.phase_track` /
         :func:`cuperiod.fit_ephemeris` for transit-timing style work.
     window : float, optional
-        Window length in days. ``None`` uses ``baseline/12``.
+        Window length in days (positive and finite). ``None`` uses
+        ``baseline/12``.
     step : float, optional
-        Spacing of window *starts* in days. ``None`` uses ``window/2`` (50%
-        overlap). ``step >= window`` gives disjoint windows.
+        Spacing of window *starts* in days (positive and finite). ``None`` uses
+        ``window/2`` (50% overlap). ``step >= window`` gives disjoint windows.
     period : float, optional
         Center a narrow frequency band on ``1/period`` instead of scanning the
         method's full default range: half-width ``6/window`` cycles/day, step
         ``1/(10*window)``. Much cheaper, and the right choice when you already
-        know roughly where the signal is.
+        know roughly where the signal is. Must be positive, finite and no
+        longer than the window (a window has to hold at least one cycle).
     grid : GridSpec, optional
         Explicit shared frequency grid, overriding both constructions. A uniform
-        frequency grid keeps the fast NUFFT path for GLS.
+        frequency grid keeps the fast NUFFT path for GLS. The map's axis is the
+        grid's frequencies in ascending order, which is the order every row is
+        computed in (so a period grid's columns run from its longest period to
+        its shortest).
     method_settings : pydantic settings, optional
         The wrapped method's own settings (e.g. ``PDMSettings(n_bins=15)``).
         Per-window false-alarm probabilities are switched off.
     backend : str, default "auto"
-        Backend request, resolved once and reused for every window.
+        Backend request, resolved once and reused for every window. ``"auto"``
+        defers to ``method_settings.backend`` (and its
+        ``CUPERIOD_<METHOD>_BACKEND`` override), as in
+        :func:`cuperiod.periodogram`.
     min_window_points : int, default 20
         Windows holding fewer points (pooled across bands) are skipped; so are
         windows the method itself rejects as too sparse. The count lands in
@@ -434,7 +494,8 @@ def sliding_periodogram(
     ------
     ValueError
         For an unsupported method, a multi-band input to a single-band method,
-        or non-positive ``window``/``step``/``period``.
+        a non-positive or non-finite ``window``/``step``/``period``, or a
+        ``period`` longer than the window.
     InsufficientDataError
         If the input has no usable baseline, the window does not fit in it, or
         fewer than two windows survive the point-count cuts.
@@ -458,9 +519,12 @@ def sliding_periodogram(
             "with phase_track / fit_ephemeris"
         )
     msettings = m.coerce_settings(method_settings)
-    resolved = m.resolve_backend(backend)
+    resolved = m.resolve_backend_for(backend, msettings)
 
     lc = to_input(data, columns=columns, domain=domain)
+    # A placeholder error column (all 0 or NaN) would otherwise empty the curve
+    # in finite() below and be reported as 'no finite points'.
+    raise_if_unusable(lc, "sliding_periodogram")
     work: LightCurve | MultiBandLightCurve
     if isinstance(lc, MultiBandLightCurve):
         if not m.supports_multiband:
@@ -479,12 +543,13 @@ def sliding_periodogram(
     if baseline <= 0.0:
         raise InsufficientDataError("sliding_periodogram: no usable time baseline")
 
+    # A bare `x <= 0` lets NaN through and inf on to a division or a floor.
     win = baseline / _WINDOWS_PER_BASELINE if window is None else float(window)
-    if win <= 0.0:
-        raise ValueError(f"window must be positive, got {win}")
+    if not (math.isfinite(win) and win > 0.0):
+        raise ValueError(f"window must be positive and finite, got {win}")
     stride = 0.5 * win if step is None else float(step)
-    if stride <= 0.0:
-        raise ValueError(f"step must be positive, got {stride}")
+    if not (math.isfinite(stride) and stride > 0.0):
+        raise ValueError(f"step must be positive and finite, got {stride}")
 
     row_settings = _row_settings(msettings)
 
@@ -493,9 +558,10 @@ def sliding_periodogram(
     if grid is not None:
         fgrid = grid
     elif period is not None:
-        if period <= 0.0:
-            raise ValueError(f"period must be positive, got {period}")
-        fgrid = _band_grid(1.0 / period, win)
+        p = float(period)
+        if not (math.isfinite(p) and p > 0.0):
+            raise ValueError(f"period must be positive and finite, got {p}")
+        fgrid = _band_grid(1.0 / p, win)
     else:
         bounds = _default_grid(m, work, row_settings).frequency
         if bounds.size == 0:
@@ -503,7 +569,11 @@ def sliding_periodogram(
                 f"sliding_periodogram: {m.name} produced an empty default grid"
             )
         fgrid, coarsened = _shared_grid(float(bounds[0]), float(bounds[-1]), win)
-    frequency = np.asarray(fgrid.frequency, dtype=np.float64)
+    # Every row comes back from Periodogram.from_spectrum sorted by ascending
+    # frequency, so that is the axis the rows live on. Taking the grid in its
+    # stored order instead mirrored every row of a descending grid onto its axis
+    # (GridSpec now refuses descending grids; sorting keeps the invariant local).
+    frequency = np.sort(np.asarray(fgrid.frequency, dtype=np.float64))
     if frequency.size < 2:
         raise InsufficientDataError(
             f"sliding_periodogram: the shared grid has {frequency.size} samples"
@@ -515,12 +585,14 @@ def sliding_periodogram(
     rows: list[FloatArray] = []
     t_mids: list[float] = []
     used_starts: list[float] = []
+    used_points: list[int] = []
     n_skipped = 0
     backend_actual = resolved
     last = int(starts.size) - 1
     for k in range(starts.size):
         lo = float(starts[k])
-        sliced, n_points = _slice_window(work, lo, lo + win, k == last)
+        hi = _window_end(lo, win, t_max, k == last)
+        sliced, n_points = _slice_window(work, lo, hi, k == last)
         if sliced is None or n_points < min_window_points:
             n_skipped += 1
             continue
@@ -541,6 +613,7 @@ def sliding_periodogram(
         rows.append(np.asarray(pg.power, dtype=np.float64))
         t_mids.append(weighted_epoch(sliced))
         used_starts.append(lo)
+        used_points.append(n_points)
     if len(rows) < 2:
         raise InsufficientDataError(
             f"sliding_periodogram: only {len(rows)} usable window(s) "
@@ -563,8 +636,11 @@ def sliding_periodogram(
                 float(score[i, j - 1]), float(score[i, j]), float(score[i, j + 1])
             )
             # Local step: exact on a uniform grid, sane on a user-supplied one.
+            # Signed toward the neighbour the parabola leans to (``offset``
+            # counts index steps), so it stays right whatever the axis order.
             neighbor = j + 1 if offset >= 0.0 else j - 1
-            f_best += offset * abs(float(frequency[neighbor]) - float(frequency[j]))
+            step_f = float(frequency[neighbor]) - float(frequency[j])
+            f_best += abs(offset) * step_f
         peak_frequency[i] = f_best
         peak_power[i] = float(power[i, j])
 
@@ -596,6 +672,7 @@ def sliding_periodogram(
         n_samples=n_samples,
         baseline=baseline,
         meta=meta,
+        n_window_points=np.asarray(used_points, dtype=np.int64),
     )
 
 

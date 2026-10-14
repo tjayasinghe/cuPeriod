@@ -58,6 +58,7 @@ from typing import Any, Final
 
 import numpy as np
 
+from cuperiod.core._coerce import as_float_array
 from cuperiod.core._typing import FloatArray
 from cuperiod.pdot.result import DAYS_PER_MYR, SECONDS_PER_YEAR
 
@@ -276,17 +277,51 @@ def pdot_from_mass_transfer(
 # --- sensitivity --------------------------------------------------------------
 
 
+#: Smallest singular value, relative to the largest, of a weighted design that
+#: still counts as full rank. Below it a coefficient is not constrained by the
+#: sampling at all (a cycle commensurate with a regular cadence, or one so long
+#: that its cosine and sine are a polynomial over the span), and its floor is
+#: reported as infinite. Generous on purpose: an honest but huge floor -- a
+#: 100-year cycle seen through a quartic -- sits near 1e-8 and must stay finite.
+_RCOND: Final[float] = 1e-10
+
+
+def _time_unit(dt: FloatArray) -> float:
+    """The time scale the polynomial columns are built in (half the span)."""
+    unit = float(np.max(np.abs(dt))) if dt.size else 0.0
+    return unit if unit > 0.0 and np.isfinite(unit) else 1.0
+
+
 def _design(dt: FloatArray, degree: int, outer_period: float | None) -> FloatArray:
-    cols = [dt**k for k in range(degree + 1)]
+    """Polynomial columns in units of :func:`_time_unit`, then cos/sin.
+
+    Raw ``dt**k`` columns over a decades-long span differ by ``T**4`` in scale,
+    which squares into the normal matrix; scaling time by ``T`` changes the
+    polynomial variances by known factors and the cos/sin ones not at all.
+    """
+    x = dt / _time_unit(dt)
+    cols = [x**k for k in range(degree + 1)]
     if outer_period is not None:
         arg = 2.0 * np.pi * dt / outer_period
         cols += [np.cos(arg), np.sin(arg)]
     return np.column_stack(cols)
 
 
-def _covariance(x: FloatArray, w: FloatArray) -> FloatArray:
-    xtw = x.T * w[None, :]
-    return np.asarray(np.linalg.inv(xtw @ x), dtype=np.float64)
+def _variances(x: FloatArray, w: FloatArray) -> FloatArray:
+    """Diagonal of ``(X^T W X)^-1`` by SVD; ``inf`` where the design is singular.
+
+    Rank deficiency is a statement about the sampling, not an error: a
+    coefficient the epochs cannot separate from the others has an infinite
+    formal error, which is exactly what a planning tool should say.
+    """
+    a = x * np.sqrt(w)[:, None]
+    try:
+        _, sv, vt = np.linalg.svd(a, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return np.full(x.shape[1], np.inf)
+    if not (sv.size == x.shape[1] and sv[-1] > _RCOND * sv[0]):
+        return np.full(x.shape[1], np.inf)
+    return np.asarray(np.sum((vt / sv[:, None]) ** 2, axis=0), dtype=np.float64)
 
 
 @dataclass(frozen=True)
@@ -355,19 +390,25 @@ class PdotSensitivity:
         baseline, which the polynomial partly absorbs, shows a larger floor
         than a short one. The value is the phase-averaged error of the
         semi-amplitude, ``sqrt((var_cos + var_sin)/2)``.
+
+        ``inf`` where the epochs cannot constrain a cycle of that period at
+        all: one commensurate with a regular cadence (an annual cycle in annual
+        timings, whose cosine and sine are then constant), or one so much
+        longer than the baseline that it is a polynomial over the span. NaN for
+        a non-finite or non-positive period.
         """
         p2 = np.atleast_1d(np.asarray(outer_period, dtype=np.float64))
         out = np.empty(p2.shape, dtype=np.float64)
-        for i, value in enumerate(p2):
+        k = self.degree + 1
+        for i, value in enumerate(p2.flat):
             if not np.isfinite(value) or value <= 0.0:
-                out[i] = np.nan
+                out.flat[i] = np.nan
                 continue
-            cov = _covariance(
+            var = _variances(
                 _design(self._dt, self.degree, float(value)), self._weights
             )
-            k = self.degree + 1
-            out[i] = float(np.sqrt(0.5 * (cov[k, k] + cov[k + 1, k + 1])))
-        return float(out[0]) if np.ndim(outer_period) == 0 else out
+            out.flat[i] = float(np.sqrt(0.5 * (var[k] + var[k + 1])))
+        return float(out.flat[0]) if np.ndim(outer_period) == 0 else out
 
     def to_dict(self) -> dict[str, Any]:
         """Flatten the scalars to a plain dict."""
@@ -450,30 +491,54 @@ def detectable_pdot(
     if degree < 1 or degree > 4:
         raise ValueError(f"degree must be between 1 and 4, got {degree}")
     if times is not None:
-        t = np.asarray(times, dtype=np.float64).ravel()
-        t = t[np.isfinite(t)]
+        t = as_float_array(times, name="times", time=True).ravel()
     else:
         if n_timings is None or baseline is None:
             raise ValueError("give either times= or both n_timings= and baseline=")
-        if baseline <= 0.0:
+        if not (np.isfinite(baseline) and baseline > 0.0):
             raise ValueError(f"baseline must be positive, got {baseline}")
         t = np.linspace(0.0, float(baseline), int(n_timings))
+    sigma_in = as_float_array(timing_error, name="timing_error")
+    if sigma_in.ndim == 0:
+        # One error for every point: a bad one is a mistake, not a point to drop.
+        if not (np.isfinite(sigma_in) and sigma_in > 0.0):
+            raise ValueError("timing_error must be positive and finite")
+        sigma = np.full(t.shape, float(sigma_in), dtype=np.float64)
+        keep = np.isfinite(t)
+    else:
+        # One per point: filter epochs and errors together, as ltte_search does,
+        # so a NaN epoch takes its own error with it.
+        sigma = sigma_in.ravel()
+        if sigma.size != t.size:
+            raise ValueError(
+                f"timing_error has {sigma.size} values but there are {t.size} "
+                "timing points (times); give a scalar or one error per point"
+            )
+        keep = np.isfinite(t) & np.isfinite(sigma)
+    t, sigma = t[keep], sigma[keep]
+    if np.any(sigma <= 0.0):
+        raise ValueError("timing_error must be positive and finite")
     if t.size < degree + 2:
         raise ValueError(
             f"need at least {degree + 2} timing points for a degree-{degree} "
             f"ephemeris, got {t.size}"
         )
-    sigma = np.array(
-        np.broadcast_to(np.asarray(timing_error, dtype=np.float64), t.shape),
-        dtype=np.float64,
-    )
-    if np.any(~np.isfinite(sigma) | (sigma <= 0.0)):
-        raise ValueError("timing_error must be positive and finite")
+    # A Vandermonde design has full rank exactly when it has degree+1 distinct
+    # epochs; repeated timings of fewer eclipses cannot separate the terms.
+    distinct = int(np.unique(t).size)
+    if distinct < degree + 1:
+        raise ValueError(
+            f"need at least {degree + 1} distinct epochs for a degree-{degree} "
+            f"ephemeris, got {distinct}"
+        )
     w = 1.0 / (sigma * sigma)
     t_ref = float(np.dot(w, t) / w.sum())
     dt = t - t_ref
-    cov = _covariance(_design(dt, degree, None), w)
-    sigma_c2 = float(np.sqrt(cov[2, 2])) if degree >= 2 else float("inf")
+    # Variances in scaled time, back to days: column k carries unit**-k.
+    unit = _time_unit(dt)
+    var = _variances(_design(dt, degree, None), w)
+    sigma_c1 = float(np.sqrt(var[1])) / unit
+    sigma_c2 = float(np.sqrt(var[2])) / unit**2 if degree >= 2 else float("inf")
     return PdotSensitivity(
         period=float(period),
         timing_error=float(np.sqrt(np.mean(sigma * sigma))),
@@ -481,7 +546,7 @@ def detectable_pdot(
         baseline=float(t.max() - t.min()),
         degree=int(degree),
         sigma_pdot=2.0 * float(period) * sigma_c2,
-        sigma_period=float(period) * float(np.sqrt(cov[1, 1])),
+        sigma_period=float(period) * sigma_c1,
         _dt=dt,
         _weights=w,
     )

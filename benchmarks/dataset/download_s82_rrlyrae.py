@@ -21,6 +21,12 @@ points at:
 
     https://github.com/astroML/astroML-data/tree/main/datasets/S82_RRLyr
 
+The files are read at a fixed commit of that repository (``BASE_URL``), not from
+the moving ``main`` branch, and each is checked against the SHA-256 pinned in
+``SHA256`` on download and when reused from disk (see ``../_download.py``). The
+pinned commit's blobs are byte-identical to the copies behind the committed
+bundle.
+
 Files used (downloaded into benchmarks/data/s82/, gitignored):
 
 * ``table1.tar.gz`` (~1.2 MB) -- one whitespace file per star,
@@ -52,7 +58,6 @@ import argparse
 import gzip
 import sys
 import tarfile
-import urllib.request
 from pathlib import Path
 
 import numpy as np
@@ -62,8 +67,25 @@ DATASET_DIR = Path(__file__).resolve().parent
 CACHE_DIR = DATASET_DIR.parent / "data" / "s82"
 OUTPUT_PARQUET = DATASET_DIR / "s82_rrlyrae.parquet"
 
-BASE_URL = "https://github.com/astroML/astroML-data/raw/main/datasets/S82_RRLyr/"
+# The verified-download helper is shared with the other benchmark download scripts
+# one folder up.
+sys.path.insert(0, str(DATASET_DIR.parent))
+from _download import DownloadError, fetch  # noqa: E402
+
+# astroML-data at commit 869ca28 (2021-06-07; the S82 files last changed in
+# b3e2bb5, 2019-11-13).
+BASE_URL = (
+    "https://github.com/astroML/astroML-data/raw/"
+    "869ca28294159d4c6302c1e63b9402bd54abf29f/datasets/S82_RRLyr/"
+)
 FILES = ("table1.tar.gz", "table2.dat.gz")
+#: SHA-256 of each file, recorded from the copies fetched on 2026-08-13.
+SHA256 = {
+    "table1.tar.gz":
+        "f6e767f6b3713f9024e1a33d530cc054f9decb071483ebc794465c478de6c53a",
+    "table2.dat.gz":
+        "17dfa90d65d2c91b15b21d76f00d7067266058cc9b2885b44d366f464fcb7614",
+}
 
 BANDS = ("u", "g", "r", "i", "z")
 SENTINEL = -99.99
@@ -84,17 +106,16 @@ EXPECTED_FIRST_STAR = {  # band -> (mjd[0], mag[0]) for star 1013184
 
 
 def download(force: bool = False) -> None:
+    """Fetch (or re-verify the cached) archive files; DownloadError on a mismatch."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     for name in FILES:
         target = CACHE_DIR / name
-        if target.exists() and not force:
-            print(f"cached: {target}")
-            continue
         url = BASE_URL + name
-        print(f"downloading {url} ...")
-        with urllib.request.urlopen(url) as resp:
-            target.write_bytes(resp.read())
-        print(f"  -> {target} ({target.stat().st_size:,} bytes)")
+        if fetch(url, target, SHA256[name], force=force):
+            print(f"downloaded {url}")
+            print(f"  -> {target} ({target.stat().st_size:,} bytes, SHA-256 OK)")
+        else:
+            print(f"cached: {target} (SHA-256 OK)")
 
 
 def load_periods() -> pd.DataFrame:
@@ -164,7 +185,10 @@ def main() -> None:
     parser.add_argument("--force-download", action="store_true")
     args = parser.parse_args()
 
-    download(force=args.force_download)
+    try:
+        download(force=args.force_download)
+    except DownloadError as exc:
+        sys.exit(f"FATAL: {exc}")
     periods = load_periods()
     stars = load_light_curves()
     sanity_check(stars)

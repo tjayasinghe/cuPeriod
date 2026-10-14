@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 
 import cuperiod as cup
-from conftest import requires_torch
+from conftest import requires_torch, torch_auto_device
 from cuperiod.methods.mhaov import aov_power
 from synth import synthetic_eclipser, synthetic_sine
 
@@ -55,6 +55,7 @@ def test_tls_torch_matches_numpy() -> None:
 
 
 @requires_torch
+@torch_auto_device
 @pytest.mark.parametrize("method", FREQ_METHODS)
 def test_bonus_torch_recovers_period(method: str) -> None:
     # The portable torch path recovers the period (or a small-integer harmonic —
@@ -111,6 +112,9 @@ def test_mhaov_multiband_torch_honours_precision() -> None:
     assert p32.backend == "torch:cpu"
     assert not np.array_equal(p64.power, p32.power)  # float32 was actually used
     assert p64.best_period() == pytest.approx(p32.best_period(), rel=1e-2)
+    # ...and float32 is a faithful spectrum, not a near-zero one: on these mag-12
+    # bands the un-centred float32 solve used to return a peak F of ~12 against 418.
+    assert float(p32.power.max()) == pytest.approx(float(p64.power.max()), rel=0.05)
 
 
 @requires_torch

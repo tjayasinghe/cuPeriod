@@ -80,6 +80,31 @@ _MIN_PERBAND_POINTS = 3
 #: cannot blow device memory.
 _FLEX_CHUNK_BYTES = 1 << 27
 
+#: The offsets model's per-band weight sums run as one batched finufft transform
+#: (each band's weights zeroed outside the band) up to this many modes ...
+_BATCH_MAX_MODES = 1 << 18
+
+#: ... and while the extra spreading it costs, ``(K - 1) * N`` zero-strength
+#: points, stays within this multiple of the mode count. Survey-sized data
+#: (``N << nf``) gain 1.6-2.5x; between ratios 4 and 8 the two are measured at
+#: break-even, and past them (or past the mode bound) per-band transforms win.
+_BATCH_MAX_SPREAD_RATIO = 4
+
+
+def _is_constant(value: FloatArray) -> bool:
+    """Whether a band's values are all identical (it has no variance at all)."""
+    return bool(value.size) and float(value.max()) == float(value.min())
+
+
+def _bands_use_errors(bands: Sequence[Any]) -> bool:
+    """Whether the contributing bands are weighted: only when *every* band has errors.
+
+    Mixing weighted and unweighted bands would put an error-less band's statistic
+    in squared magnitudes next to the others' dimensionless chi-squared, which
+    effectively drops it, so a mix runs every band unweighted (as astropy does).
+    """
+    return all(lc.error is not None for lc in bands)
+
 
 @dataclass(frozen=True)
 class _MBPrep:
@@ -92,7 +117,10 @@ class _MBPrep:
     normal-matrix scale matters (the flex model's un-traced ridge); ``y`` has each
     band's weighted mean removed, so the per-band data sums need no explicit
     offset terms and ``chi2_ref`` — the weighted variance about the per-band
-    means — is the reference chi-squared of the offsets-only null model.
+    means — is the reference chi-squared of the offsets-only null model. An
+    exactly constant band is centered to exact zeros (its float mean can sit an
+    ulp off the constant), so all-constant input has ``chi2_ref == 0`` and maps to
+    zero power rather than to a ratio of rounding residues.
     """
 
     tau: FloatArray
@@ -124,7 +152,7 @@ def _prep_multiband(mblc: MultiBandLightCurve, settings: GLSSettings) -> _MBPrep
         raise InsufficientDataError("GLS multiband: no usable time baseline")
 
     value = np.concatenate([lc.value for _, lc in bands])
-    use_errors = all(lc.error is not None for _, lc in bands)
+    use_errors = _bands_use_errors([lc for _, lc in bands])
     if use_errors:
         error = np.concatenate([lc.error for _, lc in bands])  # type: ignore[misc]
         w = 1.0 / (error * error)
@@ -142,7 +170,10 @@ def _prep_multiband(mblc: MultiBandLightCurve, settings: GLSSettings) -> _MBPrep
         stop = start + lc.n
         sl = slice(start, stop)
         wk = float(w[sl].sum())
-        y[sl] -= float(np.dot(w[sl], value[sl])) / wk
+        if _is_constant(value[sl]):
+            y[sl] = 0.0
+        else:
+            y[sl] -= float(np.dot(w[sl], value[sl])) / wk
         slices.append(sl)
         band_weight.append(wk)
         start = stop
@@ -234,11 +265,19 @@ def _offsets_power_nufft(
 ) -> FloatArray:
     """Offsets-model power via NUFFT band sums (finufft on CPU, cufinufft on GPU).
 
-    ``K + 2`` type-1 transforms: per band the weight sums ``(C_k, S_k)``, one
-    global transform of the band-centered data strengths ``w*y``, and one global
-    doubled-grid transform of the weights. On the cufinufft path all inputs move
-    to the device once and the assembly stays there; only the final power crosses
-    back to the host.
+    ``K + 2`` type-1 trig sums: per band the weight sums ``(C_k, S_k)``, one
+    global sum of the band-centered data strengths ``w*y``, and one global
+    doubled-grid sum of the weights. On finufft the first ``K + 1`` share the
+    frequency grid, so they run as **one** batched transform over the stacked
+    points, each band's row zeroed outside the band (a zero strength spreads
+    nothing): per-plan setup, which dominates when ``N << nf``, is paid twice
+    instead of ``K + 2`` times. The batch spreads ``(K - 1) * N`` extra
+    zero points, so it is used only while that stays small next to the grid
+    (:data:`_BATCH_MAX_SPREAD_RATIO`) and the grid is not huge
+    (:data:`_BATCH_MAX_MODES`); past those bounds the per-band transforms are
+    as fast. On the cufinufft path (per-band transforms, so an engine's plan
+    cache keys stay one per band count) all inputs move to the device once and
+    the assembly stays there; only the final power crosses back to the host.
     """
     tau: Any = prep.tau
     w: Any = prep.w
@@ -252,11 +291,27 @@ def _offsets_power_nufft(
     else:
         xp = np
 
+    n_bands = len(prep.slices)
     band_cs: list[tuple[Any, Any]] = []
-    for sl in prep.slices:
-        sw_k = _nufft_sums(tau[sl], w[sl][None, :], f0, df, nf, backend, eps, engine)[0]
-        band_cs.append((sw_k.real, sw_k.imag))
-    swy = _nufft_sums(tau, wy[None, :], f0, df, nf, backend, eps, engine)[0]
+    if (
+        backend == "finufft"
+        and nf <= _BATCH_MAX_MODES
+        and (n_bands - 1) * prep.n <= _BATCH_MAX_SPREAD_RATIO * nf
+    ):
+        strengths = np.zeros((n_bands + 1, prep.n), dtype=np.float64)
+        for k, sl in enumerate(prep.slices):
+            strengths[k, sl] = w[sl]
+        strengths[n_bands] = wy
+        sums = _nufft_sums(tau, strengths, f0, df, nf, backend, eps, engine)
+        band_cs = [(sums[k].real, sums[k].imag) for k in range(n_bands)]
+        swy = sums[n_bands]
+    else:
+        for sl in prep.slices:
+            sw_k = _nufft_sums(
+                tau[sl], w[sl][None, :], f0, df, nf, backend, eps, engine
+            )[0]
+            band_cs.append((sw_k.real, sw_k.imag))
+        swy = _nufft_sums(tau, wy[None, :], f0, df, nf, backend, eps, engine)[0]
     sw2 = _nufft_sums(tau, w[None, :], 2.0 * f0, 2.0 * df, nf, backend, eps, engine)[0]
 
     if xp is np:
@@ -333,6 +388,10 @@ def _perband_power(
     independently (its own amplitude and phase) with the native single-band GLS on
     the shared grid, and the standard-normalized powers are combined with the
     per-band reference chi-squared weights of VanderPlas & Ivezić (2015, eq. 23).
+    Errors weight the fits only when every contributing band has them
+    (:func:`_bands_use_errors`); otherwise ``chi2_0k`` would be dimensionless for
+    some bands and in squared magnitudes for others. An exactly constant band has
+    ``chi2_0k = 0`` and no power of its own, so it is skipped.
     """
     finite = mblc.finite()
     bands = [
@@ -349,37 +408,37 @@ def _perband_power(
     baseline = float(time.max() - time.min())
     if baseline <= 0.0:
         raise InsufficientDataError("GLS multiband: no usable time baseline")
+    use_errors = _bands_use_errors([lc for _, lc in bands])
 
-    combined: FloatArray | None = None
+    combined = np.zeros(nf, dtype=np.float64)
     weight_sum = 0.0
     for _, lc in bands:
-        w_k = np.ones(lc.n) if lc.error is None else 1.0 / (lc.error * lc.error)
+        if _is_constant(lc.value):
+            continue
+        error = lc.error if use_errors else None
+        w_k = np.ones(lc.n) if error is None else 1.0 / (error * error)
         mean_k = float(np.dot(w_k, lc.value) / w_k.sum())
         chi2_0k = float(np.dot(w_k, (lc.value - mean_k) ** 2))
         if backend == "torch" or backend.startswith("torch:"):
             device = backend.split(":", 1)[1] if ":" in backend else "cpu"
             p_k = lombscargle_power_torch(
-                lc.time, lc.value, lc.error, f0, df, nf,
+                lc.time, lc.value, error, f0, df, nf,
                 fit_mean=True,
                 device=device,
                 precision=settings.precision,
                 freq_batch=settings.direct_freq_batch,
             )
         elif backend == "cufinufft" and isinstance(engine, CufinufftGLS):
-            p_k = engine.power(
-                lc.time, lc.value, lc.error, f0, df, nf, fit_mean=True
-            )
+            p_k = engine.power(lc.time, lc.value, error, f0, df, nf, fit_mean=True)
         else:
             p_k = lombscargle_power(
-                lc.time, lc.value, lc.error, f0, df, nf,
+                lc.time, lc.value, error, f0, df, nf,
                 fit_mean=True,
                 backend=backend,  # type: ignore[arg-type]
                 eps=settings.nufft_eps,
             )
-        contribution = chi2_0k * p_k
-        combined = contribution if combined is None else combined + contribution
+        combined = combined + chi2_0k * np.asarray(p_k, dtype=np.float64)
         weight_sum += chi2_0k
-    assert combined is not None
     power = combined / weight_sum if weight_sum > 0.0 else np.zeros_like(combined)
     return power, n, baseline, tuple(name for name, _ in bands)
 
@@ -769,20 +828,31 @@ def _astropy_power(
     the same model spaces, lifted from exact degeneracy by astropy's default
     ridge — while ``"flex"`` passes the configured term counts and
     regularization through.
+
+    Only bands with a finite point are passed (and reported), so an empty band
+    without errors cannot switch the others to unweighted. When every band is
+    exactly constant there is nothing to fit, and the power is zero rather than
+    astropy's rounding-dependent 0 or 1.
     """
     from astropy.timeseries import LombScargleMultiband
 
     finite = mblc.finite()
-    time, value, error, band = finite.stacked()
-    n = int(time.size)
+    present = {name: lc for name, lc in finite.bands.items() if lc.n > 0}
+    n = sum(lc.n for lc in present.values())
     if n < settings.min_detections:
         raise InsufficientDataError(
             f"GLS multiband: {n} finite points < min_detections "
             f"{settings.min_detections}"
         )
+    time, value, error, band = MultiBandLightCurve.from_light_curves(
+        present, meta=finite.meta
+    ).stacked()
     baseline = float(time.max() - time.min()) if n else 0.0
     if baseline <= 0.0:
         raise InsufficientDataError("GLS multiband: no usable time baseline")
+    band_names = tuple(present)
+    if all(_is_constant(lc.value) for lc in present.values()):
+        return np.zeros(grid.size, dtype=np.float64), n, baseline, band_names
     if settings.mb_model == "offsets":
         nterms_base, nterms_band = 1, 0
     elif settings.mb_model == "perband":
@@ -806,7 +876,7 @@ def _astropy_power(
         posinf=0.0,
         neginf=0.0,
     )
-    return power, n, baseline, finite.band_names
+    return power, n, baseline, band_names
 
 
 # --- entry point -------------------------------------------------------------
@@ -845,12 +915,25 @@ def gls_multiband_power(
     -------
     Periodogram
         The joint power spectrum. ``meta["bands"]`` lists the contributing bands
-        and ``meta["mb_model"]`` records the model.
+        and ``meta["mb_model"]`` records the model. With
+        ``settings.mb_fap_bootstrap > 0``, ``extras["fap"]`` holds the bootstrap
+        false-alarm probability at every peak candidate (interior local maxima
+        and edge peaks; NaN elsewhere) on every route — the astropy backend and
+        non-uniform grids included, where each resample reruns astropy — and
+        ``meta`` records ``fap_level_10pct`` / ``fap_level_1pct`` once
+        ``mb_fap_bootstrap`` reaches 9 / 99 (see :meth:`MultibandFAP.level`).
 
     Raises
     ------
     InsufficientDataError
         If too few finite points remain across all bands, or the grid is empty.
+
+    Notes
+    -----
+    Errors weight the fit only when every contributing band has them; a set
+    mixing bands with and without errors runs every band unweighted, in all
+    three models and on every backend. Exactly constant bands carry no power,
+    and an all-constant set has zero power everywhere.
     """
     if grid.size == 0:
         raise InsufficientDataError("GLS multiband: empty trial grid")
@@ -907,41 +990,10 @@ def gls_multiband_power(
     power = np.nan_to_num(
         np.asarray(power, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0
     )
-    extras: dict[str, FloatArray] = {}
     meta: dict[str, Any] = {
         **finite_meta, "bands": band_names, "mb_model": settings.mb_model,
     }
-    if (
-        settings.mb_fap_bootstrap > 0
-        and actual_backend != "astropy"
-        and grid.uniform
-    ):
-        from cuperiod.core.peaks import local_maxima
-        from cuperiod.multiband.fap_mb import MultibandFAP, bootstrap_null_max
-
-        null_max = bootstrap_null_max(
-            mblc, grid, settings, backend,
-            settings.mb_fap_bootstrap, settings.mb_fap_seed,
-        )
-        calibration = MultibandFAP(
-            null_max=null_max,
-            n_bootstrap=settings.mb_fap_bootstrap,
-            seed=settings.mb_fap_seed,
-            model=settings.mb_model,
-            backend=actual_backend,
-        )
-        fap = np.full(power.shape, np.nan, dtype=np.float64)
-        candidates = local_maxima(power)
-        if candidates.size:
-            fap[candidates] = calibration.fap(power[candidates])
-        extras["fap"] = fap
-        meta["fap_method"] = "bootstrap"
-        meta["fap_n_bootstrap"] = settings.mb_fap_bootstrap
-        meta["fap_seed"] = settings.mb_fap_seed
-        meta["fap_level_10pct"] = float(np.quantile(null_max, 0.90))
-        if settings.mb_fap_bootstrap >= 99:
-            meta["fap_level_1pct"] = float(np.quantile(null_max, 0.99))
-    return Periodogram.from_spectrum(
+    pg = Periodogram.from_spectrum(
         method="GLS",
         backend=actual_backend,
         frequency=frequency,
@@ -949,7 +1001,49 @@ def gls_multiband_power(
         objective_sense="max",
         n_samples=n,
         baseline=baseline,
-        extras=extras,
+        meta=meta,
+    )
+    if settings.mb_fap_bootstrap <= 0:
+        return pg
+    # Every route is calibrated, the astropy one and non-uniform grids included:
+    # the bootstrap reruns that same route per resample (slower, but a requested
+    # FAP is never silently dropped).
+    from cuperiod.multiband.fap_mb import MultibandFAP, bootstrap_null_max
+
+    null_max = bootstrap_null_max(
+        mblc, grid, settings, backend,
+        settings.mb_fap_bootstrap, settings.mb_fap_seed,
+    )
+    calibration = MultibandFAP(
+        null_max=null_max,
+        n_bootstrap=settings.mb_fap_bootstrap,
+        seed=settings.mb_fap_seed,
+        model=settings.mb_model,
+        backend=actual_backend,
+    )
+    # One candidate rule for peaks and FAPs, the periodogram's own: interior
+    # maxima plus a peak on either grid edge, so every reportable peak has a FAP.
+    fap = np.full(pg.power.shape, np.nan, dtype=np.float64)
+    candidates = pg._peak_candidates(pg._score())
+    if candidates.size:
+        fap[candidates] = calibration.fap(pg.power[candidates])
+    meta["fap_method"] = "bootstrap"
+    meta["fap_n_bootstrap"] = settings.mb_fap_bootstrap
+    meta["fap_seed"] = settings.mb_fap_seed
+    # Thresholds only where the bootstrap resolves them (fap >= 1/(R+1)).
+    if settings.mb_fap_bootstrap >= 9:
+        meta["fap_level_10pct"] = calibration.level(0.1)
+    if settings.mb_fap_bootstrap >= 99:
+        meta["fap_level_1pct"] = calibration.level(0.01)
+    return Periodogram.from_spectrum(
+        method="GLS",
+        backend=actual_backend,
+        frequency=pg.frequency,
+        power=pg.power,
+        objective_sense="max",
+        n_samples=n,
+        baseline=baseline,
+        extras={"fap": fap},
         meta=meta,
     )
 

@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any, Final
 
 import numpy as np
 
+from cuperiod.core._coerce import as_float_array
 from cuperiod.core._typing import FloatArray
 from cuperiod.pdot.laws import PeriodLawFit
 from cuperiod.pdot.ltte import LTTEFit
@@ -59,9 +60,17 @@ _CURVE_SAMPLES: Final[int] = 400
 # --- small shared helpers -----------------------------------------------------
 
 
-def _floats(values: Any) -> FloatArray:
-    """``values`` as a flat float64 array (never a view onto the caller's data)."""
-    return np.asarray(values, dtype=np.float64).ravel()
+def _floats(values: Any, *, time: bool = False) -> FloatArray:
+    """``values`` as a flat float64 array, masked/missing entries as NaN.
+
+    Goes through the library's one input coercion, so a numpy or astropy mask
+    is honoured (a bare ``np.asarray`` returns the placeholder *under* the mask,
+    which every panel would then draw as data) and pandas/pyarrow nulls become
+    NaN; ``time=True`` also reads calendar times as the light-curve loaders do.
+    The result may share memory with the caller's array; nothing here writes
+    to it.
+    """
+    return as_float_array(values, name="plot values", time=time).ravel()
 
 
 def _time_offset(time: FloatArray) -> float:
@@ -137,7 +146,8 @@ def _as_arrays(
     :func:`cuperiod.to_input` for tables and files. The trailing flag says
     whether the y axis should be flipped, taken from the light curve's declared
     brightness domain when there is one and assumed to be magnitudes otherwise.
-    Non-finite samples are dropped here so no panel has to repeat the check.
+    Non-finite and masked samples are dropped here so no panel has to repeat
+    the check.
     """
     if light_curve is None:
         return None
@@ -145,7 +155,7 @@ def _as_arrays(
     obj = light_curve
     if not (hasattr(obj, "time") and hasattr(obj, "value")):
         if isinstance(obj, tuple | list) and 2 <= len(obj) <= 3:
-            time, value = _floats(obj[0]), _floats(obj[1])
+            time, value = _floats(obj[0], time=True), _floats(obj[1])
             error = _floats(obj[2]) if len(obj) == 3 and obj[2] is not None else None
             return _finite_curve(time, value, error, invert)
         from cuperiod.api import to_input
@@ -161,7 +171,7 @@ def _as_arrays(
         invert = str(domain) != "flux"
     error_attr = getattr(obj, "error", None)
     return _finite_curve(
-        _floats(obj.time),
+        _floats(obj.time, time=True),
         _floats(obj.value),
         None if error_attr is None else _floats(error_attr),
         invert,
@@ -214,7 +224,7 @@ def plot_light_curve(
         Flip the y axis, the magnitude convention (brighter upwards). Pass
         ``False`` for fluxes.
     """
-    t, y = _floats(time), _floats(value)
+    t, y = _floats(time, time=True), _floats(value)
     n = min(t.size, y.size)
     t, y = t[:n], y[:n]
     keep = np.isfinite(t) & np.isfinite(y)
@@ -256,6 +266,7 @@ def plot_phase_fold(
     t_ref: float | None = None,
     model: Any = None,
     error: Any = None,
+    ylabel: str = "magnitude",
 ) -> None:
     """Draw the phase fold on the *drifting* phase, coloured by epoch.
 
@@ -285,15 +296,27 @@ def plot_phase_fold(
         (:mod:`cuperiod.pdot.models`); defaults to ``"constant-pdot"``.
     error : array-like, optional
         1-sigma errors, drawn faintly beneath the points.
+    ylabel : str, default "magnitude"
+        Label of the brightness axis (:func:`pdot_figure` passes ``"flux"`` for
+        a flux light curve).
+
+    Raises
+    ------
+    ValueError
+        If ``model`` names no known period-evolution law.
 
     Notes
     -----
     The y axis is left as it is; call ``ax.invert_yaxis()`` for magnitudes (as
     :func:`pdot_figure` does). A ``constant-pdot`` warp is undefined once the
     period would pass through zero inside the span; if the given rate does that,
-    the panel falls back to an unwarped fold rather than raising.
+    the panel falls back to an unwarped fold rather than raising, and its title
+    says so instead of quoting a rate it did not apply.
     """
-    t, y = _floats(time), _floats(value)
+    # Resolved before anything else, so a misspelt law is always an error
+    # rather than a silently unwarped fold.
+    law = get_model(model)
+    t, y = _floats(time, time=True), _floats(value)
     n = min(t.size, y.size)
     t, y = t[:n], y[:n]
     keep = np.isfinite(t) & np.isfinite(y)
@@ -305,10 +328,12 @@ def plot_phase_fold(
     dt = t - epoch
     rate = pdot / period if np.isfinite(pdot) else 0.0
     try:
-        warped = get_model(model).warp(dt, rate)
+        warped = law.warp(dt, rate)
+        applied = True
     except ValueError:
         # The period would pass through zero inside the span (singular warp).
         warped = dt
+        applied = False
     phase = np.mod(warped / period, 1.0)
 
     err = _usable_errors(error, keep.size)
@@ -327,8 +352,10 @@ def plot_phase_fold(
         figure.colorbar(points, ax=ax, label=f"t - {t0:.0f} (d)")
     ax.set_xlim(0.0, 1.0)
     ax.set_xlabel("phase")
-    ax.set_ylabel("magnitude")
+    ax.set_ylabel(ylabel)
     drift = "" if rate == 0.0 else f", dP/dt = {pdot * SECONDS_PER_YEAR:+.3g} s/yr"
+    if drift and not applied:
+        drift += " outside the model's domain (unwarped)"
     ax.set_title(f"fold at P = {period:.6g} d{drift}")
 
 
@@ -608,7 +635,7 @@ def plot_timescale(
     t_offset : float, default 2450000.0
         Subtracted from the epochs before plotting.
     """
-    span = _floats(time_range)
+    span = _floats(time_range, time=True)
     span = span[np.isfinite(span)]
     grid = (
         None
@@ -672,8 +699,21 @@ def _fold_parameters(
     law linearized at its reference epoch (its local rate is exactly the
     ``exponential`` model's parameter), and finally the profile's seed period
     with no drift at all.
+
+    The tracker's ephemeris is its *fitted* one, not its input: ``track.period``
+    is the reference period the delays were measured against, and any error in
+    it is absorbed into the O-C's linear term ``c1`` (``P_true ~ P*(1 + c1)``,
+    expanded about the fit's own ``t_ref``). Folding at the input period with
+    only the quadratic rate leaves that linear drift in the panel, which then
+    looks smeared exactly when the measurement is fine.
     """
     if track is not None:
+        fit = track.quadratic_fit
+        coefficients = np.asarray(fit.coefficients, dtype=np.float64)
+        if coefficients.size >= 2:
+            period = float(track.period) * (1.0 + float(coefficients[1]))
+            if np.isfinite(period) and period > 0.0 and np.isfinite(fit.pdot):
+                return (period, float(fit.pdot), float(fit.t_ref), track.model)
         return (track.period, track.pdot, track.t_ref, track.model)
     if search is not None:
         best = search.best
@@ -877,7 +917,11 @@ def _fold_panel(
     model: Any,
     invert: bool,
 ) -> None:
-    """:func:`plot_phase_fold` plus the magnitude axis flip the figure wants."""
+    """:func:`plot_phase_fold` with the light-curve panel's axis label and flip.
+
+    Both panels follow the light curve's brightness domain: magnitudes are
+    labelled as such and flipped (brighter upwards), fluxes are neither.
+    """
     plot_phase_fold(
         ax,
         time,
@@ -887,6 +931,7 @@ def _fold_panel(
         t_ref=t_ref,
         model=model,
         error=error,
+        ylabel="magnitude" if invert else "flux",
     )
     if invert and ax.has_data():
         ax.invert_yaxis()

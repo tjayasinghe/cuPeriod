@@ -37,13 +37,15 @@ from cuperiod.core._typing import FloatArray
 from cuperiod.core.backend import ensure_cuda_dll_path
 from cuperiod.core.config import MHAOVSettings
 from cuperiod.core.errors import InsufficientDataError
-from cuperiod.core.grid import (
-    GridSpec,
-    pseudo_nyquist_frequency,
-    uniform_frequency_grid,
-)
-from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
+from cuperiod.core.grid import GridSpec, default_frequency_grid
+from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve, raise_if_unusable
 from cuperiod.core.result import Periodogram
+from cuperiod.methods._fold import (
+    check_backend,
+    evaluate_trials,
+    finite_angles,
+    usable_curve,
+)
 from cuperiod.methods.base import PeriodogramMethod, register
 
 MHAOVBackend = Literal["numpy", "cupy"]
@@ -150,58 +152,222 @@ def _model_ss_batch(
     normal equations, same ridge), gemm-free on every backend, and ``O(d)`` less
     transient memory.
     """
-    d = 2 * n_harmonics + 1
     n_freq = int(frequencies.shape[0])
     fdtype = frequencies.dtype
     dev = device_ref(frequencies)
-    ridge = _RIDGE_EPS * float(xp.finfo(fdtype).eps) * float(n_points)
     out = xp.empty(n_freq, dtype=fdtype, device=dev)
     two_pi = 2.0 * float(np.pi)
     sum_y = float(xp.sum(y))
-    h = n_harmonics
 
     for start in range(0, n_freq, batch):
         stop = min(start + batch, n_freq)
         fb = frequencies[start:stop]
-        n_f = int(fb.shape[0])
         angle = (two_pi * fb)[:, None] * tau[None, :]
-        C, S, A, B = _harmonic_sums(xp, angle, y, h)
+        sums = _harmonic_sums(xp, angle, y, n_harmonics)
         del angle
+        out[start:stop] = _model_ss_from_sums(
+            xp, sums, n_harmonics=n_harmonics, n_points=n_points, sum_y=sum_y,
+            y_mean=y_mean, total_ss=total_ss, fdtype=fdtype, dev=dev,
+        )
+    return out
 
-        gram = xp.zeros((n_f, d, d), dtype=fdtype, device=dev)
-        proj = xp.empty((n_f, d), dtype=fdtype, device=dev)
-        gram[:, 0, 0] = float(n_points) + ridge
-        proj[:, 0] = sum_y
-        for k in range(1, h + 1):
-            gram[:, 0, 2 * k - 1] = C[k]
-            gram[:, 2 * k - 1, 0] = C[k]
-            gram[:, 0, 2 * k] = S[k]
-            gram[:, 2 * k, 0] = S[k]
-            proj[:, 2 * k - 1] = A[k]
-            proj[:, 2 * k] = B[k]
-            for line in range(1, h + 1):
-                # Σ cos·cos, Σ sin·sin, Σ cos·sin over n from the m-sums; C_0 = N,
-                # S_0 = 0, S_{-m} = -S_m.
-                m_diff = abs(k - line)
-                c_diff = C[m_diff] if m_diff else float(n_points)
-                cc = 0.5 * (c_diff + C[k + line])
-                ss = 0.5 * (c_diff - C[k + line])
-                if k == line:
-                    s_diff = 0.0
-                elif k > line:
-                    s_diff = S[m_diff]
-                else:
-                    s_diff = -S[m_diff]
-                cs = 0.5 * (S[k + line] - s_diff)
-                gram[:, 2 * k - 1, 2 * line - 1] = cc + (ridge if k == line else 0.0)
-                gram[:, 2 * k, 2 * line] = ss + (ridge if k == line else 0.0)
-                gram[:, 2 * k - 1, 2 * line] = cs
-                gram[:, 2 * line, 2 * k - 1] = cs
-        # numpy 2.x batched solve treats a 2-D RHS as matrices, so add a trailing
-        # singleton to keep it a per-frequency vector solve.
-        beta = xp.linalg.solve(gram, proj[..., None])[..., 0]
-        model_ss = xp.sum(beta * proj, axis=1) - n_points * y_mean * y_mean
-        out[start:stop] = xp.clip(model_ss, 0.0, total_ss)
+
+def _model_ss_from_sums(
+    xp: ModuleType,
+    sums: tuple[list[Any], list[Any], list[Any], list[Any]],
+    *,
+    n_harmonics: int,
+    n_points: int,
+    sum_y: float,
+    y_mean: float,
+    total_ss: float,
+    fdtype: Any,
+    dev: Any,
+) -> Any:
+    """Assemble and solve the ridge-regularised normal equations of one frequency chunk.
+
+    ``sums`` are the ``(C, S, A, B)`` harmonic trig sums of :func:`_harmonic_sums`
+    (or :func:`_harmonic_sums_nufft`), each ``(F,)``. Returns the regression sum of
+    squares about the mean, clipped to ``[0, total_ss]``.
+    """
+    C, S, A, B = sums
+    d = 2 * n_harmonics + 1
+    h = n_harmonics
+    n_f = int(C[1].shape[0])
+    ridge = _RIDGE_EPS * float(xp.finfo(fdtype).eps) * float(n_points)
+    gram = xp.zeros((n_f, d, d), dtype=fdtype, device=dev)
+    proj = xp.empty((n_f, d), dtype=fdtype, device=dev)
+    gram[:, 0, 0] = float(n_points) + ridge
+    proj[:, 0] = sum_y
+    for k in range(1, h + 1):
+        gram[:, 0, 2 * k - 1] = C[k]
+        gram[:, 2 * k - 1, 0] = C[k]
+        gram[:, 0, 2 * k] = S[k]
+        gram[:, 2 * k, 0] = S[k]
+        proj[:, 2 * k - 1] = A[k]
+        proj[:, 2 * k] = B[k]
+        for line in range(1, h + 1):
+            # Σ cos·cos, Σ sin·sin, Σ cos·sin over n from the m-sums; C_0 = N,
+            # S_0 = 0, S_{-m} = -S_m.
+            m_diff = abs(k - line)
+            c_diff = C[m_diff] if m_diff else float(n_points)
+            cc = 0.5 * (c_diff + C[k + line])
+            ss = 0.5 * (c_diff - C[k + line])
+            if k == line:
+                s_diff = 0.0
+            elif k > line:
+                s_diff = S[m_diff]
+            else:
+                s_diff = -S[m_diff]
+            cs = 0.5 * (S[k + line] - s_diff)
+            gram[:, 2 * k - 1, 2 * line - 1] = cc + (ridge if k == line else 0.0)
+            gram[:, 2 * k, 2 * line] = ss + (ridge if k == line else 0.0)
+            gram[:, 2 * k - 1, 2 * line] = cs
+            gram[:, 2 * line, 2 * k - 1] = cs
+    # numpy 2.x batched solve treats a 2-D RHS as matrices, so add a trailing
+    # singleton to keep it a per-frequency vector solve.
+    beta = xp.linalg.solve(gram, proj[..., None])[..., 0]
+    model_ss = xp.sum(beta * proj, axis=1) - n_points * y_mean * y_mean
+    return xp.clip(model_ss, 0.0, total_ss)
+
+
+# --- CPU fast path for uniform grids: the trig sums as type-1 NUFFTs -----------
+
+#: finufft relative tolerance of the harmonic sums. On centred values the AOV then
+#: agrees with an exact QR least-squares fit to ~1e-11 relative (the direct sums:
+#: 2e-12).
+_NUFFT_EPS: Final = 1e-13
+
+#: Frequencies per NUFFT chunk: bounds the ``(chunk, d, d)`` Gram and the ``6H`` sum
+#: arrays (~30 MiB) on very long grids; each chunk re-spreads the points once.
+_NUFFT_CHUNK: Final = 1 << 16
+
+#: Light-curve points per numba thread from which the NUFFT sums replace the numba
+#: kernel. The direct kernel costs ``O(F*N*H)`` spread over every numba thread; the
+#: NUFFT is ``O(H*(N + F log F))`` on one, so the crossover length grows with the
+#: thread count. Measured (H=3, default grids): with 32 threads the NUFFT loses at 300
+#: points (0.6x), is 1.7x faster at 1000-2000, 3.2x at 4000 and 5x at 8000; with 4
+#: threads it already wins at 300. 64 per thread (2048 at 32 threads, 256 at 4) keeps
+#: the switch on the winning side of both.
+_NUFFT_POINTS_PER_NUMBA_THREAD: Final = 64
+
+#: Grids shorter than this stay on the direct kernels (nothing to gain, and a one-off
+#: trial frequency should not pay a transform set-up).
+_NUFFT_MIN_FREQS: Final = 64
+
+#: Below this much work (points times transforms plus modes) a finufft call runs on
+#: one thread: light-curve-sized transforms are dominated by the OpenMP start-up of a
+#: threaded call (the GLS measurement, ``gls._FINUFFT_SINGLE_THREAD_WORK``).
+_FINUFFT_SINGLE_THREAD_WORK: Final = 150_000
+
+
+def _uniform_grid_params(freqs: FloatArray) -> tuple[float, float, int] | None:
+    """``(f0, df, nf)`` if ``freqs`` is an ascending arithmetic progression, else None.
+
+    The tolerance is a few ulps of the largest frequency (plus 1e-9 of a step), so only
+    grids built as ``f0 + df*k`` -- every automatic grid -- qualify, and the NUFFT,
+    which evaluates exactly ``f0 + df*k``, reproduces the requested frequencies.
+    """
+    nf = int(freqs.size)
+    if nf < 2:
+        return None
+    f0 = float(freqs[0])
+    df = float(freqs[-1] - freqs[0]) / (nf - 1)
+    if not (np.isfinite(df) and df > 0.0):
+        return None
+    scale = max(abs(f0), abs(float(freqs[-1])))
+    tolerance = 1e-9 * df + 8.0 * float(np.finfo(np.float64).eps) * scale
+    deviation = np.abs(freqs - (f0 + df * np.arange(nf, dtype=np.float64)))
+    if float(deviation.max()) > tolerance:
+        return None
+    return f0, df, nf
+
+
+def _use_nufft(backend: str, n_points: int, n_freq: int) -> bool:
+    """Whether the CPU ``backend`` should take the NUFFT sums for this problem size."""
+    if n_freq < _NUFFT_MIN_FREQS:
+        return False
+    if backend == "numpy":
+        return True  # the vectorized direct sums are 5-150x slower at every size
+    if backend != "numba":
+        return False
+    import numba
+
+    threads = max(1, int(numba.get_num_threads()))
+    return n_points >= _NUFFT_POINTS_PER_NUMBA_THREAD * threads
+
+
+def _harmonic_sums_nufft(
+    tau: FloatArray, y: FloatArray, f0: float, df: float, nf: int, n_harmonics: int
+) -> tuple[list[Any], list[Any], list[Any], list[Any]]:
+    """:func:`_harmonic_sums` on the uniform grid ``f0 + df*k``, by type-1 NUFFTs.
+
+    ``Σ_j c_j exp(2πi·m·(f0 + k·df)·τ_j)`` for ``k = 0..nf-1`` is one finufft type-1
+    transform at the points ``x_j = 2π·m·df·τ_j`` (wrapped to ``[-π, π)``) with the
+    strengths modulated by ``exp(2πi·m·(f0 + ⌊nf/2⌋·df)·τ_j)`` -- finufft puts mode
+    ``k - ⌊nf/2⌋`` at output ``k``. ``m = 1..2H`` gives ``C_m + i·S_m`` (strength 1)
+    and, for ``m ≤ H``, ``A_m + i·B_m`` (strength ``y``) in the same batched call.
+    """
+    import finufft
+
+    two_pi = 2.0 * float(np.pi)
+    h = n_harmonics
+    m_max = 2 * h
+    half = nf // 2
+    C: list[Any] = [None] * (m_max + 1)
+    S: list[Any] = [None] * (m_max + 1)
+    A: list[Any] = [None] * (h + 1)
+    B: list[Any] = [None] * (h + 1)
+    for m in range(1, m_max + 1):
+        x = np.mod((two_pi * m * df) * tau + np.pi, two_pi) - np.pi
+        carrier = np.exp((1j * two_pi * m * (f0 + half * df)) * tau)
+        strengths = np.stack([carrier, y * carrier]) if m <= h else carrier[None, :]
+        work = int(strengths.shape[0]) * int(tau.size) + nf
+        options = {"nthreads": 1} if work <= _FINUFFT_SINGLE_THREAD_WORK else {}
+        out = np.reshape(
+            finufft.nufft1d1(
+                x, np.ascontiguousarray(strengths), nf, eps=_NUFFT_EPS, isign=1,
+                **options,
+            ),
+            (-1, nf),
+        )
+        C[m] = np.ascontiguousarray(out[0].real)
+        S[m] = np.ascontiguousarray(out[0].imag)
+        if m <= h:
+            A[m] = np.ascontiguousarray(out[1].real)
+            B[m] = np.ascontiguousarray(out[1].imag)
+    return C, S, A, B
+
+
+def _model_ss_nufft(
+    tau: FloatArray,
+    y: FloatArray,
+    f0: float,
+    df: float,
+    nf: int,
+    *,
+    n_harmonics: int,
+    total_ss: float,
+    y_mean: float,
+) -> FloatArray:
+    """Regression SS on the uniform grid ``f0 + df*k`` from NUFFT harmonic sums.
+
+    ``y`` must be centred: the NUFFT's error is relative to ``Σ|y_j|``, which on raw
+    values (mean >> scatter) would swamp the small regression sum.
+    """
+    n_points = int(tau.size)
+    sum_y = float(y.sum())
+    out = np.empty(nf, dtype=np.float64)
+    xp = array_namespace(out)
+    for start in range(0, nf, _NUFFT_CHUNK):
+        n_chunk = min(_NUFFT_CHUNK, nf - start)
+        sums = _harmonic_sums_nufft(
+            tau, y, f0 + start * df, df, n_chunk, n_harmonics
+        )
+        out[start:start + n_chunk] = _model_ss_from_sums(
+            xp, sums, n_harmonics=n_harmonics, n_points=n_points, sum_y=sum_y,
+            y_mean=y_mean, total_ss=total_ss, fdtype=out.dtype, dev=device_ref(out),
+        )
     return out
 
 
@@ -317,8 +483,11 @@ def _compute_model_ss(
     """Host-side regression SS per frequency, plus ``(total_ss, n)`` for one band.
 
     Returns all-zero model SS (and ``total_ss=0``) when the band has too few points or
-    no variance, so a caller can skip it.
+    no variance, so a caller can skip it; all-NaN (and a NaN ``total_ss``) when the
+    values are not finite. A trial frequency whose angles ``2 pi f tau`` are not all
+    finite (NaN, inf) gives NaN there and leaves the others as on a clean grid.
     """
+    check_backend(backend)
     t = np.ascontiguousarray(t, dtype=np.float64)
     y = np.ascontiguousarray(y, dtype=np.float64)
     freqs = np.ascontiguousarray(frequencies, dtype=np.float64)
@@ -328,16 +497,66 @@ def _compute_model_ss(
     tau = t - t.min()
     y_mean = float(y.mean())
     total_ss = float(((y - y_mean) ** 2).sum())
-    if total_ss <= 0.0:
+    if not np.isfinite(total_ss):
+        return np.full(freqs.size, np.nan, dtype=np.float64), total_ss, n
+    if total_ss <= 0.0 or float(y.max()) == float(y.min()):
+        # No variance. A constant band's float mean is often an ulp off, leaving a
+        # rounding-level total SS that must not count as a band.
         return np.zeros(freqs.size, dtype=np.float64), 0.0, n
+    # The model has a constant column, so the statistic is offset-invariant: every
+    # backend fits the centred values. On raw values the ridge that the constant
+    # column also carries biased beta.proj low by ~ridge*mean^2 -- in float32 more
+    # than the whole variance once mean/scatter exceeds ~90 (all-zero spectra on
+    # magnitudes or normalised flux), in float64 visible from mean/scatter ~1e5.
+    # ``yc_mean`` is the centred mean (round-off), kept so the projection algebra
+    # stays exact.
+    yc = y - y_mean
+    yc_mean = float(yc.mean())
 
+    def model_ss_for(trials: FloatArray) -> FloatArray:
+        return _model_ss_dispatch(
+            tau, yc, trials, n_harmonics=n_harmonics, backend=backend, batch=batch,
+            precision=precision, total_ss=total_ss, y_mean=yc_mean,
+        )
+
+    ok = finite_angles(float(tau.max()), freqs)
+    return evaluate_trials(model_ss_for, freqs, ok), total_ss, n
+
+
+def _model_ss_dispatch(
+    tau: FloatArray,
+    y: FloatArray,
+    freqs: FloatArray,
+    *,
+    n_harmonics: int,
+    backend: str,
+    batch: int,
+    precision: str,
+    total_ss: float,
+    y_mean: float,
+) -> FloatArray:
+    """Regression SS on one backend (centred ``y``, finite trial frequencies).
+
+    On a uniform grid the CPU backends take the NUFFT harmonic sums when that is
+    cheaper (always for ``numpy``; for ``numba`` from
+    :data:`_NUFFT_POINTS_PER_NUMBA_THREAD` points per numba thread) -- the same
+    normal equations, agreeing with the direct sums to ~1e-11 relative.
+    """
+    n = int(tau.size)
+    if backend in ("numpy", "numba") and _use_nufft(backend, n, int(freqs.size)):
+        params = _uniform_grid_params(freqs)
+        if params is not None:
+            return _model_ss_nufft(
+                tau, y, *params, n_harmonics=n_harmonics, total_ss=total_ss,
+                y_mean=y_mean,
+            )
     if backend == "numba":
         kernel = _numba_mhaov_kernel()
         ridge = _RIDGE_EPS * float(np.finfo(np.float64).eps) * float(n)
         out = kernel(
             tau, y, freqs, n_harmonics, ridge, float(y.sum()), y_mean, total_ss
         )
-        return np.asarray(out, dtype=np.float64), total_ss, n
+        return np.asarray(out, dtype=np.float64)
     if backend == "cupy":
         ensure_cuda_dll_path()
         import cupy as cp
@@ -350,7 +569,7 @@ def _compute_model_ss(
             n_harmonics=n_harmonics, total_ss=total_ss, y_mean=y_mean,
             n_points=n, batch=_resolve_batch(batch, n, on_device=True),
         )
-        return np.asarray(cp.asnumpy(out), dtype=np.float64), total_ss, n
+        return np.asarray(cp.asnumpy(out), dtype=np.float64)
     if backend == "torch" or backend.startswith("torch:"):
         import torch
 
@@ -365,15 +584,19 @@ def _compute_model_ss(
             n_harmonics=n_harmonics, total_ss=total_ss, y_mean=y_mean,
             n_points=n, batch=_resolve_batch(batch, n, on_device=device != "cpu"),
         )
-        return to_host(out), total_ss, n
+        return to_host(out)
     if backend != "numpy":
         raise ValueError(f"unknown backend {backend!r}")
+    # The array-API namespace, as on the device branches: the kernel creates its
+    # arrays with ``device=``, which raw numpy only accepts from 2.0 (the declared
+    # floor is 1.24, and the numba 0.59 floor of the [fast] extra needs numpy < 2).
+    # Identical results.
     out = _model_ss_batch(
-        np, tau, y, freqs,
+        array_namespace(freqs), tau, y, freqs,
         n_harmonics=n_harmonics, total_ss=total_ss, y_mean=y_mean,
         n_points=n, batch=_resolve_batch(batch, n, on_device=False),
     )
-    return np.asarray(out, dtype=np.float64), total_ss, n
+    return np.asarray(out, dtype=np.float64)
 
 
 def aov_power(
@@ -438,6 +661,12 @@ def aov_multiband_power(
     are pooled across bands into one F-statistic with ``B*2H`` model and
     ``N_total - B*(2H+1)`` residual degrees of freedom.
 
+    The sums are pooled in each band's own variance units (divided by its sample
+    variance, so every band's total SS is ``n - 1``): the F ratio of one band does
+    not depend on its scale, and the pooled one should not either -- on raw sums a
+    band in flux units, or merely a noisier band, outweighed all the others. A band
+    with no variance (constant values) is left out.
+
     Parameters
     ----------
     frequencies : numpy.ndarray
@@ -466,8 +695,9 @@ def aov_multiband_power(
         )
         if total_ss <= 0.0:
             continue
-        model_sum += model_ss
-        resid_sum += total_ss - model_ss
+        scale = total_ss / (n - 1)  # n > 2H+1 here, so n - 1 > 0
+        model_sum += model_ss / scale
+        resid_sum += (total_ss - model_ss) / scale
         n_total += n
         n_used_bands += 1
     d = 2 * n_harmonics + 1
@@ -493,18 +723,17 @@ class MHAOVMethod(PeriodogramMethod):
     all_backends: ClassVar[tuple[str, ...]] = ("numba", "numpy", "cupy", "torch")
 
     def default_grid(self, lc: LightCurve, settings: MHAOVSettings) -> GridSpec:  # type: ignore[override]
-        finite = lc.finite()
+        finite = usable_curve(lc, "MHAOV")
         if finite.baseline <= 0.0:
             raise InsufficientDataError("MHAOV: no usable time baseline")
-        minimum = settings.minimum_frequency or 1.0 / finite.baseline
-        maximum = settings.maximum_frequency or pseudo_nyquist_frequency(
-            finite.time, settings.nyquist_factor
-        )
-        return uniform_frequency_grid(
-            finite.baseline,
-            maximum_frequency=maximum,
-            minimum_frequency=minimum,
+        # The shared fold-method recipe, size-checked before allocation (see PDM).
+        return default_frequency_grid(
+            finite.time,
+            minimum_frequency=settings.minimum_frequency or None,
+            maximum_frequency=settings.maximum_frequency or None,
             samples_per_peak=settings.samples_per_peak,
+            nyquist_factor=settings.nyquist_factor,
+            context="MHAOV default grid",
         )
 
     def power(  # type: ignore[override]
@@ -515,12 +744,17 @@ class MHAOVMethod(PeriodogramMethod):
         backend: str,
         engine: object | None = None,
     ) -> Periodogram:
-        finite = lc.finite()
+        finite = usable_curve(lc, "MHAOV")
         n = finite.n
-        if n < settings.min_detections or n <= 2 * settings.n_harmonics + 1:
+        if n < settings.min_detections:
+            raise InsufficientDataError(
+                f"MHAOV: {n} finite points < min_detections {settings.min_detections}"
+            )
+        n_terms = 2 * settings.n_harmonics + 1
+        if n <= n_terms:
             raise InsufficientDataError(
                 f"MHAOV: {n} finite points are too few for {settings.n_harmonics} "
-                "harmonics"
+                f"harmonics (the {n_terms}-term model needs at least {n_terms + 1})"
             )
         if finite.baseline <= 0.0:
             raise InsufficientDataError("MHAOV: no usable time baseline")
@@ -554,6 +788,7 @@ class MHAOVMethod(PeriodogramMethod):
     ) -> Periodogram:
         from cuperiod.multiband.mhaov_mb import mhaov_multiband_power
 
+        raise_if_unusable(mblc, "MHAOV")
         if backend == "torch" or backend.startswith("torch:"):
             backend = f"torch:{resolve_torch_device(backend, settings.device)}"
         return mhaov_multiband_power(grid, mblc, settings, backend)

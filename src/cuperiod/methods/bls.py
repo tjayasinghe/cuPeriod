@@ -13,6 +13,7 @@ mid-transit time, depth-SNR) and the global signal-detection efficiency (SDE).
 
 from __future__ import annotations
 
+import math
 from typing import Any, ClassVar, Literal
 
 import numpy as np
@@ -22,7 +23,7 @@ from cuperiod.core._typing import FloatArray
 from cuperiod.core.columns import Domain
 from cuperiod.core.config import BLSSettings
 from cuperiod.core.errors import InsufficientDataError
-from cuperiod.core.grid import GridSpec
+from cuperiod.core.grid import GridSpec, check_grid_size
 from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
 from cuperiod.core.result import Periodogram
 from cuperiod.methods._bls_core import bls_power
@@ -30,6 +31,9 @@ from cuperiod.methods.base import PeriodogramMethod, register
 
 #: Per-period fields shared by every backend (astropy + the in-house search).
 _SEGMENT_FIELDS = ("period", "power", "depth", "depth_snr", "duration", "transit_time")
+
+#: ``(periods, durations)`` of one log period segment.
+Segment = tuple[FloatArray, FloatArray]
 
 
 def _segment_durations(p_lo: float, settings: BLSSettings) -> FloatArray:
@@ -50,24 +54,140 @@ def _max_period(baseline: float, settings: BLSSettings) -> float:
     return min(settings.max_period_days, baseline / settings.min_transits)
 
 
-def _segment_grids(
+def _segment_bounds(
     baseline: float, settings: BLSSettings
-) -> list[tuple[FloatArray, FloatArray]]:
-    """``[(periods, durations), ...]`` for each log period segment, ascending period."""
+) -> list[tuple[float, float]]:
+    """``[(p_lo, p_hi), ...]`` of the default log period segments, ascending."""
     max_period = _max_period(baseline, settings)
-    if max_period <= settings.min_period_days:
-        return []
-    df = settings.grid_duration_frac / (settings.grid_oversample * baseline)
-    grids: list[tuple[FloatArray, FloatArray]] = []
+    bounds: list[tuple[float, float]] = []
     p_lo = settings.min_period_days
     while p_lo < max_period:
         p_hi = min(p_lo * settings.segment_factor, max_period)
-        freq = np.arange(1.0 / p_hi, 1.0 / p_lo, df)
-        if freq.size:
-            periods = np.asarray(1.0 / freq[::-1], dtype=np.float64)
-            grids.append((periods, _segment_durations(p_lo, settings)))
+        bounds.append((p_lo, p_hi))
         p_lo = p_hi
-    return grids
+    return bounds
+
+
+def _segment_periods(
+    baseline: float,
+    settings: BLSSettings,
+    *,
+    time: FloatArray | None = None,
+    context: str = "BLS default grid",
+) -> list[tuple[float, FloatArray]]:
+    """``[(p_lo, periods), ...]`` of the non-empty default log segments, ascending.
+
+    Each segment is uniform in frequency at ``grid_duration_frac / (grid_oversample
+    * baseline)``. The total size is checked before anything is allocated
+    (:func:`~cuperiod.core.grid.check_grid_size`; ``time``, when given, lets the
+    message diagnose an outlier-inflated baseline, the usual cause of a huge grid).
+    """
+    bounds = _segment_bounds(baseline, settings)
+    if not bounds:
+        return []
+    df = settings.grid_duration_frac / (settings.grid_oversample * baseline)
+    # np.arange's own length rule, ceil((stop - start) / step), summed over segments.
+    total = sum(
+        max(0, math.ceil((1.0 / p_lo - 1.0 / p_hi) / df)) for p_lo, p_hi in bounds
+    )
+    check_grid_size(
+        total, automatic=True, time=time, baseline=baseline, context=context
+    )
+    parts: list[tuple[float, FloatArray]] = []
+    for p_lo, p_hi in bounds:
+        freq = np.arange(1.0 / p_hi, 1.0 / p_lo, df)
+        # arange can overshoot its stop by a rounding quantum: that sample would be a
+        # period at (or just below) p_lo -- a duplicate of the previous segment's
+        # longest period, or below min_period_days in the first segment.
+        freq = freq[freq < 1.0 / p_lo]
+        if freq.size:
+            parts.append((p_lo, np.asarray(1.0 / freq[::-1], dtype=np.float64)))
+    return parts
+
+
+def _segment_grids(
+    baseline: float,
+    settings: BLSSettings,
+    *,
+    time: FloatArray | None = None,
+    context: str = "BLS default grid",
+) -> list[Segment]:
+    """``[(periods, durations), ...]`` for each log period segment, ascending period.
+
+    The default grid of a light curve with this ``baseline`` (see
+    :func:`_segment_periods`), each segment with its own duration set.
+    """
+    return [
+        (periods, _segment_durations(p_lo, settings))
+        for p_lo, periods in _segment_periods(
+            baseline, settings, time=time, context=context
+        )
+    ]
+
+
+def _log_segments(periods: FloatArray, settings: BLSSettings) -> list[Segment]:
+    """Split an arbitrary period grid into the log segments the default grid uses.
+
+    Segment ``k`` holds the periods in ``[p0 * f**k, p0 * f**(k+1))`` (``p0`` the
+    shortest period, ``f = segment_factor``) and is searched with the durations of
+    a segment starting at ``p0 * f**k``, so a box duration tracks the period as on
+    the default grid -- one duration set scaled to the shortest period would fit a
+    long-period eclipse with boxes far too short, and blow the phase-bin count (the
+    bin is a tenth of the shortest box) up to ~1e5 per period on a 1-100 d grid.
+    The grid's periods are kept exactly (in their order within each segment).
+    """
+    p0 = float(periods.min())
+    with np.errstate(divide="ignore", invalid="ignore"):
+        index = np.floor(
+            np.log(periods / p0) / math.log(settings.segment_factor) + 1e-9
+        ).astype(np.int64)
+    segments: list[Segment] = []
+    for k in np.unique(index).tolist():
+        segments.append(
+            (
+                np.ascontiguousarray(periods[index == k]),
+                _segment_durations(p0 * settings.segment_factor**k, settings),
+            )
+        )
+    return segments
+
+
+def _grid_segments(grid: GridSpec, settings: BLSSettings) -> list[Segment]:
+    """The ``(periods, durations)`` segments that search exactly ``grid``'s periods.
+
+    A grid from :meth:`BLSMethod.default_grid` records its segments
+    (``meta["segment_starts"]`` / ``meta["segment_sizes"]``) and is split exactly
+    there, whatever light curve or settings built it; any other grid is split into
+    log segments by :func:`_log_segments`. The grid is never rebuilt from the light
+    curve, so a grid made with other settings, or for another light curve, is
+    searched as given. Shared by the single- and multi-band searches.
+    """
+    periods = np.asarray(grid.period, dtype=np.float64)
+    if periods.size == 0:
+        return []
+    if not np.all(np.isfinite(periods)):
+        # A frequency grid may start at 0 (period inf); a box cannot be folded on it.
+        raise ValueError(
+            "BLS: trial periods must be finite; drop frequency 0 from the grid"
+        )
+    starts = grid.meta.get("segment_starts")
+    sizes = grid.meta.get("segment_sizes")
+    if (
+        starts is not None
+        and sizes is not None
+        and len(starts) == len(sizes)
+        and sum(int(s) for s in sizes) == periods.size
+    ):
+        segments: list[Segment] = []
+        offset = 0
+        for p_lo, size in zip(starts, sizes, strict=True):
+            stop = offset + int(size)
+            segments.append(
+                (periods[offset:stop], _segment_durations(float(p_lo), settings))
+            )
+            offset = stop
+        return segments
+    return _log_segments(periods, settings)
 
 
 def _segment_power(
@@ -168,18 +288,37 @@ class BLSMethod(PeriodogramMethod):
     )
 
     def default_grid(self, lc: LightCurve, settings: BLSSettings) -> GridSpec:  # type: ignore[override]
+        """Log period segments, each uniform in frequency, up to the period cap.
+
+        The cap is ``min(max_period_days, baseline / min_transits)``. ``meta``
+        records the segmentation (``segment_starts``, ``segment_sizes``) so
+        :meth:`power` searches exactly these periods with these segments' box
+        durations, whichever light curve the grid is later used with.
+
+        Raises
+        ------
+        InsufficientDataError
+            If the baseline is too short for the configured period range.
+        GridTooLargeError
+            If the grid would exceed :data:`~cuperiod.core.grid.MAX_GRID_SIZE`
+            periods (checked before allocation; usually a mis-converted timestamp).
+        """
         finite = lc.finite()
-        grids = _segment_grids(finite.baseline, settings)
-        if not grids:
+        parts = _segment_periods(finite.baseline, settings, time=finite.time)
+        if not parts:
             raise InsufficientDataError(
                 "BLS: baseline too short for the configured period range"
             )
-        periods = np.concatenate([p for p, _ in grids])
+        periods = np.concatenate([p for _, p in parts])
         return GridSpec(
             kind="period",
             values=periods,
             uniform=False,
-            meta={"segmented": True},
+            meta={
+                "segmented": True,
+                "segment_starts": tuple(float(p_lo) for p_lo, _ in parts),
+                "segment_sizes": tuple(int(p.size) for _, p in parts),
+            },
         )
 
     def power(  # type: ignore[override]
@@ -208,16 +347,9 @@ class BLSMethod(PeriodogramMethod):
             # "torch"/"auto"/"gpu".
             backend = f"torch:{resolve_torch_device(backend, settings.device)}"
 
-        if grid.meta.get("segmented", False):
-            segments = _segment_grids(finite.baseline, settings)
-        else:  # user-supplied flat period grid
-            periods = grid.period
-            durations = _segment_durations(float(periods.min()), settings)
-            segments = [(periods, durations)]
+        segments = _grid_segments(grid, settings)
         if not segments:
-            raise InsufficientDataError(
-                "BLS: baseline too short for the configured period range"
-            )
+            raise InsufficientDataError("BLS: empty trial grid")
 
         chunks: dict[str, list[FloatArray]] = {name: [] for name in _SEGMENT_FIELDS}
         device_cache: dict[str, Any] = {}
@@ -239,6 +371,10 @@ class BLSMethod(PeriodogramMethod):
     ) -> Periodogram:
         from cuperiod.multiband.bls_mb import bls_multiband_power
 
+        if backend == "torch" or backend.startswith("torch:"):
+            # As in power(): a bare "torch" would otherwise run on torch's CPU device,
+            # ignore settings.device and be recorded without its device.
+            backend = f"torch:{resolve_torch_device(backend, settings.device)}"
         return bls_multiband_power(grid, mblc, settings, backend, self)
 
     def estimate_device_bytes(self, n_points: int) -> int:

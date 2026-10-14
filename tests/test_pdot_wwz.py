@@ -2,22 +2,33 @@
 
 from __future__ import annotations
 
+import importlib
 import math
 
 import numpy as np
 import pytest
 
 import cuperiod as cup
-from cuperiod.core.errors import InsufficientDataError
+from conftest import requires_numba
+from cuperiod.core.errors import BackendUnavailableError, InsufficientDataError
 from synth import synthetic_multiband_sine, synthetic_period_change, synthetic_sine
 
 PERIOD = 0.6234
+
+#: The module itself (``cuperiod.pdot.wwz`` the attribute is the function).
+wwz_module = importlib.import_module("cuperiod.pdot.wwz")
 
 #: Foster's decay constant in the VARTOOLS convention (the function's default).
 DEFAULT_C = 1.0 / (8.0 * math.pi**2)
 
 #: The long-period-variable convention: a 3.56-period window, 4.5% resolution.
 LPV_C = 0.001
+
+#: Both CPU backends; the numba tier is skipped where the [fast] extra is missing.
+BACKENDS = [
+    pytest.param("numpy", id="numpy"),
+    pytest.param("numba", id="numba", marks=requires_numba),
+]
 
 
 def _reference_wwz(
@@ -76,21 +87,81 @@ def gapped() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 # --- parity with the transparent reference -----------------------------------
 
 
-def test_grid_matches_the_reference_cell_by_cell() -> None:
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_grid_matches_the_reference_cell_by_cell(backend: str) -> None:
     """Six scattered (tau, f) cells reproduce Foster's formulas exactly."""
     t, mag, _ = synthetic_sine(n=150, span=40.0, period=1.3, noise=0.02, seed=5)
     freq = np.array([0.5, 1.0 / 1.3, 0.9])
     taus = float(t.min()) + np.array([10.0, 25.0])
-    res = cup.wwz((t, mag), frequency=freq, tau=taus, c=DEFAULT_C)
+    res = cup.wwz((t, mag), frequency=freq, tau=taus, c=DEFAULT_C, backend=backend)
     assert res.shape == (2, 3)
+    assert res.meta["wwz"]["backend"] == backend
+    # The statistic is exactly offset-invariant, so the reference runs on the
+    # centred values the implementation itself uses (raw magnitudes would only
+    # add the reference's own round-off to the comparison).
+    centred = mag - float(np.mean(mag))
     for i, tau_val in enumerate(taus):
         for j, f_val in enumerate(freq):
             ref_z, ref_a, ref_n = _reference_wwz(
-                t, mag, float(tau_val), float(f_val), DEFAULT_C
+                t, centred, float(tau_val), float(f_val), DEFAULT_C
             )
             assert res.wwz[i, j] == pytest.approx(ref_z, rel=1e-9)
             assert res.wwa[i, j] == pytest.approx(ref_a, rel=1e-9)
             assert res.n_eff[i, j] == pytest.approx(ref_n, rel=1e-9)
+
+
+@requires_numba
+def test_numba_and_numpy_backends_agree() -> None:
+    """The multicore kernel is the vectorized path, cell for cell, mask for mask."""
+    t, mag, err = gapped()
+    freq = np.geomspace(0.02, 3.0, 90)
+    taus = float(t.min()) + np.linspace(0.0, 360.0, 23)
+    slow = cup.wwz((t, mag, err), frequency=freq, tau=taus, backend="numpy")
+    fast = cup.wwz((t, mag, err), frequency=freq, tau=taus, backend="numba")
+    assert fast.meta["wwz"]["backend"] == "numba"
+    assert np.array_equal(np.isnan(slow.wwz), np.isnan(fast.wwz))
+    peak = float(np.nanmax(slow.wwz))
+    np.testing.assert_allclose(fast.wwz, slow.wwz, rtol=1e-8, atol=1e-10 * peak)
+    np.testing.assert_allclose(fast.wwa, slow.wwa, rtol=1e-8, atol=1e-12)
+    np.testing.assert_allclose(fast.n_eff, slow.n_eff, rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(fast.peak_frequency, slow.peak_frequency, rtol=1e-9)
+
+
+def test_backend_selection() -> None:
+    """'auto'/'cpu' take the fastest CPU tier; anything else is refused by name."""
+    t, mag, err = steady()
+    freq = np.geomspace(1.0, 2.5, 12)
+    taus = float(t.min()) + np.array([100.0, 200.0])
+    auto = cup.wwz((t, mag, err), frequency=freq, tau=taus)
+    expected = "numba" if wwz_module._numba_available() else "numpy"
+    assert auto.meta["wwz"]["backend"] == expected
+    cpu = cup.wwz((t, mag, err), frequency=freq, tau=taus, backend=" CPU ")
+    assert cpu.meta["wwz"]["backend"] == expected
+    with pytest.raises(BackendUnavailableError, match="unknown backend"):
+        cup.wwz((t, mag, err), frequency=freq, tau=taus, backend="gpu")
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_window_truncation_is_lossless(
+    backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Skipping points far under the Gaussian changes nothing but round-off.
+
+    The cut is anchored on the *nearest* datum, so a tau inside a gap (where
+    every weight is tiny but the statistic is still defined) keeps its cells
+    and its n_eff exactly as the full sum gives them.
+    """
+    t, mag, err = gapped()
+    freq = np.geomspace(0.02, 3.0, 90)
+    taus = float(t.min()) + np.linspace(0.0, 360.0, 23)
+    cut = cup.wwz((t, mag, err), frequency=freq, tau=taus, backend=backend)
+    monkeypatch.setattr(wwz_module, "_WINDOW_CUT", math.inf)
+    full = cup.wwz((t, mag, err), frequency=freq, tau=taus, backend=backend)
+    assert np.array_equal(np.isnan(cut.wwz), np.isnan(full.wwz))
+    np.testing.assert_allclose(cut.n_eff, full.n_eff, rtol=1e-9, atol=1e-12)
+    peak = float(np.nanmax(full.wwz))
+    finite = np.isfinite(full.wwz)
+    assert np.all(np.abs(cut.wwz[finite] - full.wwz[finite]) <= 1e-9 * peak)
 
 
 # --- a constant period gives a flat ridge ------------------------------------
@@ -105,14 +176,14 @@ def test_constant_period_ridge_is_flat() -> None:
     assert res.baseline == pytest.approx(float(t.max() - t.min()))
 
     f_true = 1.0 / PERIOD
-    peak_f = res.peak_frequency()
+    peak_f = res.peak_frequency
     valid = np.isfinite(peak_f)
     assert np.count_nonzero(valid) == 50
     # Well inside the window's own 4.5% frequency resolution at c = 0.001.
     assert np.all(np.abs(peak_f[valid] / f_true - 1.0) < 2e-2)
-    assert np.allclose(res.peak_period()[valid], 1.0 / peak_f[valid])
+    assert np.allclose(res.peak_period[valid], 1.0 / peak_f[valid])
 
-    wwa = res.peak_wwa()
+    wwa = res.peak_wwa
     assert np.all(np.abs(wwa[valid] / 0.4 - 1.0) < 0.15)
 
     pdot_over_p, trend_err = res.period_trend()
@@ -160,10 +231,34 @@ def test_drifting_period_is_recovered_by_the_ridge() -> None:
     assert 0.5 < pdot_over_p / truth["pdot_over_p"] < 2.0
     assert trend_err < 0.5 * pdot_over_p
     # A lengthening period is a falling frequency, first valid tau to last.
-    peak_f = res.peak_frequency()
+    peak_f = res.peak_frequency
     valid = np.flatnonzero(np.isfinite(peak_f))
     assert peak_f[valid[-1]] < peak_f[valid[0]]
-    assert res.peak_period()[valid[-1]] > res.peak_period()[valid[0]]
+    assert res.peak_period[valid[-1]] > res.peak_period[valid[0]]
+
+
+def test_descending_frequency_axis_gives_the_same_ridge() -> None:
+    """``frequency=1/periods`` (a descending axis) refines the ridge correctly.
+
+    The parabolic offset is measured in index steps; on a descending axis a
+    step to the next index is a step *down* in frequency, so an unsigned grid
+    spacing moved every refined peak the wrong way.
+    """
+    t, mag, _ = synthetic_sine(
+        n=1500, span=3000.0, period=100.37, amp=0.5, noise=0.05, seed=11
+    )
+    descending = 1.0 / np.linspace(80.0, 130.0, 41)
+    taus = float(t.min()) + np.linspace(300.0, 2700.0, 25)
+    desc = cup.wwz((t, mag), frequency=descending, tau=taus)
+    asc = cup.wwz((t, mag), frequency=descending[::-1], tau=taus)
+    np.testing.assert_allclose(desc.wwz[:, ::-1], asc.wwz, rtol=1e-9)
+    np.testing.assert_allclose(desc.peak_frequency, asc.peak_frequency, rtol=1e-9)
+    # And the refinement improves on the raw cells rather than undoing them.
+    cells = np.array([asc.frequency[np.nanargmax(row)] for row in asc.wwz])
+    truth = 1.0 / 100.37
+    refined_err = np.sqrt(np.mean((1.0 / desc.peak_frequency - 1.0 / truth) ** 2))
+    cell_err = np.sqrt(np.mean((1.0 / cells - 1.0 / truth) ** 2))
+    assert refined_err < cell_err
 
 
 # --- the N_eff mask ----------------------------------------------------------
@@ -243,10 +338,26 @@ def test_too_few_points_raises() -> None:
         cup.wwz((t, mag, err))
 
 
-def test_bad_c_and_n_tau_raise() -> None:
+@pytest.mark.parametrize("bad", [0.0, -1.0, math.nan, math.inf])
+def test_bad_c_raises(bad: float) -> None:
+    """c must be a positive *finite* number: NaN and inf used to slip through."""
     t, mag, err = steady()
     with pytest.raises(ValueError, match="c must be positive"):
-        cup.wwz((t, mag, err), c=0.0)
+        cup.wwz((t, mag, err), c=bad)
+    with pytest.raises(ValueError, match="c must be positive"):
+        cup.wwz((t, mag, err), c=bad, frequency=np.array([1.0, 1.5]))
+
+
+@pytest.mark.parametrize("bad", [0.0, 2.9, -5.0, math.nan])
+def test_min_neff_below_the_algebraic_floor_raises(bad: float) -> None:
+    """Below N_eff = 3 the statistic turns negative; NaN would mask everything."""
+    t, mag, err = steady()
+    with pytest.raises(ValueError, match="min_neff"):
+        cup.wwz((t, mag, err), min_neff=bad)
+
+
+def test_bad_n_tau_and_axes_raise() -> None:
+    t, mag, err = steady()
     with pytest.raises(ValueError, match="n_tau must be"):
         cup.wwz((t, mag, err), n_tau=0)
     with pytest.raises(ValueError, match="finite and positive"):
@@ -269,6 +380,147 @@ def test_explicit_axes_are_used_verbatim() -> None:
     assert res.meta["wwz"]["n_tau"] == 9  # n_tau= is ignored when tau= is given
 
 
+def test_explicit_axes_are_copied() -> None:
+    """The frozen result owns its axes: editing the caller's arrays changes nothing."""
+    t, mag, err = steady()
+    freq = np.linspace(1.0, 2.5, 37)
+    taus = float(t.min()) + np.linspace(10.0, 350.0, 9)
+    res = cup.wwz((t, mag, err), frequency=freq, tau=taus)
+    assert not np.shares_memory(res.frequency, freq)
+    assert not np.shares_memory(res.tau, taus)
+    ridge = res.peak_frequency.copy()
+    freq *= 2.0
+    taus += 100.0
+    assert res.frequency[0] == pytest.approx(1.0)
+    assert res.tau[0] == pytest.approx(float(t.min()) + 10.0)
+    assert np.array_equal(res.peak_frequency, ridge, equal_nan=True)
+
+
+# --- inputs ------------------------------------------------------------------
+
+
+def test_masked_values_in_a_tuple_are_dropped() -> None:
+    """A numpy mask is honoured: placeholders under it never reach the map."""
+    t, mag, _ = steady()
+    bad = np.zeros(t.size, dtype=bool)
+    bad[::10] = True
+    masked = np.ma.MaskedArray(np.where(bad, 99.99, mag), mask=bad)
+    freq = np.geomspace(1.0, 2.5, 30)
+    taus = float(t.min()) + np.linspace(20.0, 340.0, 8)
+    res = cup.wwz((t, masked), frequency=freq, tau=taus)
+    clean = cup.wwz((t[~bad], mag[~bad]), frequency=freq, tau=taus)
+    assert res.n_samples == int(np.count_nonzero(~bad))
+    assert np.array_equal(res.wwz, clean.wwz, equal_nan=True)
+
+
+def test_unusable_errors_do_not_drop_points() -> None:
+    """WWZ ignores the errors, so a blank or zero error must not cost the point.
+
+    Visual estimates in AAVSO-style data carry no uncertainty; dropping them
+    (the weighted methods' ``finite()`` convention) silently discarded most of
+    such a light curve. Rows with a non-finite time or value still go.
+    """
+    t, mag, err = steady()
+    freq = np.geomspace(1.0, 2.5, 30)
+    taus = float(t.min()) + np.linspace(20.0, 340.0, 8)
+    holey = err.copy()
+    holey[::3] = np.nan
+    holey[1::3] = 0.0
+    res = cup.wwz((t, mag, holey), frequency=freq, tau=taus)
+    plain = cup.wwz((t, mag), frequency=freq, tau=taus)
+    assert res.n_samples == t.size
+    assert np.array_equal(res.wwz, plain.wwz, equal_nan=True)
+    for blank in (np.full(t.size, np.nan), np.zeros(t.size)):
+        assert cup.wwz((t, mag, blank), frequency=freq, tau=taus).n_samples == t.size
+    nan_value = mag.copy()
+    nan_value[5] = np.nan
+    assert cup.wwz((t, nan_value, err), frequency=freq, tau=taus).n_samples == (
+        t.size - 1
+    )
+
+
+@pytest.mark.parametrize("level", [0.0, 12.0, 13.37])
+def test_constant_series_gives_an_empty_map(level: float) -> None:
+    """No variation, no ridge: every cell is masked and n_eff still explains it."""
+    t, _, _ = steady()
+    freq = np.geomspace(0.05, 3.0, 40)
+    taus = float(t.min()) + np.linspace(0.0, 360.0, 10)
+    res = cup.wwz((t, np.full(t.size, level)), frequency=freq, tau=taus)
+    assert np.all(np.isnan(res.wwz))
+    assert np.all(np.isnan(res.wwa))
+    assert np.all(np.isnan(res.peak_frequency))
+    assert np.all(np.isfinite(res.n_eff))
+
+
+def test_a_constant_offset_does_not_change_the_map() -> None:
+    """The constant trial function makes WWZ offset-invariant, so it must be.
+
+    Raw values used to enter the sums, where ``<x|x> - y.b`` cancels terms of
+    size mean^2: at a mean 10^5 times the scatter the low-Z cells were wrong by
+    tens of percent and some came out negative.
+    """
+    t, mag, _ = steady()
+    freq = np.geomspace(0.05, 3.0, 80)
+    taus = float(t.min()) + np.linspace(0.0, 360.0, 20)
+    base = cup.wwz((t, mag), frequency=freq, tau=taus)
+    shifted = cup.wwz((t, mag + 1.0e5), frequency=freq, tau=taus)
+    assert np.array_equal(np.isnan(base.wwz), np.isnan(shifted.wwz))
+    peak = float(np.nanmax(base.wwz))
+    np.testing.assert_allclose(shifted.wwz, base.wwz, rtol=1e-6, atol=1e-9 * peak)
+    np.testing.assert_allclose(shifted.wwa, base.wwa, rtol=1e-6, atol=1e-12)
+    assert float(np.nanmin(shifted.wwz)) >= 0.0
+
+
+# --- the ridge trend's error bar ----------------------------------------------
+
+
+def _lpv(seed: int) -> tuple[np.ndarray, np.ndarray]:
+    """A constant-period long-period variable: 400 points over 4000 d, P = 120 d."""
+    t, mag, _ = synthetic_sine(
+        n=400, span=4000.0, period=120.0, amp=0.3, noise=0.15, seed=seed
+    )
+    return t, mag
+
+
+def test_period_trend_error_does_not_shrink_with_more_taus() -> None:
+    """Overlapping windows are not independent: n_tau is a grid knob, not data.
+
+    At c = 0.001 a window is 3.56 periods wide, so 25 or 200 taus over the run
+    sample the same handful of independent windows; the quoted error used to
+    fall as 1/sqrt(n_tau) while the true scatter stayed put.
+    """
+    t, mag = _lpv(0)
+    freq = np.geomspace(1.0 / 150.0, 1.0 / 100.0, 40)
+    coarse = cup.wwz((t, mag), frequency=freq, n_tau=25, c=LPV_C).period_trend()
+    fine = cup.wwz((t, mag), frequency=freq, n_tau=200, c=LPV_C).period_trend()
+    assert 0.8 < fine[1] / coarse[1] < 1.25
+
+
+def test_period_trend_error_is_calibrated_on_constant_periods() -> None:
+    """Null ensemble at the LPV convention: the pulls have roughly unit scatter.
+
+    With the independent-points error, half of these constant-period stars
+    showed a >3 sigma 'drift' (pull rms ~4-8).
+    """
+    freq = np.geomspace(1.0 / 150.0, 1.0 / 100.0, 30)
+    pulls = []
+    for seed in range(16):
+        t, mag = _lpv(100 + seed)
+        rate, err = cup.wwz((t, mag), frequency=freq, c=LPV_C).period_trend()
+        pulls.append(rate / err)
+    assert float(np.sqrt(np.mean(np.square(pulls)))) < 2.5
+
+
+def test_period_trend_error_is_infinite_without_independent_windows() -> None:
+    """Taus packed inside one window's width carry no slope information."""
+    t, mag = _lpv(0)
+    freq = np.geomspace(1.0 / 150.0, 1.0 / 100.0, 30)
+    taus = float(t.min()) + np.linspace(1900.0, 2100.0, 9)
+    rate, err = cup.wwz((t, mag), frequency=freq, tau=taus, c=LPV_C).period_trend()
+    assert math.isfinite(rate)
+    assert err == math.inf
+
+
 def test_period_trend_needs_three_valid_taus() -> None:
     """Two rows have no residuals to fit; the trend refuses rather than guesses."""
     t, mag, err = steady()
@@ -277,6 +529,29 @@ def test_period_trend_needs_three_valid_taus() -> None:
     res = cup.wwz((t, mag, err), frequency=freq, tau=taus, c=LPV_C)
     with pytest.raises(InsufficientDataError, match="at least 3 valid taus"):
         res.period_trend()
+
+
+def test_ridge_accessors_match_the_sliding_periodogram() -> None:
+    """WWZResult and SlidingPeriodogram spell the ridge the same way.
+
+    Both expose ``peak_frequency``/``peak_period`` as arrays (not methods) and
+    take ``include_map=`` in ``to_dict``, so code written against one map works
+    on the other.
+    """
+    t, mag, err = steady()
+    freq = np.geomspace(1.0, 2.5, 30)
+    taus = float(t.min()) + np.linspace(20.0, 340.0, 8)
+    res = cup.wwz((t, mag, err), frequency=freq, tau=taus, c=LPV_C)
+    slide = cup.sliding_periodogram((t, mag, err), period=PERIOD)
+    for ridge in (res, slide):
+        assert isinstance(ridge.peak_frequency, np.ndarray)
+        assert isinstance(ridge.peak_period, np.ndarray)
+        assert np.isfinite(float(np.nanmedian(ridge.peak_period)))
+        assert "frequency" in ridge.to_dict(include_map=True)
+    assert isinstance(res.peak_wwa, np.ndarray)
+    # The cached ridge is read-only, so it cannot drift from the map.
+    with pytest.raises(ValueError):
+        res.peak_frequency[0] = 1.0
 
 
 def test_to_dict_round_trip() -> None:
@@ -304,7 +579,7 @@ def test_to_dict_round_trip() -> None:
     assert len(plain["peak_frequency"]) == 8
     assert plain["c"] == LPV_C
 
-    full = res.to_dict(include_maps=True)
+    full = res.to_dict(include_map=True)
     assert set(full) - set(plain) == {"frequency", "wwz", "wwa", "n_eff"}
     assert np.asarray(full["wwz"]).shape == res.wwz.shape
     assert np.asarray(full["n_eff"]).shape == res.n_eff.shape

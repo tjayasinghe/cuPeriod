@@ -263,6 +263,49 @@ def _harmonic_chi2(
     return float(np.dot(w, resid * resid))
 
 
+#: Elements of one stacked (trials x points x coefficients) design in
+#: :func:`_harmonic_chi2_many`: cache-sized, so batching never loses to the
+#: per-trial loop even on long intervals.
+_STACK_BUDGET: int = 1 << 16
+
+
+def _harmonic_chi2_many(
+    dt: FloatArray, y: FloatArray, w: FloatArray, freqs: FloatArray, n_harmonics: int
+) -> FloatArray:
+    """:func:`_harmonic_chi2` at every frequency in ``freqs``, batched.
+
+    One stacked design, one batched solve and one residual pass per chunk of
+    trials, instead of a Python call per trial, whose overhead dominated the
+    whole profile on the usual ~50-point intervals. The design is built in the
+    same operation order as :func:`cuperiod.pdot.track._design`; a chunk with
+    a singular trial falls back to the scalar function, which keeps its ``inf``.
+    """
+    freqs = np.asarray(freqs, dtype=np.float64)
+    n = int(dt.size)
+    k = 2 * n_harmonics + 1
+    chunk = max(1, _STACK_BUDGET // max(1, n * k))
+    m = np.arange(1, n_harmonics + 1, dtype=np.float64)
+    out = np.empty(freqs.size, dtype=np.float64)
+    for start in range(0, freqs.size, chunk):
+        f = freqs[start : start + chunk]
+        ang = (2.0 * np.pi * f)[:, None, None] * dt[None, :, None] * m[None, None, :]
+        design = np.empty((f.size, n, k), dtype=np.float64)
+        design[:, :, 0] = 1.0
+        design[:, :, 1 : 1 + n_harmonics] = np.cos(ang)
+        design[:, :, 1 + n_harmonics :] = np.sin(ang)
+        xtw = np.swapaxes(design, 1, 2) * w[None, None, :]
+        try:
+            coef = np.linalg.solve(xtw @ design, (xtw @ y)[..., None])
+        except np.linalg.LinAlgError:
+            out[start : start + f.size] = [
+                _harmonic_chi2(dt, y, w, float(v), n_harmonics) for v in f
+            ]
+            continue
+        resid = y[None, :] - (design @ coef)[..., 0]
+        out[start : start + f.size] = (resid * resid) @ w
+    return out
+
+
 def _refine_frequency(
     dt: FloatArray,
     y: FloatArray,
@@ -271,43 +314,69 @@ def _refine_frequency(
     f_hi: float,
     n_harmonics: int,
     oversample: int,
+    *,
+    unit_weights: bool = False,
 ) -> tuple[float, float, float, bool]:
     """Best frequency in ``[f_lo, f_hi]`` and its curvature error.
 
     A dense scan finds the global minimum inside the window (the harmonic
-    chi-squared is multi-modal on the alias comb), then two parabolic passes
-    refine it and read the curvature. Returns
-    ``(frequency, sigma_f, chi2_min, at_edge)``.
+    chi-squared is multi-modal on the alias comb), a bounded minimization
+    converges on it inside the scan's bracket, and two parabolic passes read
+    the curvature there. Returns ``(frequency, sigma_f, chi2_min, at_edge)``.
+
+    The scan steps at ``1/(oversample * span * n_harmonics)``: the ``m``-th
+    harmonic narrows the chi-squared's structure to ``1/(m * span)``, and a
+    stencil scaled for the fundamental alone can bracket the wrong sub-basin
+    of a many-harmonic template. And the minimum is *converged*, not read off
+    the scan stencil's parabolic vertex: at stencil scale the chi-squared of
+    irregular sampling is asymmetric, the vertex misses the minimum by more
+    than the curvature sigma whenever that sigma is small (many harmonics,
+    high signal-to-noise), and the period then scatters several times beyond
+    its own error bar.
+
+    With ``unit_weights`` (no photometric errors) the curvature sigma is in
+    the units of the values until ``chi2_reduced`` restores it, so the second
+    curvature pass sizes its stencil from the restored, physical sigma; the
+    errors are then the same whatever the units of the light curve.
     """
+    from scipy.optimize import minimize_scalar
+
     span = max(float(dt.max() - dt.min()), 1e-9)
-    step = 1.0 / (oversample * span)
+    step = 1.0 / (oversample * span * max(1, n_harmonics))
     n = max(9, int(math.ceil((f_hi - f_lo) / step)) + 1)
     grid = np.linspace(f_lo, f_hi, n)
-    chi2 = np.array([_harmonic_chi2(dt, y, w, f, n_harmonics) for f in grid])
+    chi2 = _harmonic_chi2_many(dt, y, w, grid, n_harmonics)
     k = int(np.argmin(chi2))
     at_edge = k in (0, n - 1)
     f_best = float(grid[k])
-    if not at_edge:  # parabolic vertex on the scan stencil
-        a, b, c = chi2[k - 1], chi2[k], chi2[k + 1]
-        denom = a - 2.0 * b + c
-        if denom > 0.0:
-            f_best += float(grid[1] - grid[0]) * 0.5 * (a - c) / denom
+    chi2_min = float(chi2[k])
+    if not at_edge and np.isfinite(chi2_min):
+        res = minimize_scalar(
+            lambda f: _harmonic_chi2(dt, y, w, float(f), n_harmonics),
+            bounds=(float(grid[k - 1]), float(grid[k + 1])),
+            method="bounded",
+            options={"xatol": 1e-6 * float(grid[1] - grid[0])},
+        )
+        if np.isfinite(res.fun) and float(res.fun) <= chi2_min:
+            f_best, chi2_min = float(res.x), float(res.fun)
 
-    # Curvature at the refined minimum. The first pass uses a scan-scale step,
-    # the second one scaled to the sigma it implied, so the parabola is
-    # evaluated where the chi-squared is actually parabolic.
+    # Curvature at the minimum. The first pass uses a scan-scale step, the
+    # second one scaled to the sigma it implied, so the parabola is evaluated
+    # where the chi-squared is actually parabolic.
+    dof = max(1, int(dt.size) - (2 * n_harmonics + 1))
+    unit = math.sqrt(max(chi2_min, 0.0) / dof) if unit_weights else 1.0
     h = 0.25 * step
     sigma = float("nan")
-    chi2_min = _harmonic_chi2(dt, y, w, f_best, n_harmonics)
     for _ in range(2):
-        lo = _harmonic_chi2(dt, y, w, f_best - h, n_harmonics)
-        hi = _harmonic_chi2(dt, y, w, f_best + h, n_harmonics)
+        lo, hi = _harmonic_chi2_many(
+            dt, y, w, np.array([f_best - h, f_best + h]), n_harmonics
+        )
         curv = (lo - 2.0 * chi2_min + hi) / (h * h)
         if not np.isfinite(curv) or curv <= 0.0:
             sigma = float("nan")
             break
         sigma = math.sqrt(2.0 / curv)
-        h = max(min(sigma, 4.0 * step), 1e-4 * step)
+        h = max(min(sigma * unit, 4.0 * step), 1e-4 * step)
     return f_best, sigma, chi2_min, at_edge
 
 
@@ -432,7 +501,7 @@ def period_profile(
     settings: PdotSettings | None = None,
     backend: str = "auto",
     columns: ColumnMap | None = None,
-    domain: Domain | None = None,
+    domain: Domain | str | None = None,
 ) -> PeriodProfile:
     """Measure the period independently in consecutive time intervals.
 
@@ -497,8 +566,18 @@ def period_profile(
     window = (
         period_window if period_window is not None else psettings.profile_period_window
     )
-    if window <= 0.0 or window >= 1.0:
+    # `not (a < x < b)` rather than `x <= a or x >= b`: NaN fails every
+    # comparison and must be refused here, not deep inside the scan.
+    if not 0.0 < window < 1.0:
         raise ValueError(f"period_window must be in (0, 1), got {window}")
+    if harmonics is not None and harmonics < 1:
+        raise ValueError(f"harmonics must be >= 1, got {harmonics}")
+    if per_interval < 1:
+        raise ValueError(f"points_per_interval must be >= 1, got {per_interval}")
+    if n_intervals is not None and n_intervals < 1:
+        raise ValueError(f"n_intervals must be >= 1, got {n_intervals}")
+    if period is not None and not (math.isfinite(period) and period > 0.0):
+        raise ValueError(f"period must be finite and positive, got {period}")
 
     lc = to_input(data, columns=columns, domain=domain)
     if isinstance(lc, MultiBandLightCurve):
@@ -527,8 +606,8 @@ def period_profile(
         period = pdot_search(
             finite, settings=psettings, backend=backend
         ).best.period
-    if period <= 0.0:
-        raise ValueError(f"period must be positive, got {period}")
+    if not (math.isfinite(period) and period > 0.0):
+        raise ValueError(f"period must be finite and positive, got {period}")
     f_ref = 1.0 / period
 
     slices = _interval_slices(time.size, per_interval, n_intervals)
@@ -560,6 +639,11 @@ def period_profile(
             continue
         if span < 2.0 * period:
             continue
+        if float(np.ptp(seg_y)) == 0.0:
+            # Nothing varies: any "period" would be the scan's argmin of a flat
+            # chi-squared. (Not `total > 0` below -- on constant data the
+            # weighted mean's rounding leaves `total` at ~1e-24, not 0.)
+            continue
         dt = seg_t - float(np.mean(seg_t))
         f_best, sigma_f, chi2_min, at_edge = _refine_frequency(
             dt,
@@ -569,6 +653,7 @@ def period_profile(
             f_ref / (1.0 - window),
             n_harm,
             psettings.samples_per_peak,
+            unit_weights=not weighted,
         )
         if not (np.isfinite(f_best) and f_best > 0.0):
             continue
@@ -581,8 +666,13 @@ def period_profile(
         sigma_f = sigma_f * scale
         design = _design(dt, f_best, n_harm)
         xtw = design.T * seg_w[None, :]
-        coef = np.linalg.solve(xtw @ design, xtw @ seg_y)
-        amplitude = float(math.hypot(float(coef[1]), float(coef[2])))
+        try:
+            coef = np.linalg.solve(xtw @ design, xtw @ seg_y)
+        except np.linalg.LinAlgError:
+            continue  # weights that underflow, or a degenerate interval
+        # Columns are [1, cos(1..H), sin(1..H)]: the fundamental's sine
+        # coefficient is coef[1 + H], not coef[2] (the second cosine).
+        amplitude = float(math.hypot(float(coef[1]), float(coef[1 + n_harm])))
         mean = float(np.dot(seg_w, seg_y) / seg_w.sum())
         total = float(np.dot(seg_w, (seg_y - mean) ** 2))
         if not np.isfinite(sigma_f):

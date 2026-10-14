@@ -23,6 +23,7 @@ explicit :class:`ColumnMap`.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Final
@@ -31,10 +32,39 @@ from cuperiod.core.errors import ColumnResolutionError
 
 
 class Domain(StrEnum):
-    """Brightness domain of a light curve's value column."""
+    """Brightness domain of a light curve's value column.
+
+    Construction from a string ignores case and surrounding whitespace, so
+    ``Domain("Flux")`` is :attr:`FLUX`; anything else raises ``ValueError``.
+    """
 
     MAGNITUDE = "magnitude"
     FLUX = "flux"
+
+    @classmethod
+    def _missing_(cls, value: object) -> Domain | None:
+        if isinstance(value, str):
+            norm = value.strip().lower()
+            for member in cls:
+                if member.value == norm:
+                    return member
+        return None
+
+
+def coerce_domain(domain: Domain | str | None) -> Domain | None:
+    """``None`` stays ``None``; a string or :class:`Domain` becomes a :class:`Domain`.
+
+    Every public entry point takes ``domain`` as either spelling (``"flux"`` is
+    documented), but identity checks such as ``domain is Domain.FLUX`` only hold
+    for the enum: an uncoerced ``"flux"`` used to fall through to the magnitude
+    branch. Coerce once, at the entry point, with this.
+
+    Raises
+    ------
+    ValueError
+        If ``domain`` is not a valid domain name.
+    """
+    return None if domain is None else Domain(domain)
 
 
 #: Time-column name candidates, most-specific first. Barycentric/heliocentric
@@ -194,13 +224,21 @@ def infer_domain(value_column: str) -> Domain | None:
     Domain or None
         :attr:`Domain.FLUX` if the name looks flux-like, :attr:`Domain.MAGNITUDE`
         if magnitude-like, otherwise ``None`` (caller should default or require an
-        explicit domain).
+        explicit domain). Every name in :data:`FLUX_NAMES` / :data:`MAG_NAMES` maps
+        to its own list's domain.
     """
     low = value_column.lower()
+    # The detection lists first: a column picked *because* it is a flux name must be
+    # labelled flux. The bare ``f`` matches no flux token and used to fall back to
+    # magnitude, so BLS/TLS converted a {t, f, err} table with 10**(-0.4 f).
+    if low in FLUX_NAMES:
+        return Domain.FLUX
+    if low in MAG_NAMES:
+        return Domain.MAGNITUDE
     flux_tokens = ("flux", "fnu", "ujy", "mjy", "njy", "nmgy", "jansky")
     if any(tok in low for tok in flux_tokens):
         return Domain.FLUX
-    if "mag" in low or low in {"m", "vmag", "gmag", "rmag", "bmag", "imag"}:
+    if "mag" in low:
         return Domain.MAGNITUDE
     return None
 
@@ -218,7 +256,9 @@ class ColumnMap:
     ----------
     time, value, error, band : str, optional
         Explicit column names. ``time`` and ``value`` are required (by detection or
-        override); ``error`` and ``band`` are optional.
+        override); ``error`` and ``band`` are optional. A non-string label (the
+        integer columns of ``pandas.read_csv(header=None)``) is taken as its
+        string form, which is how table column names are matched.
 
     Examples
     --------
@@ -231,18 +271,28 @@ class ColumnMap:
     error: str | None = None
     band: str | None = None
 
+    def __post_init__(self) -> None:
+        for role in ("time", "value", "error", "band"):
+            label = getattr(self, role)
+            if label is not None and not isinstance(label, str):
+                object.__setattr__(self, role, str(label))
+
     def resolve(
-        self, columns: list[str], *, domain: Domain | None = None
+        self, columns: list[str], *, domain: Domain | str | None = None
     ) -> ResolvedColumns:
         """Resolve against a table's actual column names.
 
         Parameters
         ----------
         columns : list of str
-            The table's column names.
-        domain : Domain, optional
-            Explicit domain override. If ``None``, the domain is inferred from the
-            resolved value-column name, defaulting to :attr:`Domain.MAGNITUDE`.
+            The table's column names (non-string labels are matched as strings).
+        domain : Domain or str, optional
+            Explicit domain (``"flux"``/``"magnitude"`` or the enum). It labels the
+            value column and, when ``value`` is auto-detected, decides which kind of
+            column is preferred: a table carrying both flux and magnitude columns
+            gives its magnitude column for ``domain="magnitude"``. If ``None``, the
+            domain is inferred from the resolved value-column name, defaulting to
+            :attr:`Domain.MAGNITUDE`.
 
         Returns
         -------
@@ -252,13 +302,33 @@ class ColumnMap:
         ------
         ColumnResolutionError
             If the time or value column cannot be resolved.
+        ValueError
+            If ``domain`` is not a valid domain name.
+
+        Warns
+        -----
+        UserWarning
+            If ``domain`` is given and ``value`` is auto-detected, but the table has
+            no column of that domain and the one found looks like the other (e.g.
+            only ``flux`` with ``domain="magnitude"``). The override is still
+            honoured.
         """
-        available = list(columns)
+        explicit = coerce_domain(domain)
+        available = [str(col) for col in columns]
         lower_to_actual: dict[str, str] = {}
         for col in available:  # first spelling wins on case collisions
             lower_to_actual.setdefault(col.lower(), col)
 
-        value_candidates = FLUX_NAMES + MAG_NAMES if self.value is None else ()
+        # Without an explicit domain flux names are tried first (the long-standing
+        # order); with one, that domain's names are, so domain="magnitude" on an
+        # ASAS-SN/Gaia table with both `flux` and `mag` reads `mag` instead of
+        # stamping the flux column as magnitudes (which made BLS invert transits).
+        if self.value is not None:
+            value_candidates: tuple[str, ...] = ()
+        elif explicit is Domain.MAGNITUDE:
+            value_candidates = MAG_NAMES + FLUX_NAMES
+        else:
+            value_candidates = FLUX_NAMES + MAG_NAMES
         time = _match("time", self.time, TIME_NAMES, available, lower_to_actual)
         value = _match(
             "value", self.value, value_candidates, available, lower_to_actual
@@ -277,7 +347,23 @@ class ColumnMap:
                 "ColumnMap(value=...) explicitly. Available columns: "
                 f"{available}"
             )
-        resolved_domain = domain or infer_domain(value) or Domain.MAGNITUDE
+        inferred = infer_domain(value)
+        if (
+            explicit is not None
+            and self.value is None
+            and inferred is not None
+            and inferred is not explicit
+        ):
+            warnings.warn(
+                f"domain={explicit.value!r} was given but no {explicit.value} column "
+                f"was found; the auto-detected value column {value!r} looks like a "
+                f"{inferred.value} column and is read as {explicit.value} as "
+                "requested. Pin ColumnMap(value=...) to silence this, or omit "
+                "domain= to label the column by its name.",
+                UserWarning,
+                stacklevel=2,
+            )
+        resolved_domain = explicit or inferred or Domain.MAGNITUDE
         # Resolve the error for the *same* measurement as the value: first try names
         # derived from the value column (so ``PDCSAP_FLUX`` pairs with
         # ``PDCSAP_FLUX_ERR`` and ``uJy`` with ``duJy``), then the spellings for the
@@ -305,5 +391,6 @@ __all__ = [
     "ColumnMap",
     "Domain",
     "ResolvedColumns",
+    "coerce_domain",
     "infer_domain",
 ]

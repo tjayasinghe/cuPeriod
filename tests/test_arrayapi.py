@@ -136,3 +136,44 @@ def test_bls_resolves_torch_backend() -> None:
 def test_resolve_unknown_torch_device_raises() -> None:
     with pytest.raises(BackendUnavailableError):
         GLSMethod().resolve_backend("torch:bogus")
+
+
+# --- METH-B-8: negative-stride host views ---------------------------------------------
+
+
+@requires_torch
+@pytest.mark.parametrize("n", [1, 4])
+def test_to_device_array_accepts_reversed_views(n: int) -> None:
+    import torch
+
+    from cuperiod.core._arrayapi import to_device_array
+
+    view = np.arange(1.0, n + 1.0)[::-1]
+    out = to_device_array(view, device="cpu", dtype=torch.float64)
+    assert out.tolist() == view.tolist()
+
+
+@requires_torch
+@pytest.mark.parametrize(
+    ("method", "kind", "value"),
+    [
+        ("PDM", "frequency", 0.81),
+        ("CE", "frequency", 0.81),
+        ("STRINGLENGTH", "frequency", 0.81),
+        ("MHAOV", "period", 1.2345),
+    ],
+)
+def test_one_sample_grid_of_the_opposite_kind_runs_on_torch(
+    method: str, kind: str, value: float
+) -> None:
+    import cuperiod as cup
+    from cuperiod.core.grid import GridSpec
+
+    rng = np.random.default_rng(0)
+    t = np.sort(rng.uniform(0.0, 30.0, 200))
+    y = np.sin(2 * np.pi * 0.81 * t) + 0.1 * rng.standard_normal(t.size)
+    grid = GridSpec(kind=kind, values=np.array([value]))  # type: ignore[arg-type]
+    ref = cup.periodogram((t, y), method, backend="numpy", grid=grid)
+    got = cup.periodogram((t, y), method, backend="torch:cpu", grid=grid)
+    assert isinstance(ref, cup.Periodogram) and isinstance(got, cup.Periodogram)
+    np.testing.assert_allclose(got.power, ref.power, rtol=1e-8, atol=1e-10)

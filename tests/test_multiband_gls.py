@@ -212,3 +212,158 @@ def test_too_few_points_raises() -> None:
 def test_flex_zero_terms_rejected() -> None:
     with pytest.raises(ValueError, match="mb_nterms"):
         cup.GLSSettings(mb_model="flex", mb_nterms_base=0, mb_nterms_band=0)
+
+
+# --- bands with and without errors (MULTIBAND-6) ------------------------------
+
+
+def _strip_errors(
+    names: tuple[str, ...], scale: float = 1.0
+) -> cup.MultiBandLightCurve:
+    """The standard 3-band set with the bands in ``names`` stripped of errors."""
+    bands = synthetic_multiband_sine(period=PERIOD)
+    return cup.MultiBandLightCurve.from_light_curves(
+        {
+            k: cup.LightCurve.from_arrays(
+                t, scale * m, None if k in names else scale * e
+            )
+            for k, (t, m, e) in bands.items()
+        }
+    )
+
+
+def test_perband_mixed_errors_match_astropy() -> None:
+    # One band without errors used to enter chi2_0k in mag^2 next to dimensionless
+    # weighted bands (0.11-0.19 off astropy); every band now runs unweighted, as the
+    # offsets/flex models and astropy already did.
+    grid = make_grid(2001)
+    s = cup.GLSSettings(mb_model="perband")
+    mixed = _strip_errors(("b1",))
+    native = gls_multiband_power(grid, mixed, s, "finufft").power
+    reference = gls_multiband_power(grid, mixed, s, "astropy").power
+    assert np.allclose(native, reference, atol=5e-3)
+    bare = gls_multiband_power(grid, _strip_errors(("b0", "b1", "b2")), s, "finufft")
+    np.testing.assert_array_equal(native, bare.power)
+
+
+@pytest.mark.parametrize("model", ["offsets", "perband", "flex"])
+def test_mixed_error_power_is_unit_free(model: str) -> None:
+    grid = make_grid(1001)
+    s = cup.GLSSettings(mb_model=model)  # type: ignore[arg-type]
+    a = gls_multiband_power(grid, _strip_errors(("b1",)), s, "finufft").power
+    b = gls_multiband_power(grid, _strip_errors(("b1",), 1000.0), s, "finufft").power
+    assert np.allclose(a, b, atol=1e-9)
+
+
+def test_perband_uniform_and_nonuniform_grids_agree_on_mixed_errors() -> None:
+    mixed = _strip_errors(("b1",))
+    s = cup.GLSSettings(mb_model="perband")
+    freq = np.linspace(0.05, 6.0, 1001)
+    uniform = gls_multiband_power(
+        GridSpec(kind="frequency", values=freq, uniform=True), mixed, s, "finufft"
+    )
+    other = gls_multiband_power(
+        GridSpec(kind="frequency", values=freq, uniform=False), mixed, s, "finufft"
+    )
+    assert other.backend == "astropy"
+    assert np.allclose(uniform.power, other.power, atol=5e-3)
+
+
+# --- constant bands (MULTIBAND-11) --------------------------------------------
+
+_MODEL_BACKENDS = [
+    ("offsets", "finufft"),
+    ("flex", "finufft"),
+    ("perband", "finufft"),
+    ("offsets", "astropy"),
+    ("flex", "astropy"),
+    pytest.param("offsets", "torch:cpu", marks=requires_torch),
+    pytest.param("flex", "torch:cpu", marks=requires_torch),
+    pytest.param("perband", "torch:cpu", marks=requires_torch),
+]
+
+
+def _constant(values: tuple[float, ...], hetero: bool) -> cup.MultiBandLightCurve:
+    rng = np.random.default_rng(3)
+    bands = {}
+    for index, value in enumerate(values):
+        t = np.sort(rng.uniform(0.0, 120.0, 50)) + 2458000.0
+        e = 0.02 * (0.5 + rng.random(50)) if hetero else np.full(50, 0.02)
+        bands[f"b{index}"] = cup.LightCurve.from_arrays(t, np.full(50, value), e)
+    return cup.MultiBandLightCurve.from_light_curves(bands)
+
+
+@pytest.mark.parametrize(("model", "backend"), _MODEL_BACKENDS)
+@pytest.mark.parametrize("hetero", [False, True])
+def test_constant_bands_have_no_power(model: str, backend: str, hetero: bool) -> None:
+    # 15.3 and 14.7 sit one ulp off their float means, leaving a ~1e-30 reference
+    # chi-squared: the offsets model reported up to 0.21 (0.44 with unequal errors)
+    # and the flex model 1.0 at every frequency.
+    mb = _constant((15.3, 14.7), hetero)
+    s = cup.GLSSettings(mb_model=model)  # type: ignore[arg-type]
+    pg = gls_multiband_power(make_grid(1001), mb, s, backend)
+    assert np.count_nonzero(pg.power) == 0
+
+
+@pytest.mark.parametrize("model", ["offsets", "flex", "perband"])
+def test_constant_band_beside_a_signal_band(model: str) -> None:
+    signal = make_mblc().bands["b0"]
+    flat = _constant((15.3,), True).bands["b0"]
+    mb = cup.MultiBandLightCurve.from_light_curves({"g": signal, "flat": flat})
+    s = cup.GLSSettings(mb_model=model)  # type: ignore[arg-type]
+    pg = gls_multiband_power(make_grid(), mb, s, "finufft")
+    assert pg.best_period() == pytest.approx(PERIOD, rel=2e-3)
+
+
+# --- one batched transform for the offsets band sums (PERF-METHODS-10) ---------
+
+
+def _uneven_bands(errors: bool) -> cup.MultiBandLightCurve:
+    """Unequal bands, one of them a single point."""
+    bands = synthetic_multiband_sine(
+        band_points=(70, 40, 1, 25), amplitudes=(0.3, 0.2, 0.1, 0.15),
+        offsets=(15.0, 14.2, 13.0, 13.9),
+    )
+    return cup.MultiBandLightCurve.from_light_curves(
+        {
+            k: cup.LightCurve.from_arrays(t, m, e if errors else None)
+            for k, (t, m, e) in bands.items()
+        }
+    )
+
+
+@pytest.mark.parametrize("errors", [True, False])
+def test_batched_band_transform_matches_per_band(
+    monkeypatch: pytest.MonkeyPatch, errors: bool
+) -> None:
+    import cuperiod.multiband.gls_mb as gls_mb
+
+    mb, grid, s = _uneven_bands(errors), make_grid(), cup.GLSSettings()
+    monkeypatch.setattr(gls_mb, "_BATCH_MAX_MODES", 1 << 30)
+    monkeypatch.setattr(gls_mb, "_BATCH_MAX_SPREAD_RATIO", 1 << 30)
+    batched = gls_multiband_power(grid, mb, s, "finufft").power
+    monkeypatch.setattr(gls_mb, "_BATCH_MAX_MODES", 0)
+    per_band = gls_multiband_power(grid, mb, s, "finufft").power
+    assert np.allclose(batched, per_band, rtol=0.0, atol=1e-12)
+    reference = gls_multiband_power(grid, mb, s, "astropy").power
+    assert np.allclose(batched, reference, atol=2e-4)
+
+
+def test_batched_band_transform_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    import cuperiod.multiband.gls_mb as gls_mb
+
+    calls: list[int] = []
+    real = gls_mb._nufft_sums
+
+    def spy(tau, strengths, *args, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append(int(strengths.shape[0]))
+        return real(tau, strengths, *args, **kwargs)
+
+    monkeypatch.setattr(gls_mb, "_nufft_sums", spy)
+    mb, grid, s = make_mblc(), make_grid(), cup.GLSSettings()
+    gls_multiband_power(grid, mb, s, "finufft")
+    assert calls == [4, 1]  # K + 1 = 4 strengths in one transform, then the 2f one
+    calls.clear()
+    monkeypatch.setattr(gls_mb, "_BATCH_MAX_SPREAD_RATIO", 0)
+    gls_multiband_power(grid, mb, s, "finufft")
+    assert calls == [1, 1, 1, 1, 1]  # per-band fallback: K + 2 transforms

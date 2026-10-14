@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pickle
+from typing import Any
 
 import numpy as np
 import pytest
@@ -442,3 +443,310 @@ def test_auto_detection_without_preset() -> None:
     )
     assert columns.domain is cup.Domain.MAGNITUDE
     assert columns.read_columns == ["lc.hmjd", "lc.mag", "lc.magerr"]
+
+
+def test_default_nest_is_lc_without_a_preset() -> None:
+    assert resolve_nested_columns(make_frame()).nested == "lc"
+
+
+# --- a preset with an overridden value column (BATCH-B-3) ---------------------
+
+ECLIPSE_PERIOD = 2.37
+
+
+def make_rubin_eclipse_frame(
+    n: int = 300, with_mag_err: bool = True, name: str = "objectForcedSource"
+) -> NestedFrame:
+    """A 20%-deep eclipse in nJy fluxes, with the magnitudes DP1 carries beside them."""
+    rng = np.random.default_rng(7)
+    t = np.sort(rng.uniform(60000.0, 60030.0, n))
+    phase = ((t - 60000.3) / ECLIPSE_PERIOD) % 1.0
+    in_eclipse = (phase < 0.04) | (phase > 0.96)
+    flux_err = rng.uniform(300.0, 900.0, n)
+    flux = 50_000.0 * np.where(in_eclipse, 0.80, 1.0) + rng.normal(0.0, flux_err)
+    nest = {
+        "midpointMjdTai": t,
+        "psfFlux": flux,
+        "psfFluxErr": flux_err,
+        "psfMag": 31.4 - 2.5 * np.log10(flux),
+    }
+    if with_mag_err:
+        nest["psfMagErr"] = 1.0857 * flux_err / flux
+    flat = pd.DataFrame({"id": np.zeros(n, dtype=int), **nest}).set_index("id")
+    base = pd.DataFrame({"id": [0], "ra": [1.0]}).set_index("id")
+    return NestedFrame(base).join_nested(flat, name=name)
+
+
+def test_overriding_the_preset_value_drops_its_error_and_domain() -> None:
+    """psfMag must not be weighted by nJy errors nor searched as a flux."""
+    columns = resolve_nested_columns(
+        make_rubin_eclipse_frame(), preset="rubin_dp1_object", value="psfMag"
+    )
+    assert columns.value == "objectForcedSource.psfMag"
+    assert columns.error == "objectForcedSource.psfMagErr"
+    assert columns.domain is cup.Domain.MAGNITUDE
+    # The preset's time column still applies.
+    assert columns.time == "objectForcedSource.midpointMjdTai"
+
+
+def test_overridden_value_without_its_own_error_runs_unweighted() -> None:
+    frame = make_rubin_eclipse_frame(with_mag_err=False)
+    columns = resolve_nested_columns(frame, preset="rubin_dp1_object", value="psfMag")
+    assert columns.error is None
+    assert columns.domain is cup.Domain.MAGNITUDE
+
+
+def test_value_matching_the_preset_keeps_its_error_and_domain() -> None:
+    """Only a *different* value column cuts the preset's pairing (case-insensitive)."""
+    frame = make_rubin_eclipse_frame()
+    for value in ("PSFFLUX", "objectForcedSource.psfFlux"):
+        columns = resolve_nested_columns(frame, preset="rubin_dp1_object", value=value)
+        assert columns.error == "objectForcedSource.psfFluxErr"
+        assert columns.domain is cup.Domain.FLUX
+
+
+def test_explicit_error_and_domain_still_win_over_an_overridden_value() -> None:
+    columns = resolve_nested_columns(
+        make_rubin_eclipse_frame(),
+        preset="rubin_dp1_object",
+        value="psfMag",
+        error="psfFluxErr",
+        domain="flux",
+    )
+    assert columns.error == "objectForcedSource.psfFluxErr"
+    assert columns.domain is cup.Domain.FLUX
+
+
+def test_bls_on_an_overridden_magnitude_column_finds_the_eclipse() -> None:
+    """The flux-natural BLS searched an inverted signal before (best 0.92 d)."""
+    out = nested_periodogram(
+        make_rubin_eclipse_frame(),
+        preset="rubin_dp1_object",
+        value="psfMag",
+        method="BLS",
+        backend="cpu",
+        append_columns=False,
+    )
+    assert out["best_period"].to_numpy()[0] == pytest.approx(ECLIPSE_PERIOD, rel=0.01)
+
+
+# --- an explicit nest name beside a preset (BATCH-B-4) ------------------------
+
+
+def make_two_nest_frame() -> NestedFrame:
+    """The survey nest (P = 3.1 d) and the user's own cleaned ``lc`` (P = 0.9 d)."""
+    rng = np.random.default_rng(21)
+    base = pd.DataFrame({"id": [0], "ra": [1.0]}).set_index("id")
+    frame = NestedFrame(base)
+    for name, period in (("objectForcedSource", 3.1), ("lc", 0.9)):
+        t = np.sort(rng.uniform(0.0, 60.0, 200))
+        flux = 100.0 + 20.0 * np.sin(2 * np.pi * t / period)
+        flat = pd.DataFrame(
+            {
+                "id": np.zeros(t.size, dtype=int),
+                "midpointMjdTai": t,
+                "psfFlux": flux + rng.normal(0.0, 0.5, t.size),
+                "psfFluxErr": np.full(t.size, 0.5),
+            }
+        ).set_index("id")
+        frame = frame.join_nested(flat, name=name)
+    return frame
+
+
+def test_explicit_lc_nest_beats_the_preset_nest() -> None:
+    frame = make_two_nest_frame()
+    columns = resolve_nested_columns(frame, "lc", preset="rubin_dp1_object")
+    assert columns.nested == "lc"
+    assert columns.time == "lc.midpointMjdTai"
+    assert columns.domain is cup.Domain.FLUX
+    keyword = resolve_nested_columns(frame, nested="lc", preset="rubin_dp1_object")
+    assert keyword == columns
+    # Both tiers must search the nest that was asked for.
+    row_wise = nested_periodogram(
+        frame, "lc", preset="rubin_dp1_object", backend="cpu", append_columns=False
+    )
+    batched = partition_periodogram(
+        frame, "lc", preset="rubin_dp1_object", backend="cpu"
+    )
+    for out in (row_wise, batched):
+        assert out["best_period"].to_numpy()[0] == pytest.approx(0.9, rel=0.01)
+
+
+def test_preset_alone_still_picks_its_own_nest() -> None:
+    columns = resolve_nested_columns(make_two_nest_frame(), preset="rubin_dp1_object")
+    assert columns.nested == "objectForcedSource"
+
+
+def test_preset_on_a_frame_whose_only_nest_is_lc() -> None:
+    frame = make_rubin_eclipse_frame(name="lc")
+    columns = resolve_nested_columns(frame, "lc", preset="rubin_dp1_object")
+    assert columns.time == "lc.midpointMjdTai"
+    assert columns.value == "lc.psfFlux"
+    assert columns.domain is cup.Domain.FLUX
+
+
+# --- empty frames and colliding result columns (BATCH-B-8, BATCH-B-13) --------
+
+
+@pytest.mark.parametrize("append", [False, True])
+def test_row_wise_on_empty_frame_returns_typed_empty(append: bool) -> None:
+    frame = make_frame()
+    reference = nested_periodogram(
+        frame, "lc", grid=make_grid(), n_best=2, prefix="gls_", backend="cpu",
+        append_columns=append,
+    )
+    out = nested_periodogram(
+        frame.iloc[:0], "lc", grid=make_grid(), n_best=2, prefix="gls_",
+        append_columns=append,
+    )
+    assert isinstance(out, NestedFrame)
+    assert len(out) == 0
+    assert list(out.columns) == list(reference.columns)
+    results = ["gls_best_period", "gls_best_power", "gls_fap", "gls_period_2"]
+    assert all(out[name].dtype == np.float64 for name in results)
+    assert out.index.name == reference.index.name
+
+
+def test_empty_frame_still_validates_the_configuration() -> None:
+    empty = make_multiband_frame().iloc[:0]
+    with pytest.raises(ValueError, match="does not support multi-band"):
+        nested_periodogram(empty, "lc", band="lc.band", method="TLS", grid=make_grid())
+
+
+def test_appending_onto_existing_result_columns_raises() -> None:
+    frame, grid = make_frame(), make_grid()
+    first = nested_periodogram(frame, "lc", grid=grid, backend="cpu")
+    with pytest.raises(ValueError, match="prefix") as info:
+        nested_periodogram(first, "lc", method="PDM", grid=grid)
+    assert "best_period" in str(info.value)
+    # The escape hatches named in the message both work.
+    second = nested_periodogram(
+        first, "lc", method="PDM", grid=grid, prefix="pdm_", backend="cpu"
+    )
+    assert second.columns.is_unique
+    assert {"best_period", "pdm_best_period"} <= set(second.columns)
+    only = nested_periodogram(
+        first, "lc", method="PDM", grid=grid, append_columns=False, backend="cpu"
+    )
+    assert list(only.columns) == ["best_period", "best_power", "fap"]
+
+
+def test_collision_lists_only_the_clashing_names() -> None:
+    frame = make_frame()
+    frame["fap"] = 0.0
+    with pytest.raises(ValueError, match="prefix") as info:
+        nested_periodogram(frame, "lc", grid=make_grid(), n_best=2)
+    message = str(info.value)
+    assert "'fap'" in message
+    assert "period_2" not in message and "best_power" not in message
+
+
+def test_catalog_collision_is_caught_from_the_schema() -> None:
+    first = nested_periodogram(make_frame(), "lc", grid=make_grid(), backend="cpu")
+    catalog = _FakeCatalog(first)
+    with pytest.raises(ValueError, match="prefix"):
+        nested_periodogram(catalog, "lc", grid=make_grid())
+    assert catalog.meta is None  # refused before map_rows was called
+
+
+# --- backend and peak defaults come from the settings -------------------------
+
+
+def test_settings_backend_is_honoured() -> None:
+    """``GLSSettings(backend=...)`` (and CUPERIOD_GLS_BACKEND) pick the backend."""
+    from cuperiod.interop.lincc import _RowKernel
+
+    columns = resolve_nested_columns(make_frame(), "lc")
+    kernel = _RowKernel(
+        columns=columns, method="GLS", settings=cup.GLSSettings(backend="astropy"),
+        backend="auto", grid=make_grid(), n_best=1, prefix="",
+    )
+    assert kernel.prepare()[2] == "astropy"
+    explicit = _RowKernel(
+        columns=columns, method="GLS", settings=cup.GLSSettings(backend="astropy"),
+        backend="cpu", grid=make_grid(), n_best=1, prefix="",
+    )
+    assert explicit.prepare()[2] != "astropy"
+
+
+def test_settings_backend_env_override_is_honoured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cuperiod.interop.lincc import _RowKernel
+
+    monkeypatch.setenv("CUPERIOD_GLS_BACKEND", "astropy")
+    kernel = _RowKernel(
+        columns=resolve_nested_columns(make_frame(), "lc"), method="GLS",
+        settings=None, backend="auto", grid=make_grid(), n_best=1, prefix="",
+    )
+    assert kernel.prepare()[2] == "astropy"
+
+
+def test_results_carry_the_settings_peak_defaults() -> None:
+    """period_2 is picked with the settings' separation, as in cup.periodogram."""
+    from cuperiod.interop.lincc import _RowKernel
+
+    objects = make_objects()
+    time, mag, err = objects[0]
+    settings = cup.GLSSettings(peak_separation_rayleigh=40.0)
+    kernel = _RowKernel(
+        columns=resolve_nested_columns(make_frame(), "lc"), method="GLS",
+        settings=settings, backend="cpu", grid=make_grid(), n_best=2, prefix="",
+    )
+    method, coerced, backend = kernel.prepare()
+    pg = kernel.compute(
+        method, coerced, backend, kernel.light_curve(time, mag, err, None), None
+    )
+    assert pg.peak_defaults["min_separation_rayleigh"] == 40.0
+    reference = cup.periodogram((time, mag, err), "GLS", grid=make_grid(),
+                                settings=settings, backend="cpu")
+    assert isinstance(reference, cup.Periodogram)
+    expected = [p.period for p in reference.best_periods(2)]
+    assert [p.period for p in pg.best_periods(2)] == pytest.approx(expected)
+
+
+# --- engine teardown ------------------------------------------------------------
+
+
+def _partition_kernel(backend: str) -> Any:
+    from cuperiod.interop.lincc import _PartitionKernel
+
+    return _PartitionKernel(
+        columns=resolve_nested_columns(make_frame(), "lc"), method="GLS",
+        settings=cup.GLSSettings(), backend=backend, grid=make_grid(), n_best=1,
+        prefix="",
+    )
+
+
+def test_cpu_engine_partition_does_not_touch_the_gpu_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GLS on finufft builds a CPU engine; tearing it down must not flush cupy."""
+    pytest.importorskip("finufft")
+    import cuperiod.core.device as device
+
+    calls: list[int] = []
+    monkeypatch.setattr(device, "free_gpu_memory", lambda: calls.append(1))
+    kernel = _partition_kernel("finufft")
+    out = kernel(make_frame())
+    assert kernel.prepare()[2] == "finufft"
+    assert np.isfinite(out["best_period"].to_numpy()[:-1]).all()
+    assert calls == []
+
+
+def test_gpu_engine_partition_frees_the_gpu_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A GPU engine still returns its cached blocks after the partition."""
+    import cuperiod.core.device as device
+
+    calls: list[int] = []
+    monkeypatch.setattr(device, "free_gpu_memory", lambda: calls.append(1))
+    kernel = _partition_kernel("cpu")
+    method, settings, _ = kernel.prepare()
+    # Pretend the backend resolved to the CUDA engine without running on a GPU.
+    monkeypatch.setattr(method, "make_engine", lambda backend, settings: object())
+    kernel._prepared = (method, settings, "cufinufft")
+    monkeypatch.setattr(kernel, "evaluate", lambda *a, **k: kernel.nan_row())
+    kernel(make_frame())
+    assert calls == [1]

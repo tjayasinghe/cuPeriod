@@ -7,18 +7,28 @@ the signal detection efficiency (SDE) for shallow signals.
 
 For each trial period the (flux) light curve is phase-folded and binned; the template —
 a quadratic limb-darkening profile for a central transit, resampled to each trial
-duration — is slid across phase, and at every position the matched-filter depth and its
-signal residue ``SR = (sum w g y')^2 / sum w g^2`` are evaluated in one batched
-correlation. The per-period maximum SR is normalized across the grid into the SDE, which
-is *maximized* at the transit period. Inputs are flux (a transit is a dip); magnitudes
-are converted automatically.
+duration — is slid across phase, and at every position the out-of-transit level and
+the transit depth are fitted jointly by weighted least squares, in one batched
+correlation. With ``y'`` the flux minus its weighted mean, ``g`` the template (1 at
+mid-transit, 0 outside its window) and ``W = sum w``, the fitted depth is
+``-(sum w g y') / D`` and the signal residue — the chi-square reduction of the fit —
+is ``SR = (sum w g y')^2 / D``, with ``D = sum w g^2 - (sum w g)^2 / W``. (Fitting the
+depth alone, ``D = sum w g^2``, would bias it low by about the duty cycle: the mean
+that ``y'`` is taken about already contains the transit.) The per-period maximum SR is
+normalized across the grid into the SDE, which is *maximized* at the transit period.
+Each period also reports the best template's ``duration`` (days) and ``t0``, the
+mid-transit time of the first transit at or after the first observation — an absolute
+time on the input's time axis, like BLS's — or the first observation where no dip is
+found. Inputs are flux (a transit is a dip); magnitudes are converted automatically.
 
-This implementation is CPU (numpy) and vectorizes over the period grid; a GPU kernel and
-the Ofir (2014) optimal-frequency grid are planned refinements.
+Backends: the array-API matched filter (``numpy`` on the CPU, ``torch`` on any torch
+device), a numba-parallel CPU tier and a one-block-per-period cupy ``RawKernel``. The
+Ofir (2014) optimal-frequency grid is a planned refinement.
 """
 
 from __future__ import annotations
 
+import math
 from types import ModuleType
 from typing import Any, ClassVar, Final, Literal
 
@@ -38,7 +48,7 @@ from cuperiod.core.backend import ensure_cuda_dll_path
 from cuperiod.core.columns import Domain
 from cuperiod.core.config import TLSSettings
 from cuperiod.core.errors import InsufficientDataError
-from cuperiod.core.grid import GridSpec
+from cuperiod.core.grid import GridSpec, check_grid_size
 from cuperiod.core.lightcurve import LightCurve
 from cuperiod.core.result import Periodogram
 from cuperiod.methods.base import PeriodogramMethod, register
@@ -47,6 +57,28 @@ TLSBackend = Literal["numpy", "cupy"]
 
 #: Smallest admissible per-bin weight (an empty side is skipped, not divided by).
 _W_EPS: Final = 1e-300
+
+#: Relative floor on the level-corrected template energy ``D`` (against
+#: ``sum w g^2``). Below it the template window holds essentially all the weight at a
+#: single template value, so level and depth are degenerate and the position is
+#: skipped. The float32 floor sits well above that dtype's cancellation error.
+_DEN_REL_EPS: Final = 1e-9
+_DEN_REL_EPS_F32: Final = 1e-5
+
+#: A flux series whose full range is within this many ulps of its largest magnitude
+#: is constant (see :func:`_is_constant`).
+_CONSTANT_ULPS: Final = 64.0
+
+#: Transient byte budgets of one trial-period batch of the array-API path, which
+#: materializes about five ``(batch, N)`` 8-byte arrays (phase, bin index, and each
+#: scatter's flat index and broadcast weights). ``period_batch`` is capped by them,
+#: so the working set no longer grows with the light-curve length. Device backends
+#: get a larger budget: fewer, larger batches cut per-batch dispatch overhead.
+_BATCH_BYTES: Final = 1 << 27
+_DEVICE_BATCH_BYTES: Final = 1 << 28
+
+#: The per-period output arrays of every backend.
+_OUTPUTS: Final = ("sde", "sr", "depth", "duration", "t0")
 
 
 def limb_darkened_template(n: int, u1: float, u2: float) -> FloatArray:
@@ -94,17 +126,97 @@ def _duration_bins(settings: TLSSettings) -> list[int]:
     return sorted(widths)
 
 
-def _period_grid(baseline: float, settings: TLSSettings) -> FloatArray:
-    """Ascending trial periods from a frequency grid capped by the baseline."""
+def _grid_duration_frac(settings: TLSSettings) -> float:
+    """Phase-drift budget of one period-grid step (before ``oversample``).
+
+    ``grid_duration_frac``, but never more than twice the shortest searched duration:
+    between two grid periods a transit must not drift across more than about its own
+    width over the baseline, or the narrowest transits the duration grid templates
+    lose most of their signal residue (57-66% retained midway between samples with
+    the former 0.05 step against the default 0.01 shortest duration; 0.90-0.98 now).
+    """
+    return min(settings.grid_duration_frac, 2.0 * settings.duration_min_frac)
+
+
+def _period_grid(
+    baseline: float, settings: TLSSettings, *, time: FloatArray | None = None
+) -> FloatArray:
+    """Ascending trial periods from a frequency grid capped by the baseline.
+
+    The size is checked before allocation (:func:`~cuperiod.core.grid.check_grid_size`):
+    the step scales with ``1/baseline``, so one mis-converted timestamp can ask for
+    billions of trial periods. ``time`` lets the check diagnose such an outlier.
+    """
     max_period = min(settings.max_period_days, baseline / settings.min_transits)
     if max_period <= settings.min_period_days:
         return np.zeros(0, dtype=np.float64)
     # Spacing tied to the transit width so TLS's narrow peaks are well sampled.
-    df = settings.grid_duration_frac / (settings.oversample * baseline)
-    freq = np.arange(1.0 / max_period, 1.0 / settings.min_period_days, df)
+    df = _grid_duration_frac(settings) / (settings.oversample * baseline)
+    f_lo, f_hi = 1.0 / max_period, 1.0 / settings.min_period_days
+    check_grid_size(
+        math.ceil((f_hi - f_lo) / df),
+        automatic=True,
+        time=time,
+        baseline=baseline,
+        maximum_frequency=f_hi,
+        context=(
+            "TLS default period grid (min_period_days, grid_duration_frac and "
+            "oversample set its size)"
+        ),
+    )
+    freq = np.arange(f_lo, f_hi, df)
     if freq.size == 0:
         return np.zeros(0, dtype=np.float64)
     return np.ascontiguousarray(1.0 / freq[::-1], dtype=np.float64)
+
+
+def _resolve_period_batch(
+    period_batch: int, n_points: int, n_bins: int, max_width: int, on_device: bool
+) -> int:
+    """Trial periods per array-API batch: ``period_batch``, capped by a byte budget.
+
+    Besides the ~five ``(batch, N)`` point workspaces, a batch holds about a dozen
+    ``(batch, n_bins + max_width)`` bin arrays. The batch does not affect the result
+    (every row is computed independently).
+    """
+    per_row = 8 * (5 * max(n_points, 1) + 12 * (n_bins + max_width))
+    budget = _DEVICE_BATCH_BYTES if on_device else _BATCH_BYTES
+    return max(1, min(int(period_batch), budget // per_row))
+
+
+def _is_constant(y: FloatArray) -> bool:
+    """Whether the flux is constant to within :data:`_CONSTANT_ULPS` ulps.
+
+    Decided on the data itself, not on ``y - mean``: the weighted mean of a constant
+    series is an ulp or two off, so every window looked like a uniform ~1e-15 'dip'
+    whose signal residue the SDE normalization blew up to an order-unity spectrum.
+    """
+    if y.size == 0:
+        return True
+    scale = float(np.max(np.abs(y)))
+    eps = float(np.finfo(np.float64).eps)
+    return float(np.ptp(y)) <= _CONSTANT_ULPS * eps * scale
+
+
+def _flux_scale(y: FloatArray, dy: FloatArray | None) -> float:
+    """A power of two near the flux noise scale (``median(dy)``, else ``std(y)``).
+
+    The flux and errors are divided by it before the weights ``1/dy^2`` are formed,
+    so fluxes in physical units (1e-15 erg/s/cm^2/A, or 1e12 counts) keep the
+    float32 weights and their bin sums in range. A power of two divides exactly, so
+    float64 results are unchanged by it.
+    """
+    s = float(np.std(y)) if dy is None else float(np.median(np.abs(dy)))
+    if not (math.isfinite(s) and s > 0.0):
+        return 1.0
+    return 2.0 ** min(max(round(math.log2(s)), -1000), 1000)
+
+
+def _no_transit(n_periods: int, t_ref: float) -> dict[str, FloatArray]:
+    """The output of a search that finds no dip at any period."""
+    out = {key: np.zeros(n_periods, dtype=np.float64) for key in _OUTPUTS}
+    out["t0"] = np.full(n_periods, t_ref, dtype=np.float64)
+    return out
 
 
 def _matched_filter(
@@ -117,6 +229,8 @@ def _matched_filter(
     n_bins: int,
     dur_bins: list[int],
     templates: dict[int, FloatArray],
+    w_total: float,
+    den_rel: float,
     period_batch: int,
 ) -> dict[str, Any]:
     """Per-period best matched-filter signal residue and transit parameters.
@@ -126,6 +240,8 @@ def _matched_filter(
     template width is small), which needs no ``sliding_window_view``. Templates stay on
     the host; their per-bin scalars broadcast against the device arrays. The cupy
     ``RawKernel`` fast path (NVIDIA) is separate. Float dtype follows ``periods``.
+    ``w_total`` is the total weight ``W`` of the level-corrected denominator ``D``;
+    ``t0`` is returned relative to ``tau = 0``.
     """
     fdtype = periods.dtype
     idtype = xp.int64
@@ -159,21 +275,27 @@ def _matched_filter(
         best_width = xp.zeros(n_p, dtype=idtype, device=dev)
         for width in dur_bins:
             g = templates[width]
-            num = float(g[0]) * a_ext[:, :n_bins]
-            den = float(g[0] * g[0]) * b_ext[:, :n_bins]
+            g0 = float(g[0])
+            num = g0 * a_ext[:, :n_bins]  # sum w g y'
+            cwg = g0 * b_ext[:, :n_bins]  # sum w g: template overlap with the level
+            den = float(g[0] * g[0]) * b_ext[:, :n_bins]  # sum w g^2
             for k in range(1, width):  # correlate the folded data with the template
                 gk = float(g[k])
                 num += gk * a_ext[:, k : k + n_bins]
+                cwg += gk * b_ext[:, k : k + n_bins]
                 den += (gk * gk) * b_ext[:, k : k + n_bins]
-            safe_den = xp.where(den > _W_EPS, den, 1.0)
+            # Joint level + depth fit: the level absorbs the template's overlap with
+            # the mean, D = sum w g^2 - (sum w g)^2 / W.
+            den_eff = den - cwg * cwg / w_total
             # a dip means the in-transit weighted residual is negative -> num < 0
-            sr = xp.where((den > _W_EPS) & (num < 0.0), num * num / safe_den, 0.0)
+            ok = (num < 0.0) & (den > _W_EPS) & (den_eff > den_rel * den)
+            safe_den = xp.where(ok, den_eff, 1.0)
+            sr = xp.where(ok, num * num / safe_den, 0.0)
             s_best = xp.argmax(sr, axis=1)
             sr_best = sr[rows_p, s_best]
             improve = sr_best > best_sr
             best_sr = xp.where(improve, sr_best, best_sr)
-            den_best = den[rows_p, s_best]
-            depth = -num[rows_p, s_best] / xp.where(den_best > _W_EPS, den_best, 1.0)
+            depth = -num[rows_p, s_best] / safe_den[rows_p, s_best]
             best_depth = xp.where(improve, depth, best_depth)
             best_start = xp.where(improve, s_best, best_start)
             best_width = xp.where(improve, width, best_width)
@@ -194,8 +316,9 @@ CUDA_BLOCK: Final = 128
 
 #: One-block-per-period TLS kernel: a block folds its points into shared-memory phase
 #: bins (weighted residual ``a`` and weight ``b``), then its threads sweep every
-#: (duration, phase) box, correlating the limb-darkened template against the bins, and
-#: block-reduce to the best signal residue. No (period, point) global intermediates.
+#: (duration, phase) box, correlating the limb-darkened template against the bins
+#: (joint level + depth fit, as in :func:`_matched_filter`), and block-reduce to the
+#: best signal residue. No (period, point) global intermediates.
 _TLS_CUDA_SRC: Final = r"""
 extern "C" __global__ void tls_block(
     const REAL* __restrict__ tau, const REAL* __restrict__ yw,
@@ -203,6 +326,7 @@ extern "C" __global__ void tls_block(
     const int* __restrict__ dur_bins, const int* __restrict__ tmpl_off,
     const REAL* __restrict__ tmpl, const int n_dur, const int tmpl_len,
     const int n_points, const int n_periods, const int n_bins, const REAL W_EPS,
+    const REAL W_TOTAL, const REAL DEN_REL,
     double* o_sr, double* o_depth, double* o_duration, double* o_t0)
 {
     const int pidx = blockIdx.x;
@@ -237,19 +361,23 @@ extern "C" __global__ void tls_block(
         const int start = idx % n_bins;
         const int width = dur_bins[di];
         const int off = tmpl_off[di];
-        REAL num = 0.0, den = 0.0;
+        REAL num = 0.0, cwg = 0.0, den = 0.0;
         for (int k = 0; k < width; ++k) {
             int bb = start + k;
             if (bb >= n_bins) bb -= n_bins;  // circular wrap
             REAL gk = s_tmpl[off + k];
             num += gk * a[bb];
+            cwg += gk * b[bb];
             den += gk * gk * b[bb];
         }
-        if (den > W_EPS && num < 0.0) {
-            REAL sr = num * num / den;
-            if (sr > loc_sr) {
-                loc_sr = sr; loc_start = start; loc_width = width;
-                loc_depth = -num / den;
+        if (num < 0.0 && den > W_EPS) {
+            REAL den_eff = den - cwg * cwg / W_TOTAL;  // joint level + depth fit
+            if (den_eff > DEN_REL * den) {
+                REAL sr = num * num / den_eff;
+                if (sr > loc_sr) {
+                    loc_sr = sr; loc_start = start; loc_width = width;
+                    loc_depth = -num / den_eff;
+                }
             }
         }
     }
@@ -306,6 +434,8 @@ def _tls_cuda(
     n_bins: int,
     dur_bins: list[int],
     templates: dict[int, FloatArray],
+    w_total: float,
+    den_rel: float,
     precision: str = "float64",
     block: int = CUDA_BLOCK,
 ) -> dict[str, FloatArray]:
@@ -347,6 +477,7 @@ def _tls_cuda(
             np.int32(n_bins),
             # _W_EPS (1e-300) underflows to 0 in float32; use a float32-scale floor.
             rdtype(1e-30) if precision == "float32" else np.float64(_W_EPS),
+            rdtype(w_total), rdtype(den_rel),
             out["sr"], out["depth"], out["duration"], out["t0"],
         ),
         shared_mem=smem,
@@ -367,6 +498,14 @@ def _numba_tls_kernel() -> Any:
     the best signal residue — JIT-run across all cores with ``prange``. The duration
     then start iteration order and strict ``>`` improvement reproduce the vectorized
     path's tie-breaking exactly.
+
+    The correlation loops run template sample outermost over a circularly padded bin
+    array, so the innermost loop is a branch-free elementwise update over all start
+    phases that LLVM vectorizes (2-5x faster than one scalar reduction per start). Each
+    start still accumulates ``k = 0, 1, ...`` in order, exactly as the array-API path
+    does; with ``fastmath=False`` the results are bit-identical to it. The kernel must
+    not call other jitted helpers defined in this factory: a closure over dispatchers
+    defeats numba's on-disk cache.
     """
     global _NUMBA_TLS_KERNEL
     if _NUMBA_TLS_KERNEL is not None:
@@ -374,18 +513,26 @@ def _numba_tls_kernel() -> Any:
     from numba import njit, prange
 
     @njit(parallel=True, cache=True, fastmath=False)  # pragma: no cover - njit
-    def _kernel(tau, yw, wv, periods, dur_bins, tmpl_off, tmpl, n_bins, w_eps):  # type: ignore[no-untyped-def]
+    def _kernel(  # type: ignore[no-untyped-def]
+        tau, yw, wv, periods, dur_bins, tmpl_off, tmpl, n_bins, w_eps, w_total,
+        den_rel,
+    ):
         n_periods = periods.shape[0]
         n_points = tau.shape[0]
         n_dur = dur_bins.shape[0]
+        max_width = 1
+        for di in range(n_dur):
+            if dur_bins[di] > max_width:
+                max_width = dur_bins[di]
+        n_ext = n_bins + max_width - 1  # one circular pad serves every width
         o_sr = np.zeros(n_periods)
         o_depth = np.zeros(n_periods)
         o_duration = np.zeros(n_periods)
         o_t0 = np.zeros(n_periods)
         for pidx in prange(n_periods):
             period = periods[pidx]
-            a = np.zeros(n_bins)
-            b = np.zeros(n_bins)
+            a = np.zeros(n_ext)  # sum w*y' per bin
+            b = np.zeros(n_ext)  # sum w per bin
             for j in range(n_points):
                 q = tau[j] / period
                 ph = q - np.floor(q)
@@ -396,6 +543,12 @@ def _numba_tls_kernel() -> Any:
                     bb = 0
                 a[bb] += yw[j]
                 b[bb] += wv[j]
+            for j in range(max_width - 1):
+                a[n_bins + j] = a[j]
+                b[n_bins + j] = b[j]
+            num = np.empty(n_bins)  # sum w g y'
+            cwg = np.empty(n_bins)  # sum w g
+            den = np.empty(n_bins)  # sum w g^2
             loc_sr = 0.0
             loc_depth = 0.0
             loc_start = 0
@@ -403,23 +556,32 @@ def _numba_tls_kernel() -> Any:
             for di in range(n_dur):
                 width = dur_bins[di]
                 off = tmpl_off[di]
-                for start in range(n_bins):
-                    num = 0.0
-                    den = 0.0
-                    for k in range(width):
-                        bb = start + k
-                        if bb >= n_bins:
-                            bb -= n_bins  # circular wrap
-                        gk = tmpl[off + k]
-                        num += gk * a[bb]
-                        den += gk * gk * b[bb]
-                    if den > w_eps and num < 0.0:
-                        sr = num * num / den
-                        if sr > loc_sr:
-                            loc_sr = sr
-                            loc_start = start
-                            loc_width = width
-                            loc_depth = -num / den
+                g0 = tmpl[off]
+                g00 = g0 * g0
+                for s in range(n_bins):
+                    num[s] = g0 * a[s]
+                    cwg[s] = g0 * b[s]
+                    den[s] = g00 * b[s]
+                for k in range(1, width):
+                    gk = tmpl[off + k]
+                    gkk = gk * gk
+                    for s in range(n_bins):
+                        num[s] += gk * a[k + s]
+                        cwg[s] += gk * b[k + s]
+                        den[s] += gkk * b[k + s]
+                for s in range(n_bins):
+                    nm = num[s]
+                    dn = den[s]
+                    if nm < 0.0 and dn > w_eps:
+                        # Joint level + depth fit: D = sum w g^2 - (sum w g)^2 / W.
+                        de = dn - cwg[s] * cwg[s] / w_total
+                        if de > den_rel * dn:
+                            sr = nm * nm / de
+                            if sr > loc_sr:
+                                loc_sr = sr
+                                loc_start = s
+                                loc_width = width
+                                loc_depth = -nm / de
             o_sr[pidx] = loc_sr
             o_depth[pidx] = loc_depth
             o_duration[pidx] = loc_width / n_bins * period
@@ -440,6 +602,8 @@ def _tls_numba(
     n_bins: int,
     dur_bins: list[int],
     templates: dict[int, FloatArray],
+    w_total: float,
+    den_rel: float,
 ) -> dict[str, FloatArray]:
     """Numba CPU matched filter; same output dict as :func:`_matched_filter`."""
     kernel = _numba_tls_kernel()
@@ -452,7 +616,7 @@ def _tls_numba(
         np.ascontiguousarray(tau), np.ascontiguousarray(yw), np.ascontiguousarray(w),
         np.ascontiguousarray(periods),
         np.asarray(dur_bins, dtype=np.int64), offsets, tmpl,
-        int(n_bins), float(_W_EPS),
+        int(n_bins), float(_W_EPS), float(w_total), float(den_rel),
     )
     return {"sr": sr, "depth": depth, "duration": duration, "t0": t0}
 
@@ -478,59 +642,76 @@ def tls_power(
         Trial periods (days).
     settings : TLSSettings
         Search configuration.
-    backend : {"numpy", "cupy"}, default "numpy"
-        CPU or GPU; both run the identical vectorized matched filter.
+    backend : str, default "numpy"
+        ``"numpy"``, ``"numba"``, ``"cupy"``, or ``"torch"`` / ``"torch:<device>"``;
+        all run the same matched filter.
 
     Returns
     -------
     dict of numpy.ndarray
-        ``sde`` (per-period detection efficiency) plus ``sr``/``depth``/``duration``/
-        ``t0`` aligned with ``periods``.
+        float64 arrays aligned with ``periods``: ``sde`` (signal detection
+        efficiency), ``sr`` (signal residue: the chi-square reduction of the best
+        level + transit fit; in flux units squared when ``dy`` is None), ``depth``
+        (mid-transit depth in flux units), ``duration`` (days) and ``t0``, the
+        mid-transit time of the first transit at or after ``t.min()`` -- an absolute
+        time on ``t``'s axis, in ``[t.min(), t.min() + period)``. Where no dip is
+        found (``sr == 0``) ``depth`` and ``duration`` are 0 and ``t0`` is
+        ``t.min()``; a constant flux finds none at any period.
     """
     t = np.ascontiguousarray(t, dtype=np.float64)
     y = np.ascontiguousarray(y, dtype=np.float64)
     periods_host = np.ascontiguousarray(periods, dtype=np.float64)
     n_periods = int(periods_host.size)
     if n_periods == 0:
-        empty = np.zeros(0)
-        return {k: empty for k in ("sde", "sr", "depth", "duration", "t0")}
+        return {key: np.zeros(0, dtype=np.float64) for key in _OUTPUTS}
+    t_ref = float(t.min())
+    if _is_constant(y):
+        return _no_transit(n_periods, t_ref)
 
+    # Work in units of a power of two near the flux noise: exact in float64, and it
+    # keeps float32 weights 1/dy^2 in range for fluxes in physical units.
+    scale = _flux_scale(y, dy)
+    y = y / scale
     w = (
         np.ones_like(y)
         if dy is None
-        else 1.0 / np.ascontiguousarray(dy, dtype=np.float64) ** 2
+        else 1.0 / (np.ascontiguousarray(dy, dtype=np.float64) / scale) ** 2
     )
-    y_mean = float(np.dot(w, y) / w.sum())
+    w_total = float(w.sum())
+    y_mean = float(np.dot(w, y) / w_total)
     yw = w * (y - y_mean)  # weighted, mean-subtracted
-    tau = t - t.min()
+    tau = t - t_ref
 
     dur_bins = _duration_bins(settings)
     u1, u2 = settings.limb_dark_u1, settings.limb_dark_u2
     templates = {width: limb_darkened_template(width, u1, u2) for width in dur_bins}
     if not dur_bins:
-        z = np.zeros(n_periods)
-        return {"sde": z, "sr": z, "depth": z, "duration": z, "t0": z}
+        return _no_transit(n_periods, t_ref)
 
     n_bins = settings.n_phase_bins
+    max_width = max(dur_bins)
     if backend == "cupy":
         ensure_cuda_dll_path()
+        precision = resolve_precision(settings.precision, "cuda")
         res = _tls_cuda(
             tau, yw, w, periods_host,
             n_bins=n_bins, dur_bins=dur_bins, templates=templates,
-            precision=resolve_precision(settings.precision, "cuda"),
+            w_total=w_total,
+            den_rel=_DEN_REL_EPS_F32 if precision == "float32" else _DEN_REL_EPS,
+            precision=precision,
         )
     elif backend == "numba":
         res = _tls_numba(
             tau, yw, w, periods_host,
             n_bins=n_bins, dur_bins=dur_bins, templates=templates,
+            w_total=w_total, den_rel=_DEN_REL_EPS,
         )
     elif backend == "torch" or backend.startswith("torch:"):
         import torch
 
         device = backend.split(":", 1)[1] if ":" in backend else "cpu"
-        fdt = (torch.float32
-               if resolve_precision(settings.precision, device) == "float32"
-               else torch.float64)
+        single = resolve_precision(settings.precision, device) == "float32"
+        fdt = torch.float32 if single else torch.float64
         per_d = to_device_array(periods_host, device=device, dtype=fdt)
         dev_res = _matched_filter(
             array_namespace(per_d),
@@ -539,21 +720,38 @@ def tls_power(
             to_device_array(w, device=device, dtype=fdt),
             per_d,
             n_bins=n_bins, dur_bins=dur_bins, templates=templates,
-            period_batch=settings.period_batch,
+            w_total=w_total,
+            den_rel=_DEN_REL_EPS_F32 if single else _DEN_REL_EPS,
+            period_batch=_resolve_period_batch(
+                settings.period_batch, tau.size, n_bins, max_width,
+                on_device=device != "cpu",
+            ),
         )
         res = {k: to_host(v) for k, v in dev_res.items()}
     elif backend == "numpy":
         res = _matched_filter(
             array_namespace(periods_host), tau, yw, w, periods_host,
             n_bins=n_bins, dur_bins=dur_bins, templates=templates,
-            period_batch=settings.period_batch,
+            w_total=w_total, den_rel=_DEN_REL_EPS,
+            period_batch=_resolve_period_batch(
+                settings.period_batch, tau.size, n_bins, max_width, on_device=False
+            ),
         )
     else:
         raise ValueError(f"unknown backend {backend!r}")
 
+    # float64 on the host from here on: a JD-scale epoch does not fit float32.
+    res = {key: np.asarray(value, dtype=np.float64) for key, value in res.items()}
     sr = res["sr"]
     mean, std = float(sr.mean()), float(sr.std())
     res["sde"] = (sr - mean) / std if std > 0.0 else np.zeros_like(sr)
+    # Back to the caller's flux units (the SDE is scale-free); SR carries the flux
+    # unit squared only without errors, where the weights do not scale with it.
+    res["depth"] = res["depth"] * scale
+    if dy is None:
+        res["sr"] = sr * (scale * scale)
+    # The kernels fold tau = t - t.min(); report the epoch on the input time axis.
+    res["t0"] = res["t0"] + t_ref
     return res
 
 
@@ -573,7 +771,7 @@ class TLSMethod(PeriodogramMethod):
 
     def default_grid(self, lc: LightCurve, settings: TLSSettings) -> GridSpec:  # type: ignore[override]
         finite = lc.finite()
-        periods = _period_grid(finite.baseline, settings)
+        periods = _period_grid(finite.baseline, settings, time=finite.time)
         if periods.size == 0:
             raise InsufficientDataError(
                 "TLS: baseline too short for the configured period range"
@@ -622,7 +820,8 @@ class TLSMethod(PeriodogramMethod):
         )
 
     def estimate_device_bytes(self, n_points: int) -> int:
-        return 128 * 1024**2 + n_points * 8 * 4
+        # The torch path's batch workspaces are capped at _DEVICE_BATCH_BYTES.
+        return _DEVICE_BATCH_BYTES + 64 * 1024**2 + n_points * 8 * 4
 
 
 register(TLSMethod())

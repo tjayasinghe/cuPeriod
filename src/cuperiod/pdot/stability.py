@@ -33,28 +33,45 @@ Two refinements over the classical recipe, both load-bearing:
 ``alpha``/``epsilon`` are reported in the 1929 mean-absolute convention
 (Gaussian sigma times ``sqrt(2/pi)``); ``alpha_sigma``/``epsilon_sigma`` give
 the Gaussian sigmas.
+
+The uncertainties are those of the estimator itself. The lag-bin means are not
+independent measurements -- every one is a quadratic form in the *same*
+detrended residuals, and under a walk they rise and fall together -- so the
+scatter of the bins about the fitted line says little about how far the fitted
+variances can be off. The final weighted fit is a fixed linear map from the
+bin means to the two variances, so each variance is ``r^T Q_k r`` for the
+detrended residuals ``r`` and a known banded matrix ``Q_k``, and for Gaussian
+residuals of covariance ``C`` its variance is the exact ``2 tr(Q_k C Q_k C)``.
+The errors use ``C`` at the fitted variances; ``slope_significance`` uses ``C``
+of pure timing noise at the observed residual scatter, which makes it a
+z-score under the no-wander null.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
+from collections.abc import Callable
+from dataclasses import dataclass, fields
 from typing import Any
 
 import numpy as np
 
-from cuperiod.core._typing import FloatArray
+from cuperiod.core._typing import FloatArray, IntArray
 from cuperiod.core.errors import InsufficientDataError
 
 #: Fewest pairs a lag bin needs before its mean enters the fit.
 _MIN_PAIRS: int = 5
 
-#: Largest event count for the exact O(N^2) expectation matrices (~200 MB).
+#: Largest event count accepted. No n x n matrix is ever formed: the estimate
+#: costs O(n * max_lag) and its error bars O(n^2 * (max_lag + 256)) time in
+#: O(n * (max_lag + 256)) memory -- about 130 MB and 2 s at this cap with the
+#: default lag range -- but a timing list this long wants thinning anyway.
 _MAX_EVENTS: int = 5000
 
 _MEAN_ABS: float = float(np.sqrt(2.0 / np.pi))
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class EddingtonPlakidisResult:
     """Result of the Eddington-Plakidis fluctuation test.
 
@@ -69,11 +86,17 @@ class EddingtonPlakidisResult:
         Mean absolute random period fluctuation per cycle (days). 0.0 if the
         fitted walk variance came out negative.
     alpha_err, epsilon_err : float
-        Formal 1-sigma uncertainties (NaN where the parameter was clipped).
+        1-sigma uncertainties of the estimator, from the exact covariance of
+        the lag-bin means at the fitted variances (NaN where the parameter was
+        clipped to 0). They scale with the estimate, so they are best read in
+        log space: a walk measured at ``epsilon +- epsilon_err`` is uncertain
+        by a factor, not by an additive amount.
     slope_significance : float
-        t-statistic of the per-cycle walk variance: how significantly the
-        accumulated delays grow with lag. Above ~3, random cycle-to-cycle
-        fluctuation is present.
+        The fitted walk variance in units of its standard deviation under the
+        null of pure timing noise (at the observed residual scatter): a z-score,
+        about N(0, 1) when there is no wander. Above ~3, random cycle-to-cycle
+        fluctuation is present. 0.0 for an exactly periodic series (every O-C
+        exactly zero), which has nothing to test.
     lags : numpy.ndarray
         Cycle separations with at least the minimum pair count.
     mean_u : numpy.ndarray
@@ -93,6 +116,25 @@ class EddingtonPlakidisResult:
     mean_u: FloatArray
     n_pairs: FloatArray
     detrend: int
+
+    def __eq__(self, other: object) -> bool:
+        """Value equality, arrays included (NaN equal to NaN).
+
+        The generated ``__eq__`` compares the ndarray fields with ``==`` and
+        raises "truth value of an array is ambiguous" on any two results.
+        """
+        if not isinstance(other, EddingtonPlakidisResult):
+            return NotImplemented
+        return all(
+            np.array_equal(
+                np.asarray(getattr(self, f.name)),
+                np.asarray(getattr(other, f.name)),
+                equal_nan=True,
+            )
+            for f in fields(self)
+        )
+
+    __hash__ = None  # type: ignore[assignment]
 
     @property
     def alpha_sigma(self) -> float:
@@ -119,6 +161,139 @@ class EddingtonPlakidisResult:
             "mean_u": self.mean_u.tolist(),
             "n_pairs": self.n_pairs.tolist(),
         }
+
+
+#: Rows per block of the trace products in :func:`_trace_products`.
+_BLOCK: int = 256
+
+
+def _walk_times(e_rel: FloatArray, x: FloatArray) -> FloatArray:
+    """``M @ x`` for the walk covariance ``M_ij = min(E_i, E_j)``, ``E`` ascending.
+
+    ``(M x)_i = sum_{j <= i} E_j x_j + E_i sum_{j > i} x_j``: two cumulative
+    sums, O(n) per column instead of a dense n x n product.
+    """
+    e = e_rel.reshape((-1,) + (1,) * (x.ndim - 1))
+    below = np.cumsum(e * x, axis=0)
+    csum = np.cumsum(x, axis=0)
+    return np.asarray(below + e * (csum[-1] - csum), dtype=np.float64)
+
+
+def _pairs(cycles: FloatArray, top: int) -> tuple[IntArray, IntArray]:
+    """Index pairs ``i < j`` (row-major) at most ``top`` cycles apart.
+
+    Enumerated row by row from the sorted cycles, so only the pairs the lag
+    profile uses are ever built -- not all ``n(n-1)/2`` of them.
+    """
+    n = cycles.size
+    stop = np.searchsorted(cycles, cycles + top, side="right")
+    count = stop - np.arange(n) - 1
+    ii = np.repeat(np.arange(n), count)
+    first = np.cumsum(count) - count
+    jj = ii + 1 + (np.arange(ii.size) - np.repeat(first, count))
+    return ii, jj
+
+
+def _pair_expectations(
+    u_mat: FloatArray, e_rel: FloatArray, ii: IntArray, jj: IntArray, lag: IntArray
+) -> tuple[FloatArray, FloatArray]:
+    """``E[u^2]`` of every pair per unit walk and per unit timing variance.
+
+    The detrended covariance is ``s_eps^2 A M A + s_alpha^2 A`` with
+    ``A = I - U U^T``. For the difference ``d = e_j - e_i`` and ``c = U_j - U_i``
+    (rows of ``U``): ``d^T A d = 2 - |c|^2`` and
+    ``d^T A M A d = lag - 2 c.(R_j - R_i) + c^T G c``, with ``R = M U`` and
+    ``G = U^T M U`` -- the dense ``A M A`` (n x n, O(n^3) to form) reduced to
+    n x (detrend + 1).
+    """
+    r_mat = _walk_times(e_rel, u_mat)
+    g_mat = u_mat.T @ r_mat
+    c = u_mat[jj] - u_mat[ii]
+    g_noise = 2.0 - np.einsum("pk,pk->p", c, c)
+    cross = np.einsum("pk,pk->p", c, r_mat[jj] - r_mat[ii])
+    g_walk = lag - 2.0 * cross + np.einsum("pk,pk->p", c @ g_mat, c)
+    return g_walk, g_noise
+
+
+def _band(ii: IntArray, jj: IntArray, w: FloatArray, n: int, h: int) -> FloatArray:
+    """Band storage ``band[i, h + j - i] = Q[i, j]`` of the pair Laplacian.
+
+    ``Q = sum_p w_p (e_j - e_i)(e_j - e_i)^T``; every pair is at most ``h``
+    indices apart, so ``Q`` is banded.
+    """
+    band = np.zeros((n, 2 * h + 1), dtype=np.float64)
+    band[:, h] = np.bincount(ii, weights=w, minlength=n) + np.bincount(
+        jj, weights=w, minlength=n
+    )
+    off = jj - ii
+    band[ii, h + off] = -w
+    band[jj, h - off] = -w
+    return band
+
+
+def _band_block(
+    band: FloatArray, h: int, a: int, b: int, lo: int, hi: int
+) -> FloatArray:
+    """Rows ``a:b``, columns ``lo:hi`` of the banded matrix, dense."""
+    out = np.zeros((b - a, hi - lo), dtype=np.float64)
+    rows = np.arange(a, b)[:, None]
+    cols = rows - h + np.arange(2 * h + 1)[None, :]
+    ok = (cols >= lo) & (cols < hi)
+    out[np.broadcast_to(rows - a, cols.shape)[ok], (cols - lo)[ok]] = band[a:b][ok]
+    return out
+
+
+def _trace_products(
+    bands: list[FloatArray], h: int, apply_cov: Callable[[FloatArray], FloatArray]
+) -> FloatArray:
+    """``tr(Q_k C Q_k C)`` for each banded ``Q_k``; ``C`` symmetric, as an operator.
+
+    Column block by column block: from the one block ``C[:, J']`` (``J``
+    widened by the band) come ``(Q C)[J, :] = Q[J, J'] C[J', :]`` and
+    ``(Q C)[:, J] = Q C[:, J]``, and the trace collects
+    ``sum_{i, j in J} (Q C)[i, j] (Q C)[j, i]``. Memory is O(n (block + h)),
+    the work O(n^2 (block + h)) in matrix products.
+    """
+    n = bands[0].shape[0]
+    spans = [
+        (a, min(n, a + _BLOCK), max(0, a - h), min(n, a + _BLOCK + h))
+        for a in range(0, n, _BLOCK)
+    ]
+    blocks = [[_band_block(band, h, *span) for span in spans] for band in bands]
+    out = np.zeros(len(bands), dtype=np.float64)
+    for idx, (a, b, lo, hi) in enumerate(spans):
+        c_wide = np.empty((n, hi - lo), dtype=np.float64)  # C[:, lo:hi]
+        # Applied to a few unit columns at a time: the operator's temporaries
+        # are each as large as its input.
+        for s in range(lo, hi, _BLOCK // 4):
+            e = min(hi, s + _BLOCK // 4)
+            unit = np.zeros((n, e - s), dtype=np.float64)
+            unit[np.arange(s, e), np.arange(e - s)] = 1.0
+            c_wide[:, s - lo : e - lo] = apply_cov(unit)
+        c_j = c_wide[:, a - lo : b - lo]  # C[:, a:b]
+        for k, qb in enumerate(blocks):
+            row_part = qb[idx] @ c_wide.T  # (Q C)[a:b, :]
+            col_part = np.empty((n, b - a), dtype=np.float64)
+            for idx2, (a2, b2, lo2, hi2) in enumerate(spans):
+                col_part[a2:b2] = qb[idx2] @ c_j[lo2:hi2]  # (Q C)[:, a:b]
+            out[k] += float(np.sum(col_part * row_part.T))
+    return out
+
+
+def _null_trace(band: FloatArray, h: int, u_mat: FloatArray) -> float:
+    """``tr(Q A Q A)`` for ``A = I - U U^T``, from the band alone.
+
+    ``tr(QQ) - 2 |QU|_F^2 + |U^T Q U|_F^2`` (``Q`` symmetric): O(n h) work, so
+    the null spread costs nothing next to the estimate itself.
+    """
+    n = band.shape[0]
+    pad = np.zeros((n + 2 * h, u_mat.shape[1]), dtype=np.float64)
+    pad[h : h + n] = u_mat
+    qu = np.zeros_like(u_mat)
+    for t in range(2 * h + 1):
+        qu += band[:, t, None] * pad[t : t + n]
+    g = u_mat.T @ qu
+    return float(np.sum(band * band) - 2.0 * np.sum(qu * qu) + np.sum(g * g))
 
 
 def eddington_plakidis(
@@ -171,8 +346,12 @@ def eddington_plakidis(
     """
     t = np.asarray(times, dtype=np.float64).ravel()
     t = np.sort(t[np.isfinite(t)])
-    if period <= 0.0:
-        raise ValueError(f"period must be positive, got {period}")
+    # `not (finite and > 0)`: NaN passes a plain `<= 0` test and only failed
+    # much later, converting a NaN cycle count to an integer.
+    if not (math.isfinite(period) and period > 0.0):
+        raise ValueError(f"period must be positive and finite, got {period}")
+    if t0 is not None and not math.isfinite(t0):
+        raise ValueError(f"t0 must be finite, got {t0}")
     if not 0 <= detrend <= 4:
         raise ValueError(f"detrend must be between 0 and 4, got {detrend}")
     if t.size < max(8, detrend + 4):
@@ -208,38 +387,25 @@ def eddington_plakidis(
             "eddington_plakidis: too few distinct cycles for a lag profile"
         )
 
-    # Detrending projector A = I - H and the detrended delays.
+    # Detrending: an orthonormal basis U of the polynomial, A = I - U U^T,
+    # and the detrended delays. Nothing below forms an n x n matrix.
     basis = np.vander(cycles - cycles.mean(), detrend + 1, increasing=True)
-    q, _ = np.linalg.qr(basis)
-    a_mat = np.eye(n) - q @ q.T
-    resid = a_mat @ oc
-
-    # Exact expectations: with walk covariance M_ij = min(E_i, E_j) (cycles
-    # since the first event) and white timing noise, the detrended covariance
-    # is  s_eps^2 * A M A^T + s_alpha^2 * A A^T,  so every pair's E[u^2] is
-    # linear in the two variances.
+    u_mat = np.asarray(np.linalg.qr(basis)[0], dtype=np.float64)
+    resid = oc - u_mat @ (u_mat.T @ oc)
     e_rel = cycles - cycles[0]
-    walk_cov = np.minimum.outer(e_rel, e_rel)
-    b_walk = a_mat @ walk_cov @ a_mat.T
-    b_noise = a_mat @ a_mat.T
 
-    ii, jj = np.triu_indices(n, k=1)
-    lag_flat = (cycles[jj] - cycles[ii]).astype(np.int64)
-    keep = (lag_flat >= 1) & (lag_flat <= top)
-    ii, jj, lag_flat = ii[keep], jj[keep], lag_flat[keep]
-    if lag_flat.size == 0:
+    ii, jj = _pairs(cycles, top)
+    if ii.size == 0:
         raise InsufficientDataError("eddington_plakidis: no usable pairs")
+    lag_flat = (cycles[jj] - cycles[ii]).astype(np.int64)
     d = resid[jj] - resid[ii]
-    u2 = d * d
-    dw = np.diag(b_walk)
-    dn = np.diag(b_noise)
-    g_walk = dw[ii] + dw[jj] - 2.0 * b_walk[ii, jj]
-    g_noise = dn[ii] + dn[jj] - 2.0 * b_noise[ii, jj]
+    g_walk, g_noise = _pair_expectations(u_mat, e_rel, ii, jj, lag_flat)
 
-    sums_u2 = np.bincount(lag_flat, weights=u2, minlength=top + 1)
+    sums_u2 = np.bincount(lag_flat, weights=d * d, minlength=top + 1)
     sums_gw = np.bincount(lag_flat, weights=g_walk, minlength=top + 1)
     sums_gn = np.bincount(lag_flat, weights=g_noise, minlength=top + 1)
     counts = np.bincount(lag_flat, minlength=top + 1)
+    del d, g_walk, g_noise
     good = np.flatnonzero(counts >= _MIN_PAIRS)
     good = good[good >= 1]
     if good.size < 3:
@@ -251,33 +417,79 @@ def eddington_plakidis(
     y = sums_u2[good] / m
     x_mat = np.stack([sums_gn[good] / m, sums_gw[good] / m], axis=1)
 
+    def result(**values: float) -> EddingtonPlakidisResult:
+        return EddingtonPlakidisResult(
+            **values,
+            lags=good.astype(np.float64),
+            mean_u=np.sqrt(y),
+            n_pairs=m,
+            detrend=detrend,
+        )
+
+    if not np.any(y > 0.0):
+        # Every detrended delay is exactly zero (an exact ephemeris, or timings
+        # rounded far coarser than their scatter): no wander and no noise to
+        # measure, and the reweighting below would divide by zero.
+        return result(
+            alpha=0.0,
+            epsilon=0.0,
+            alpha_err=float("nan"),
+            epsilon_err=float("nan"),
+            slope_significance=0.0,
+        )
+
     # Weighted LSQ for (sigma_alpha^2, sigma_eps^2). A bin mean of squared
     # Gaussian differences has variance ~ 2*E[u^2]^2/m, so after a count-
     # weighted first pass the fit is reweighted once by the model-predicted
     # variance — without this, the large-lag bins (huge u^2, huge scatter)
-    # drown the timing-noise term.
+    # drown the timing-noise term. ``lin`` is the linear map the final pass
+    # applies to the bin means: coef = lin^T y.
     weights = m.copy()
     coef = np.zeros(2)
-    cov = np.eye(2)
+    lin = np.zeros((good.size, 2))
     for _ in range(2):
         xtw = x_mat.T * weights[None, :]
-        cov = np.asarray(np.linalg.inv(xtw @ x_mat), dtype=np.float64)
-        coef = np.asarray(cov @ (xtw @ y), dtype=np.float64)
+        lin = np.asarray(np.linalg.solve(xtw @ x_mat, xtw), dtype=np.float64).T
+        coef = lin.T @ y
         floor = 0.05 * float(np.median(y))
         predicted = np.maximum(x_mat @ coef, max(floor, np.finfo(float).tiny))
         weights = m / (2.0 * predicted * predicted)
-    fit_resid = y - x_mat @ coef
-    dof = max(1, good.size - 2)
-    s2 = float(np.dot(weights, fit_resid * fit_resid)) / dof
-    cov = cov * s2
     var_alpha, var_eps = float(coef[0]), float(coef[1])
-    var_alpha_err = float(np.sqrt(cov[0, 0]))
-    var_eps_err = float(np.sqrt(cov[1, 1]))
+
+    # The two variances as quadratic forms r^T Q_k r in the residuals: Q_k is
+    # the pair Laplacian with weight lin[x, k] / m_x on every pair of lag x.
+    weight_of_lag = np.zeros((2, top + 1))
+    weight_of_lag[:, good] = (lin / m[:, None]).T
+    pair_w = weight_of_lag[:, lag_flat]
+    used = np.flatnonzero(counts[lag_flat] >= _MIN_PAIRS)
+    ii, jj, pair_w = ii[used], jj[used], pair_w[:, used]
+    half_band = int(np.max(jj - ii))
+    bands = [_band(ii, jj, pair_w[k], n, half_band) for k in range(2)]
+    del ii, jj, pair_w, lag_flat
+
+    # Errors: the covariance at the fitted variances.
+    if var_eps > 0.0 or var_alpha > 0.0:
+        s_eps, s_alpha = max(var_eps, 0.0), max(var_alpha, 0.0)
+
+        def apply_cov(x: FloatArray) -> FloatArray:
+            ax = x - u_mat @ (u_mat.T @ x)
+            sx = s_eps * _walk_times(e_rel, ax) + s_alpha * ax
+            return np.asarray(sx - u_mat @ (u_mat.T @ sx), dtype=np.float64)
+
+        var_cov = 2.0 * _trace_products(bands, half_band, apply_cov)
+        var_alpha_err = float(np.sqrt(max(var_cov[0], 0.0)))
+        var_eps_err = float(np.sqrt(max(var_cov[1], 0.0)))
+    else:
+        var_alpha_err = var_eps_err = float("nan")
+
+    # Significance: var_eps against its spread under pure timing noise at the
+    # observed residual scatter (C = s^2 A), which has a closed form in Q_k.
+    s2 = float(np.dot(resid, resid)) / max(1, n - (detrend + 1))
+    null_sd = s2 * math.sqrt(max(2.0 * _null_trace(bands[1], half_band, u_mat), 0.0))
+    significance = var_eps / null_sd if null_sd > 0.0 else float("nan")
 
     sigma_alpha = float(np.sqrt(var_alpha)) if var_alpha > 0.0 else 0.0
     sigma_eps = float(np.sqrt(var_eps)) if var_eps > 0.0 else 0.0
-    alpha = sigma_alpha * _MEAN_ABS
-    epsilon = sigma_eps * _MEAN_ABS
     # d(sigma)/d(var) = 1/(2*sigma); the mean-abs factor carries through.
     alpha_err = (
         _MEAN_ABS * var_alpha_err / (2.0 * sigma_alpha)
@@ -289,18 +501,12 @@ def eddington_plakidis(
         if sigma_eps > 0.0
         else float("nan")
     )
-    significance = var_eps / var_eps_err if var_eps_err > 0.0 else float("inf")
-
-    return EddingtonPlakidisResult(
-        alpha=alpha,
-        epsilon=epsilon,
+    return result(
+        alpha=sigma_alpha * _MEAN_ABS,
+        epsilon=sigma_eps * _MEAN_ABS,
         alpha_err=alpha_err,
         epsilon_err=epsilon_err,
         slope_significance=float(significance),
-        lags=good.astype(np.float64),
-        mean_u=np.sqrt(y),
-        n_pairs=m,
-        detrend=detrend,
     )
 
 

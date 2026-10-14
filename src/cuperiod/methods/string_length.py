@@ -30,19 +30,35 @@ from cuperiod.core._typing import FloatArray
 from cuperiod.core.backend import ensure_cuda_dll_path
 from cuperiod.core.config import StringLengthSettings
 from cuperiod.core.errors import InsufficientDataError
-from cuperiod.core.grid import (
-    GridSpec,
-    pseudo_nyquist_frequency,
-    uniform_frequency_grid,
-)
-from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
+from cuperiod.core.grid import GridSpec, default_frequency_grid
+from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve, raise_if_unusable
 from cuperiod.core.result import Periodogram
+from cuperiod.methods._fold import (
+    check_backend,
+    evaluate_trials,
+    fold_batch,
+    fold_phase,
+    foldable_periods,
+    usable_curve,
+)
 from cuperiod.methods.base import PeriodogramMethod, register
 
 SLBackend = Literal["numpy", "cupy"]
 
-#: Trial periods per vectorized batch (bounds the (P, N) sort/gather arrays).
+#: Trial periods per vectorized batch (bounds the (P, N) sort/gather arrays), lowered
+#: on long curves to a transient budget (see
+#: :func:`~cuperiod.methods._fold.fold_batch`).
 DEFAULT_BATCH: Final = 1024
+
+#: ``(batch, N)`` arrays alive at the peak of :func:`_length_batch` (phase, sort order,
+#: the two gathered rows, their differences and squares).
+_WORKSPACES: Final = 10
+
+#: Fullest phase bucket the numba kernel's O(N) stable sort accepts; a fold that
+#: clumps more points into one 1/N-wide bucket (a trial period far longer than a dense
+#: run of points) would make its insertion pass quadratic, so it takes the comparison
+#: sort instead.
+_SL_BUCKET_FILL: Final = 16
 
 
 def _length_batch(
@@ -69,7 +85,7 @@ def _length_batch(
         stop = min(start + batch, n_periods)
         pb = periods[start:stop]
         n_p = int(pb.shape[0])
-        phase = xp.remainder(tau[None, :] / pb[:, None], 1.0)  # (P, N)
+        phase = fold_phase(xp, tau, pb)  # (P, N)
         if torch_input:
             # torch.sort returns sorted values and the (stable) order in one kernel,
             # replacing the argsort + row-gather pair.
@@ -103,8 +119,9 @@ _SL_BYTES_PER_POINT: Final = 12
 #: the (phase, original index) pairs in shared memory — comparing the index on equal
 #: phases makes the order *stable*, matching the array-API paths' stable argsort — and
 #: accumulates the string length from the sorted neighbours. No (P, N) intermediates
-#: and no global sort scratch. Fits light curves up to the shared-memory capacity
-#: (~4096 points at the default 48 KB); larger curves take the vectorized path.
+#: and no global sort scratch. The sort pads to a power of two, so it fits curves up to
+#: the largest power of two whose padding fits in shared memory (2048 points at 48 KB,
+#: 8192 at the 99 KB opt-in of recent GPUs); longer curves take the vectorized path.
 _SL_CUDA_SRC: Final = r"""
 extern "C" __global__ void sl_block(
     const double* __restrict__ tau, const double* __restrict__ mag,
@@ -190,14 +207,28 @@ def _sl_kernel(block: int) -> Any:
     return kernel
 
 
+def _sl_kernel_capacity(optin: int, block: int = CUDA_BLOCK) -> int:
+    """Longest light curve the sort kernel fits in ``optin`` bytes of shared memory.
+
+    The kernel sorts ``n_pad`` (the next power of two >= ``n``) slots of
+    ``_SL_BYTES_PER_POINT`` bytes, beside its static ``block``-double reduction buffer.
+    So the capacity is the largest *power of two* whose padding fits: comparing the
+    raw ``n`` with ``(optin - static) // 12`` let every length between that power of
+    two and the raw quotient (8193..8277 points at 99 KB) through to a launch that
+    could not get its shared memory, instead of to the vectorized fallback.
+    """
+    raw = (int(optin) - block * 8) // _SL_BYTES_PER_POINT
+    return 1 << (raw.bit_length() - 1) if raw > 0 else 0
+
+
 def _sl_cuda_capacity() -> int:
-    """Largest light curve the sort kernel can hold in opt-in shared memory."""
+    """Longest light curve the sort kernel can hold in this device's shared memory."""
     import cupy
 
     optin = int(
         cupy.cuda.Device().attributes.get("MaxSharedMemoryPerBlockOptin", 48 * 1024)
     )
-    return (optin - CUDA_BLOCK * 8) // _SL_BYTES_PER_POINT  # static reduce buffer
+    return _sl_kernel_capacity(optin)
 
 
 def _sl_cuda(
@@ -241,10 +272,21 @@ _NUMBA_SL_KERNEL: Any = None
 def _numba_sl_kernel() -> Any:
     """Lazily compile (once) and cache the numba string-length kernel.
 
-    Per period: fold (``q - floor(q)``, the vectorized path's formula), **stable**
-    ``mergesort`` argsort (matching the array-API paths' stable sort, so equal phases
+    Per period: fold (``q - floor(q)``, the vectorized path's formula), sort the
+    phases **stably** (matching the array-API paths' stable sort, so equal phases
     keep the same backend-independent neighbour pairing), and accumulate the string.
     ``prange`` over periods; no ``(P, N)`` transients at all.
+
+    The sort is a counting sort into ``N`` equal phase buckets, filled in original
+    index order, followed by one insertion pass that shifts only on a strictly
+    greater phase. Folded phases are close to uniform, so that is expected ``O(N)``
+    -- the comparison sort was ~90% of the kernel (2.7-7x faster overall). The bucket
+    index is monotone in phase and both passes keep equal phases in index order, so
+    the permutation is *the* stable order: identical to ``argsort(kind="mergesort")``,
+    which still handles a fold with a NaN phase or a bucket fuller than
+    :data:`_SL_BUCKET_FILL` (clumped phases would make the insertion pass quadratic).
+    The sort is written inline: an ``njit`` helper defined in this factory would be
+    recompiled in every process instead of loaded from numba's cache.
     """
     global _NUMBA_SL_KERNEL
     if _NUMBA_SL_KERNEL is not None:
@@ -262,7 +304,46 @@ def _numba_sl_kernel() -> Any:
             for j in range(n_points):
                 q = tau[j] / period
                 phase[j] = q - np.floor(q)
-            order = np.argsort(phase, kind="mergesort")
+            # Stable bucket sort (see the factory docstring): count per bucket ...
+            order = np.empty(n_points, dtype=np.int64)
+            fill = np.zeros(n_points + 1, dtype=np.int64)
+            bucketed = True
+            for j in range(n_points):
+                ph = phase[j]
+                if not (ph >= 0.0 and ph <= 1.0):  # NaN: no bucket to put it in
+                    bucketed = False
+                    break
+                b = int(ph * n_points)
+                if b > n_points - 1:
+                    b = n_points - 1
+                fill[b + 1] += 1
+            if bucketed:
+                fullest = 0
+                for b in range(n_points):
+                    if fill[b + 1] > fullest:
+                        fullest = fill[b + 1]
+                    fill[b + 1] += fill[b]  # -> start offset of each bucket
+                if fullest > _SL_BUCKET_FILL:
+                    bucketed = False
+            if bucketed:
+                # ... place in ascending original index (stable within a bucket) ...
+                for j in range(n_points):
+                    b = int(phase[j] * n_points)
+                    if b > n_points - 1:
+                        b = n_points - 1
+                    order[fill[b]] = j
+                    fill[b] += 1
+                # ... and order each bucket, shifting only past strictly greater.
+                for i in range(1, n_points):
+                    key = order[i]
+                    ph = phase[key]
+                    k = i - 1
+                    while k >= 0 and phase[order[k]] > ph:
+                        order[k + 1] = order[k]
+                        k -= 1
+                    order[k + 1] = key
+            else:
+                order[:] = np.argsort(phase, kind="mergesort")
             first = order[0]
             prev_ph = phase[first]
             prev_m = m_scaled[first]
@@ -305,13 +386,18 @@ def string_length(
     backend : {"numpy", "cupy"}, default "numpy"
         CPU or GPU.
     batch : int, default 1024
-        Trial periods per vectorized batch.
+        Trial periods per vectorized batch (numpy/torch, and the cupy fallback for
+        long curves), lowered on long curves so the batch's transient arrays stay
+        within ~128 MiB (512 MiB on a GPU); it never changes the result.
 
     Returns
     -------
     numpy.ndarray
-        String length per period.
+        String length per period. A trial period that cannot be folded (0, NaN, or
+        so small that ``tau / period`` overflows) gives NaN -- on the GPU it no longer
+        reaches the bitonic sort, where NaN phases let pad slots into the string.
     """
+    check_backend(backend)
     t = np.ascontiguousarray(t, dtype=np.float64)
     y = np.ascontiguousarray(y, dtype=np.float64)
     periods_host = np.ascontiguousarray(periods, dtype=np.float64)
@@ -321,18 +407,41 @@ def string_length(
     span = float(y.max() - y.min())
     m_scaled = (y - y.min()) / span * 0.5 - 0.25 if span > 0.0 else np.zeros_like(y)
 
+    def length_for(trials: FloatArray) -> FloatArray:
+        return _sl_dispatch(
+            tau, m_scaled, trials, backend=backend, batch=batch, precision=precision
+        )
+
+    ok = foldable_periods(float(tau.max()), periods_host)
+    return evaluate_trials(length_for, periods_host, ok)
+
+
+def _sl_dispatch(
+    tau: FloatArray,
+    m_scaled: FloatArray,
+    periods_host: FloatArray,
+    *,
+    backend: str,
+    batch: int,
+    precision: str,
+) -> FloatArray:
+    """Run :func:`string_length` on one backend (valid periods only)."""
+    n = int(tau.size)
     if backend == "cupy":
         ensure_cuda_dll_path()
-        # The in-block sort kernel needs the whole curve in shared memory; longer
-        # curves fall back to the vectorized sort-based path.
-        if t.size <= _sl_cuda_capacity():
+        # The in-block sort kernel needs the whole (power-of-two padded) curve in
+        # shared memory; longer curves fall back to the vectorized sort-based path.
+        if n <= _sl_cuda_capacity():
             return _sl_cuda(tau, m_scaled, periods_host)
         import cupy as cp
 
         per_cp = cp.asarray(periods_host)
         length = _length_batch(
             array_namespace(per_cp), cp.asarray(tau), cp.asarray(m_scaled), per_cp,
-            batch=batch,
+            batch=fold_batch(
+                batch, n, workspaces=_WORKSPACES, on_device=True,
+                default=DEFAULT_BATCH,
+            ),
         )
         return np.asarray(cp.asnumpy(length), dtype=np.float64)
     if backend == "numba":
@@ -347,14 +456,21 @@ def string_length(
         tau_d = to_device_array(tau, device=device, dtype=fdt)
         m_d = to_device_array(m_scaled, device=device, dtype=fdt)
         per_d = to_device_array(periods_host, device=device, dtype=fdt)
+        chunk = fold_batch(
+            batch, n, workspaces=_WORKSPACES, on_device=device != "cpu",
+            default=DEFAULT_BATCH,
+        )
         return to_host(
-            _length_batch(array_namespace(per_d), tau_d, m_d, per_d, batch=batch)
+            _length_batch(array_namespace(per_d), tau_d, m_d, per_d, batch=chunk)
         )
     if backend != "numpy":
         raise ValueError(f"unknown backend {backend!r}")
+    chunk = fold_batch(
+        batch, n, workspaces=_WORKSPACES, on_device=False, default=DEFAULT_BATCH
+    )
     return np.asarray(
         _length_batch(
-            array_namespace(periods_host), tau, m_scaled, periods_host, batch=batch
+            array_namespace(periods_host), tau, m_scaled, periods_host, batch=chunk
         ),
         dtype=np.float64,
     )
@@ -374,18 +490,17 @@ class StringLengthMethod(PeriodogramMethod):
     all_backends: ClassVar[tuple[str, ...]] = ("numba", "numpy", "cupy", "torch")
 
     def default_grid(self, lc: LightCurve, settings: StringLengthSettings) -> GridSpec:  # type: ignore[override]
-        finite = lc.finite()
+        finite = usable_curve(lc, "string-length")
         if finite.baseline <= 0.0:
             raise InsufficientDataError("string-length: no usable time baseline")
-        minimum = settings.minimum_frequency or 1.0 / finite.baseline
-        maximum = settings.maximum_frequency or pseudo_nyquist_frequency(
-            finite.time, settings.nyquist_factor
-        )
-        return uniform_frequency_grid(
-            finite.baseline,
-            maximum_frequency=maximum,
-            minimum_frequency=minimum,
+        # The shared fold-method recipe, size-checked before allocation (see PDM).
+        return default_frequency_grid(
+            finite.time,
+            minimum_frequency=settings.minimum_frequency or None,
+            maximum_frequency=settings.maximum_frequency or None,
             samples_per_peak=settings.samples_per_peak,
+            nyquist_factor=settings.nyquist_factor,
+            context="STRINGLENGTH default grid",
         )
 
     def power(  # type: ignore[override]
@@ -396,7 +511,7 @@ class StringLengthMethod(PeriodogramMethod):
         backend: str,
         engine: object | None = None,
     ) -> Periodogram:
-        finite = lc.finite()
+        finite = usable_curve(lc, "string-length")
         n = finite.n
         if n < settings.min_detections:
             raise InsufficientDataError(
@@ -434,6 +549,7 @@ class StringLengthMethod(PeriodogramMethod):
     ) -> Periodogram:
         from cuperiod.multiband.string_length_mb import string_length_multiband
 
+        raise_if_unusable(mblc, "string-length")
         if backend == "torch" or backend.startswith("torch:"):
             backend = f"torch:{resolve_torch_device(backend, settings.device)}"
         return string_length_multiband(grid, mblc, settings, backend)

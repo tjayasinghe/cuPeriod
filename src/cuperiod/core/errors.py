@@ -35,7 +35,12 @@ class UnknownMethodError(CuPeriodError, ValueError):
 
 
 class InsufficientDataError(CuPeriodError, ValueError):
-    """A light curve has too few finite points or no usable time baseline."""
+    """A light curve has too few finite points or no usable time baseline.
+
+    Also raised (via :func:`cuperiod.core.lightcurve.raise_if_unusable`) when an
+    error column holds no usable weight -- every error zero, negative or
+    non-finite -- so that cause is named instead of the empty baseline it leaves.
+    """
 
 
 __all__ = [

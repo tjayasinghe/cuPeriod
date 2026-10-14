@@ -60,18 +60,28 @@ def string_length_multiband(
     -------
     Periodogram
         Point-count-weighted mean of the per-band string lengths (minimized at the true
-        period).
+        period). ``meta["bands"]`` lists the participating bands.
 
     Raises
     ------
     InsufficientDataError
-        If no band has enough finite points, or the stacked baseline is empty.
+        If no band has enough finite points, the participating bands hold fewer
+        than ``min_detections`` points, or the stacked baseline is empty.
     """
     finite = mblc.finite()
-    bands = [lc for lc in finite.bands.values() if lc.n >= _MIN_BAND_POINTS]
-    if not bands:
+    used = [
+        (name, lc) for name, lc in finite.bands.items() if lc.n >= _MIN_BAND_POINTS
+    ]
+    if not used:
         raise InsufficientDataError(
             f"string-length multiband: no band has {_MIN_BAND_POINTS} finite points"
+        )
+    bands = [lc for _, lc in used]
+    n_usable = sum(lc.n for lc in bands)
+    if n_usable < settings.min_detections:
+        raise InsufficientDataError(
+            f"string-length multiband: {n_usable} finite points across usable "
+            f"bands < min_detections {settings.min_detections}"
         )
     stacked_time, _, _, _ = finite.stacked()
     baseline = float(stacked_time.max() - stacked_time.min())
@@ -102,7 +112,7 @@ def string_length_multiband(
         objective_sense="min",
         n_samples=n_total,
         baseline=baseline,
-        meta={**dict(finite.meta), "bands": finite.band_names},
+        meta={**dict(finite.meta), "bands": tuple(name for name, _ in used)},
     )
 
 

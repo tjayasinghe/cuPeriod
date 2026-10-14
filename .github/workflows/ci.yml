@@ -5,10 +5,18 @@ on:
     branches: [main]
   pull_request:
 
+# Least privilege: every job only reads the repository. A job that needs more must
+# ask for it in its own `permissions:` block.
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Actions are pinned to full commit SHAs (a tag can be moved to other code; a commit
+# cannot); the comment names the release. Dependabot (.github/dependabot.yml) opens
+# the update PRs. tests/test_supply_chain.py enforces both.
 jobs:
   test:
     name: test (${{ matrix.os }}, py${{ matrix.python }})
@@ -20,13 +28,15 @@ jobs:
         os: [ubuntu-latest, windows-latest]
         python: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          persist-credentials: false
       # PySide6 (the GUI tests, run offscreen) needs the EGL/OpenGL system
       # libraries, which the ubuntu-latest image no longer preinstalls.
       - name: Install Qt system libraries (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libegl1 libopengl0 libgl1
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
       - name: Create environment
         run: uv venv --python ${{ matrix.python }}
       - name: Install
@@ -38,8 +48,10 @@ jobs:
     name: lint + types
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v7
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
       - name: Create environment
         run: uv venv --python 3.12
       - name: Install
@@ -53,8 +65,10 @@ jobs:
     name: docs build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v7
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
       - name: Create environment
         run: uv venv --python 3.12
       - name: Install

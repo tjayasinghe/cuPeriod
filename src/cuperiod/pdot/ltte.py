@@ -55,17 +55,23 @@ unseen star brighter than the binary — settles it.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Final
 
 import numpy as np
 
+from cuperiod.core._coerce import as_float_array
 from cuperiod.core._typing import FloatArray
 from cuperiod.core.config import PdotSettings
 from cuperiod.core.errors import InsufficientDataError
 from cuperiod.pdot.physics import AU_LIGHT_SECONDS, DAYS_PER_YEAR
 from cuperiod.pdot.result import SECONDS_PER_YEAR
-from cuperiod.pdot.track import EphemerisFit, PhaseTrackResult, _build_ephemeris
+from cuperiod.pdot.track import (
+    EphemerisFit,
+    PhaseTrackResult,
+    _build_ephemeris,
+    _f_test,
+)
 
 _TWO_PI: Final[float] = 2.0 * np.pi
 #: Eccentricity ceiling of the polish (Kepler's equation converges comfortably).
@@ -74,6 +80,9 @@ _KEPLER_TOL: Final[float] = 1e-12
 _KEPLER_ITERS: Final[int] = 60
 #: Trial outer frequencies per batched linear solve.
 _FREQ_CHUNK: Final[int] = 256
+#: Elements of one (trials x points) temporary of the scan; long timing lists
+#: take fewer trials per chunk so the half-dozen such arrays stay ~100 MB.
+_SCAN_BUDGET: Final[int] = 1 << 21
 #: Hard cap on the trial grid (a timing list this dense wants min_outer_period).
 _MAX_TRIALS: Final[int] = 2_000_000
 #: Starting eccentricity of the eccentric polish (0 is a stationary edge).
@@ -84,19 +93,49 @@ _ECC_START: Final[float] = 0.1
 
 
 def _true_anomaly(mean_anomaly: FloatArray, e: float) -> FloatArray:
-    """Solve Kepler's equation by Newton iteration; returns the true anomaly."""
+    """Solve Kepler's equation by Newton iteration; returns the true anomaly.
+
+    Newton from ``E0 = M + e sin M`` converges in a handful of steps for every
+    eccentricity the fits allow, but close to the parabolic limit (``e`` above
+    ~0.99) it can cycle at phases near periastron. Whatever has not converged
+    when the iterations run out is finished by bisection, which cannot fail:
+    ``E - e sin E - M`` is increasing for ``e < 1`` and changes sign on
+    ``[0, 2π]``.
+    """
     m = np.mod(mean_anomaly, _TWO_PI)
+    if m.size == 0:
+        return np.asarray(m, dtype=np.float64)
     ecc = m + e * np.sin(m)
     for _ in range(_KEPLER_ITERS):
         f = ecc - e * np.sin(ecc) - m
         ecc = ecc - f / (1.0 - e * np.cos(ecc))
         if float(np.max(np.abs(f))) < _KEPLER_TOL:
             break
+    else:
+        ecc = _kepler_bisect(np.atleast_1d(m), np.atleast_1d(ecc), e).reshape(m.shape)
     half = 0.5 * ecc
     nu = 2.0 * np.arctan2(
         np.sqrt(1.0 + e) * np.sin(half), np.sqrt(1.0 - e) * np.cos(half)
     )
     return np.asarray(nu, dtype=np.float64)
+
+
+def _kepler_bisect(m: FloatArray, ecc: FloatArray, e: float) -> FloatArray:
+    """Finish the elements Newton left unconverged, by bisection on ``[0, 2π]``."""
+    out = np.array(ecc, dtype=np.float64)
+    bad = ~(np.abs(out - e * np.sin(out) - m) < _KEPLER_TOL) | ~np.isfinite(out)
+    if not np.any(bad):
+        return out
+    mb = m[bad]
+    lo, hi = np.zeros_like(mb), np.full_like(mb, _TWO_PI)
+    # 2π / 2**60 is below the spacing of doubles near 2π: the bracket closes.
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        below = mid - e * np.sin(mid) - mb < 0.0
+        lo = np.where(below, mid, lo)
+        hi = np.where(below, hi, mid)
+    out[bad] = 0.5 * (lo + hi)
+    return out
 
 
 def ltte_delay(
@@ -114,7 +153,7 @@ def ltte_delay(
     dt : array-like
         Times, in days, relative to the same epoch as ``t_periastron``.
     outer_period : float
-        Period of the outer orbit (days).
+        Period of the outer orbit (days); finite and positive.
     amplitude : float
         Semi-amplitude ``a_12 sin i / c`` of the delay (days).
     omega : float
@@ -122,7 +161,8 @@ def ltte_delay(
         centre of mass (radians). For a circular orbit it is the phase of the
         sinusoid at ``t_periastron``.
     eccentricity : float, default 0
-        Outer eccentricity; 0 gives ``amplitude * sin(2π (dt - t_peri)/P_2 + ω)``.
+        Outer eccentricity, in ``[0, 1)`` (a bound orbit); 0 gives
+        ``amplitude * sin(2π (dt - t_peri)/P_2 + ω)``.
     t_periastron : float, default 0
         Epoch of periastron passage, relative to the same epoch as ``dt``.
 
@@ -131,7 +171,21 @@ def ltte_delay(
     numpy.ndarray
         The delay in days: positive when the binary is on the far side of the
         outer orbit and its eclipses arrive late.
+
+    Raises
+    ------
+    ValueError
+        A non-finite or non-positive ``outer_period``, or an eccentricity
+        outside ``[0, 1)``.
     """
+    if not (np.isfinite(outer_period) and outer_period > 0.0):
+        raise ValueError(
+            f"outer_period must be finite and positive, got {outer_period}"
+        )
+    if not 0.0 <= eccentricity < 1.0:
+        raise ValueError(
+            f"eccentricity must be in [0, 1) for a bound orbit, got {eccentricity}"
+        )
     x = np.asarray(dt, dtype=np.float64)
     m = _TWO_PI * (x - t_periastron) / outer_period
     if eccentricity == 0.0:
@@ -185,34 +239,72 @@ def _scan(
     Returns ``(chi2, cos_sin, poly)``: the chi-squared per trial, the
     ``(cos, sin)`` coefficients, and the polynomial coefficients (scaled
     units) — everything the polish needs to start from the best trial.
+
+    Only the cosine and sine depend on the trial frequency, so the normal
+    equations are assembled from blocks: the polynomial Gram matrix and its
+    right-hand side once, and per trial just the two cross rows and the 2x2
+    trigonometric block, as matrix products. Each trial's chi-squared is still
+    taken from its explicit residual, not from the normal equations, so it
+    does not lose precision when the cycle explains nearly everything.
     """
-    n, k = dt.size, degree + 3
-    base = np.column_stack([scaled**j for j in range(degree + 1)])
+    n_poly = degree + 1
+    k = n_poly + 2
+    base = np.column_stack([scaled**j for j in range(n_poly)])
+    base_w = base * w[:, None]
+    gram = base_w.T @ base
+    rhs_poly = base_w.T @ oc
+    w_oc = w * oc
     chi2 = np.empty(freqs.size, dtype=np.float64)
     cos_sin = np.empty((freqs.size, 2), dtype=np.float64)
-    poly = np.empty((freqs.size, degree + 1), dtype=np.float64)
-    for start in range(0, freqs.size, _FREQ_CHUNK):
-        f = freqs[start : start + _FREQ_CHUNK]
+    poly = np.empty((freqs.size, n_poly), dtype=np.float64)
+    chunk = max(1, min(_FREQ_CHUNK, _SCAN_BUDGET // max(1, dt.size)))
+    for start in range(0, freqs.size, chunk):
+        f = freqs[start : start + chunk]
         arg = _TWO_PI * f[:, None] * dt[None, :]
-        x = np.empty((f.size, n, k), dtype=np.float64)
-        x[:, :, : degree + 1] = base[None, :, :]
-        x[:, :, -2] = np.cos(arg)
-        x[:, :, -1] = np.sin(arg)
-        xw = x * w[None, :, None]
-        ata = np.einsum("mnk,mnl->mkl", xw, x)
-        atb = np.einsum("mnk,n->mk", xw, oc)
+        c, s = np.cos(arg), np.sin(arg)
+        cw, sw = c * w[None, :], s * w[None, :]
+        ata = np.empty((f.size, k, k), dtype=np.float64)
+        ata[:, :n_poly, :n_poly] = gram
+        cross_c, cross_s = c @ base_w, s @ base_w
+        ata[:, n_poly, :n_poly] = cross_c
+        ata[:, :n_poly, n_poly] = cross_c
+        ata[:, n_poly + 1, :n_poly] = cross_s
+        ata[:, :n_poly, n_poly + 1] = cross_s
+        ata[:, n_poly, n_poly] = np.einsum("mn,mn->m", cw, c)
+        ata[:, n_poly + 1, n_poly + 1] = np.einsum("mn,mn->m", sw, s)
+        cs = np.einsum("mn,mn->m", cw, s)
+        ata[:, n_poly, n_poly + 1] = cs
+        ata[:, n_poly + 1, n_poly] = cs
+        atb = np.empty((f.size, k), dtype=np.float64)
+        atb[:, :n_poly] = rhs_poly
+        atb[:, n_poly] = c @ w_oc
+        atb[:, n_poly + 1] = s @ w_oc
         try:
             coef = np.linalg.solve(ata, atb[..., None])[..., 0]
         except np.linalg.LinAlgError:
+            # A degenerate trial (f = 0 is the constant column again): solve
+            # each one by least squares, building its design only here.
+            sqw = np.sqrt(w)
             coef = np.stack(
-                [np.linalg.lstsq(x[i] * np.sqrt(w)[:, None], oc * np.sqrt(w),
-                                 rcond=None)[0] for i in range(f.size)]
+                [
+                    np.linalg.lstsq(
+                        np.column_stack([base, c[i], s[i]]) * sqw[:, None],
+                        oc * sqw,
+                        rcond=None,
+                    )[0]
+                    for i in range(f.size)
+                ]
             )
-        resid = oc[None, :] - np.einsum("mnk,mk->mn", x, coef)
+        model = (
+            coef[:, :n_poly] @ base.T
+            + coef[:, n_poly, None] * c
+            + coef[:, n_poly + 1, None] * s
+        )
+        resid = oc[None, :] - model
         sl = slice(start, start + f.size)
-        chi2[sl] = np.einsum("mn,n->m", resid * resid, w)
-        cos_sin[sl] = coef[:, -2:]
-        poly[sl] = coef[:, : degree + 1]
+        chi2[sl] = (resid * resid) @ w
+        cos_sin[sl] = coef[:, n_poly:]
+        poly[sl] = coef[:, :n_poly]
     return chi2, cos_sin, poly
 
 
@@ -321,7 +413,9 @@ class LTTEFit:
         Number of O-C points and of fitted parameters.
     aic, bic : float
         ``chi2 + 2k`` and ``chi2 + k ln n`` (the convention of
-        :class:`~cuperiod.EphemerisFit`).
+        :class:`~cuperiod.EphemerisFit`) when timing errors were given; the
+        concentrated-likelihood ``n ln(RSS/n) + 2k`` and ``n ln(RSS/n) + k ln n``
+        when they were estimated (``meta["errors"] == "estimated"``).
     delta_bic : float
         ``null.bic - bic``: positive favours the cycle over the polynomial
         alone; > 10 is conventionally strong, > 4.6 is a Bayes factor of 10.
@@ -437,19 +531,29 @@ class LTTEFit:
         """The third-body mass (solar masses) for ``sin i = 1``.
 
         Solves ``m_3^3 / (m_12 + m_3)^2 = f`` for the given total inner mass;
-        any inclination below 90° means a heavier companion.
+        any inclination below 90° means a heavier companion. NaN for a
+        negative or non-finite inner mass.
         """
         from scipy.optimize import brentq
 
         f = self.mass_function
-        if not np.isfinite(f) or f <= 0.0 or inner_mass < 0.0:
+        if not (np.isfinite(f) and f > 0.0):
             return float("nan")
+        if not (np.isfinite(inner_mass) and inner_mass >= 0.0):
+            return float("nan")
+        if inner_mass == 0.0:
+            # m^3 / m^2 = f: the root is f itself (the bracket below would
+            # start exactly on it).
+            return float(f)
 
         def g(m: float) -> float:
             return m**3 - f * (inner_mass + m) ** 2
 
+        # m_3 >= f always (m^3 = f (M + m)^2 >= f m^2), and g(f) < 0 for M > 0,
+        # so [f, upper] brackets the one positive root -- never the trivial
+        # root at 0 that a bracket starting there can return.
         upper = 4.0 * (f + inner_mass) + 1e-9
-        return float(brentq(g, 0.0, upper))
+        return float(brentq(g, f, upper))
 
     def _dt(self, time: Any) -> FloatArray:
         return np.asarray(time, dtype=np.float64) - self.t_ref
@@ -619,6 +723,25 @@ class LTTESearchResult:
 # --- the search -----------------------------------------------------------------
 
 
+def _as_1d(values: Any, name: str, *, time: bool = False) -> FloatArray:
+    """One column of the input as a 1-D float array, masked entries as NaN.
+
+    A mask is honoured (a masked timing becomes NaN and is dropped with the
+    other non-finite points, as a light curve's would be), a single ``(n, 1)``
+    column is accepted, and anything with more than one column is refused: a
+    ``(t, oc, err)`` tuple flattened into "event times" is three times too many
+    points, all of them wrong.
+    """
+    arr = np.atleast_1d(np.squeeze(as_float_array(values, name=name, time=time)))
+    if arr.ndim != 1:
+        raise ValueError(
+            f"ltte_search: {name} must be 1-D, got shape {arr.shape}; pass the "
+            "epochs as data and the O-C values and their errors through oc= "
+            "and errors="
+        )
+    return arr
+
+
 def _resolve_input(
     data: Any,
     period: float | None,
@@ -638,22 +761,28 @@ def _resolve_input(
             float(data.period),
             "phase_track",
         )
-    if period is None or period <= 0.0:
-        raise ValueError("period= (days, positive) is required for array input")
-    t = np.asarray(data, dtype=np.float64).ravel()
+    if period is None or not (np.isfinite(period) and period > 0.0):
+        raise ValueError(
+            f"period= (days, finite and positive) is required for array input, "
+            f"got {period}"
+        )
+    t = _as_1d(data, "times", time=True)
     sigma: FloatArray | None = None
     if errors is not None:
-        sigma = np.asarray(errors, dtype=np.float64).ravel()
+        sigma = _as_1d(errors, "errors")
         if sigma.size != t.size:
             raise ValueError("errors and times length mismatch")
     if oc is not None:
-        values = np.asarray(oc, dtype=np.float64).ravel()
+        values = _as_1d(oc, "oc")
         if values.size != t.size:
             raise ValueError("oc and times length mismatch")
         kind = "oc"
     else:
         # Event times: nearest-integer cycles, as fit_ephemeris does.
-        epoch = float(np.nanmin(t)) if t0 is None else float(t0)
+        finite_t = t[np.isfinite(t)]
+        if finite_t.size == 0:
+            raise InsufficientDataError("ltte_search: no finite event times")
+        epoch = float(finite_t.min()) if t0 is None else float(t0)
         cycles = np.round((t - epoch) / period)
         values = t - epoch - period * cycles
         kind = "times"
@@ -669,15 +798,20 @@ def _resolve_input(
     return t, values, sigma, float(period), kind
 
 
-def _f_test(delta: float, k_extra: int, chi2_full: float, dof_full: int) -> float:
-    from scipy.stats import f as f_dist
+def _distinct_epochs(t: FloatArray, period_ref: float) -> FloatArray:
+    """Mean epoch of each group of sorted times closer than a quarter period.
 
-    if dof_full < 1 or k_extra < 1:
-        return float("nan")
-    if chi2_full <= 0.0:
-        return 0.0 if delta > 0.0 else float("nan")
-    stat = (max(0.0, delta) / k_extra) / (chi2_full / dof_full)
-    return float(f_dist.sf(stat, k_extra, dof_full))
+    Two timings of the same eclipse (other filters, other observers) differ by
+    far less than that, consecutive eclipses by a whole period -- and a
+    secondary minimum, should the list carry them, by about half of one.
+    """
+    if t.size == 0:
+        return t
+    starts = np.concatenate([[True], np.diff(t) >= 0.25 * period_ref])
+    group = np.cumsum(starts) - 1
+    sums = np.bincount(group, weights=t)
+    counts = np.bincount(group)
+    return np.asarray(sums / counts, dtype=np.float64)
 
 
 def ltte_search(
@@ -716,19 +850,29 @@ def ltte_search(
     t0 : float, optional
         Trial epoch for cycle assignment of event times; defaults to the first.
     errors : array-like, optional
-        1-sigma timing errors (days) for array input. Without them every point
-        gets the same error, set from the scatter about the polynomial-only fit.
+        1-sigma timing errors (days) for array input; a masked entry drops its
+        point. Without them every point gets the same error, estimated from the
+        scatter about the *joint* fit: its ``chi2_reduced`` is then 1 by
+        construction, the formal errors carry that scatter, and ``aic``/``bic``
+        (and so ``delta_bic``) come from the concentrated likelihood
+        ``n*ln(RSS/n) + k*ln(n)`` rather than ``chi2 + k*ln(n)``.
+        ``meta["errors"]`` says which applied (``"given"`` or ``"estimated"``).
     oc : array-like, optional
-        O-C values (days) at the epochs in ``data``.
+        O-C values (days) at the epochs in ``data`` (masked entries dropped).
     outer_period : float, optional
         Hold the outer period fixed at this value (days) and fit only the
         amplitude, phase and polynomial — to test a published orbit, or a
         magnetic-cycle period seen elsewhere. Skips the scan.
     min_outer_period, max_outer_period : float, optional
         Outer-period range of the scan (days). Defaults: the larger of four
-        median point spacings and 20 reference periods, up to the baseline
-        divided by ``settings.ltte_min_cycles`` (one full cycle by default —
-        longer orbits are degenerate with the polynomial).
+        epoch spacings and 20 reference periods, up to the baseline divided by
+        ``settings.ltte_min_cycles`` (one full cycle by default — longer orbits
+        are degenerate with the polynomial). The epoch spacing is taken over
+        *distinct* epochs (timings closer than a quarter of the reference period
+        are one eclipse) and is the larger of their median and mean spacing, so
+        an eclipse listed in three filters, or a few eclipses timed per season,
+        do not drag the floor down to a few periods. It is reported as
+        ``meta["epoch_spacing"]``, next to ``meta["n_epochs"]``.
     samples_per_peak : int, optional
         Oversampling of the outer-frequency grid relative to ``1/baseline``
         (``settings.ltte_samples_per_peak``).
@@ -750,9 +894,13 @@ def ltte_search(
     Raises
     ------
     InsufficientDataError
-        Fewer O-C points than ``settings.ltte_min_points`` (or than the model
-        needs), or a baseline too short to hold one cycle above the resolvable
-        floor.
+        Fewer O-C points, or fewer distinct epochs, than
+        ``settings.ltte_min_points`` (or than the model needs), or a baseline
+        too short to hold one cycle above the resolvable floor.
+    ValueError
+        A missing or non-finite ``period`` for array input, a non-finite or
+        non-positive ``outer_period``, or array input with more than one
+        column.
 
     Examples
     --------
@@ -779,21 +927,36 @@ def ltte_search(
     )
     if spp < 1:
         raise ValueError(f"samples_per_peak must be >= 1, got {spp}")
+    if outer_period is not None and not (
+        np.isfinite(outer_period) and outer_period > 0.0
+    ):
+        raise ValueError(
+            f"outer_period must be finite and positive, got {outer_period}"
+        )
 
     t, values, sigma, period_ref, kind = _resolve_input(data, period, t0, errors, oc)
     n_params = deg + 1 + (5 if eccentric else 3)
     floor = max(int(psettings.ltte_min_points), n_params + 2)
-    if t.size < floor:
+    # Repeated timings of one eclipse (several filters or observers) are one
+    # sample of the cycle, not several: the point floor and the scan's spacing
+    # count distinct epochs. Every point is still fitted.
+    epochs = _distinct_epochs(t, period_ref)
+    if t.size < floor or epochs.size < floor:
         raise InsufficientDataError(
-            f"ltte_search: need at least {floor} O-C points for a degree-{deg} "
-            f"{'eccentric' if eccentric else 'circular'} fit, got {t.size}"
+            f"ltte_search: need at least {floor} O-C points at distinct epochs for "
+            f"a degree-{deg} {'eccentric' if eccentric else 'circular'} fit, got "
+            f"{t.size} points at {epochs.size} distinct epochs"
         )
     baseline = float(t[-1] - t[0])
     if baseline <= 0.0:
         raise InsufficientDataError("ltte_search: the O-C points span no time")
 
+    estimated = sigma is None
     if sigma is None:
-        # Equal weights, scaled from the polynomial-only residuals.
+        # Equal weights. This provisional scale (the scatter about the
+        # polynomial alone, which still contains any cycle) only conditions the
+        # scan and the polish; it is replaced by the joint fit's own scatter
+        # once that fit exists, below.
         resid = values - np.polyval(np.polyfit(t - t.mean(), values, deg), t - t.mean())
         scale = max(float(np.std(resid)), 1e-9 * period_ref)
         sigma = np.full(t.size, scale, dtype=np.float64)
@@ -803,12 +966,17 @@ def ltte_search(
     time_scale = max(0.5 * baseline, 1e-300)
     scaled = dt / time_scale
 
-    null = _build_ephemeris(
-        dt, values, sigma, period_ref=period_ref, t_ref=t_ref, degree=deg
-    )
-
     # -- the trial grid ------------------------------------------------------
-    spacing = float(np.median(np.diff(t))) if t.size > 1 else baseline
+    # The typical epoch spacing, robust to clustering: the median spacing of
+    # the distinct epochs, but never below their mean spacing -- a few eclipses
+    # a season sample the cycle once a season, however close they sit.
+    if epochs.size > 1:
+        spacing = max(
+            float(np.median(np.diff(epochs))),
+            float(epochs[-1] - epochs[0]) / (epochs.size - 1),
+        )
+    else:
+        spacing = baseline
     lo = (
         max(4.0 * spacing, 20.0 * period_ref)
         if min_outer_period is None
@@ -820,12 +988,10 @@ def ltte_search(
         else float(max_outer_period)
     )
     if outer_period is not None:
-        if outer_period <= 0.0:
-            raise ValueError(f"outer_period must be positive, got {outer_period}")
         freqs = np.array([1.0 / outer_period], dtype=np.float64)
         p2_bounds = (float(outer_period), float(outer_period))
     else:
-        if not (lo > 0.0 and hi > lo):
+        if not (np.isfinite(lo) and np.isfinite(hi) and lo > 0.0 and hi > lo):
             raise InsufficientDataError(
                 "ltte_search: no outer period is resolvable — the scan range "
                 f"[{lo:.4g}, {hi:.4g}] d is empty (baseline {baseline:.4g} d, "
@@ -872,8 +1038,44 @@ def ltte_search(
         assert best is not None
         params, cov, chi2 = best
 
-    # -- unpack --------------------------------------------------------------
+    n = int(t.size)
     n_poly = deg + 1
+    k_full = int(params.size) - (1 if outer_period is not None else 0)
+    dof = max(1, n - k_full)
+    if estimated and chi2 > 0.0:
+        # No errors were given: the noise is what the joint fit leaves. Move
+        # every chi-squared, the periodogram and the covariance onto that scale
+        # (the joint fit's chi2_reduced becomes 1 by construction).
+        s2 = chi2 / dof
+        sigma = sigma * np.sqrt(s2)
+        cov = cov * s2
+        chi2 = chi2 / s2
+        chi2_grid = chi2_grid / s2
+    null = _build_ephemeris(
+        dt, values, sigma, period_ref=period_ref, t_ref=t_ref, degree=deg
+    )
+    log_n = float(np.log(n))
+    if estimated:
+        # The criteria then come from the concentrated likelihood,
+        # n*ln(RSS/n) + k*ln(n): the chi-squared difference of two fits whose
+        # common error was estimated from one of them is capped by n and says
+        # nothing about the signal.
+        var = float(sigma[0]) ** 2
+        tiny = float(np.finfo(np.float64).tiny)
+        log_full = float(np.log(max(chi2 * var, tiny) / n))
+        log_null = float(np.log(max(null.chi2 * var, tiny) / n))
+        bic = n * log_full + k_full * log_n
+        aic = n * log_full + 2.0 * k_full
+        null = replace(
+            null,
+            bic=n * log_null + n_poly * log_n,
+            aic=n * log_null + 2.0 * n_poly,
+        )
+    else:
+        bic = chi2 + k_full * log_n
+        aic = chi2 + 2.0 * k_full
+
+    # -- unpack --------------------------------------------------------------
     names = _param_names(deg, eccentric)
     scale_vec = np.ones(params.size, dtype=np.float64)
     scale_vec[-n_poly:] = [1.0 / time_scale**k for k in range(n_poly)]
@@ -892,11 +1094,7 @@ def ltte_search(
     c2 = float(coef[2]) if deg >= 2 else 0.0
     c2_err = float(coef_err[2]) if deg >= 2 else 0.0
 
-    n = int(t.size)
-    k_full = int(params.size) - (1 if outer_period is not None else 0)
-    dof = max(1, n - k_full)
     k_extra = k_full - n_poly
-    bic = chi2 + k_full * float(np.log(n))
     fit = LTTEFit(
         period_ref=period_ref,
         t_ref=t_ref,
@@ -918,7 +1116,7 @@ def ltte_search(
         chi2_reduced=chi2 / dof,
         n_used=n,
         n_params=k_full,
-        aic=chi2 + 2.0 * k_full,
+        aic=aic,
         bic=bic,
         delta_bic=null.bic - bic,
         f_test_p=_f_test(null.chi2 - chi2, k_extra, chi2, dof),
@@ -935,6 +1133,9 @@ def ltte_search(
         "max_outer_period": float(1.0 / freqs[0]),
         "n_trials": int(freqs.size),
         "fixed_outer_period": outer_period is not None,
+        "errors": "estimated" if estimated else "given",
+        "n_epochs": int(epochs.size),
+        "epoch_spacing": float(spacing),
     }
     return LTTESearchResult(
         outer_period=1.0 / freqs,

@@ -2,13 +2,23 @@
 
 from __future__ import annotations
 
+import sys
+import types
+
 import numpy as np
 import pytest
 
 import cuperiod as cup
+import cuperiod.methods.string_length as sl_mod
 from conftest import requires_gpu
 from cuperiod.methods.string_length import string_length
 from synth import synthetic_eclipser, synthetic_sine
+
+
+def _fake_cupy(optin: int) -> types.SimpleNamespace:
+    """A host-only stand-in for cupy reporting ``optin`` bytes of opt-in shared mem."""
+    device = types.SimpleNamespace(attributes={"MaxSharedMemoryPerBlockOptin": optin})
+    return types.SimpleNamespace(cuda=types.SimpleNamespace(Device=lambda: device))
 
 
 def _reference_length(t: np.ndarray, y: np.ndarray, period: float) -> float:
@@ -68,3 +78,34 @@ def test_string_length_gpu_matches_cpu() -> None:
     cpu = string_length(t, mag, periods, backend="numpy")
     gpu = string_length(t, mag, periods, backend="cupy")
     assert float(np.max(np.abs(cpu - gpu))) < 1e-9
+
+
+@pytest.mark.parametrize("optin_kb", [48, 64, 96, 99, 163, 227])
+def test_sl_cuda_capacity_covers_the_padded_sort(
+    optin_kb: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Regression: the dispatch compared the raw point count with the shared-memory
+    # capacity, but the bitonic sort pads to the next power of two, so every length
+    # between the largest fitting power of two and the capacity (8193..8277 points
+    # on a 99 KB device; 4097..5290 on 64 KB) raised instead of falling back.
+    optin = optin_kb * 1024
+    monkeypatch.setitem(sys.modules, "cupy", _fake_cupy(optin))
+    capacity = sl_mod._sl_cuda_capacity()
+    n_pad = 1 << max(0, (capacity - 1).bit_length())  # what the kernel allocates
+    static = sl_mod.CUDA_BLOCK * 8  # the kernel's reduction buffer
+    assert n_pad * sl_mod._SL_BYTES_PER_POINT + static <= optin
+    # ...and it is the longest such curve: one more point doubles the padding.
+    assert 2 * n_pad * sl_mod._SL_BYTES_PER_POINT + static > optin
+
+
+@requires_gpu
+def test_string_length_gpu_at_the_kernel_capacity_boundary() -> None:
+    # The longest curve the in-block sort takes, and one point more (the vectorized
+    # fallback), both match the CPU.
+    capacity = sl_mod._sl_cuda_capacity()
+    periods = np.linspace(0.3, 3.0, 64)
+    for n in (capacity, capacity + 1):
+        t, mag, _ = synthetic_sine(n=n, seed=n % 7)
+        cpu = string_length(t, mag, periods, backend="numpy")
+        gpu = string_length(t, mag, periods, backend="cupy")
+        assert float(np.max(np.abs(cpu - gpu))) < 1e-9, n

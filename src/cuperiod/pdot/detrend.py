@@ -23,11 +23,13 @@ before measuring its period is not something a library should do unasked.
 
 from __future__ import annotations
 
+from bisect import bisect_left, insort
 from typing import Any, Literal
 
 import numpy as np
 
-from cuperiod.core._typing import FloatArray
+from cuperiod.core._coerce import as_float_array
+from cuperiod.core._typing import FloatArray, IntArray
 
 #: Filter kernels understood by :func:`running_median`.
 TrendMethod = Literal["median", "binned"]
@@ -54,30 +56,34 @@ def running_median(
         studied and well below the trend's own timescale; a factor of ~20 above
         the period is a reasonable starting point.
     method : {"median", "binned"}, default "median"
-        ``"median"`` evaluates an exact running median centred on every point.
-        It costs ``O(N * k)`` for ``k`` points per window, which is the right
-        choice up to some tens of thousands of points. ``"binned"`` takes the
-        median of fixed ``width/2`` bins and linearly interpolates between bin
-        centres — ``O(N log N)``, and the pragmatic choice for very long or
-        very dense light curves, at the price of a coarser, slightly
-        phase-shifted filter.
+        ``"median"`` evaluates an exact running median centred on every point,
+        sliding one sorted window across the time-ordered data: ``O(N log k)``
+        comparisons plus ``O(k)`` memory moves per point for ``k`` points per
+        window, the right choice up to some hundreds of thousands of points.
+        ``"binned"`` takes the median of fixed ``width/2`` bins and linearly
+        interpolates between bin centres — ``O(N log N)`` whatever the span or
+        the gaps, and the pragmatic choice for very long or very dense light
+        curves, at the price of a coarser, slightly phase-shifted filter.
     min_points : int, default 3
-        Windows holding fewer points than this fall back to the global median
-        rather than returning a value driven by one or two observations.
+        Windows holding fewer points than this do not set the trend from one
+        or two observations. For ``"median"`` such a point falls back to the
+        global median; for ``"binned"`` such a bin is not used as an
+        interpolation node, so its points take the trend interpolated from the
+        populated bins around them (the global median when no bin qualifies).
 
     Returns
     -------
     numpy.ndarray
-        The trend, in the input's order and units. Non-finite inputs contribute
-        nothing to the filter and receive the global median.
+        The trend, in the input's order and units. Non-finite (or masked)
+        inputs contribute nothing to the filter and receive the global median.
 
     Examples
     --------
     >>> trend = running_median(t, mag, 40.0)          # doctest: +SKIP
     >>> flat = mag - trend                            # doctest: +SKIP
     """
-    t = np.asarray(time, dtype=np.float64).ravel()
-    y = np.asarray(value, dtype=np.float64).ravel()
+    t = as_float_array(time, name="time", time=True).ravel()
+    y = as_float_array(value, name="value").ravel()
     if t.size != y.size:
         raise ValueError("time and value must have the same length")
     if not np.isfinite(width) or width <= 0.0:
@@ -100,46 +106,92 @@ def running_median(
     ts, ys = t[idx], y[idx]
 
     if method == "binned":
-        out[idx] = _binned_trend(ts, ys, width, fallback)
+        out[idx] = _binned_trend(ts, ys, width, fallback, min_points)
         return out
 
     half = 0.5 * width
     lo = np.searchsorted(ts, ts - half, side="left")
     hi = np.searchsorted(ts, ts + half, side="right")
-    trend = np.full(ts.size, fallback, dtype=np.float64)
-    for i in range(ts.size):
-        a, b = int(lo[i]), int(hi[i])
-        if b - a >= min_points:
-            trend[i] = float(np.median(ys[a:b]))
-    out[idx] = trend
+    out[idx] = _sliding_median(ys, lo, hi, fallback, min_points)
     return out
 
 
-def _binned_trend(
-    ts: FloatArray, ys: FloatArray, width: float, fallback: float
+def _sliding_median(
+    ys: FloatArray,
+    lo: IntArray,
+    hi: IntArray,
+    fallback: float,
+    min_points: int,
 ) -> FloatArray:
-    """Bin medians on a ``width/2`` grid, linearly interpolated back."""
+    """Median of ``ys[lo[i]:hi[i]]`` for every ``i``, from one sorted window.
+
+    Over time-sorted points both window edges only move right, so the window's
+    values are kept in one sorted list: each point is inserted once as the
+    leading edge passes it and removed once as the trailing edge does, and the
+    median is read by index. That replaces a fresh ``np.median`` (call overhead
+    plus an ``O(k)`` partition) per point. The values are those ``np.median``
+    returns — the middle element, or the mean of the two middle ones — so the
+    trend is unchanged; only the sign of a zero median can differ.
+    """
+    vals = ys.tolist()
+    starts = lo.tolist()
+    stops = hi.tolist()
+    trend = [fallback] * len(vals)
+    window: list[float] = []
+    a = b = 0
+    for i, (start, stop) in enumerate(zip(starts, stops, strict=True)):
+        # Insert before deleting: point i lies in its own window, so start < stop
+        # and every value about to leave has already been inserted.
+        while b < stop:
+            insort(window, vals[b])
+            b += 1
+        while a < start:
+            del window[bisect_left(window, vals[a])]
+            a += 1
+        k = stop - start
+        if k >= min_points:
+            mid = k >> 1
+            trend[i] = (
+                window[mid] if k & 1 else (window[mid - 1] + window[mid]) / 2.0
+            )
+    return np.asarray(trend, dtype=np.float64)
+
+
+def _binned_trend(
+    ts: FloatArray,
+    ys: FloatArray,
+    width: float,
+    fallback: float,
+    min_points: int,
+) -> FloatArray:
+    """Bin medians on a ``width/2`` grid, linearly interpolated back.
+
+    Only occupied bins are visited, found from the sorted bin index itself, so
+    the work is ``O(N)`` after the sort however long the span or wide the gaps:
+    a stray epoch (a ``0.0`` "missing" sentinel among JDs) no longer means
+    millions of empty bins. The index stays a float, so a far-out epoch cannot
+    overflow it. Bins holding fewer than ``min_points`` points are not used as
+    nodes, so one or two observations never set the trend on their own.
+    """
     step = 0.5 * width
-    start = float(ts[0])
-    bin_of = np.floor((ts - start) / step).astype(np.int64)
-    n_bins = int(bin_of[-1]) + 1
-    centres = np.empty(n_bins, dtype=np.float64)
-    levels = np.empty(n_bins, dtype=np.float64)
-    edges = np.searchsorted(bin_of, np.arange(n_bins + 1))
-    filled = 0
-    for k in range(n_bins):
-        a, b = int(edges[k]), int(edges[k + 1])
-        if b > a:
-            centres[filled] = float(np.median(ts[a:b]))
-            levels[filled] = float(np.median(ys[a:b]))
-            filled += 1
-    if filled == 0:  # pragma: no cover - ts is non-empty, so a bin is filled
+    bin_of = np.floor((ts - float(ts[0])) / step)
+    starts = np.flatnonzero(np.r_[True, bin_of[1:] != bin_of[:-1]])
+    stops = np.r_[starts[1:], ts.size]
+    populated = (stops - starts) >= min_points
+    starts, stops = starts[populated], stops[populated]
+    if starts.size == 0:
         return np.full(ts.size, fallback, dtype=np.float64)
-    if filled == 1:
-        return np.full(ts.size, levels[0], dtype=np.float64)
-    return np.asarray(
-        np.interp(ts, centres[:filled], levels[:filled]), dtype=np.float64
+    centres = np.array(
+        [np.median(ts[a:b]) for a, b in zip(starts, stops, strict=True)],
+        dtype=np.float64,
     )
+    levels = np.array(
+        [np.median(ys[a:b]) for a, b in zip(starts, stops, strict=True)],
+        dtype=np.float64,
+    )
+    if levels.size == 1:
+        return np.full(ts.size, levels[0], dtype=np.float64)
+    return np.asarray(np.interp(ts, centres, levels), dtype=np.float64)
 
 
 def detrend(
@@ -172,7 +224,7 @@ def detrend(
     >>> flat = detrend(t, mag, 40.0)                  # doctest: +SKIP
     >>> res = cup.pdot_search((t, flat, err), period=1.43)   # doctest: +SKIP
     """
-    y = np.asarray(value, dtype=np.float64).ravel()
+    y = as_float_array(value, name="value").ravel()
     trend = running_median(
         time, value, width, method=method, min_points=min_points
     )

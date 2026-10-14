@@ -19,26 +19,23 @@ import numpy as np
 from pydantic_settings import BaseSettings
 
 from cuperiod.api import _multiband_grid
-from cuperiod.core.columns import ColumnMap, Domain
+from cuperiod.core.backend import is_gpu_selector
+from cuperiod.core.columns import ColumnMap, Domain, coerce_domain, infer_domain
 from cuperiod.core.errors import ColumnResolutionError
 from cuperiod.core.grid import GridSpec
-from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
+from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve, raise_if_unusable
 from cuperiod.core.result import Periodogram
 from cuperiod.methods.base import PeriodogramMethod, get_method
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import pandas as pd
 
-#: Sentinel default for the ``nested`` parameter, so a preset can supply its own nest
-#: name while an explicitly passed name always wins.
+#: Nest name used when neither ``nested=`` nor a preset names one. The parameter
+#: itself defaults to ``None``, so an explicitly passed ``"lc"`` is told apart from
+#: "not given" and always wins over a preset's own nest.
 _DEFAULT_NEST: Final[str] = "lc"
 
 _NAN: Final[float] = float("nan")
-
-#: Per-process cache of ``(method, requested backend) -> concrete backend``. Backend
-#: availability cannot change inside a run, and the row-wise tier would otherwise
-#: re-probe the environment for every object.
-_BACKEND_CACHE: dict[tuple[str, str], str] = {}
 
 
 # --- optional-dependency guard -----------------------------------------------
@@ -67,7 +64,9 @@ def require_nested_pandas() -> None:
 #: Verified column layouts of the common LINCC-stack catalogs. Each entry carries
 #: ``nested``, ``time``, ``value``, ``error``, ``band`` and ``domain``; sub-column names
 #: are bare (they are prefixed with whichever nest name is in use). Pass one by name as
-#: ``preset=`` to fill every column parameter you did not set yourself.
+#: ``preset=`` to fill every column parameter you did not set yourself — except that a
+#: ``value=`` naming a *different* column (e.g. ``psfMag`` under a ``psfFlux`` preset)
+#: drops the preset's ``error`` and ``domain``, which describe the preset's own value.
 #:
 #: * ``"ztf_dr22"`` — ZTF DR22 object table: nest ``lc`` with ``hmjd``/``mag``/
 #:   ``magerr``/``catflags``. The band is *not* in the nest: DR22 has one row per
@@ -193,15 +192,24 @@ def _subcolumn_names(dtype: Any) -> list[str]:
     )
 
 
-def _nested_dtype(data: Any, nested: str) -> Any:
-    """The ``NestedDtype`` of column ``nested`` (lazy: reads the schema only)."""
+def _schema(data: Any) -> tuple[Any, list[str]]:
+    """``(dtypes, column names)`` of a frame or catalog (lazy: reads the schema only).
+
+    ``.dtypes`` is the adapter's whole contract with its input: a ``NestedFrame`` and
+    a lazy lsdb ``Catalog`` both expose it without computing anything.
+    """
     dtypes = getattr(data, "dtypes", None)
     if dtypes is None:
         raise TypeError(
             f"expected a nested-pandas NestedFrame or an lsdb Catalog, got "
             f"{type(data).__name__}"
         )
-    available = [str(c) for c in getattr(dtypes, "index", dtypes)]
+    return dtypes, [str(c) for c in getattr(dtypes, "index", dtypes)]
+
+
+def _nested_dtype(data: Any, nested: str) -> Any:
+    """The ``NestedDtype`` of column ``nested`` (lazy: reads the schema only)."""
+    dtypes, available = _schema(data)
     if nested not in available:
         raise ColumnResolutionError(
             f"no nested column {nested!r}; available columns: {available}"
@@ -238,7 +246,7 @@ def _preset_entry(preset: str | None) -> dict[str, Any]:
 
 def resolve_nested_columns(
     data: Any,
-    nested: str = _DEFAULT_NEST,
+    nested: str | None = None,
     *,
     time: str | None = None,
     value: str | None = None,
@@ -257,9 +265,10 @@ def resolve_nested_columns(
     ----------
     data : NestedFrame or lsdb Catalog
         Anything exposing ``.dtypes``.
-    nested : str, default "lc"
-        Name of the nested column holding the light curves. A ``preset`` supplies its
-        own nest name unless you pass a different one here.
+    nested : str, optional
+        Name of the nested column holding the light curves. ``None`` takes the
+        preset's nest, or ``"lc"`` without a preset; any name passed here — ``"lc"``
+        included — wins over the preset's.
     time, value, error : str, optional
         Sub-column names, bare (``"hmjd"``) or dotted (``"lc.hmjd"``). Auto-detected
         when ``None``.
@@ -272,6 +281,12 @@ def resolve_nested_columns(
     preset : str, optional
         A key of :data:`COLUMN_PRESETS`. Preset ``time``/``value`` are required to
         exist; preset ``error``/``band`` are dropped when the nest does not have them.
+        A ``value`` naming a different column than the preset's (case-insensitive)
+        does not inherit the preset's ``error`` or ``domain`` — those describe the
+        preset's value: the error is then paired with the new value column
+        (``psfMag`` -> ``psfMagErr``; none found -> unweighted) and the domain is
+        inferred from its name, falling back to the preset's only when the name says
+        nothing. An explicit ``error=``/``domain=`` always wins.
 
     Returns
     -------
@@ -290,8 +305,8 @@ def resolve_nested_columns(
                   time='objectForcedSource.midpointMjdTai', ...)
     """
     entry = _preset_entry(preset)
-    if entry and nested == _DEFAULT_NEST:
-        nested = str(entry["nested"])
+    if nested is None:
+        nested = str(entry["nested"]) if entry else _DEFAULT_NEST
     subcols = _subcolumn_names(_nested_dtype(data, nested))
     lower = {c.lower(): c for c in subcols}
 
@@ -300,9 +315,21 @@ def resolve_nested_columns(
         return name if name is not None and name.lower() in lower else None
 
     time_name = _bare(time, nested, "time") or entry.get("time")
-    value_name = _bare(value, nested, "value") or entry.get("value")
+    explicit_value = _bare(value, nested, "value")
+    value_name = explicit_value or entry.get("value")
+    # A preset's error column and domain describe the preset's *value* column. When
+    # value= picks another one (psfMag beside a psfFlux preset), inheriting them
+    # weighted magnitudes by nJy errors and searched them as fluxes — BLS/TLS then
+    # chased an inverted signal. Let the new value pick its own pairing instead.
+    overridden = bool(
+        entry
+        and explicit_value is not None
+        and explicit_value.lower() != str(entry.get("value", "")).lower()
+    )
     if error is not None:
         error_name = _bare(error, nested, "error")
+    elif overridden:
+        error_name = None  # ColumnMap pairs it with the value (psfMag -> psfMagErr)
     else:
         error_name = soft(entry.get("error"))
     if band is not None:
@@ -315,11 +342,16 @@ def resolve_nested_columns(
     else:
         band_name = soft(entry.get("band"))
 
-    if domain is None and entry:
-        domain = entry.get("domain")
+    resolved_domain = coerce_domain(domain)
+    if resolved_domain is None and entry:
+        preset_domain = coerce_domain(entry.get("domain"))
+        if overridden and explicit_value is not None:
+            resolved_domain = infer_domain(explicit_value) or preset_domain
+        else:
+            resolved_domain = preset_domain
     resolved = ColumnMap(
         time=time_name, value=value_name, error=error_name
-    ).resolve(subcols, domain=None if domain is None else Domain(domain))
+    ).resolve(subcols, domain=resolved_domain)
     band_actual = None if band_name is None else lower[band_name.lower()]
     return NestedColumns(
         nested=nested,
@@ -340,16 +372,6 @@ def _unique_in_order(labels: np.ndarray) -> list[Any]:
     for label in labels.tolist():
         seen.setdefault(label, None)
     return list(seen)
-
-
-def _resolved_backend(method: PeriodogramMethod, requested: str) -> str:
-    """``method.resolve_backend`` with a per-process cache."""
-    key = (method.name, requested)
-    cached = _BACKEND_CACHE.get(key)
-    if cached is None:
-        cached = method.resolve_backend(requested)
-        _BACKEND_CACHE[key] = cached
-    return cached
 
 
 @dataclass
@@ -385,23 +407,41 @@ class _Kernel:
         A multi-band run with a single-band-only method cannot produce a result for
         *any* row, and :meth:`evaluate` turns per-object failures into NaN rows — so
         the combination has to raise here, before a single object is touched, or the
-        misconfiguration ships as a silently all-NaN frame.
+        misconfiguration ships as a silently all-NaN frame. A settings object of the
+        wrong method is rejected here too, for the same reason.
         """
         method = get_method(self.method)
         if self.columns.band is not None and not method.supports_multiband:
             raise ValueError(f"{method.name} does not support multi-band input")
+        method.coerce_settings(self.settings)
         return method
 
     def prepare(self) -> tuple[PeriodogramMethod, BaseSettings, str]:
-        """Resolve method, settings and backend once (raises on misconfiguration)."""
+        """Resolve method, settings and backend once (raises on misconfiguration).
+
+        The backend goes through
+        :meth:`~cuperiod.methods.base.PeriodogramMethod.resolve_backend_for`, so a
+        ``backend="auto"`` request defers to ``settings.backend`` (and its
+        ``CUPERIOD_<METHOD>_BACKEND`` override) exactly as :func:`cuperiod.periodogram`
+        does. Resolution is memoised by the backend module, and this kernel keeps the
+        result, so the row-wise tier does not re-probe the environment per object.
+        """
         if self._prepared is None:
             method = self.validate()
+            settings = method.coerce_settings(self.settings)
             self._prepared = (
                 method,
-                method.coerce_settings(self.settings),
-                _resolved_backend(method, self.backend),
+                settings,
+                method.resolve_backend_for(self.backend, settings),
             )
         return self._prepared
+
+    def empty_result(self, index: Any = None) -> pd.DataFrame:
+        """A correctly-typed zero-row result (dask/lsdb meta, empty inputs)."""
+        import pandas as pd
+
+        data = {name: pd.Series(dtype="float64") for name in self.out_columns}
+        return pd.DataFrame(data, index=index)
 
     # -- per-object work ------------------------------------------------------
     def nan_row(self) -> dict[str, float]:
@@ -442,15 +482,26 @@ class _Kernel:
         lc: LightCurve | MultiBandLightCurve,
         engine: object | None,
     ) -> Periodogram:
-        """Run one light curve, reusing ``engine`` when the method has one."""
+        """Run one light curve, reusing ``engine`` when the method has one.
+
+        The result carries the settings' peak-selection defaults (``n_peaks``,
+        ``peak_separation_rayleigh``, ``alias_freq_tolerance``, ...), as
+        :func:`cuperiod.periodogram` attaches them, so ``period_2 ...`` are picked
+        by the same rule as in a single-curve call.
+        """
+        raise_if_unusable(lc, method.name)
         if isinstance(lc, MultiBandLightCurve):
             if not method.supports_multiband:
                 raise ValueError(f"{method.name} does not support multi-band input")
             grid = self.grid or _multiband_grid(method, lc, settings)
-            return method.multiband_power(grid, lc, settings, backend, engine=engine)
-        single = lc.in_domain(method.natural_domain) if method.natural_domain else lc
-        grid = self.grid or method.default_grid(single, settings)
-        return method.power(grid, single, settings, backend, engine=engine)
+            pg = method.multiband_power(grid, lc, settings, backend, engine=engine)
+        else:
+            single = (
+                lc.in_domain(method.natural_domain) if method.natural_domain else lc
+            )
+            grid = self.grid or method.default_grid(single, settings)
+            pg = method.power(grid, single, settings, backend, engine=engine)
+        return pg.with_peak_defaults(settings)
 
     def peaks_row(self, pg: Periodogram) -> dict[str, float]:
         """Flatten a periodogram to this kernel's result columns."""
@@ -510,13 +561,6 @@ class _RowKernel(_Kernel):
 class _PartitionKernel(_Kernel):
     """Tier 2: called with a whole partition; one engine serves every object."""
 
-    def empty_result(self, index: Any = None) -> pd.DataFrame:
-        """A correctly-typed zero-row result (dask/lsdb meta, empty partitions)."""
-        import pandas as pd
-
-        data = {name: pd.Series(dtype="float64") for name in self.out_columns}
-        return pd.DataFrame(data, index=index)
-
     def __call__(self, df: Any) -> pd.DataFrame:
         import pandas as pd
 
@@ -545,8 +589,12 @@ class _PartitionKernel(_Kernel):
                 for i, j in zip(starts, ends, strict=True)
             ]
         finally:
-            if engine is not None:
-                del engine
+            gpu_engine = engine is not None and is_gpu_selector(backend)
+            del engine
+            # Only a GPU engine leaves blocks in cupy's pool. A CPU engine (GLS on
+            # "finufft" builds one too) must not import cupy, where it is installed,
+            # and flush a device pool this partition never touched.
+            if gpu_engine:
                 from cuperiod.core.device import free_gpu_memory
 
                 free_gpu_memory()
@@ -613,12 +661,32 @@ def _catalog_meta(out_columns: tuple[str, ...]) -> dict[str, type]:
     return dict.fromkeys(out_columns, float)
 
 
+def _refuse_column_clash(data: Any, out_columns: tuple[str, ...]) -> None:
+    """Raise when appending would duplicate a column name already on ``data``.
+
+    ``map_rows(append_columns=True)`` ends in a plain ``concat`` with no uniqueness
+    check, so a second method run on the first one's output (or a base table that
+    already has a ``fap`` column) produced two ``best_period`` columns: selection
+    then returns a frame instead of a Series, and Parquet export refuses the table.
+    Read from the schema only, so a lazy catalog stays lazy.
+    """
+    _, existing = _schema(data)
+    taken = set(existing)
+    clash = [name for name in out_columns if name in taken]
+    if clash:
+        raise ValueError(
+            f"the input already has result column(s) {clash}; appending would "
+            "duplicate them. Pass prefix= (e.g. prefix='pdm_') to name this run's "
+            "columns apart, or append_columns=False to get the results alone."
+        )
+
+
 # --- tier 1: row-wise ---------------------------------------------------------
 
 
 def nested_periodogram(
     data: Any,
-    nested: str = _DEFAULT_NEST,
+    nested: str | None = None,
     *,
     time: str | None = None,
     value: str | None = None,
@@ -650,8 +718,9 @@ def nested_periodogram(
     ----------
     data : NestedFrame or lsdb Catalog
         A table with one row per object and the light curves in a nested column.
-    nested : str, default "lc"
-        The nested column's name. A ``preset`` supplies its own unless set here.
+    nested : str, optional
+        The nested column's name. ``None`` takes the preset's nest, or ``"lc"``
+        without a preset; a name passed here (``"lc"`` included) always wins.
     time, value, error : str, optional
         Sub-column names, bare (``"hmjd"``) or dotted (``"lc.hmjd"``). Auto-detected
         from the nest's schema when ``None``.
@@ -662,13 +731,16 @@ def nested_periodogram(
     preset : str, optional
         A key of :data:`COLUMN_PRESETS` (``"ztf_dr22"``, ``"ztf_alerts"``,
         ``"rubin_dp1_object"``, ``"rubin_dp1_dia"``) filling every column parameter you
-        did not set.
+        did not set. A ``value`` naming another column than the preset's keeps none of
+        the preset's ``error``/``domain`` (see :func:`resolve_nested_columns`).
     method : str, default "GLS"
         Any registered method name.
     settings : settings model, optional
-        The method's settings (e.g. :class:`~cuperiod.GLSSettings`).
+        The method's settings (e.g. :class:`~cuperiod.GLSSettings`). Its peak fields
+        (``peak_separation_rayleigh``, ...) shape the ``period_i`` columns.
     backend : str, default "auto"
-        ``"auto"``/``"cpu"``/``"gpu"`` or a concrete backend.
+        ``"auto"``/``"cpu"``/``"gpu"`` or a concrete backend. ``"auto"`` defers to
+        ``settings.backend`` (``CUPERIOD_<METHOD>_BACKEND``) when that is pinned.
     grid : GridSpec, optional
         One explicit trial grid for every object; by default each object gets the
         method's own grid from its baseline and sampling.
@@ -681,7 +753,8 @@ def nested_periodogram(
         Prepended to every result-column name (e.g. ``"gls_"``).
     append_columns : bool, default True
         Keep the input columns and append the results; ``False`` returns only the
-        result columns.
+        result columns. Appending onto a table that already has a column of a result
+        name raises — use ``prefix=`` to run several methods on one frame.
     meta : dict, optional
         lsdb ``meta`` override. Built automatically (``{column: float}``) otherwise;
         ignored for an in-memory ``NestedFrame``.
@@ -691,12 +764,14 @@ def nested_periodogram(
     NestedFrame or lsdb Catalog
         The same kind of object that came in, with ``{prefix}best_period``,
         ``{prefix}best_power``, ``{prefix}fap`` (NaN when the method reports none) and
-        any ``{prefix}period_i`` columns.
+        any ``{prefix}period_i`` columns. A zero-row frame gives zero rows with the
+        same float64 result columns.
 
     Raises
     ------
     ValueError
-        If ``band`` resolves but ``method`` has no multi-band model. Per-object
+        If ``band`` resolves but ``method`` has no multi-band model, or if
+        ``append_columns`` would duplicate an existing column name. Per-object
         failures become NaN rows, so a configuration that can never work is rejected
         up front instead.
 
@@ -750,6 +825,8 @@ def nested_periodogram(
         prefix=prefix,
     )
     kernel.validate()  # fail now, not once per object as an all-NaN row
+    if append_columns:
+        _refuse_column_clash(data, kernel.out_columns)
     read = columns.read_columns
     if _is_lsdb_catalog(data):
         return data.map_rows(
@@ -759,9 +836,24 @@ def nested_periodogram(
             infer_nesting=False,
             append_columns=append_columns,
         )
+    if len(data) == 0:
+        # nested-pandas never calls the kernel on zero rows and returns a frame with
+        # no result columns at all; give the typed empty result Tier 2 gives.
+        return _empty_row_result(data, kernel, append_columns)
     return data.map_rows(
         kernel, read, infer_nesting=False, append_columns=append_columns
     )
+
+
+def _empty_row_result(data: Any, kernel: _Kernel, append_columns: bool) -> Any:
+    """Tier 1's answer for a zero-row ``NestedFrame``: typed, correctly named."""
+    import pandas as pd
+    from nested_pandas import NestedFrame
+
+    results = NestedFrame(kernel.empty_result(data.index[:0]))
+    if not append_columns:
+        return results
+    return pd.concat([data, results], axis=1)
 
 
 # --- tier 2: partition-wise ---------------------------------------------------
@@ -769,7 +861,7 @@ def nested_periodogram(
 
 def partition_periodogram(
     data: Any,
-    nested: str = _DEFAULT_NEST,
+    nested: str | None = None,
     *,
     time: str | None = None,
     value: str | None = None,

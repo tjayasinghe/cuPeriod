@@ -34,11 +34,12 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from cuperiod.core._coerce import as_float_array
 from cuperiod.core._typing import FloatArray
 from cuperiod.core.columns import ColumnMap, Domain
 from cuperiod.core.config import PdotSettings
 from cuperiod.core.errors import InsufficientDataError
-from cuperiod.core.lightcurve import LightCurve
+from cuperiod.core.lightcurve import LightCurve, raise_if_unusable
 from cuperiod.pdot.models import PeriodModel, get_model
 from cuperiod.pdot.result import SECONDS_PER_YEAR
 
@@ -57,6 +58,10 @@ _NEWTON_STEPS: int = 6
 _SYMMETRY_POWER_FRACTION: float = 0.05
 #: Symmetry orders tested, highest first (2 = the equal-minima contact binary).
 _SYMMETRY_ORDERS: tuple[int, ...] = (4, 3, 2)
+#: Fewest segments (O-C points) a track can use: the quadratic ephemeris has
+#: three parameters, and its F-test against the linear one needs a spare degree
+#: of freedom.
+_MIN_SEGMENTS: int = 4
 
 
 # --- template ----------------------------------------------------------------
@@ -104,6 +109,20 @@ class PhaseTemplate:
             omega * self.sin_coeffs
         )
 
+    def _shape_and_deriv(self, x: FloatArray) -> tuple[FloatArray, FloatArray]:
+        """:meth:`_shape` and :meth:`_shape_deriv` from one cos/sin evaluation.
+
+        The arithmetic is exactly theirs (same angle, same products), so the
+        values are bit-identical; only the trigonometry is shared.
+        """
+        m = np.arange(1, self.n_harmonics + 1, dtype=np.float64)
+        omega = 2.0 * np.pi * self.frequency * m
+        ang = (2.0 * np.pi * self.frequency) * x[:, None] * m[None, :]
+        cos, sin = np.cos(ang), np.sin(ang)
+        shape = cos @ self.cos_coeffs + sin @ self.sin_coeffs
+        deriv = sin @ (-omega * self.cos_coeffs) + cos @ (omega * self.sin_coeffs)
+        return shape, deriv
+
 
 def _design(dt: FloatArray, f0: float, n_harmonics: int) -> FloatArray:
     m = np.arange(1, n_harmonics + 1, dtype=np.float64)
@@ -131,6 +150,47 @@ def _fit_template_order(
     return tpl, chi2
 
 
+#: Condition number of the weighted top-order design above which the nested-QR
+#: order ladder is not trusted (sampling commensurate with the period makes high
+#: harmonics alias onto low ones) and every order is fitted on its own instead.
+_LADDER_MAX_COND: float = 1e8
+
+
+def _ladder_chi2(
+    dt: FloatArray, y: FloatArray, w: FloatArray, f0: float, top: int
+) -> FloatArray | None:
+    """Weighted chi-squared of every template order ``1..top`` from one QR.
+
+    With the design columns ordered ``[1, cos1, sin1, cos2, sin2, ...]`` the
+    order-``k`` model is exactly the leading ``2k+1`` columns, so a single QR of
+    the weighted design augmented with the weighted data column gives every
+    nested fit at once: the residual of the leading-``m`` fit is the norm of the
+    data column's ``R`` entries below row ``m``. One ``O(N*top**2)``
+    factorization replaces ``top`` separate least-squares solves on freshly
+    built designs. Returns ``None`` when the design is too ill-conditioned for
+    the nested residuals to be trusted; the caller then fits each order itself.
+    """
+    n = int(dt.size)
+    m = np.arange(1, top + 1, dtype=np.float64)
+    ang = (2.0 * np.pi * f0) * dt[:, None] * m[None, :]
+    sw = np.sqrt(w)
+    aug = np.empty((n, 2 * top + 2), dtype=np.float64)
+    aug[:, 0] = sw
+    aug[:, 1 : 2 * top + 1 : 2] = np.cos(ang) * sw[:, None]
+    aug[:, 2 : 2 * top + 1 : 2] = np.sin(ang) * sw[:, None]
+    aug[:, -1] = y * sw
+    # mode="r" returns R alone (the stubs type every mode as the Q, R pair).
+    r: FloatArray = np.asarray(np.linalg.qr(aug, mode="r"), dtype=np.float64)
+    if not np.all(np.isfinite(r)):
+        return None
+    if float(np.linalg.cond(r[:, :-1])) > _LADDER_MAX_COND:
+        return None
+    tail = r[:, -1] ** 2
+    # chi2 of the leading-m fit = sum of tail[m:]; reverse cumulative sum.
+    below = np.cumsum(tail[::-1])[::-1]
+    return np.asarray(below[1 + 2 * np.arange(1, top + 1)], dtype=np.float64)
+
+
 def fit_template(
     dt: FloatArray,
     y: FloatArray,
@@ -143,28 +203,55 @@ def fit_template(
 ) -> PhaseTemplate:
     """Fit the fixed-frequency template, BIC-selecting the order if not given.
 
-    With per-point errors (``weighted``), BIC = chi2 + k*ln(N); without, the
-    Gaussian profile form ``N*ln(RSS/N) + k*ln(N)`` is used.
+    The order is chosen with the *scale-free* BIC ``N*ln(chi2/N) + k*ln(N)``,
+    which depends on the weights only up to an overall factor, whether or not
+    per-point errors were supplied. The weighted form ``chi2 + k*ln(N)`` is
+    right only when the quoted errors are right: survey photometry routinely
+    understates them several-fold, every extra harmonic then looks like a
+    bargain, the selection runs to ``max_harmonics``, and the noise-fitted
+    harmonics inflate the Fisher information of every segment delay (the same
+    failure :func:`cuperiod.period_profile` guards against). The returned
+    template is fitted with the original weights, so its ``chi2_reduced`` still
+    measures the fit against the quoted errors.
+
+    Parameters
+    ----------
+    dt, y, w : numpy.ndarray
+        Times relative to the reference epoch (days), values, and weights.
+    f0 : float
+        Template frequency (cycles/day).
+    n_harmonics : int, optional
+        Pin the order instead of selecting it.
+    max_harmonics : int, default 10
+        Largest order the selection may pick.
+    weighted : bool, default True
+        Kept for backward compatibility. The selection no longer depends on it:
+        for equal weights the scale-free form is the Gaussian profile BIC
+        ``N*ln(RSS/N) + k*ln(N)`` up to a constant, as before.
     """
+    del weighted  # the scale-free criterion needs no branch (see above)
     n = dt.size
     if n_harmonics is not None:
         return _fit_template_order(dt, y, w, f0, n_harmonics)[0]
-    best: PhaseTemplate | None = None
-    best_bic = np.inf
     top = max(1, min(max_harmonics, (n - 2) // 2))
-    log_n = np.log(n)
+    ladder = _ladder_chi2(dt, y, w, f0, top)
+    if ladder is None:
+        ladder = np.array(
+            [_fit_template_order(dt, y, w, f0, k)[1] for k in range(1, top + 1)],
+            dtype=np.float64,
+        )
+    # A noise-free curve leaves chi2 at rounding level, where its logarithm is
+    # noise: floor it at a tiny fraction of the data's own weighted power so
+    # such orders tie and the cheapest wins.
+    floor = max(np.finfo(np.float64).tiny, 1e-24 * float(np.dot(w, y * y)))
+    log_n = float(np.log(n))
+    best_order, best_bic = 1, np.inf
     for order in range(1, top + 1):
-        tpl, chi2 = _fit_template_order(dt, y, w, f0, order)
-        k = 1 + 2 * order
-        if weighted:
-            bic = chi2 + k * log_n
-        else:
-            # w is 1/N each: chi2 is then RSS/N exactly.
-            bic = n * np.log(max(chi2, np.finfo(float).tiny)) + k * log_n
+        chi2 = max(float(ladder[order - 1]), floor)
+        bic = n * float(np.log(chi2 / n)) + (1 + 2 * order) * log_n
         if bic < best_bic - 1e-12:
-            best, best_bic = tpl, bic
-    assert best is not None
-    return best
+            best_order, best_bic = order, bic
+    return _fit_template_order(dt, y, w, f0, best_order)[0]
 
 
 # --- per-segment shift fit ---------------------------------------------------
@@ -180,6 +267,56 @@ class SegmentShift:
     n_points: int
     duration: float
     chi2_reduced: float
+
+
+def _shift_scan_chi2(
+    dt: FloatArray,
+    y: FloatArray,
+    w: FloatArray,
+    template: PhaseTemplate,
+    shifts: FloatArray,
+    *,
+    free_offset: bool,
+) -> FloatArray:
+    """Weighted chi-squared of the template shifted by each of ``shifts``.
+
+    A time shift ``s`` only rotates each harmonic's ``(a_m, b_m)`` pair,
+
+        a_m*cos(w_m*(x - s)) + b_m*sin(w_m*(x - s))
+            = (a_m*cos(w_m*s) - b_m*sin(w_m*s)) * cos(w_m*x)
+            + (a_m*sin(w_m*s) + b_m*cos(w_m*s)) * sin(w_m*x),
+
+    so with the fixed basis ``B = [cos(w_m*x), sin(w_m*x)]`` and rotated
+    coefficients ``q(s)`` the whole scan is
+    ``chi2(s) = r'Wr - 2*q(s)'B'Wr + q(s)'(B'WB)q(s)``, ``r = y - offset``. The
+    basis is evaluated once (``N x 2H``) instead of once per trial shift, and
+    no ``(n_shifts, N)`` temporaries are built. A free per-segment offset is
+    the weighted mean of the residual, which is linear in ``q``: centring ``r``
+    and every basis column on their weighted means marginalizes it exactly.
+
+    The value is a difference of large terms, good to ~1e-14 of the grid's
+    range; that is ample for picking the best cell and seeding the parabola,
+    and the Newton polish that follows evaluates the residuals directly.
+    """
+    m = np.arange(1, template.n_harmonics + 1, dtype=np.float64)
+    two_pi_f = 2.0 * np.pi * template.frequency
+    ang = two_pi_f * dt[:, None] * m[None, :]
+    basis = np.hstack([np.cos(ang), np.sin(ang)])
+    resid = y - template.offset
+    if free_offset:
+        sum_w = float(w.sum())
+        resid = resid - float(np.dot(w, resid)) / sum_w
+        basis = basis - (w @ basis)[None, :] / sum_w
+    weighted_basis = basis * w[:, None]
+    gram = weighted_basis.T @ basis
+    proj = weighted_basis.T @ resid
+    rr = float(np.dot(w, resid * resid))
+    s_ang = two_pi_f * shifts[:, None] * m[None, :]
+    cs, ss = np.cos(s_ang), np.sin(s_ang)
+    a, b = template.cos_coeffs, template.sin_coeffs
+    q = np.hstack([a * cs - b * ss, a * ss + b * cs])  # (n_shifts, 2H)
+    quad = np.einsum("ki,ki->k", q @ gram, q)
+    return np.asarray(rr - 2.0 * (q @ proj) + quad, dtype=np.float64)
 
 
 def _fit_segment_shift(
@@ -204,15 +341,7 @@ def _fit_segment_shift(
     shifts = (np.arange(n_scan, dtype=np.float64) / n_scan - 0.5) * period
     sum_w = float(w.sum())
 
-    # chi2 on the coarse grid, vectorized over shifts: (n_scan, n_pts).
-    shape = np.empty((n_scan, dt.size), dtype=np.float64)
-    for k, s in enumerate(shifts):
-        shape[k] = template._shape(dt - s)
-    resid0 = y[None, :] - template.offset - shape
-    if free_offset:
-        c = (resid0 @ w) / sum_w
-        resid0 = resid0 - c[:, None]
-    chi2_grid = (resid0 * resid0) @ w
+    chi2_grid = _shift_scan_chi2(dt, y, w, template, shifts, free_offset=free_offset)
     k0 = int(np.argmin(chi2_grid))
 
     # Parabolic seed on the (periodic) grid.
@@ -225,9 +354,9 @@ def _fit_segment_shift(
 
     # Newton (Gauss-Newton) polish with analytic derivatives.
     for _ in range(_NEWTON_STEPS):
-        x = dt - delay
-        model = template.offset + template._shape(x)
-        slope = -template._shape_deriv(x)  # d(model)/d(delay)
+        shape, deriv = template._shape_and_deriv(dt - delay)
+        model = template.offset + shape
+        slope = -deriv  # d(model)/d(delay)
         resid = y - model
         if free_offset:
             resid = resid - float(np.dot(w, resid)) / sum_w
@@ -240,9 +369,9 @@ def _fit_segment_shift(
         delay += float(np.clip(move, -step, step))
     delay = (delay + 0.5 * period) % period - 0.5 * period
 
-    x = dt - delay
-    slope = -template._shape_deriv(x)
-    resid = y - template.offset - template._shape(x)
+    shape, deriv = template._shape_and_deriv(dt - delay)
+    slope = -deriv
+    resid = y - template.offset - shape
     n_free = 1
     if free_offset:
         resid = resid - float(np.dot(w, resid)) / sum_w
@@ -307,8 +436,11 @@ class EphemerisFit:
     n_used : int
         Number of O-C points.
     f_test_p : float
-        p-value of the quadratic term against the linear model (NaN for the
-        linear fit itself, or when dof does not allow the test).
+        p-value of the quadratic term against the linear model. NaN for the
+        linear fit itself and whenever no test is possible: too few degrees of
+        freedom, a non-finite chi-squared, or O-C values both models fit
+        exactly (a noise-free linear ephemeris has nothing for the quadratic
+        term to explain).
     worst_phase_residual : float
         Largest ``|O-C| / period`` seen during cycle assignment (NaN when the
         fit was built from delays rather than event times). Values approaching
@@ -350,6 +482,16 @@ class EphemerisFit:
         that already matches its errors.
         """
         return self.pdot_err * float(np.sqrt(max(1.0, self.chi2_reduced)))
+
+    @property
+    def pddot_err_scaled(self) -> float:
+        """:attr:`pddot_err` inflated by ``sqrt(chi2_reduced)`` when > 1.
+
+        The same honest-error inflation as :attr:`pdot_err_scaled`, for the rate
+        of change of the rate; NaN below degree 3, where no ``pddot`` is fitted.
+        :attr:`implied_model` still reads the formal :attr:`pddot_err`.
+        """
+        return self.pddot_err * float(np.sqrt(max(1.0, self.chi2_reduced)))
 
     @property
     def implied_model(self) -> str:
@@ -414,6 +556,7 @@ class EphemerisFit:
             "dlnp_dt_per_yr": self.dlnp_dt_per_yr,
             "pddot": self.pddot,
             "pddot_err": self.pddot_err,
+            "pddot_err_scaled": self.pddot_err_scaled,
             "period_correction": self.period_correction,
             "t0_correction": self.t0_correction,
             "chi2_reduced": self.chi2_reduced,
@@ -529,13 +672,30 @@ def _ephemeris_from_delays(
             "ephemeris fit: need at least 4 O-C points for the quadratic term"
         )
     quad = build(2, float("nan"))
+    p = _f_test(linear.chi2 - quad.chi2, 1, quad.chi2, dof_quad)
+    return linear, replace(quad, f_test_p=p)
+
+
+def _f_test(delta: float, k_extra: int, chi2_full: float, dof_full: int) -> float:
+    """p-value of ``k_extra`` nested extra parameters (the classical F-test).
+
+    ``delta`` is the chi-squared the extra parameters remove and ``chi2_full``
+    the fuller model's own, on ``dof_full`` degrees of freedom. NaN whenever no
+    test is possible: no degrees of freedom, a non-finite chi-squared (a failed
+    fit), or a fit that is exact under *both* models (nothing to explain, so
+    nothing to be significant about). An exact fuller model that the smaller one
+    misses is the one infinitely significant case, ``p = 0``.
+    """
     from scipy.stats import f as f_dist
 
-    delta = max(0.0, linear.chi2 - quad.chi2)
-    f_stat = delta / (quad.chi2 / dof_quad) if quad.chi2 > 0.0 else np.inf
-    p = float(f_dist.sf(f_stat, 1, dof_quad))
-    quad = build(2, p)
-    return linear, quad
+    if dof_full < 1 or k_extra < 1:
+        return float("nan")
+    if not (np.isfinite(delta) and np.isfinite(chi2_full)):
+        return float("nan")
+    if chi2_full <= 0.0:
+        return 0.0 if delta > 0.0 else float("nan")
+    stat = (max(0.0, delta) / k_extra) / (chi2_full / dof_full)
+    return float(f_dist.sf(stat, k_extra, dof_full))
 
 
 def fit_ephemeris(
@@ -555,14 +715,18 @@ def fit_ephemeris(
     Parameters
     ----------
     times : array-like
-        Event times (days; any consistent epoch, e.g. HJD/BJD).
+        Event times (days; any consistent epoch, e.g. HJD/BJD), in any order.
+        Non-finite (or masked) times are dropped together with their errors.
     period : float
-        Trial period (days).
+        Trial period (days); positive and finite.
     t0 : float, optional
         Trial epoch of zero phase; defaults to the first event.
     errors : array-like, optional
-        1-sigma timing errors (days). ``None`` uses equal weights and an
-        RMS-derived scale.
+        1-sigma timing errors (days), one per entry of ``times`` and in the
+        same order. ``None`` gives every event the same error, estimated a
+        posteriori from the scatter about the fitted quadratic (so the
+        quadratic's ``chi2_reduced`` is 1 by construction and ``pdot_err`` is
+        the ordinary unweighted least-squares error).
 
     Returns
     -------
@@ -576,30 +740,62 @@ def fit_ephemeris(
     classical O-C ambiguity. Densely sampled timing lists are safe; sparse
     ones should be inspected (a wrong branch shows up as a sawtooth O-C).
     """
-    t = np.asarray(times, dtype=np.float64).ravel()
-    t = np.sort(t[np.isfinite(t)])
+    if not (np.isfinite(period) and period > 0.0):
+        raise ValueError(f"period must be positive and finite, got {period}")
+    if t0 is not None and not np.isfinite(t0):
+        raise ValueError(f"t0 must be finite, got {t0}")
+    t_all = as_float_array(times, name="times", time=True).ravel()
+    sigma_all: FloatArray | None = None
+    if errors is not None:
+        sigma_all = as_float_array(errors, name="errors").ravel()
+        if sigma_all.size != t_all.size:
+            raise ValueError("errors and times length mismatch")
+    # One mask and one ordering for both arrays: each error stays with its event.
+    keep = np.flatnonzero(np.isfinite(t_all))
+    keep = keep[np.argsort(t_all[keep], kind="stable")]
+    t = t_all[keep]
     if t.size < 4:
         raise InsufficientDataError(
             f"fit_ephemeris: need at least 4 finite event times, got {t.size}"
         )
-    if period <= 0.0:
-        raise ValueError(f"period must be positive, got {period}")
     epoch = float(t[0]) if t0 is None else float(t0)
     cycles = np.round((t - epoch) / period)
     oc = t - epoch - period * cycles
-    if errors is None:
-        scale = max(float(np.std(oc)), 1e-9 * period)
-        sigma = np.full(t.size, scale, dtype=np.float64)
+    if sigma_all is None:
+        sigma = np.full(t.size, _quadratic_scatter(t, oc, period), dtype=np.float64)
     else:
-        sigma = np.asarray(errors, dtype=np.float64).ravel()
-        if sigma.size != t.size:
-            raise ValueError("errors and times length mismatch")
+        sigma = sigma_all[keep]
         if np.any(~np.isfinite(sigma) | (sigma <= 0.0)):
             raise ValueError("errors must be finite and positive")
     _, quad = _ephemeris_from_delays(t, oc, sigma, period)
     return replace(
         quad, worst_phase_residual=float(np.max(np.abs(oc)) / period)
     )
+
+
+def _quadratic_scatter(t: FloatArray, oc: FloatArray, period: float) -> float:
+    """A-posteriori timing error: the RMS about an unweighted quadratic O-C fit.
+
+    The raw O-C spread is the wrong scale: it holds the linear term left by an
+    imperfect trial period/epoch and the very parabola being measured, so
+    ``pdot_err`` would measure the trend (tens of times too large, and changing
+    with the trial period) rather than the timing noise. The residual RMS on
+    ``n - 3`` degrees of freedom is the standard unweighted least-squares
+    noise estimate. Times are centred and scaled to ``[-1, 1]`` first so the
+    fit stays well conditioned over long baselines; the residual is unchanged
+    by that reparameterization. Floored at ``1e-9 * period`` so exact data still
+    give a finite fit.
+    """
+    x = t - float(np.mean(t))
+    half = float(np.max(np.abs(x)))
+    if half > 0.0:
+        x = x / half
+    design = np.vander(x, 3, increasing=True)
+    coef, *_ = np.linalg.lstsq(design, oc, rcond=None)
+    resid = oc - design @ coef
+    dof = max(1, t.size - 3)
+    rms = float(np.sqrt(float(np.dot(resid, resid)) / dof))
+    return max(rms, 1e-9 * period)
 
 
 # --- phase_track -------------------------------------------------------------
@@ -750,11 +946,17 @@ def _segment_bounds(
     n_seg = min(by_points, max(1, by_cycles), 20)
     if settings.n_segments is not None:
         n_seg = min(settings.n_segments, by_points)
-    if n_seg < 3:
+    if n_seg < _MIN_SEGMENTS:
+        knobs = (
+            f"raise n_segments (set to {settings.n_segments}) or lower "
+            "min_segment_points"
+            if settings.n_segments is not None
+            else "relax min_segment_points / min_segment_cycles"
+        )
         raise InsufficientDataError(
-            "phase_track: cannot form 3 usable segments "
-            f"({n} points, {baseline:.1f} d baseline, period {period} d); "
-            "relax min_segment_points / min_segment_cycles"
+            f"phase_track: cannot form {_MIN_SEGMENTS} usable segments "
+            f"({n} points, {baseline:.1f} d baseline, period {period} d; the "
+            f"quadratic ephemeris needs {_MIN_SEGMENTS} O-C points); {knobs}"
         )
     edges = np.linspace(0, n, n_seg + 1).astype(np.int64)
     return [slice(int(a), int(b)) for a, b in zip(edges[:-1], edges[1:], strict=True)]
@@ -768,7 +970,7 @@ def phase_track(
     model: str | PeriodModel | None = None,
     settings: PdotSettings | None = None,
     columns: ColumnMap | None = None,
-    domain: Domain | None = None,
+    domain: Domain | str | None = None,
 ) -> PhaseTrackResult:
     """Measure dP/dt from the drift of the light curve's phase over time.
 
@@ -817,14 +1019,17 @@ def phase_track(
 
     psettings = settings or PdotSettings()
     pmodel = get_model(model)
-    if period <= 0.0:
-        raise ValueError(f"period must be positive, got {period}")
+    if not (np.isfinite(period) and period > 0.0):
+        raise ValueError(f"period must be positive and finite, got {period}")
+    if not np.isfinite(pdot):
+        raise ValueError(f"pdot must be finite, got {pdot}")
     lc = to_input(data, columns=columns, domain=domain)
     if not isinstance(lc, LightCurve):
         raise ValueError(
             "phase_track works on a single band; pass one band of the "
             "MultiBandLightCurve (multi-band tracking is not supported yet)"
         )
+    raise_if_unusable(lc, "phase_track")
     finite = lc.finite()
     if finite.n < psettings.min_detections:
         raise InsufficientDataError(
@@ -1002,10 +1207,10 @@ def _track_pass(
                 chi2_reduced=chi2r,
             )
         )
-    if len(shifts) < 3:
+    if len(shifts) < _MIN_SEGMENTS:
         raise InsufficientDataError(
-            f"phase_track: only {len(shifts)} usable segments; "
-            "relax the segmentation settings"
+            f"phase_track: only {len(shifts)} usable segments (the quadratic "
+            f"ephemeris needs {_MIN_SEGMENTS}); relax the segmentation settings"
         )
 
     # Cycle continuity: unwrap each delay to the branch nearest its predecessor.

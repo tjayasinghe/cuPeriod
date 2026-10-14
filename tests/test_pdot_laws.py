@@ -280,3 +280,278 @@ def test_at_bound_is_serialized() -> None:
     t, period, sigma = flat_track_with_one_outlier()
     row = fit_period_law(t, period, sigma, law="singular").to_dict()
     assert row["at_bound"] is True
+
+
+# --- the edge test measures the law, not the sampling --------------------------
+
+
+def test_a_long_final_gap_does_not_demote_a_real_singularity() -> None:
+    """The edge test must not read the sampling as the law.
+
+    Eleven even epochs, then one 600 d later, on the exact V1309 law: the
+    singular epoch sits ~6 median spacings past the data and the fit is good,
+    but the model's step between the last two *samples* is over half its swing
+    because those two samples are far apart.
+    """
+    p0, b, t0 = V1309
+    t = np.concatenate([np.linspace(2452100.0, 2453700.0, 11), [2454300.0]])
+    rng = np.random.default_rng(0)
+    period = p0 * np.exp(b / (t - t0)) + rng.normal(0.0, 1e-4, t.size)
+    sigma = np.full(t.size, 1e-4)
+    fit = fit_period_law(t, period, sigma, law="singular")
+    assert not fit.at_bound
+    assert fit.chi2_reduced < 3.0
+    assert fit_period_law(t, period, sigma, law="auto").law == "singular"
+
+
+def test_an_end_outlier_on_uneven_epochs_is_caught() -> None:
+    """A spike on an end point stays a spike when the end step is short.
+
+    Flat tracks on random epochs with one 4-sigma end point: the sample-based
+    test flagged the singular absorber on 11 of these 24 and let ``auto`` pick
+    ``singular`` on 8. Measured on the law at the track's resolution it is
+    flagged on 21 and wins once (an absorber spread over the last two points,
+    which no edge test can tell from a trend).
+    """
+    flagged = wins = 0
+    for seed in range(24):
+        rng = np.random.default_rng(7000 + seed)
+        n = 25
+        t = np.sort(rng.uniform(0.0, 3000.0, n)) + 2455000.0
+        sigma = np.full(n, 1e-6)
+        period = 0.4 + rng.normal(0.0, 1e-6, n)
+        end = 0 if seed % 2 == 0 else n - 1
+        period[end] += 4e-6 * (1 if (seed // 2) % 2 == 0 else -1)
+        flagged += fit_period_law(t, period, sigma, law="singular").at_bound
+        wins += fit_period_law(t, period, sigma, law="auto").law == "singular"
+    assert flagged >= 18
+    assert wins <= 2
+
+
+# --- ranking that survives understated errors, and fits without errors ---------
+
+
+def test_understated_errors_do_not_buy_a_period_change() -> None:
+    """Constant tracks scattering 5x beyond their quoted errors stay constant.
+
+    The weighted BIC multiplies every chi-squared difference by 25 here and
+    ranked a period change first on most of them; the scaled BIC divides that
+    factor back out using the scatter of the most flexible free law.
+    """
+    rng = np.random.default_rng(9050)
+    wins = decisive = 0
+    trials = 40
+    for _ in range(trials):
+        t = np.sort(rng.uniform(0.0, 3000.0, 30)) + 2455000.0
+        period = 0.4 + rng.normal(0.0, 5e-6, t.size)
+        ranked = compare_period_laws(t, period, np.full(t.size, 1e-6))
+        wins += ranked[0].law == "constant"
+        by_name = {f.law: f for f in ranked}
+        decisive += by_name["constant"].bic_scaled - ranked[0].bic_scaled > 10.0
+    assert wins >= 0.85 * trials
+    assert decisive == 0
+
+
+def test_honest_errors_rank_exactly_as_the_plain_bic() -> None:
+    """With chi2_reduced <= 1 the scaled BIC *is* the BIC."""
+    t, period, sigma = singular_track()
+    ranked = compare_period_laws(t, period, sigma * 3.0, laws=available_laws())
+    for fit in ranked:
+        assert fit.bic_scaled == pytest.approx(fit.bic, rel=1e-12)
+    assert np.isnan(fit_period_law(t, period, sigma, law="linear").bic_scaled)
+
+
+def test_unweighted_fits_find_the_trend_and_its_errors() -> None:
+    """Without period_err the laws are compared on the residuals' own scale.
+
+    With one-day stand-in errors every chi-squared was ~1e-10, the BIC was the
+    parameter penalty alone, and 'auto' returned 'constant' for any track; the
+    parameter errors assumed a one-day scatter (a million times too large here).
+    """
+    t, period, sigma = linear_track()
+    auto = fit_period_law(t, period, None, law="auto")
+    assert auto.law in {"linear", "exponential"}
+    assert not auto.weighted and auto.chi2_reduced == pytest.approx(1.0)
+    weighted = fit_period_law(t, period, sigma, law="linear")
+    plain = fit_period_law(t, period, None, law="linear")
+    assert plain.params["pdot"] == pytest.approx(weighted.params["pdot"], rel=1e-6)
+    assert plain.errors["pdot"] == pytest.approx(weighted.errors["pdot"], rel=0.3)
+    st, sp, _ = singular_track()
+    assert fit_period_law(st, sp, None, law="auto").law == "singular"
+    rng = np.random.default_rng(2)
+    ct = np.sort(rng.uniform(0.0, 1000.0, 30)) + 2455000.0
+    cp = 0.5 + rng.normal(0.0, 1e-5, ct.size)
+    assert fit_period_law(ct, cp, None, law="auto").law == "constant"
+
+
+def test_unweighted_ranking_ignores_the_units() -> None:
+    t, period, _ = linear_track()
+    days = compare_period_laws(t, period)
+    seconds = compare_period_laws(t, period * 86400.0)
+    assert [f.law for f in days] == [f.law for f in seconds]
+    for a, b in zip(days, seconds, strict=True):
+        assert a.bic_scaled - days[0].bic_scaled == pytest.approx(
+            b.bic_scaled - seconds[0].bic_scaled, abs=1e-6
+        )
+
+
+# --- caller mistakes are not skipped laws ---------------------------------------
+
+
+def test_compare_refuses_caller_mistakes() -> None:
+    t, period, sigma = linear_track()
+    with pytest.raises(ValueError, match="same length"):
+        compare_period_laws(np.arange(5.0), np.arange(4.0))
+    with pytest.raises(ValueError, match="unknown period law"):
+        compare_period_laws(t, period, sigma, laws=("constant", "linar"))
+    with pytest.raises(ValueError, match="unknown period law"):
+        compare_period_laws(t, period, sigma, laws=("linar",))
+    # A bare name is one law, not a sequence of letters.
+    assert [f.law for f in compare_period_laws(t, period, sigma, laws="linear")] == [
+        "linear"
+    ]
+
+
+# --- errors -------------------------------------------------------------------
+
+
+def _physical_covariance_errors(fit, t, period, sigma) -> np.ndarray:
+    """Gauss-Newton errors computed directly in the published parameters."""
+    names = list(fit.params)
+    theta = np.array([fit.params[k] for k in names])
+
+    def model(th: np.ndarray) -> np.ndarray:
+        p0, amp, t0, delta = th
+        gap = np.abs(t - t0)
+        return p0 * np.exp((amp / (1.0 - delta)) * gap ** (1.0 - delta))
+
+    steps = np.maximum(np.abs(theta) * 1e-6, 1e-6)
+    steps[2] = 1e-4 * min(abs(theta[2] - t.min()), abs(theta[2] - t.max()))
+    jac = np.empty((t.size, theta.size))
+    for j in range(theta.size):
+        up, down = theta.copy(), theta.copy()
+        up[j] += steps[j]
+        down[j] -= steps[j]
+        jac[:, j] = (model(up) - model(down)) / (2.0 * steps[j] * sigma)
+    return np.sqrt(np.diag(np.linalg.inv(jac.T @ jac)))
+
+
+def test_pejcha_errors_include_the_exponent_dependence() -> None:
+    """amplitude = a' * T**(delta-1) depends on delta too; its error must say so."""
+    t, period, sigma = singular_track(n=90, sigma=0.0004, seed=17)
+    fit = fit_period_law(t, period, sigma, law="pejcha", scale_errors=False)
+    direct = _physical_covariance_errors(fit, t, period, sigma)
+    got = np.array([fit.errors[k] for k in fit.params])
+    assert np.allclose(got, direct, rtol=0.05)
+
+
+def test_unconstrained_parameters_report_nan_not_zero() -> None:
+    t = np.linspace(2455000.0, 2456000.0, 8)
+    flat = np.full(t.size, 0.5)
+    sigma = np.full(t.size, 1e-5)
+    singular = fit_period_law(t, flat, sigma, law="singular")
+    assert np.isnan(singular.errors["t0"])
+    pejcha = fit_period_law(t, flat, sigma, law="pejcha")
+    assert np.isnan(pejcha.errors["t0"]) and np.isnan(pejcha.errors["delta"])
+    assert all(v != 0.0 for v in singular.errors.values())
+    # A singular epoch held on the floor has no Gaussian error either.
+    ft, fp, fs = flat_track_with_one_outlier()
+    pinned = fit_period_law(ft, fp, fs, law="singular")
+    assert pinned.at_bound and np.isnan(pinned.errors["t0"])
+
+
+def test_singular_errors_are_unchanged_by_the_reparametrization() -> None:
+    """Pinned from the published-coordinate fit this replaced."""
+    t, period, sigma = singular_track()
+    fit = fit_period_law(t, period, sigma, law="singular")
+    assert fit.chi2 == pytest.approx(69.39418, abs=1e-4)
+    assert fit.errors["period"] == pytest.approx(0.001131, rel=2e-3)
+    assert fit.errors["b"] == pytest.approx(2.60, rel=5e-3)
+    assert fit.errors["t0"] == pytest.approx(146.2, rel=2e-3)
+
+
+@pytest.mark.parametrize("make", ["v1309", "rising", "pejcha"])
+def test_parameters_reproduce_the_published_form(make: str) -> None:
+    """``params`` must mean what the law's formula says, on both sides of t0."""
+    if make == "v1309":
+        t, period, sigma = singular_track()
+        law = "singular"
+    elif make == "rising":
+        rng = np.random.default_rng(23)
+        t = np.sort(rng.uniform(2453000.0, 2455000.0, 60))
+        period = np.exp(-6.0 / (t - 2452500.0)) + rng.normal(0.0, 2e-4, t.size)
+        sigma = np.full(t.size, 2e-4)
+        law = "singular"
+    else:
+        t, period, sigma = singular_track(n=90, sigma=0.0004, seed=17)
+        law = "pejcha"
+    fit = fit_period_law(t, period, sigma, law=law)
+    probe = np.linspace(t.min(), t.max(), 7)
+    q = fit.params
+    if law == "singular":
+        formula = q["period"] * np.exp(q["b"] / (probe - q["t0"]))
+    else:
+        gap = np.abs(probe - q["t0"])
+        formula = q["period"] * np.exp(
+            (q["amplitude"] / (1.0 - q["delta"])) * gap ** (1.0 - q["delta"])
+        )
+    assert np.allclose(fit.period_at(probe), formula, rtol=1e-9)
+
+
+# --- cost -----------------------------------------------------------------------
+
+
+def test_singular_fits_converge_without_burning_the_budget(monkeypatch) -> None:
+    """The losing t0 branch used to creep to max_nfev=4000 on every trend."""
+    import scipy.optimize
+
+    calls: list[int] = []
+    real = scipy.optimize.least_squares
+
+    def counting(*args, **kwargs):
+        sol = real(*args, **kwargs)
+        calls.append(int(sol.nfev))
+        return sol
+
+    monkeypatch.setattr(scipy.optimize, "least_squares", counting)
+    t, period, sigma = singular_track()
+    for law in ("singular", "pejcha"):
+        calls.clear()
+        fit = fit_period_law(t, period, sigma, law=law)
+        assert sum(calls) < 400, (law, calls)
+        assert fit.converged
+    calls.clear()
+    lt, lp, ls = linear_track()
+    fit = fit_period_law(lt, lp, ls, law="singular")
+    assert sum(calls) < 400 and fit.chi2 <= 34.58012
+
+
+def test_track_constants_are_computed_once_per_fit(monkeypatch) -> None:
+    from cuperiod.pdot import laws
+
+    count = 0
+    real = laws._epoch_floor
+
+    def counting(t: np.ndarray) -> float:
+        nonlocal count
+        count += 1
+        return real(t)
+
+    monkeypatch.setattr(laws, "_epoch_floor", counting)
+    t, period, sigma = singular_track()
+    fit_period_law(t, period, sigma, law="pejcha")
+    assert count <= 2
+
+
+# --- equality -------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("law", ["linear", "singular"])
+def test_identical_fits_compare_equal(law: str) -> None:
+    t, period, sigma = singular_track()
+    f1 = fit_period_law(t, period, sigma, law=law)
+    f2 = fit_period_law(t, period, sigma, law=law)
+    assert f1 == f2
+    assert f2 in [f1]
+    f3 = fit_period_law(t, period + 1e-4, sigma, law=law)
+    assert f1 != f3

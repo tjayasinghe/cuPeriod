@@ -44,7 +44,18 @@ from cuperiod.core.errors import (
     InsufficientDataError,
     UnknownMethodError,
 )
-from cuperiod.core.grid import GridSpec, log_period_grid, uniform_frequency_grid
+from cuperiod.core.grid import (
+    GridSizeWarning,
+    GridSpec,
+    GridTooLargeError,
+    check_grid_size,
+    default_frequency_grid,
+    log_period_grid,
+    pseudo_nyquist_frequency,
+    regular_cadence_nyquist,
+    uniform_frequency_grid,
+    uniform_grid_size,
+)
 from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
 from cuperiod.core.result import MultiResult, Peak, Periodogram
 from cuperiod.diagnostics import (
@@ -142,7 +153,9 @@ __all__ = [
     "LTTESearchResult",
     "GLSSettings",
     "GpuInfo",
+    "GridSizeWarning",
     "GridSpec",
+    "GridTooLargeError",
     "InsufficientDataError",
     "LightCurve",
     "MethodInfo",
@@ -188,8 +201,10 @@ __all__ = [
     "batch_prewhiten",
     "best_periods",
     "buoyancy_radius",
+    "check_grid_size",
     "compare_period_laws",
     "convert_pdot",
+    "default_frequency_grid",
     "detectable_pdot",
     "detrend",
     "echelle",
@@ -216,6 +231,8 @@ __all__ = [
     "periodogram",
     "phase_track",
     "prewhiten",
+    "pseudo_nyquist_frequency",
+    "regular_cadence_nyquist",
     "running_median",
     "sliding_periodogram",
     "spacing_spectrum",
@@ -223,6 +240,7 @@ __all__ = [
     "suggest_gpu_workers",
     "to_input",
     "uniform_frequency_grid",
+    "uniform_grid_size",
     "weighted_epoch",
     "wwz",
 ]

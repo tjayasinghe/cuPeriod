@@ -9,6 +9,7 @@ scatter shims, and the BLS per-light-curve device cache.
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 import cuperiod as cup
 from conftest import requires_gpu, requires_numba, requires_torch
@@ -59,6 +60,78 @@ def test_numba_string_length_matches_numpy_with_ties() -> None:
     cpu = string_length(t, mag, PERIODS, backend="numpy")
     fast = string_length(t, mag, PERIODS, backend="numba")
     assert np.max(np.abs(cpu - fast)) < 1e-9
+
+
+def _stable_string_length(tau: np.ndarray, m: np.ndarray, period: float) -> float:
+    """The numba kernel's string length, written out with numpy's stable argsort.
+
+    Same fold and the same left-to-right sum, so it is bit-identical to the kernel
+    exactly when the kernel visits the points in the stable order.
+    """
+    q = tau / period
+    phase = q - np.floor(q)
+    order = np.argsort(phase, kind="stable")
+    ph, mm = phase[order], m[order]
+    total = 0.0
+    for j in range(1, ph.size):
+        dphi, dmag = ph[j] - ph[j - 1], mm[j] - mm[j - 1]
+        total += np.sqrt(dphi * dphi + dmag * dmag)
+    wrap_phi, wrap_mag = (ph[0] + 1.0) - ph[-1], mm[0] - mm[-1]
+    return float(total + np.sqrt(wrap_phi * wrap_phi + wrap_mag * wrap_mag))
+
+
+def _sl_cases() -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    rng = np.random.default_rng(11)
+    t, mag = _tied_sine()
+    nights = (np.arange(3.0)[:, None] + rng.uniform(0.0, 0.3, (3, 400))).ravel()
+    lattice = np.repeat(np.arange(120.0), 3)  # whole days, three points per epoch
+    return {
+        "ties": (t, mag),
+        "three dense nights": (np.sort(nights), rng.normal(size=nights.size)),
+        "integer-day lattice": (lattice, rng.normal(size=lattice.size)),
+    }
+
+
+@requires_numba
+@pytest.mark.parametrize("case", ["ties", "three dense nights", "integer-day lattice"])
+def test_numba_string_length_bucket_sort_is_the_stable_order(case: str) -> None:
+    # PERF-METHODS-05: the kernel sorts each fold with an O(N) bucket + insertion
+    # sort (falling back to mergesort on clumped folds). The permutation must be the
+    # stable one, or tied phases would pair different neighbours: bit-identical to
+    # a stable-argsort reference on ties, clumped folds, commensurate periods (every
+    # point at phase 0) and periods longer than the baseline.
+    from cuperiod.methods.string_length import _numba_sl_kernel
+
+    t, y = _sl_cases()[case]
+    tau = t - t.min()
+    span = float(y.max() - y.min())
+    m = (y - y.min()) / span * 0.5 - 0.25
+    baseline = float(tau.max())
+    periods = np.concatenate([
+        np.linspace(0.3, 3.0, 40), [0.5, 1.0, 2.0, 1.5],
+        baseline * np.array([1.0, 1.7, 5.0]),
+    ])
+    got = _numba_sl_kernel()(tau, m, periods)
+    want = np.array([_stable_string_length(tau, m, float(p)) for p in periods])
+    assert np.array_equal(got, want)
+    # ...and the public entry point agrees with the vectorized numpy path.
+    cpu = string_length(t, y, periods, backend="numpy")
+    fast = string_length(t, y, periods, backend="numba")
+    assert np.max(np.abs(cpu - fast)) < 1e-11
+
+
+@requires_numba
+def test_numba_string_length_kernel_survives_unfoldable_periods() -> None:
+    # The public entry point never passes these, but the kernel itself must not
+    # bucket a NaN phase (an out-of-range bucket index would write out of bounds).
+    from cuperiod.methods.string_length import _numba_sl_kernel
+
+    t, mag, _ = synthetic_sine(n=200)
+    tau = t - t.min()
+    m = (mag - mag.min()) / float(np.ptp(mag)) * 0.5 - 0.25
+    out = _numba_sl_kernel()(tau, m, np.array([0.5, np.nan, 0.0, 2.0]))
+    assert np.isnan(out[1]) and np.isnan(out[2])
+    assert np.isfinite(out[0]) and np.isfinite(out[3])
 
 
 @requires_numba
