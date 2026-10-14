@@ -252,6 +252,162 @@ def test_a_tilted_series_survives_realistic_scatter() -> None:
     assert found == 40
 
 
+@pytest.mark.parametrize("intruder", [5.3, 10.0, 25.0, 80.0])
+def test_one_far_outlier_does_not_hide_the_comb(intruder: float) -> None:
+    # PW-B-1: the default trial range was built on the raw span, so one long period
+    # lifted the floor above the true spacing and opened the zero-lag lobe; the comb
+    # was reported at ~the span and no series was found.
+    periods = np.append(_comb(spacing=0.03), intruder)
+    assert spacing_spectrum(periods).best_spacing == pytest.approx(0.03, rel=0.02)
+    series = find_period_spacing(periods)
+    assert series is not None and series.n_modes == 14
+    assert series.mean_spacing == pytest.approx(0.03, rel=1e-3)
+    weighted = find_period_spacing(
+        periods, np.append(np.linspace(0.006, 0.002, 14), 3e-4)
+    )
+    assert weighted is not None and weighted.n_modes == 14
+
+
+def test_a_tilted_comb_survives_a_far_outlier() -> None:
+    periods = np.append(_comb(n=16, spacing=0.028, slope=0.008), 17.3)
+    series = find_period_spacing(periods)
+    assert series is not None and series.n_modes == 16
+    assert series.slope == pytest.approx(0.008, rel=0.05)
+
+
+def test_close_multiplets_keep_their_spacing_in_range() -> None:
+    # A robust range must not shrink to the multiplet splitting either (a guard on the
+    # PW-B-1 fix: a median-gap rule alone would cap the range at ~8x the splitting).
+    from cuperiod.prewhiten.spacing import _default_spacing_range
+
+    centres = _comb(n=10, spacing=0.03)
+    for splitting in (0.0013, 0.0023, 0.004):
+        periods = np.sort(
+            np.concatenate([centres - splitting, centres, centres + splitting])
+        )
+        low, high = _default_spacing_range(periods)
+        assert high == pytest.approx(float(np.ptp(periods)))  # the full range as before
+        span = float(np.ptp(periods))
+        assert low == pytest.approx(max(0.5 * splitting, span / (10 * periods.size)))
+        assert spacing_spectrum(periods).spacing[-1] >= 0.03
+
+
+def test_spacing_survives_a_slow_signal_in_the_pre_whitened_list() -> None:
+    time, value, error, periods = synthetic_gmode(n_modes=14)
+    value = value + 0.002 * np.sin(2 * np.pi * (time - time.min()) / 17.3)
+    solution = prewhiten(
+        (time, value, error),
+        settings=cup.PreWhitenSettings(backend="finufft", max_frequencies=20),
+    )
+    assert max(solution.period) > 10.0  # the slow signal is in the list
+    series = find_period_spacing(solution.period, solution.amplitude)
+    assert series is not None and series.n_modes >= 12
+    expected = float(np.mean(np.diff(periods)))
+    assert series.mean_spacing == pytest.approx(expected, rel=0.05)
+
+
+def test_non_finite_values_keep_their_weights_aligned() -> None:
+    # PW-B-8: one NaN value with full-length weights raised 'same length'; a NaN or
+    # inf weight made the whole response NaN and returned the full span.
+    periods = 0.5 + 0.03 * np.arange(12)
+    holed = periods.copy()
+    holed[3] = np.nan
+    result = spacing_spectrum(holed, weights=np.ones(12))
+    assert result.best_spacing == pytest.approx(0.03, rel=0.02)
+    assert result.n_values == 11
+    for bad in (np.nan, np.inf):
+        weights = np.ones(12)
+        weights[2] = bad
+        result = spacing_spectrum(periods, weights=weights)
+        assert result.best_spacing == pytest.approx(0.03, rel=0.02)
+        assert np.isfinite(result.best_power)
+        assert np.all(np.isfinite(result.power))
+    with pytest.raises(ValueError, match="same length"):
+        spacing_spectrum(periods, weights=np.ones(11))
+
+
+def _pick_on_the_full_grid(inverse_spacing, power, values, oversample):
+    """The pre-optimisation _pick_spacing: the member response on the whole grid."""
+    from cuperiod.prewhiten.spacing import (
+        _COMB_MEMBER_TOL,
+        _MAX_SUBMULTIPLE,
+        _SUBMULTIPLE_RATIO,
+        _comb_members,
+        _comb_response,
+    )
+
+    best = int(np.argmax(power))
+    members = _comb_members(values, inverse_spacing[best], _COMB_MEMBER_TOL)
+    if members.size < 3:
+        return best
+    counting = _comb_response(inverse_spacing, members, np.ones_like(members))
+    peak = float(counting[best])
+    if peak <= 0.0:
+        return best
+    half_width = max(1, int(oversample))
+    chosen = best
+    for multiple in range(2, _MAX_SUBMULTIPLE + 1):
+        target = inverse_spacing[best] / multiple
+        if target < inverse_spacing[0]:
+            break
+        index = int(np.searchsorted(inverse_spacing, target))
+        lo = max(0, index - half_width)
+        hi = min(int(inverse_spacing.size), index + half_width + 1)
+        if lo >= hi:
+            continue
+        local = lo + int(np.argmax(counting[lo:hi]))
+        if counting[local] >= _SUBMULTIPLE_RATIO * peak:
+            chosen = local
+    return chosen
+
+
+@pytest.mark.parametrize("oversample", [1, 20, 40])
+def test_windowed_promotion_matches_the_full_grid(oversample: int, monkeypatch) -> None:
+    # PERF-PREWHITEN-08: the promotion reads a few windows of the member response, so
+    # only those are evaluated now.
+    from cuperiod.prewhiten import spacing as spacing_module
+
+    rng = np.random.default_rng(oversample)
+    cases = [
+        (_comb(n=12, spacing=0.03), None, 0.001),
+        (np.concatenate([_comb(spacing=0.03), [0.4137, 1.2916, 0.6231]]),
+         np.concatenate([np.linspace(0.006, 0.002, 14), [3e-4] * 3]), None),
+        (np.sort(_comb(n=20, spacing=0.02) + rng.normal(0.0, 2e-4, 20)), None, None),
+    ]
+    rows = {"n": 0}
+    original = spacing_module._comb_response
+
+    def counting(inverse_spacing, values, weights):
+        rows["n"] += int(inverse_spacing.size)
+        return original(inverse_spacing, values, weights)
+
+    for values, weights, minimum in cases:
+        v = np.sort(values)
+        a = np.ones(v.size) if weights is None else np.abs(weights[np.argsort(values)])
+        lo, hi = spacing_module._default_spacing_range(v)
+        lo = minimum or lo
+        step = 1.0 / (oversample * float(v[-1] - v[0]))
+        u = 1.0 / hi + step * np.arange(int(np.ceil((1.0 / lo - 1.0 / hi) / step)) + 1)
+        power = original(u, v, a)
+        expected = _pick_on_the_full_grid(u, power, v, oversample)
+        monkeypatch.setattr(spacing_module, "_comb_response", counting)
+        rows["n"] = 0
+        assert spacing_module._pick_spacing(u, power, v, oversample) == expected
+        assert rows["n"] <= 1 + 5 * (2 * oversample + 1)
+        monkeypatch.setattr(spacing_module, "_comb_response", original)
+
+
+def test_spacing_results_compare_by_identity_without_raising() -> None:
+    # PW-B-10
+    periods = _comb(n=12, spacing=0.03)
+    first, second = spacing_spectrum(periods), spacing_spectrum(periods)
+    assert first == first and (first == second) is False
+    series_a, series_b = find_period_spacing(periods), find_period_spacing(periods)
+    assert series_a is not None and series_b is not None
+    assert (series_a == series_b) is False
+    assert len({first, second, series_a, series_b}) == 4
+
+
 def test_a_wide_amplitude_spread_does_not_promote_past_the_true_spacing() -> None:
     # Regression: the sub-multiple promotion was judged on the amplitude-weighted
     # response, so dropping every other (weak) tooth barely lowered it and the search

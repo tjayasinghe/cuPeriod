@@ -249,8 +249,11 @@ def test_default_band_reaches_short_period_pulsators_on_sparse_sampling() -> Non
     assert default_prewhiten_grid(lc).values[-1] == pytest.approx(
         DEFAULT_MAX_FREQUENCY_FLOOR, abs=0.01
     )
-    # Dense sampling is governed by the pseudo-Nyquist itself, not the floor.
-    dense = np.linspace(0.0, 27.0, 20_000)
+    # Dense irregular sampling is governed by the pseudo-Nyquist itself, not the floor.
+    # (This used np.linspace times, which are a regular cadence: those now stop at
+    # their true Nyquist frequency instead — see the PW-A-3 regression below.)
+    rng = np.random.default_rng(0)
+    dense = np.sort(rng.uniform(0.0, 27.0, 20_000))
     assert default_maximum_frequency(dense) == pytest.approx(
         pseudo_nyquist_frequency(dense, 5), rel=1e-9
     )
@@ -515,6 +518,302 @@ def test_top_level_api_exposes_prewhiten() -> None:
         )
     )
     assert isinstance(solution, cup.PreWhitenResult)
+
+
+# --- regressions -------------------------------------------------------------
+
+_TWO_PI = 2.0 * np.pi
+
+
+def _thirty_minute(n: int = 1296, barycentric: bool = False) -> np.ndarray:
+    steps = np.arange(n) / 48.0
+    if barycentric:  # a realistic light-travel-time term over the sector
+        steps = steps + (400.0 / 86400.0) * np.sin(_TWO_PI * (steps + 40.0) / 365.25)
+    return 2459000.0 + steps
+
+
+def _nightly(n_nights: int = 200, width: float = 0.06, per_night: int = 3, seed=0):
+    rng = np.random.default_rng(seed)
+    return np.sort(
+        np.concatenate(
+            [night + 0.4 + rng.uniform(0.0, width, per_night)
+             for night in range(n_nights)]
+        )
+    )
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_regular_cadence_noise_yields_no_giant_components(seed: int) -> None:
+    # PW-A-1: near k/dt and (k + 1/2)/dt the floating-mean design is nearly singular;
+    # pure noise produced components of 0.8 mag to 1.5e7 mag at 96 and 120 c/d with
+    # S/N ~1e4. The band is set explicitly here so this tests the spectrum and the
+    # acceptance guard, not the Nyquist cap of PW-A-3.
+    time = _thirty_minute()
+    rng = np.random.default_rng(seed)
+    value = 10.0 + rng.normal(0.0, 0.001, time.size)
+    for error in (np.full(time.size, 0.001), None):
+        solution = prewhiten(
+            (time, value) if error is None else (time, value, error),
+            settings=_settings(maximum_frequency=120.0),
+        )
+        assert np.all(solution.amplitude < 10 * 0.001), solution.summary()
+        assert abs(solution.offset - 10.0) < 0.001
+
+
+@pytest.mark.parametrize("seed", [3, 6])
+def test_nightly_sampling_noise_yields_no_giant_components(seed: int) -> None:
+    # PW-A-1: single-site nightly sampling made the 1 c/d zone ill-conditioned and
+    # pure noise came out as f = 1.000 c/d components of up to 26 mag.
+    time = _nightly(seed=seed)
+    rng = np.random.default_rng(100 + seed)
+    value = 13.0 + rng.normal(0.0, 0.02, time.size)
+    solution = prewhiten(
+        (time, value, np.full(time.size, 0.02)), settings=_settings()
+    )
+    assert np.all(solution.amplitude < 10 * 0.02), solution.summary()
+    assert abs(solution.offset - 13.0) < 0.01
+
+
+def test_a_real_nightly_mode_keeps_its_frequency() -> None:
+    # The guard must not trade a genuine ground-based mode for its 1 c/d aliases.
+    time = _nightly(width=0.25, per_night=4, seed=5)
+    rng = np.random.default_rng(9)
+    value = (
+        13.0 + 0.05 * np.sin(_TWO_PI * 2.0037 * time + 0.4)
+        + rng.normal(0.0, 0.01, time.size)
+    )
+    solution = prewhiten(
+        (time, value, np.full(time.size, 0.01)), settings=_settings()
+    )
+    assert solution.n_components >= 1
+    assert solution.components[0].frequency == pytest.approx(2.0037, abs=2e-3)
+
+
+def test_minimum_frequency_must_be_positive() -> None:
+    with pytest.raises(ValueError):
+        cup.PreWhitenSettings(minimum_frequency=0.0)
+
+
+@pytest.mark.parametrize("barycentric", [False, True])
+def test_regular_cadence_reports_the_true_frequency_not_a_mirror_alias(
+    barycentric: bool,
+) -> None:
+    # PW-A-3: the automatic band reached 5x the true Nyquist on regular cadences, where
+    # every mode has equal-height mirror images; F1 came out at 88.7 / 103.3 c/d.
+    time = _thirty_minute(barycentric=barycentric)
+    found = []
+    for seed in range(4):
+        rng = np.random.default_rng(seed)
+        value = (
+            10.0 + 0.005 * np.sin(_TWO_PI * 7.3 * (time - time[0]) + 0.4)
+            + rng.normal(0.0, 0.001, time.size)
+        )
+        solution = prewhiten(
+            (time, value, np.full(time.size, 0.001)),
+            settings=_settings(max_frequencies=2),
+        )
+        found.append(solution.components[0].frequency)
+    assert np.allclose(found, 7.3, atol=2e-3), found
+
+
+def test_default_band_stops_at_the_nyquist_frequency_of_a_regular_cadence() -> None:
+    from cuperiod.core.grid import pseudo_nyquist_frequency
+    from cuperiod.prewhiten.engine import (
+        DEFAULT_MAX_FREQUENCY_FLOOR,
+        default_maximum_frequency,
+    )
+
+    assert default_maximum_frequency(_thirty_minute()) == pytest.approx(24.0)
+    assert default_maximum_frequency(np.linspace(0.0, 27.0, 20_000)) == pytest.approx(
+        0.5 * 19_999 / 27.0
+    )
+    # Irregular and nightly sampling keep the pseudo-Nyquist rule (and its floor).
+    rng = np.random.default_rng(4)
+    irregular = np.sort(rng.uniform(0.0, 27.0, 1296))
+    for sampling in (irregular, _nightly(), _nightly(width=0.25, per_night=2)):
+        assert default_maximum_frequency(sampling) == pytest.approx(
+            max(pseudo_nyquist_frequency(sampling, 5), DEFAULT_MAX_FREQUENCY_FLOOR)
+        )
+
+
+def test_a_band_above_the_automatic_nyquist_names_the_knob_that_opens_it() -> None:
+    # Super-Nyquist work on a regular cadence: an explicit minimum above the capped
+    # automatic maximum used to end in a bare "empty search band".
+    time = _thirty_minute()
+    value = 0.01 * np.sin(_TWO_PI * 30.0 * time)
+    lc = cup.LightCurve(time, value)
+    with pytest.raises(InsufficientDataError, match="set maximum_frequency"):
+        default_prewhiten_grid(lc, cup.PreWhitenSettings(minimum_frequency=30.0))
+    grid = default_prewhiten_grid(
+        lc, cup.PreWhitenSettings(minimum_frequency=30.0, maximum_frequency=40.0)
+    )
+    assert grid.uniform_frequency_params()[0] == pytest.approx(30.0)
+
+
+@pytest.mark.parametrize("n", [20, 30, 60])
+def test_sparse_noise_cannot_run_away_to_an_interpolating_solution(n: int) -> None:
+    # PW-A-4: nothing compared the parameter count 3K+1 with N, so sparse noise ran to
+    # max_frequencies with residuals at round-off, NaN errors and S/N ~1e15.
+    rng = np.random.default_rng(n)
+    time = np.sort(rng.uniform(0.0, 200.0, n))
+    value = rng.normal(0.0, 0.02, n)
+    solution = prewhiten(
+        (time, value, np.full(n, 0.02)),
+        settings=_settings(max_frequencies=30),
+    )
+    k = solution.n_components
+    assert 2 * (3 * k + 1) <= n
+    assert np.all(np.isfinite(solution.frequency_error))
+    assert np.isfinite(solution.reduced_chi2)
+    if k:
+        assert solution.rms > 1e-6
+
+
+def test_the_degrees_of_freedom_guard_names_itself() -> None:
+    rng = np.random.default_rng(1)
+    time = np.sort(rng.uniform(0.0, 10.0, 24))
+    value = sum(
+        a * np.sin(_TWO_PI * f * time)
+        for a, f in ((0.3, 1.13), (0.2, 2.71), (0.15, 4.42), (0.1, 6.37))
+    ) + rng.normal(0.0, 1e-4, time.size)
+    solution = prewhiten((time, value), settings=_settings(max_frequencies=30))
+    assert "too few points" in solution.stop_reason
+    assert 2 * (3 * solution.n_components + 1) <= time.size
+
+
+def test_fit_mean_false_on_uncentred_data_matches_the_floating_mean_solution() -> None:
+    # PW-A-5: fit_mean=False fitted the raw (mean ~10) values while the spectrum was
+    # centred; the sinusoids absorbed the constant (0.45 mag "modes", D = 750).
+    time, value, error = synthetic_pulsator(
+        n=1500, frequencies=(12.34, 17.81), amplitudes=(0.012, 0.007),
+        phases=(0.5, 2.0),
+    )
+    floating = prewhiten((time, value, error), settings=_settings())
+    fixed = prewhiten((time, value, error), settings=_settings(fit_mean=False))
+    assert fixed.n_components == floating.n_components == 2
+    assert np.allclose(
+        fixed.frequency, floating.frequency, atol=2 * floating.frequency_error
+    )
+    assert np.allclose(
+        fixed.amplitude, floating.amplitude, atol=2 * floating.amplitude_error
+    )
+    assert fixed.offset == pytest.approx(floating.offset, abs=1e-3)
+    assert np.allclose(fixed.residuals, value - fixed.model(time), atol=1e-10)
+    assert fixed.correlation_factor < 2.0
+    assert np.isnan(fixed.offset_error)
+
+
+@pytest.mark.parametrize("with_errors", [True, False])
+def test_a_constant_light_curve_has_no_components(with_errors: bool) -> None:
+    # PW-A-7: zero-variance data returned components of amplitude ~1e-15 with S/N ~9.
+    rng = np.random.default_rng(0)
+    time = np.sort(rng.uniform(0.0, 27.0, 500)) + 2458000.0
+    value = np.full(time.size, 10.0)
+    data = (time, value, np.full(time.size, 0.01)) if with_errors else (time, value)
+    solution = prewhiten(data, settings=_settings())
+    assert solution.n_components == 0
+    assert "round-off" in solution.stop_reason
+
+
+@pytest.mark.parametrize("planted", [1, 2])
+def test_noise_free_sines_return_exactly_the_planted_count(planted: int) -> None:
+    rng = np.random.default_rng(20)
+    time = np.sort(rng.uniform(0.0, 27.0, 800)) + 2458000.0
+    value = np.full(time.size, 10.0)
+    for f, a in list(((5.6018, 0.05), (9.3311, 0.02)))[:planted]:
+        value = value + a * np.sin(_TWO_PI * f * (time - time[0]) + 0.3)
+    for error in (np.full(time.size, 0.001), None):
+        data = (time, value) if error is None else (time, value, error)
+        solution = prewhiten(data, settings=_settings())
+        assert solution.n_components == planted, solution.summary()
+
+
+def test_one_stray_timestamp_cannot_request_a_multi_gigabyte_grid() -> None:
+    # PW-A-11: one t = 0 row among JD-stamped data made the default grid ~5e9 samples
+    # (37 GiB per array). It is refused before anything is allocated.
+    from cuperiod.core.grid import GridTooLargeError
+
+    time, value, error = synthetic_pulsator(n=600)
+    time = np.append(time, 0.0)
+    value = np.append(value, 10.0)
+    error = np.append(error, 0.0015)
+    with pytest.raises(GridTooLargeError, match="baseline"):
+        prewhiten((time, value, error), settings=_settings())
+
+
+def test_an_unusable_error_column_is_named_as_the_cause() -> None:
+    time, value, _ = synthetic_pulsator(n=200)
+    with pytest.raises(InsufficientDataError, match="error"):
+        prewhiten((time, value, np.zeros(time.size)), settings=_settings())
+
+
+def test_the_bootstrap_mirrors_the_final_polish(monkeypatch) -> None:
+    # PW-B-4: the replicate fits were one cyclic sweep, with fit_multisine's default
+    # evaluation cap, whatever the run's own polish and max_nfev were.
+    from cuperiod.prewhiten import engine as engine_module
+
+    seen: dict[str, object] = {}
+    original = engine_module.component_uncertainties
+
+    def spy(*args, **kwargs):
+        seen.update(kwargs)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(engine_module, "component_uncertainties", spy)
+    time, value, error = synthetic_pulsator(n=600)
+    prewhiten(
+        (time, value, error),
+        settings=_settings(
+            uncertainty="bootstrap", n_resamples=4, max_nfev=77, max_frequencies=2
+        ),
+    )
+    assert seen["refine"] == "simultaneous"
+    assert seen["max_nfev"] == 77
+    prewhiten(
+        (time, value, error),
+        settings=_settings(
+            uncertainty="bootstrap", n_resamples=4, max_simultaneous=1,
+            max_frequencies=2,
+        ),
+    )
+    assert seen["refine"] == "cyclic"
+    assert seen["sweeps"] >= 3
+
+
+def test_only_the_kept_spectra_are_materialised(monkeypatch) -> None:
+    # PERF-PREWHITEN-02: in-loop spectra are amplitude-only scans; the full phase and
+    # power arrays are built only for the (at most two) spectra the result keeps.
+    from cuperiod.prewhiten.spectrum import _SpectrumScan
+
+    calls = {"n": 0}
+    original = _SpectrumScan.to_spectrum
+
+    def spy(self):
+        calls["n"] += 1
+        return original(self)
+
+    monkeypatch.setattr(_SpectrumScan, "to_spectrum", spy)
+    time, value, error = synthetic_pulsator()
+    kept = prewhiten((time, value, error), settings=_settings())
+    assert kept.n_components == 3
+    assert calls["n"] <= 2
+    assert kept.residual_spectrum is not None and kept.spectrum is not None
+    assert kept.residual_spectrum.power.shape == kept.residual_spectrum.frequency.shape
+    calls["n"] = 0
+    prewhiten((time, value, error), settings=_settings(store_spectra=False))
+    assert calls["n"] == 0
+
+
+def test_results_compare_by_identity_without_raising() -> None:
+    # PW-B-10: identical runs raised 'truth value of an array is ambiguous' on ==.
+    time, value, error = synthetic_pulsator(n=400)
+    settings = _settings(max_frequencies=1)
+    first = prewhiten((time, value, error), settings=settings)
+    second = prewhiten((time, value, error), settings=settings)
+    assert first == first and (first == second) is False
+    assert len({first, second}) == 2
+    assert [first, second].index(second) == 1
+    assert first.components == second.components  # value equality where it is cheap
 
 
 @requires_gpu

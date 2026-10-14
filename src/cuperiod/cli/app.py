@@ -5,7 +5,8 @@ code path. Commands:
 
 * ``run`` — one light curve, one or more methods; prints the N best periods.
 * ``batch`` — many light curves with CPU or GPU workers, written to Parquet/CSV.
-* ``prewhiten`` — automated iterative frequency extraction for a pulsator.
+* ``prewhiten`` — automated iterative frequency extraction for a pulsator; it can also
+  save the run as a project file and export a script that reproduces it.
 * ``batch-prewhiten`` — the same over many light curves, written to Parquet/CSV.
 * ``pdot`` — joint (period, dP/dt) search, then a phase-tracking dP/dt measurement.
 * ``pdot-batch`` — the whole period-change chain over many light curves, written to
@@ -14,30 +15,42 @@ code path. Commands:
 * ``gpu-info`` — show the CUDA GPU and suggested worker counts.
 * ``doctor`` — diagnose available backends, torch devices, and the precision each uses.
 * ``grid-info`` — show a method's trial grid for a light curve without computing it.
+* ``session verify | script | replay`` — check a saved pre-whitening project against
+  its own action log, export it as a script, or re-create it from the log.
 """
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import json
 import math
-from collections.abc import Sequence
+import warnings
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import numpy as np
 import typer
 from pydantic import ValidationError
 
 from cuperiod.api import periodogram
-from cuperiod.batch.runner import batch_periodograms
-from cuperiod.core.columns import ColumnMap, Domain
+from cuperiod.batch.io import alias_diverse_for, write_rows
+from cuperiod.batch.runner import BatchSummary, batch_periodograms
+from cuperiod.core.columns import ColumnMap, Domain, coerce_domain
 from cuperiod.core.config import PdotSettings, PreWhitenSettings
 from cuperiod.core.device import gpu_info as _gpu_info
 from cuperiod.core.device import suggest_gpu_workers
-from cuperiod.core.errors import InsufficientDataError
+from cuperiod.core.errors import (
+    BackendUnavailableError,
+    ColumnResolutionError,
+    CuPeriodError,
+    InsufficientDataError,
+    UnknownMethodError,
+)
 from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
-from cuperiod.core.result import MultiResult, Periodogram
+from cuperiod.core.result import MultiResult, Peak, Periodogram
 from cuperiod.methods.base import get_method, list_methods
 from cuperiod.prewhiten.result import PreWhitenResult
 
@@ -55,11 +68,43 @@ if TYPE_CHECKING:  # annotations only — the pdot modules load inside the comma
 #: (the canonical definition lives in :mod:`cuperiod.pdot.result`).
 _SECONDS_PER_YEAR: float = 86400.0 * 365.25
 
+#: Error lines a batch command prints before summarising the rest.
+_MAX_ERROR_LINES = 10
+
 app = typer.Typer(
     add_completion=False,
     help="Optimized, GPU-accelerated periodograms for astronomy.",
     no_args_is_help=True,
 )
+
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+
+def _clean_errors(func: _F) -> _F:
+    """Report the library's user-facing errors as CLI errors, not tracebacks.
+
+    A bad method or backend name, a missing input file or column is a usage error
+    (exit status 2), like a bad option value; any other cuPeriod error (too few
+    points, say) prints ``Error: ...`` and exits with status 1. Anything else is a bug
+    and keeps its traceback.
+    """
+
+    @functools.wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return func(*args, **kwargs)
+        except (
+            UnknownMethodError,
+            BackendUnavailableError,
+            ColumnResolutionError,
+            FileNotFoundError,
+        ) as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        except CuPeriodError as exc:
+            typer.echo(f"Error: {exc}", err=True)
+            raise typer.Exit(code=1) from exc
+
+    return cast(_F, wrapper)
 
 
 def _column_map(
@@ -71,16 +116,101 @@ def _column_map(
 
 
 def _parse_methods(method: str) -> list[str]:
-    return [m.strip() for m in method.split(",") if m.strip()]
+    names = [m.strip() for m in method.split(",") if m.strip()]
+    if not names:
+        raise typer.BadParameter(f"no method named in --method {method!r}")
+    return names
 
 
 def _domain(value: str | None) -> Domain | None:
-    if value is None:
-        return None
     try:
-        return Domain(value.lower())
+        return coerce_domain(value)
     except ValueError as exc:
         raise typer.BadParameter("domain must be 'magnitude' or 'flux'") from exc
+
+
+def _device(value: str) -> str:
+    """Validate ``--device`` up front, so a typo is a usage error."""
+    key = value.strip().lower()
+    if key not in {"cpu", "gpu"}:
+        raise typer.BadParameter(f"device must be 'cpu' or 'gpu', got {value!r}")
+    return key
+
+
+def _sink_path(value: Path) -> Path:
+    """Validate a batch ``--out``/``--sink``: a .parquet/.csv file, or a directory."""
+    suffix = value.suffix.lower()
+    if suffix in {".parquet", ".pq", ".csv"}:
+        if value.is_dir():
+            raise typer.BadParameter(
+                f"{value} is an existing directory; a {suffix} sink must be a file "
+                "(pass a path without an extension for a directory sink)"
+            )
+        return value
+    if suffix and not value.is_dir():
+        raise typer.BadParameter(
+            f"unsupported sink {str(value)!r}: use a .parquet or .csv file, or a "
+            "directory (no extension) for a resumable multi-part sink"
+        )
+    return value
+
+
+def _positive_period(value: float | None) -> float | None:
+    """Validate ``--period``: a seed period must be positive and finite."""
+    if value is not None and not (math.isfinite(value) and value > 0.0):
+        raise typer.BadParameter(f"period must be positive and finite, got {value}")
+    return value
+
+
+def _npz_path(path: Path) -> Path:
+    """Where ``numpy.savez_compressed`` really writes: it appends ``.npz`` if absent."""
+    return path if path.suffix.lower() == ".npz" else path.with_name(path.name + ".npz")
+
+
+def _save_npz(path: Path, arrays: dict[str, np.ndarray]) -> None:
+    target = _npz_path(path)
+    # numpy's stub collides **kwargs with the bool allow_pickle keyword.
+    np.savez_compressed(target, **arrays)  # type: ignore[arg-type]
+    typer.echo(f"Wrote {target}")
+
+
+def _errors_file(sink: Path) -> Path:
+    """Where a batch command lists every failure: beside a file sink, in a directory."""
+    if sink.suffix.lower() in {".parquet", ".pq", ".csv"}:
+        return sink.with_name(f"{sink.stem}.errors.csv")
+    return sink / "_errors.csv"
+
+
+def _report_batch(
+    summary: BatchSummary, *, errors_file: Path | None, where: str | None = None
+) -> None:
+    """Print a batch's failures; exit 1 when every light curve that ran failed.
+
+    The first few errors are printed, then how many more there are and where the
+    full list is: ``errors_file`` (written here, or removed when this run had no
+    failures so a stale list cannot mislead), or ``where`` for a driver that stores
+    them itself.
+    """
+    errors = summary.errors
+    for key, msg in errors[:_MAX_ERROR_LINES]:
+        typer.echo(f"  ! {key}: {msg}")
+    # With no inputs the driver left the sink untouched; its errors list stays too.
+    if errors_file is not None and summary.n_inputs > 0:
+        if errors:
+            write_rows([{"key": k, "error": m} for k, m in errors], errors_file)
+        else:
+            errors_file.unlink(missing_ok=True)
+    hidden = len(errors) - _MAX_ERROR_LINES
+    if errors_file is not None and errors:
+        more = f"  ... and {hidden} more; " if hidden > 0 else "  "
+        typer.echo(f"{more}all {len(errors)} errors are listed in {errors_file}")
+    elif hidden > 0:
+        typer.echo(f"  ... and {hidden} more" + (f" ({where})" if where else ""))
+    if summary.n_inputs == 0:
+        typer.echo("warning: no inputs to process", err=True)
+    if summary.n_done == 0 and summary.n_failed > 0:
+        typer.echo(f"Error: all {summary.n_failed} light curves failed", err=True)
+        raise typer.Exit(code=1)
 
 
 def _json_safe(obj: Any) -> Any:
@@ -100,8 +230,14 @@ def _json_safe(obj: Any) -> Any:
 
 
 @app.command()
+@_clean_errors
 def run(
-    path: Path = typer.Argument(..., help="Light-curve file (CSV/ECSV/FITS/Parquet)."),
+    path: Path = typer.Argument(
+        ...,
+        exists=True,
+        dir_okay=False,
+        help="Light-curve file (CSV/ECSV/FITS/Parquet).",
+    ),
     method: str = typer.Option("GLS", "--method", "-m", help="Methods (comma-sep)."),
     backend: str = typer.Option("auto", help="auto | cpu | gpu | concrete backend."),
     time: str | None = typer.Option(None, help="Time column name override."),
@@ -109,13 +245,16 @@ def run(
     error: str | None = typer.Option(None, help="Error column name override."),
     band: str | None = typer.Option(None, help="Band column (multi-band input)."),
     domain: str | None = typer.Option(None, help="magnitude | flux."),
-    n_best: int = typer.Option(10, "--n-best", help="Number of peaks to report."),
+    n_best: int = typer.Option(
+        10, "--n-best", min=1, help="Number of peaks to report."
+    ),
     out: Path | None = typer.Option(None, help="Write results as JSON here."),
     save_periodogram: Path | None = typer.Option(
         None, "--save-periodogram", help="Write raw spectra to this .npz."
     ),
 ) -> None:
     """Compute periodogram(s) for a single light curve and print the best periods."""
+    names = _parse_methods(method)
     columns = _column_map(time, value, error, band)
     lc: LightCurve | MultiBandLightCurve
     if band is not None:
@@ -124,18 +263,18 @@ def run(
         )
     else:
         lc = LightCurve.from_file(path, columns=columns, domain=_domain(domain))
-    result = periodogram(lc, _parse_methods(method), backend=backend)
+    result = periodogram(lc, names, backend=backend)
     results = (
         result.results if isinstance(result, MultiResult) else {result.method: result}
     )
     for name, pg in results.items():
         _print_peaks(name, pg, n_best)
     if out is not None:
-        payload = (
-            result.to_dict(n_best=n_best)
-            if isinstance(result, (MultiResult, Periodogram))
-            else {}
-        )
+        # The same peaks as printed (and as `cuperiod batch` stores): BLS/TLS
+        # alias-diverse, not the harmonics a plain top-N list would hold.
+        payload = {
+            name: _result_payload(name, pg, n_best) for name, pg in results.items()
+        }
         out.write_text(
             json.dumps(_json_safe(payload), indent=2, allow_nan=False),
             encoding="utf-8",
@@ -146,57 +285,92 @@ def run(
         for name, pg in results.items():
             arrays[f"{name}_frequency"] = pg.frequency
             arrays[f"{name}_power"] = pg.power
-        # numpy's stub collides **kwargs with the bool allow_pickle keyword.
-        np.savez_compressed(save_periodogram, **arrays)  # type: ignore[arg-type]
-        typer.echo(f"Wrote {save_periodogram}")
+        _save_npz(save_periodogram, arrays)
+
+
+def _ranked_peaks(name: str, pg: Periodogram, n_best: int) -> list[Peak]:
+    """The peaks the CLI reports for a method: one selection policy everywhere."""
+    return pg.best_periods(n_best, alias_diverse=alias_diverse_for(name))
+
+
+def _result_payload(name: str, pg: Periodogram, n_best: int) -> dict[str, Any]:
+    """``pg.to_dict`` with the reported (policy-selected) peaks."""
+    payload = pg.to_dict(n_best=0)
+    payload["peaks"] = [peak.to_dict() for peak in _ranked_peaks(name, pg, n_best)]
+    return payload
 
 
 def _print_peaks(name: str, pg: Periodogram, n_best: int) -> None:
     typer.echo(f"\n{name}  (backend={pg.backend}, n={pg.n_samples})")
     typer.echo(f"  {'rank':>4}  {'period':>14}  {'power':>12}")
-    for peak in pg.best_periods(n_best, alias_diverse=(name == "BLS")):
+    for peak in _ranked_peaks(name, pg, n_best):
         typer.echo(
             f"  {peak.rank:>4}  {peak.period:>14.8f}  {peak.power:>12.6g}"
         )
 
 
 @app.command()
+@_clean_errors
 def batch(
     inputs: str = typer.Argument(..., help="Glob, directory, or file of light curves."),
     method: str = typer.Option("GLS", "--method", "-m", help="Methods (comma-sep)."),
     device: str = typer.Option("cpu", help="cpu | gpu."),
     backend: str = typer.Option("auto", help="auto | cpu | gpu | concrete backend."),
     workers: int | None = typer.Option(None, help="Worker count (None = auto)."),
+    chunk_size: int | None = typer.Option(
+        None,
+        "--chunk-size",
+        min=1,
+        help="Light curves per chunk/task (None = about four tasks per worker).",
+    ),
     time: str | None = typer.Option(None, help="Time column name override."),
     value: str | None = typer.Option(None, help="Value column name override."),
     error: str | None = typer.Option(None, help="Error column name override."),
     domain: str | None = typer.Option(None, help="magnitude | flux."),
     out: Path = typer.Option(..., "--out", help="Output .parquet/.csv file or dir."),
-    n_best: int = typer.Option(10, "--n-best", help="Peaks stored per light curve."),
+    n_best: int = typer.Option(
+        10, "--n-best", min=0, help="Peaks stored per light curve."
+    ),
     store_raw: bool = typer.Option(False, "--store-raw", help="Store raw spectra."),
-    resume: bool = typer.Option(True, "--resume/--no-resume", help="Skip done chunks."),
+    resume: bool = typer.Option(
+        True, "--resume/--no-resume", help="Skip light curves already in --out."
+    ),
 ) -> None:
-    """Compute periodograms for many light curves with CPU or GPU workers."""
+    """Compute periodograms for many light curves with CPU or GPU workers.
+
+    Exits with status 1 when every light curve that ran failed; all failures are
+    listed in a CSV beside the sink (inside it, for a directory sink).
+    """
     columns = _column_map(time, value, error, None)
-    summary = batch_periodograms(
-        inputs,
-        _parse_methods(method),
-        backend=backend,
-        device=device,
-        workers=workers,
-        columns=columns,
-        domain=_domain(domain),
-        sink=out,
-        n_best=n_best,
-        store_raw=store_raw,
-        resume=resume,
+    sink = _sink_path(out)
+    try:
+        summary = batch_periodograms(
+            inputs,
+            _parse_methods(method),
+            backend=backend,
+            device=_device(device),
+            workers=workers,
+            columns=columns,
+            domain=_domain(domain),
+            sink=sink,
+            n_best=n_best,
+            store_raw=store_raw,
+            resume=resume,
+            chunk_size=chunk_size,
+        )
+    except ValueError as exc:  # up-front validation; per-curve errors are collected
+        raise typer.BadParameter(str(exc)) from exc
+    n_workers = summary.n_workers
+    workers_note = (
+        "" if n_workers is None
+        else f", {n_workers} worker{'' if n_workers == 1 else 's'}"
     )
     typer.echo(
         f"Processed {summary.n_done} results from {summary.n_inputs} inputs "
-        f"({summary.n_skipped} skipped, {summary.n_failed} failed) -> {summary.sink}"
+        f"({summary.n_skipped} skipped, {summary.n_failed} failed{workers_note}) "
+        f"-> {summary.sink}"
     )
-    for key, msg in summary.errors[:10]:
-        typer.echo(f"  ! {key}: {msg}")
+    _report_batch(summary, errors_file=_errors_file(sink))
 
 
 def _prewhiten_settings(
@@ -208,11 +382,14 @@ def _prewhiten_settings(
     maximum_frequency: float | None,
     uncertainty: str,
     combinations: bool,
-    backend: str,
+    backend: str | None,
     store_spectra: bool = True,
 ) -> PreWhitenSettings:
     """Build a :class:`PreWhitenSettings` from CLI options (validated by pydantic)."""
     criteria = tuple(c.strip().lower() for c in stop.split(",") if c.strip())
+    # Pass --backend only when given: an explicit backend="auto" would pin the field
+    # and hide CUPERIOD_PREWHITEN_BACKEND, which the library API honours.
+    pinned: dict[str, Any] = {} if backend is None else {"backend": backend}
     try:
         return PreWhitenSettings(
             max_frequencies=max_frequencies,
@@ -222,17 +399,27 @@ def _prewhiten_settings(
             maximum_frequency=maximum_frequency,
             uncertainty=uncertainty,  # type: ignore[arg-type]
             combinations=combinations,
-            backend=backend,  # type: ignore[arg-type]
             store_spectra=store_spectra,
+            **pinned,
         )
     except ValidationError as exc:
         raise typer.BadParameter(str(exc)) from exc
 
 
 @app.command()
+@_clean_errors
 def prewhiten(
-    path: Path = typer.Argument(..., help="Light-curve file (CSV/ECSV/FITS/Parquet)."),
-    backend: str = typer.Option("auto", help="auto | cpu | gpu | concrete backend."),
+    path: Path = typer.Argument(
+        ...,
+        exists=True,
+        dir_okay=False,
+        help="Light-curve file (CSV/ECSV/FITS/Parquet).",
+    ),
+    backend: str | None = typer.Option(
+        None,
+        help="auto | cpu | gpu | concrete backend (default: the settings' backend,"
+        " CUPERIOD_PREWHITEN_BACKEND, else auto).",
+    ),
     max_frequencies: int = typer.Option(
         30, "--max-frequencies", "-n", help="Cap on extracted components."
     ),
@@ -268,6 +455,17 @@ def prewhiten(
     save_spectrum: Path | None = typer.Option(
         None, "--save-spectrum", help="Write the amplitude spectra to this .npz."
     ),
+    save_project: Path | None = typer.Option(
+        None,
+        "--save-project",
+        help="Also save the run as a pre-whitening project (*.cupw.json) to open, "
+        "edit or verify later.",
+    ),
+    export_script: Path | None = typer.Option(
+        None,
+        "--export-script",
+        help="Also write a Python script that reproduces the run with the library.",
+    ),
 ) -> None:
     """Extract a pulsator's frequency solution by automated iterative pre-whitening."""
     from cuperiod.prewhiten import find_period_spacing
@@ -285,7 +483,16 @@ def prewhiten(
         combinations=combinations,
         backend=backend,
     )
-    result = _prewhiten(lc, settings=settings)
+    session = None
+    if save_project is None and export_script is None:
+        result = _prewhiten(lc, settings=settings)
+    else:
+        # The same run as a recorded session (identical numbers), so it can be saved.
+        from cuperiod.prewhiten.session import PreWhitenSession
+
+        session = PreWhitenSession(lc, settings=settings, columns=columns)
+        session.run()
+        result = session.finalize()
     typer.echo(result.summary())
 
     if spacing:
@@ -323,8 +530,13 @@ def prewhiten(
             arrays["residual_amplitude"] = result.residual_spectrum.amplitude
         if result.window is not None:
             arrays["window_amplitude"] = result.window.amplitude
-        np.savez_compressed(save_spectrum, **arrays)  # type: ignore[arg-type]
-        typer.echo(f"Wrote {save_spectrum}")
+        _save_npz(save_spectrum, arrays)
+    if session is not None and save_project is not None:
+        session.save(save_project, title=path.stem)
+        typer.echo(f"Wrote {save_project}")
+    if session is not None and export_script is not None:
+        written = session.export_script(export_script, title=path.stem)
+        typer.echo(f"Wrote {written}")
 
 
 def _write_component_csv(result: PreWhitenResult, path: Path) -> None:
@@ -340,12 +552,23 @@ def _write_component_csv(result: PreWhitenResult, path: Path) -> None:
 
 
 @app.command(name="batch-prewhiten")
+@_clean_errors
 def batch_prewhiten_cmd(
     inputs: str = typer.Argument(..., help="Glob, directory, or file of light curves."),
     out: Path = typer.Option(..., "--out", help="Output .parquet/.csv file or dir."),
     device: str = typer.Option("cpu", help="cpu | gpu."),
-    backend: str = typer.Option("auto", help="auto | cpu | gpu | concrete backend."),
+    backend: str | None = typer.Option(
+        None,
+        help="auto | cpu | gpu | concrete backend (default: the settings' backend,"
+        " CUPERIOD_PREWHITEN_BACKEND, else auto).",
+    ),
     workers: int | None = typer.Option(None, help="Worker count (None = auto)."),
+    chunk_size: int | None = typer.Option(
+        None,
+        "--chunk-size",
+        min=1,
+        help="Light curves per chunk/task (None = the batch_prewhiten default).",
+    ),
     max_frequencies: int = typer.Option(
         30, "--max-frequencies", "-n", help="Cap on extracted components."
     ),
@@ -367,9 +590,18 @@ def batch_prewhiten_cmd(
     value: str | None = typer.Option(None, help="Value column name override."),
     error: str | None = typer.Option(None, help="Error column name override."),
     domain: str | None = typer.Option(None, help="magnitude | flux."),
-    resume: bool = typer.Option(True, "--resume/--no-resume", help="Skip done chunks."),
+    resume: bool = typer.Option(
+        True,
+        "--resume/--no-resume",
+        help="Skip light curves already in the sink and retry failures "
+        "(resume is by key).",
+    ),
 ) -> None:
-    """Pre-whiten many light curves; writes one row per extracted component."""
+    """Pre-whiten many light curves; writes one row per extracted component.
+
+    Exits with status 1 when every light curve that ran failed; all failures are
+    listed in a CSV beside the sink (inside it, for a directory sink).
+    """
     from cuperiod.prewhiten import batch_prewhiten as _batch_prewhiten
 
     settings = _prewhiten_settings(
@@ -383,23 +615,28 @@ def batch_prewhiten_cmd(
         backend=backend,
         store_spectra=False,
     )
-    summary = _batch_prewhiten(
-        inputs,
-        settings=settings,
-        backend=backend,
-        device=device,
-        workers=workers,
-        columns=_column_map(time, value, error, None),
-        domain=_domain(domain),
-        sink=out,
-        resume=resume,
-    )
+    sink = _sink_path(out)
+    extra: dict[str, Any] = {} if chunk_size is None else {"chunk_size": chunk_size}
+    try:
+        summary = _batch_prewhiten(
+            inputs,
+            settings=settings,
+            backend=backend,
+            device=_device(device),
+            workers=workers,
+            columns=_column_map(time, value, error, None),
+            domain=_domain(domain),
+            sink=sink,
+            resume=resume,
+            **extra,
+        )
+    except ValueError as exc:  # up-front validation; per-curve errors are collected
+        raise typer.BadParameter(str(exc)) from exc
     typer.echo(
         f"Wrote {summary.n_done} component rows from {summary.n_inputs} inputs "
         f"({summary.n_skipped} skipped, {summary.n_failed} failed) -> {summary.sink}"
     )
-    for key, msg in summary.errors[:10]:
-        typer.echo(f"  ! {key}: {msg}")
+    _report_batch(summary, errors_file=_errors_file(sink))
 
 
 def _pdot_range(value: str | None) -> tuple[float, float] | None:
@@ -532,8 +769,14 @@ def _require_matplotlib(option: str) -> None:
 
 
 @app.command()
+@_clean_errors
 def pdot(
-    path: Path = typer.Argument(..., help="Light-curve file (CSV/ECSV/FITS/Parquet)."),
+    path: Path = typer.Argument(
+        ...,
+        exists=True,
+        dir_okay=False,
+        help="Light-curve file (CSV/ECSV/FITS/Parquet).",
+    ),
     period: float | None = typer.Option(
         None, "--period", help="Window center in days (None = seed from a first run)."
     ),
@@ -561,7 +804,10 @@ def pdot(
         None, "--harmonics", help="Tracking template order (None = BIC-selected)."
     ),
     segments: int | None = typer.Option(
-        None, "--segments", help="Target tracking segment count (None = auto)."
+        None,
+        "--segments",
+        min=4,
+        help="Target tracking segment count (at least 4; None = auto).",
     ),
     harmonic_scale: float | None = typer.Option(
         None, "--harmonic-scale", help="Extra (dP/dt)/P refinement (None = per method)."
@@ -623,7 +869,7 @@ def pdot(
     )
     result = pdot_search(
         lc,
-        period=period,
+        period=_positive_period(period),
         method=method,
         model=model_name,
         settings=settings,
@@ -691,9 +937,7 @@ def pdot(
             "pdot_over_p": result.pdot_over_p,
             "power": result.power,
         }
-        # numpy's stub collides **kwargs with the bool allow_pickle keyword.
-        np.savez_compressed(save_map, **arrays)  # type: ignore[arg-type]
-        typer.echo(f"Wrote {save_map}")
+        _save_npz(save_map, arrays)
 
 
 def _print_pdot_search(res: PdotSearchResult) -> None:
@@ -793,18 +1037,32 @@ def _print_period_profile(prof: PeriodProfile, laws: Sequence[PeriodLawFit]) -> 
     if not laws:
         typer.echo("\nno period law could be fitted to this track")
         return
-    typer.echo(f"\nperiod laws over P(t)  (ranked by BIC, {len(laws)} fitted)")
+    typer.echo(
+        f"\nperiod laws over P(t)  (ranked by error-scaled BIC, {len(laws)} fitted)"
+    )
     typer.echo(f"  {'law':<12} {'BIC':>10} {'dBIC':>9} {'dP/P':>12}  parameters")
-    best_bic = laws[0].bic
+
+    # The column must be the criterion the list is sorted by. compare_period_laws
+    # ranks on bic_scaled (chi-squared rescaled by the excess scatter); the plain
+    # bic would make dBIC negative for a lower-ranked law when errors are
+    # understated.
+    def rank_bic(fit: PeriodLawFit) -> float:
+        scaled = float(fit.bic_scaled)
+        return scaled if math.isfinite(scaled) else float(fit.bic)
+
+    best_bic = rank_bic(laws[0])
     for fit in laws:
         params = ", ".join(f"{k}={v:.6g}" for k, v in fit.params.items())
+        bound = "  (at a bound)" if fit.at_bound else ""
         typer.echo(
-            f"  {fit.law:<12} {fit.bic:>10.4g} {fit.bic - best_bic:>9.3g} "
-            f"{fit.fractional_change(first.t_start, last.t_end):>+12.4g}  {params}"
+            f"  {fit.law:<12} {rank_bic(fit):>10.4g} {rank_bic(fit) - best_bic:>9.3g} "
+            f"{fit.fractional_change(first.t_start, last.t_end):>+12.4g}  "
+            f"{params}{bound}"
         )
 
 
 @app.command(name="pdot-batch")
+@_clean_errors
 def pdot_batch_cmd(
     inputs: str = typer.Argument(..., help="Glob, directory, or file of light curves."),
     sink: Path = typer.Option(
@@ -845,7 +1103,10 @@ def pdot_batch_cmd(
         None, "--harmonics", help="Tracking template order (None = BIC-selected)."
     ),
     segments: int | None = typer.Option(
-        None, "--segments", help="Target tracking segment count (None = auto)."
+        None,
+        "--segments",
+        min=4,
+        help="Target tracking segment count (at least 4; None = auto).",
     ),
     harmonic_scale: float | None = typer.Option(
         None, "--harmonic-scale", help="Extra (dP/dt)/P refinement (None = per method)."
@@ -889,7 +1150,12 @@ def pdot_batch_cmd(
     value: str | None = typer.Option(None, help="Value column name override."),
     error: str | None = typer.Option(None, help="Error column name override."),
     domain: str | None = typer.Option(None, help="magnitude | flux."),
-    resume: bool = typer.Option(True, "--resume/--no-resume", help="Skip done chunks."),
+    resume: bool = typer.Option(
+        True,
+        "--resume/--no-resume",
+        help="Skip light curves already in the sink and retry failures "
+        "(resume is by key).",
+    ),
 ) -> None:
     """Measure period changes for many light curves; writes up to three tables.
 
@@ -903,6 +1169,9 @@ def pdot_batch_cmd(
     # be caught before a survey-scale run, not discovered from empty cells after.
     if plots is not None:
         _require_matplotlib("--plots")
+    seed_period = _positive_period(period)
+    device = _device(device)
+    sink = _sink_path(sink)
     settings = _pdot_settings(
         max_cycle_drift=max_cycle_drift,
         samples_per_drift=samples_per_drift,
@@ -913,32 +1182,35 @@ def pdot_batch_cmd(
         segments=segments,
         harmonic_scale=harmonic_scale,
     )
-    summary = _batch_pdot(
-        inputs,
-        period=period,
-        method=method,
-        model=_period_model(model),
-        settings=settings,
-        detrend_width=_detrend_width(detrend_width),
-        detrend_method=_trend_method(detrend_method),
-        profile=profile,
-        laws=_period_laws(laws),
-        ltte=ltte,
-        points_per_interval=points_per_interval,
-        period_window=period_window,
-        backend=backend,
-        device=device,
-        workers=workers,
-        columns=_column_map(time, value, error, None),
-        domain=_domain(domain),
-        sink=sink,
-        oc_sink=oc_sink,
-        profile_sink=profile_sink,
-        plots=plots,
-        plot_keys=_comma_list(plot_keys),
-        resume=resume,
-        chunk_size=chunk_size,
-    )
+    try:
+        summary = _batch_pdot(
+            inputs,
+            period=seed_period,
+            method=method,
+            model=_period_model(model),
+            settings=settings,
+            detrend_width=_detrend_width(detrend_width),
+            detrend_method=_trend_method(detrend_method),
+            profile=profile,
+            laws=_period_laws(laws),
+            ltte=ltte,
+            points_per_interval=points_per_interval,
+            period_window=period_window,
+            backend=backend,
+            device=device,
+            workers=workers,
+            columns=_column_map(time, value, error, None),
+            domain=_domain(domain),
+            sink=sink,
+            oc_sink=oc_sink,
+            profile_sink=profile_sink,
+            plots=plots,
+            plot_keys=_comma_list(plot_keys),
+            resume=resume,
+            chunk_size=chunk_size,
+        )
+    except ValueError as exc:  # up-front validation; per-curve errors are collected
+        raise typer.BadParameter(str(exc)) from exc
     typer.echo(
         f"Measured {summary.n_done} light curves from {summary.n_inputs} inputs "
         f"({summary.n_skipped} skipped, {summary.n_failed} failed) -> {summary.sink}"
@@ -949,8 +1221,137 @@ def pdot_batch_cmd(
         typer.echo(f"  P(t) profile -> {profile_sink}")
     if plots is not None:
         typer.echo(f"  figures      -> {plots}")
-    for key, msg in summary.errors[:10]:
-        typer.echo(f"  ! {key}: {msg}")
+    # Every failure already has a summary row whose status column holds the error.
+    _report_batch(
+        summary, errors_file=None, where=f"the status column of {summary.sink}"
+    )
+
+
+session_app = typer.Typer(
+    add_completion=False,
+    help="Verify, script or replay a saved pre-whitening project (*.cupw.json).",
+    no_args_is_help=True,
+)
+app.add_typer(session_app, name="session")
+
+_PROJECT_ARGUMENT = typer.Argument(
+    ..., exists=True, dir_okay=False, help="A pre-whitening project (*.cupw.json)."
+)
+_DATA_OPTION = typer.Option(
+    None,
+    "--data",
+    exists=True,
+    dir_okay=False,
+    help="Light-curve file to use instead of the project's own data (it must hold "
+    "the same points: the content hash is checked).",
+)
+_SESSION_BACKEND_OPTION = typer.Option(
+    None, help="Spectrum backend (default: the recorded one when available, else CPU)."
+)
+
+
+def _project_data(data: Path | None) -> LightCurve | None:
+    return None if data is None else LightCurve.from_file(data)
+
+
+@contextlib.contextmanager
+def _session_warnings() -> Iterator[None]:
+    """Print a session's warnings as ``warning: ...`` lines, not Python tracebacks."""
+    from cuperiod.prewhiten.session import SessionWarning
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", SessionWarning)
+        try:
+            yield
+        finally:
+            for item in caught:
+                if issubclass(item.category, SessionWarning):
+                    typer.echo(f"warning: {item.message}", err=True)
+                else:
+                    warnings.warn_explicit(
+                        item.message, item.category, item.filename, item.lineno
+                    )
+
+
+@session_app.command("verify")
+@_clean_errors
+def session_verify_cmd(
+    project: Path = _PROJECT_ARGUMENT,
+    data: Path | None = _DATA_OPTION,
+    backend: str | None = _SESSION_BACKEND_OPTION,
+) -> None:
+    """Replay a project's action log and check it reproduces the stored solution."""
+    from cuperiod.prewhiten.session import PreWhitenSession
+
+    with _session_warnings():
+        session = PreWhitenSession.load(
+            project, data=_project_data(data), verify=True, backend=backend
+        )
+    typer.echo(
+        f"Verified {project}: its {len(session.history)} logged action(s) reproduce "
+        f"the stored solution ({len(session.state.active)} active component(s), "
+        f"backend {session.backend})."
+    )
+
+
+@session_app.command("script")
+@_clean_errors
+def session_script_cmd(
+    project: Path = _PROJECT_ARGUMENT,
+    out: Path = typer.Option(
+        ..., "--out", "-o", dir_okay=False, help="The Python script to write."
+    ),
+    data: Path | None = _DATA_OPTION,
+) -> None:
+    """Export a project as a Python script that reproduces it with the library."""
+    from cuperiod.prewhiten.session import PreWhitenSession
+
+    with _session_warnings():
+        session = PreWhitenSession.load(
+            project, data=_project_data(data), backend="cpu"
+        )
+    written = session.export_script(out, title=project.name.split(".")[0])
+    typer.echo(f"Wrote {written}")
+
+
+@session_app.command("replay")
+@_clean_errors
+def session_replay_cmd(
+    project: Path = _PROJECT_ARGUMENT,
+    out: Path | None = typer.Option(
+        None,
+        "--out",
+        "-o",
+        dir_okay=False,
+        help="Save the replayed session (with its full undo history) as a project.",
+    ),
+    data: Path | None = _DATA_OPTION,
+    backend: str | None = _SESSION_BACKEND_OPTION,
+) -> None:
+    """Re-create a project from its action log and print the resulting solution."""
+    from cuperiod.prewhiten.session import PreWhitenSession
+    from cuperiod.prewhiten.session.project import divergence, rerun
+
+    with _session_warnings():
+        stored = PreWhitenSession.load(
+            project, data=_project_data(data), backend=backend
+        )
+        replayed = rerun(stored, backend=backend)
+    typer.echo(replayed.result().summary())
+    problem = divergence(stored.state, replayed.state)
+    if problem is not None:
+        typer.echo(
+            f"Error: the replay does not reproduce the stored solution: {problem}",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    typer.echo(
+        f"\nReplayed {len(replayed.history)} logged action(s); the stored solution "
+        "is reproduced."
+    )
+    if out is not None:
+        replayed.save(out, title=project.name.split(".")[0])
+        typer.echo(f"Wrote {out}")
 
 
 @app.command()
@@ -1052,8 +1453,11 @@ def doctor() -> None:
 
 
 @app.command(name="grid-info")
+@_clean_errors
 def grid_info_cmd(
-    path: Path = typer.Argument(..., help="Light-curve file."),
+    path: Path = typer.Argument(
+        ..., exists=True, dir_okay=False, help="Light-curve file."
+    ),
     method: str = typer.Option("GLS", "--method", "-m", help="Single method."),
     time: str | None = typer.Option(None, help="Time column name override."),
     value: str | None = typer.Option(None, help="Value column name override."),

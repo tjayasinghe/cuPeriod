@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import pandas as pd
+import pytest
 from typer.testing import CliRunner
 
 from cuperiod.cli.app import app
@@ -180,3 +181,183 @@ def test_batch_prewhiten_command(tmp_path: Path) -> None:
     table = pq.read_table(out).to_pylist()
     assert {row["key"] for row in table}
     assert "frequency" in table[0]
+
+
+# --- the run printout and its JSON agree (BATCH-CLI-18) ---------------------------
+
+
+def _write_transit_csv(path: Path) -> Path:
+    from synth import synthetic_eclipser
+
+    t, flux, err = synthetic_eclipser(n=600, span=60.0)
+    pd.DataFrame({"jd": t, "flux": flux, "flux_err": err}).to_csv(path, index=False)
+    return path
+
+
+def _printed_periods(stdout: str, method: str) -> list[float]:
+    block = stdout.split(f"\n{method}  (", 1)[1].split("\n\n", 1)[0]
+    rows = [line.split() for line in block.splitlines()[2:] if line.strip()]
+    return [float(row[1]) for row in rows]
+
+
+def test_run_json_lists_the_printed_bls_peaks(tmp_path: Path) -> None:
+    import cuperiod as cup
+
+    csv = _write_transit_csv(tmp_path / "transit.csv")
+    out = tmp_path / "bls.json"
+    result = runner.invoke(
+        app,
+        ["run", str(csv), "-m", "BLS,GLS", "--backend", "cpu", "--domain", "flux",
+         "--n-best", "5", "--out", str(out)],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    for method in ("BLS", "GLS"):
+        printed = _printed_periods(result.stdout, method)
+        saved = [peak["period"] for peak in payload[method]["peaks"]]
+        assert saved == pytest.approx(printed, rel=1e-7), method
+    batch = cup.batch_periodograms(
+        str(csv), "BLS", backend="cpu", workers=0, domain="flux", n_best=5
+    )
+    assert batch.rows is not None
+    row = batch.rows[0]
+    saved_bls = [peak["period"] for peak in payload["BLS"]["peaks"]]
+    assert [row[f"period_{k}"] for k in range(1, 6)] == pytest.approx(saved_bls)
+
+
+# --- user errors are usage errors, not tracebacks (BATCH-CLI-20) -------------------
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["run", "missing.csv"],
+        ["run", "{csv}", "-m", "NOPE"],
+        ["run", "{csv}", "--backend", "bogus"],
+        ["run", "{csv}", "-m", ","],
+        ["run", "{csv}", "--n-best", "0"],
+        ["grid-info", "missing.csv"],
+        ["batch", "{dir}/*.csv", "--out", "{dir}/r.parquet", "--device", "tpu"],
+        ["batch", "{dir}/*.csv", "--out", "{dir}/r.json"],
+        ["batch", "{dir}/*.csv", "--out", "{dir}/r.parquet", "--backend", "bogus"],
+        ["batch", "{dir}/*.csv", "--out", "{dir}/r.parquet", "-m", "NOPE"],
+        ["batch", "{dir}/*.parqet", "--out", "{dir}/r.parquet"],
+        ["batch", "{dir}/*.csv", "--out", "{dir}/r.parquet", "--device", "cpu",
+         "--backend", "cufinufft"],
+    ],
+    ids=[
+        "missing-file", "unknown-method", "unknown-backend", "no-method", "n-best-0",
+        "grid-info-missing", "bad-device", "bad-sink", "batch-unknown-backend",
+        "batch-unknown-method", "empty-glob", "gpu-backend-on-cpu",
+    ],
+)
+def test_user_errors_exit_2_without_a_traceback(
+    tmp_path: Path, args: list[str]
+) -> None:
+    csv = _write_csv(tmp_path / "star.csv")
+    filled = [a.format(csv=csv, dir=tmp_path) for a in args]
+    result = runner.invoke(app, filled)
+    assert result.exit_code == 2, result.output
+    assert "Traceback" not in result.output
+    assert not (tmp_path / "r.parquet").exists()
+
+
+def test_batch_where_everything_fails_exits_1_and_lists_every_error(
+    tmp_path: Path,
+) -> None:
+    bad = tmp_path / "bad"
+    bad.mkdir()
+    for i in range(13):
+        pd.DataFrame({"a": [1.0, 2.0], "b": [3.0, 4.0]}).to_csv(
+            bad / f"x{i:02d}.csv", index=False
+        )
+    out = tmp_path / "out.parquet"
+    result = runner.invoke(
+        app,
+        ["batch", str(bad), "--out", str(out), "--backend", "cpu", "--workers", "0"],
+    )
+    assert result.exit_code == 1, result.output
+    assert "(0 skipped, 13 failed" in result.stdout
+    assert result.stdout.count("  ! ") == 10
+    assert "... and 3 more" in result.stdout
+    listed = pd.read_csv(tmp_path / "out.errors.csv")
+    assert len(listed) == 13 and {"key", "error"} <= set(listed.columns)
+
+
+def test_batch_with_no_inputs_keeps_the_previous_errors_list(tmp_path: Path) -> None:
+    # Zero inputs leave the sink untouched, so the list of its last run's failures,
+    # which describes the sink, must survive too.
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    out = tmp_path / "out.parquet"
+    listed = tmp_path / "out.errors.csv"
+    listed.write_text("key,error\nstar0,ValueError: earlier\n", encoding="utf-8")
+    result = runner.invoke(
+        app,
+        ["batch", str(empty), "--out", str(out), "--backend", "cpu", "--workers", "0"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "no inputs" in result.output
+    assert listed.exists() and not out.exists()
+
+
+def test_batch_accepts_a_chunk_size(tmp_path: Path) -> None:
+    for i in range(3):
+        _write_csv(tmp_path / f"s{i}.csv")
+    out = tmp_path / "parts"
+    result = runner.invoke(
+        app,
+        ["batch", str(tmp_path / "*.csv"), "--out", str(out), "--backend", "cpu",
+         "--workers", "0", "--chunk-size", "1"],
+    )
+    assert result.exit_code == 0, result.output
+    assert len(list(out.glob("part-*.parquet"))) == 3
+    assert not (out / "_errors.csv").exists()
+
+
+def test_batch_prewhiten_accepts_a_chunk_size(tmp_path: Path) -> None:
+    for index in range(2):
+        _write_pulsator_csv(tmp_path / f"p{index}.csv")
+    out = tmp_path / "parts"
+    result = runner.invoke(
+        app,
+        ["batch-prewhiten", str(tmp_path / "*.csv"), "--out", str(out),
+         "--backend", "finufft", "-n", "2", "--workers", "1", "--chunk-size", "1"],
+    )
+    assert result.exit_code == 0, result.output
+    assert len(list(out.glob("part-*.parquet"))) == 2
+
+
+@pytest.mark.parametrize("command", ["prewhiten", "batch-prewhiten"])
+def test_prewhiten_commands_leave_the_backend_to_the_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    # Without --backend the CLI must not pin settings.backend to "auto": that hid
+    # CUPERIOD_PREWHITEN_BACKEND, which cup.prewhiten and batch_prewhiten honour.
+    import pyarrow.parquet as pq
+
+    monkeypatch.setenv("CUPERIOD_PREWHITEN_BACKEND", "numpy")
+    csv = _write_pulsator_csv(tmp_path / "p0.csv")
+    out = tmp_path / "modes.parquet"
+    if command == "prewhiten":
+        args = ["prewhiten", str(csv), "-n", "2"]
+    else:
+        args = ["batch-prewhiten", str(csv), "--out", str(out), "-n", "2",
+                "--workers", "1"]
+    result = runner.invoke(app, args)
+    assert result.exit_code == 0, result.output
+    if command == "prewhiten":
+        assert "backend=numpy" in result.stdout
+    else:
+        assert {row["backend"] for row in pq.read_table(out).to_pylist()} == {"numpy"}
+
+
+def test_save_periodogram_reports_the_file_it_wrote(tmp_path: Path) -> None:
+    csv = _write_csv(tmp_path / "star.csv")
+    target = tmp_path / "spec.dat"
+    result = runner.invoke(
+        app, ["run", str(csv), "-m", "GLS", "--save-periodogram", str(target)]
+    )
+    assert result.exit_code == 0, result.output
+    written = tmp_path / "spec.dat.npz"
+    assert written.exists() and f"Wrote {written}" in result.stdout

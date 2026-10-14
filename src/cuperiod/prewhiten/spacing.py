@@ -54,9 +54,13 @@ _MAX_SUBMULTIPLE: Final = 6
 _COMB_MEMBER_TOL: Final = 0.15
 
 
-@dataclass(frozen=True)
+# Equality is identity (eq=False): the generated __eq__ would compare the arrays and
+# raise on their ambiguous truth value, and frozen+eq would make hash() fail on them.
+@dataclass(frozen=True, eq=False)
 class SpacingSpectrum:
     """Comb response of a set of values against trial spacings.
+
+    Compares (and hashes) by identity.
 
     Attributes
     ----------
@@ -94,9 +98,11 @@ class SpacingSpectrum:
         }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class PeriodSpacingSeries:
     """A chain of modes following one (possibly tilted) period-spacing pattern.
+
+    Compares (and hashes) by identity; compare :meth:`to_dict` for equal content.
 
     Attributes
     ----------
@@ -224,16 +230,31 @@ def echelle(
 def _default_spacing_range(sorted_values: FloatArray) -> tuple[float, float]:
     """``(minimum, maximum)`` trial spacing from the data alone.
 
-    The upper bound is the full range (a two-tooth comb); the lower bound is half the
-    smallest observed gap, floored at a tenth of the mean gap so an accidental near-pair
-    of modes cannot drag the search into a decade of meaningless fine spacings.
+    Both bounds come from the *bulk* of the values, not their extremes. The core range
+    is twice the interquartile range — the full range for an evenly filled comb, but
+    blind to a single far outlier (a slow spot or systematics period among
+    pre-whitened g modes) that would otherwise stretch the range tenfold. The lower
+    bound is half the smallest observed gap, floored at a tenth of the mean gap over
+    that core so an accidental near-pair of modes cannot drag the search into a
+    decade of meaningless fine spacings; built on the raw range, the floor rose above
+    the true spacing as soon as one outlier was present. The upper bound is the core
+    range (a two-tooth comb of the bulk), widened to eight median gaps when that is
+    larger and never beyond the full range: a trial spacing as wide as an outlier's
+    reach collapses the whole comb into one phase arc, whose response near 1 then
+    beat the true comb.
     """
     n = int(sorted_values.size)
     span = float(sorted_values[-1] - sorted_values[0])
     gaps = np.diff(sorted_values)
     gaps = gaps[gaps > 0.0]
     smallest = float(gaps.min()) if gaps.size else span
-    return max(0.5 * smallest, span / (10.0 * n)), span
+    q25, q75 = np.percentile(sorted_values, [25.0, 75.0])
+    spread = 2.0 * float(q75 - q25)
+    core = min(span, spread) if spread > 0.0 else span
+    low = max(0.5 * smallest, core / (10.0 * n))
+    typical = float(np.median(gaps)) if gaps.size else span
+    high = min(span, max(core, 8.0 * typical))
+    return low, max(high, 2.0 * low)
 
 
 def spacing_spectrum(
@@ -255,17 +276,28 @@ def spacing_spectrum(
     Parameters
     ----------
     values : numpy.ndarray
-        Periods in days (or frequencies; the tool is unit-agnostic).
+        Periods in days (or frequencies; the tool is unit-agnostic). Non-finite values
+        are dropped, together with their weights.
     weights : numpy.ndarray, optional
         Per-value weights, normally the mode amplitudes, so strong modes dominate.
+        Aligned with ``values``; a value whose weight is not finite is dropped.
     minimum_spacing, maximum_spacing : float, optional
-        Trial-spacing bounds. Default to half the smallest gap and the full range.
+        Trial-spacing bounds. Default to half the smallest gap and the full range of
+        the bulk of the values (see the notes).
     oversample : int, default 20
         Trial-grid oversampling relative to the natural resolution ``1/range``.
 
     Returns
     -------
     SpacingSpectrum
+
+    Notes
+    -----
+    The default bounds are taken from the bulk of the values (twice their
+    interquartile range, widened to eight median gaps) rather than from their full
+    range, so a single far outlier — a slow signal among pre-whitened g modes — can
+    neither lift the shortest trial spacing above the true one nor open the zero-lag
+    lobe where the whole set collapses onto one phase.
 
     Examples
     --------
@@ -274,17 +306,22 @@ def spacing_spectrum(
     0.03
     """
     v = np.ascontiguousarray(np.asarray(values, dtype=np.float64)).ravel()
-    v = v[np.isfinite(v)]
+    keep = np.isfinite(v)
+    a: FloatArray | None = None
+    if weights is not None:
+        a = np.asarray(weights, dtype=np.float64).ravel()
+        if a.size != v.size:
+            raise ValueError("weights and values must have the same length")
+        keep &= np.isfinite(a)
+        a = a[keep]
+    v = v[keep]
     if v.size < 3:
         raise ValueError("spacing_spectrum needs at least 3 finite values")
     order = np.argsort(v, kind="stable")
     v = v[order]
-    if weights is None:
+    if a is None:
         a = np.ones(v.size, dtype=np.float64)
     else:
-        a = np.asarray(weights, dtype=np.float64).ravel()
-        if a.size != order.size:
-            raise ValueError("weights and values must have the same length")
         a = np.abs(a[order])
         if not np.any(a > 0.0):
             a = np.ones(v.size, dtype=np.float64)
@@ -381,13 +418,18 @@ def _pick_spacing(
     which a weighted response barely notices a widened comb dropping the weak teeth, and
     would promote to a *multiple* of the truth — nor unrelated contaminating peaks,
     which drag an all-values unweighted response around, can distort the decision.
+
+    The member response is only ever read at the peak and in a window of
+    ``2*oversample + 1`` trials around each multiple, so only those are evaluated —
+    the comb response is computed trial by trial, so this is exactly what a
+    whole-grid evaluation would give there, at a fraction of the cost.
     """
     best = int(np.argmax(power))
     members = _comb_members(values, inverse_spacing[best], _COMB_MEMBER_TOL)
     if members.size < 3:
         return best
-    counting = _comb_response(inverse_spacing, members, np.ones_like(members))
-    peak = float(counting[best])
+    ones = np.ones_like(members)
+    peak = float(_comb_response(inverse_spacing[best : best + 1], members, ones)[0])
     if peak <= 0.0:
         return best
     half_width = max(1, int(oversample))
@@ -401,9 +443,10 @@ def _pick_spacing(
         hi = min(int(inverse_spacing.size), index + half_width + 1)
         if lo >= hi:
             continue
-        local = lo + int(np.argmax(counting[lo:hi]))
+        counting = _comb_response(inverse_spacing[lo:hi], members, ones)
+        local = int(np.argmax(counting))
         if counting[local] >= _SUBMULTIPLE_RATIO * peak:
-            chosen = local
+            chosen = lo + local
     return chosen
 
 

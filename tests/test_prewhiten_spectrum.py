@@ -275,3 +275,331 @@ def test_cufinufft_backend_matches_finufft() -> None:
     gpu = amplitude_spectrum(time, value, error, grid=grid, backend="cufinufft")
     assert gpu.backend == "cufinufft"
     assert np.max(np.abs(cpu.amplitude - gpu.amplitude)) < 1e-9
+
+
+# --- regressions ---------------------------------------------------------------
+
+
+def _reference_spectrum(engine: SpectrumEngine, values):
+    """The amplitude/phase/power of the floating-mean LSQ spectrum, written out in full.
+
+    The pre-fix ``SpectrumEngine.spectrum`` arithmetic, kept here so the lean
+    extraction-loop path can be pinned against it bit for bit away from the
+    ill-conditioned zones.
+    """
+    from cuperiod.prewhiten.spectrum import _wrapped_angles  # noqa: F401 (import check)
+
+    w = engine._weight
+    y = np.asarray(values, dtype=np.float64)
+    centred = y - float(np.dot(w, y))
+    yy = float(np.dot(w, centred * centred))
+    yc, ys = engine._base_sums(w * centred)
+    terms = engine._normal_terms()
+    a = (terms.ss * yc - terms.cs * ys) * terms.inv
+    b = (terms.cc * ys - terms.cs * yc) * terms.inv
+    amplitude = np.hypot(a, b)
+    phase = np.mod(np.arctan2(a, b), 2.0 * np.pi)
+    power = np.clip((a * yc + b * ys) / yy, 0.0, 1.0)
+    return amplitude, phase, power, terms
+
+
+@pytest.mark.parametrize("backend", ["numpy", "finufft"])
+def test_lean_scan_matches_the_full_spectrum_bit_for_bit(backend: str) -> None:
+    # PERF-PREWHITEN-02 / PW-A-9: the extraction loop reads only the amplitude and one
+    # power value; the lean scan must give exactly what spectrum() gives.
+    time, value, error = _curve(n=300, span=12.0)
+    engine = SpectrumEngine(time, error, grid=_grid(time, maximum=8.0), backend=backend)
+    scan = engine._scan(value)
+    full = scan.to_spectrum()
+    assert np.array_equal(scan.amplitude, full.amplitude)
+    assert np.array_equal(scan.frequency, full.frequency)
+    index = scan.peak_index()
+    assert index == full.peak_index()
+    assert index is not None
+    assert scan.power_at(index) == full.power[index]
+    assert all(scan.power_at(i) == full.power[i] for i in range(0, full.size, 17))
+    assert scan.refine_peak(index) == full.refine_peak(index)
+    assert scan.noise_at(1.7) == full.noise_at(1.7)
+    # spectrum() is the same computation; finufft's threaded spreading is not
+    # bitwise reproducible from one transform to the next, numpy is.
+    public = engine.spectrum(value)
+    for name in ("amplitude", "phase", "power", "frequency"):
+        if backend == "numpy":
+            assert np.array_equal(getattr(public, name), getattr(full, name)), name
+        else:
+            assert np.allclose(
+                getattr(public, name), getattr(full, name), rtol=0.0, atol=1e-13
+            ), name
+    if backend != "numpy":
+        return
+    # ...and both equal the plain normal-equation arithmetic where it is conditioned.
+    amplitude, phase, power, terms = _reference_spectrum(engine, value)
+    good = ~terms.ill
+    assert np.array_equal(full.amplitude[good], amplitude[good])
+    assert np.array_equal(full.phase[good], phase[good])
+    assert np.array_equal(full.power, power)
+
+
+def test_gram_terms_are_built_lazily_and_only_once(monkeypatch) -> None:
+    # PERF-PREWHITEN-07: the window needs only the base sums; the doubled-grid
+    # transform of the Gram terms belongs to spectrum() and runs once per engine.
+    time, value, error = _curve()
+    grid = _grid(time)
+    calls = {"n": 0}
+    original = SpectrumEngine._doubled_sums
+
+    def spy(self, strengths):
+        calls["n"] += 1
+        return original(self, strengths)
+
+    monkeypatch.setattr(SpectrumEngine, "_doubled_sums", spy)
+    window = spectral_window(time, error, grid=grid, backend="finufft")
+    assert calls["n"] == 0
+    assert window.normalization == "lsq"
+    engine = SpectrumEngine(time, error, grid=grid, backend="finufft")
+    assert calls["n"] == 0
+    engine.spectrum(value)
+    engine.spectrum(value * 2.0)
+    assert calls["n"] == 1
+    # The window of an engine that already ran spectrum() is the same window (to the
+    # last bits finufft's threaded spreading leaves free between two transforms).
+    assert np.allclose(engine.window().amplitude, window.amplitude, rtol=0, atol=1e-15)
+    numpy_engine = SpectrumEngine(time, error, grid=grid, backend="numpy")
+    first = numpy_engine.window().amplitude
+    numpy_engine.spectrum(value)
+    assert np.array_equal(numpy_engine.window().amplitude, first)
+    assert np.array_equal(
+        spectral_window(time, error, grid=grid, backend="numpy").amplitude, first
+    )
+
+
+def test_reused_plan_gives_the_same_doubled_sums_as_a_fresh_one() -> None:
+    # PERF-PREWHITEN-05: the doubled-grid sums re-point the base plan instead of
+    # building a second one; the base plan must be left exactly as it was.
+    time, value, error = _curve()
+    grid = _grid(time)
+    engine = SpectrumEngine(time, error, grid=grid, backend="finufft")
+    before = engine._base_sums(engine._weight)
+    doubled = engine._doubled_sums(engine._weight)
+    after = engine._base_sums(engine._weight)
+    # Bit-for-bit up to finufft's own run-to-run spreading noise (~1e-17).
+    assert np.max(np.abs(before[0] - after[0])) < 1e-15
+    assert np.max(np.abs(before[1] - after[1])) < 1e-15
+    reference = SpectrumEngine(
+        time, error, grid=GridSpec(
+            kind="frequency",
+            values=2.0 * grid.values,
+            uniform=True,
+        ), backend="numpy",
+    )
+    direct = reference._base_sums(reference._weight)
+    assert np.max(np.abs(doubled[0] - direct[0])) < 1e-9
+    assert np.max(np.abs(doubled[1] - direct[1])) < 1e-9
+
+
+def test_cpu_backends_resolve_without_probing_for_a_gpu(monkeypatch) -> None:
+    # PERF-PREWHITEN-06: an explicit CPU request must not import cupy / probe CUDA.
+    import importlib
+
+    spectrum_module = importlib.import_module("cuperiod.prewhiten.spectrum")
+
+    def boom() -> set[str]:
+        raise AssertionError("available_backends() probed the GPU stack")
+
+    monkeypatch.setattr(spectrum_module, "available_backends", boom)
+    assert resolve_spectrum_backend("numpy") == "numpy"
+    assert resolve_spectrum_backend("astropy") == "numpy"
+    assert resolve_spectrum_backend(" NumPy ") == "numpy"
+    assert resolve_spectrum_backend("cpu") in {"finufft", "numpy"}
+    assert resolve_spectrum_backend("CPU") in {"finufft", "numpy"}
+    assert resolve_spectrum_backend("finufft") == "finufft"
+    with pytest.raises(BackendUnavailableError, match="unknown backend"):
+        resolve_spectrum_backend("nonsense")
+
+
+@pytest.mark.parametrize("backend", ["numpy", "finufft"])
+@pytest.mark.parametrize("bad", [np.nan, np.inf])
+def test_non_finite_times_raise_instead_of_crashing(backend: str, bad: float) -> None:
+    # PW-A-8: one NaN/inf timestamp used to give an all-zero spectrum (numpy) or kill
+    # the interpreter inside finufft. It must be a ValueError naming the problem.
+    time, value, error = _curve()
+    time = time.copy()
+    time[7] = bad
+    grid = _grid(np.array([0.0, 10.0]))
+    with pytest.raises(ValueError, match="time"):
+        amplitude_spectrum(time, value, error, grid=grid, backend=backend)
+    with pytest.raises(ValueError, match="time"):
+        spectral_window(time, error, grid=grid, backend=backend)
+
+
+@pytest.mark.parametrize("bad", [0.0, -0.01, np.nan, np.inf])
+def test_unusable_errors_raise(bad: float) -> None:
+    # PW-A-8: a zero or NaN error turned every sum into NaN and the spectrum into an
+    # all-zero array with no exception.
+    time, value, error = _curve()
+    error = error.copy()
+    error[3] = bad
+    with pytest.raises(ValueError, match="error"):
+        amplitude_spectrum(time, value, error, grid=_grid(time), backend="numpy")
+
+
+def test_non_finite_values_raise() -> None:
+    time, value, error = _curve()
+    engine = SpectrumEngine(time, error, grid=_grid(time), backend="numpy")
+    value = value.copy()
+    value[5] = np.nan
+    with pytest.raises(ValueError, match="finite"):
+        engine.spectrum(value)
+
+
+def _regular_noise(seed: int = 0):
+    """Pure white noise on an exact 30-minute cadence (Nyquist 24 c/d)."""
+    time = 2459000.0 + np.arange(1296) / 48.0
+    rng = np.random.default_rng(seed)
+    return time, 10.0 + rng.normal(0.0, 0.001, time.size), np.full(time.size, 0.001)
+
+
+def test_ill_conditioned_frequencies_do_not_produce_giant_lsq_peaks() -> None:
+    # PW-A-1: near k/dt and (k + 1/2)/dt the floating-mean normal equations are nearly
+    # singular; dividing noise by the tiny eigenvalue made peaks 30x the noise there.
+    time, value, error = _regular_noise()
+    grid = uniform_frequency_grid(
+        float(time.max() - time.min()), maximum_frequency=120.0, samples_per_peak=10
+    )
+    spectrum = amplitude_spectrum(time, value, error, grid=grid, backend="finufft")
+    assert spectrum.amplitude.max() < 8.0 * np.median(spectrum.amplitude)
+    # The Deeming (DFT) amplitude is the bounded reference everywhere.
+    deeming = amplitude_spectrum(
+        time, value, error, grid=grid, backend="finufft", normalization="dft"
+    )
+    assert spectrum.amplitude.max() < 3.0 * deeming.amplitude.max()
+
+
+def test_ill_conditioned_zone_reports_the_power_equivalent_amplitude() -> None:
+    time, value, error = _regular_noise(seed=2)
+    grid = uniform_frequency_grid(
+        float(time.max() - time.min()), maximum_frequency=50.0, samples_per_peak=10
+    )
+    engine = SpectrumEngine(time, error, grid=grid, backend="finufft")
+    spectrum = engine.spectrum(value)
+    terms = engine._normal_terms()
+    assert terms.ill.any()  # the Nyquist and 1/dt zones are in band
+    w = engine._weight
+    centred = value - float(np.dot(w, value))
+    yy = float(np.dot(w, centred * centred))
+    expected = np.sqrt(2.0 * yy * spectrum.power[terms.ill])
+    assert np.allclose(spectrum.amplitude[terms.ill], expected, rtol=1e-12, atol=0.0)
+    # A well-conditioned frequency keeps the exact least-squares amplitude.
+    assert not terms.ill[np.searchsorted(grid.values, 7.3)]
+
+
+def test_numpy_direct_sums_match_a_brute_force_sum() -> None:
+    # PERF-PREWHITEN-09: the numpy direct path is a mat-vec now; it must still be the
+    # transparent reference and must not depend on the frequency chunking.
+    from cuperiod.prewhiten.spectrum import _direct_trig_sums
+
+    rng = np.random.default_rng(4)
+    tau = np.sort(rng.uniform(-15.0, 15.0, 700))
+    strengths = rng.normal(size=tau.size) * rng.uniform(0.2, 1.0, tau.size)
+    f0, df, nf = 0.05, 0.013, 900
+    expected = np.exp(
+        2j * np.pi * (f0 + df * np.arange(nf))[:, None] * tau[None, :]
+    ) @ strengths
+    cos_a, sin_a = _direct_trig_sums(np, tau, strengths, f0, df, nf, 4096)
+    cos_b, sin_b = _direct_trig_sums(np, tau, strengths, f0, df, nf, 37)
+    assert np.max(np.abs(cos_a - expected.real)) < 1e-12
+    assert np.max(np.abs(sin_a - expected.imag)) < 1e-12
+    scale = float(np.abs(strengths).sum())
+    assert np.max(np.abs(cos_a - cos_b)) < 1e-15 * scale
+    assert np.max(np.abs(sin_a - sin_b)) < 1e-15 * scale
+
+
+@requires_torch
+def test_float32_direct_path_keeps_its_phase_at_large_f_times_t() -> None:
+    # PW-A-10: forming 2*pi*f*t in float32 loses the phase as f*T grows (14% error at
+    # f*T = 1.4e6); the phases are now reduced in float64 on the host.
+    rng = np.random.default_rng(0)
+    span, frequency = 2000.0, 700.0
+    time = np.sort(rng.uniform(0.0, span, 4000))
+    value = 0.01 * np.sin(2 * np.pi * frequency * time + 0.4) + rng.normal(
+        0.0, 0.001, time.size
+    )
+    df = 1.0 / (10 * span)
+    grid = GridSpec(
+        kind="frequency",
+        values=frequency - 200 * df + df * np.arange(401),
+        uniform=True,
+    )
+    reference = amplitude_spectrum(time, value, None, grid=grid, backend="numpy")
+    single = amplitude_spectrum(
+        time, value, None, grid=grid, backend="torch:cpu", precision="float32"
+    )
+    peak = float(reference.amplitude.max())
+    assert np.max(np.abs(single.amplitude - reference.amplitude)) / peak < 1e-3
+    assert single.peak_index() == reference.peak_index()
+
+
+@requires_torch
+def test_float32_direct_path_short_baseline() -> None:
+    time, value, error = _curve(n=400, span=27.0)
+    grid = _grid(time, maximum=20.0, samples=5)
+    reference = amplitude_spectrum(time, value, error, grid=grid, backend="numpy")
+    single = amplitude_spectrum(
+        time, value, error, grid=grid, backend="torch:cpu", precision="float32"
+    )
+    peak = float(reference.amplitude.max())
+    assert np.max(np.abs(single.amplitude - reference.amplitude)) / peak < 1e-3
+
+
+def test_spectra_compare_by_identity_without_raising() -> None:
+    # PW-B-10: a frozen dataclass of arrays raised on == and hash().
+    time, value, error = _curve()
+    engine = SpectrumEngine(time, error, grid=_grid(time), backend="numpy")
+    first, second = engine.spectrum(value), engine.spectrum(value)
+    assert first == first
+    assert (first == second) is False
+    assert len({first, second}) == 2
+    assert [first, second].index(second) == 1
+
+
+# --- finufft thread count ---------------------------------------------------------
+
+
+class _PlanSpy:
+    """Records the keyword arguments every ``finufft.Plan`` is built with."""
+
+    def __init__(self, real: object) -> None:
+        self.real = real
+        self.kwargs: list[dict[str, object]] = []
+
+    def __call__(self, *args: object, **kwargs: object) -> object:
+        self.kwargs.append(kwargs)
+        return self.real(*args, **kwargs)  # type: ignore[operator]
+
+
+def test_small_finufft_spectrum_runs_on_one_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Waking finufft's thread pool cost ~7x a small transform; one thread is used."""
+    finufft = pytest.importorskip("finufft")
+    spy = _PlanSpy(finufft.Plan)
+    monkeypatch.setattr(finufft, "Plan", spy)
+    time, value, error = _curve(n=300, span=12.0)
+    grid = _grid(time, maximum=8.0)
+    single = SpectrumEngine(time, error, grid=grid, backend="finufft").spectrum(value)
+    assert spy.kwargs and all(k.get("nthreads") == 1 for k in spy.kwargs)
+    direct = amplitude_spectrum(time, value, error, grid=grid, backend="numpy")
+    assert np.max(np.abs(direct.amplitude - single.amplitude)) < 1e-9
+    assert np.max(np.abs(direct.power - single.power)) < 1e-9
+
+
+def test_large_finufft_spectrum_keeps_every_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    finufft = pytest.importorskip("finufft")
+    spy = _PlanSpy(finufft.Plan)
+    monkeypatch.setattr(finufft, "Plan", spy)
+    rng = np.random.default_rng(5)
+    time = np.sort(rng.uniform(0.0, 20.0, 150_001))  # the points alone exceed it
+    SpectrumEngine(time, None, grid=_grid(time, maximum=1.0), backend="finufft")
+    assert spy.kwargs and all("nthreads" not in k for k in spy.kwargs)

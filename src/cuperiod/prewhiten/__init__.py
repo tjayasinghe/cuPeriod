@@ -37,12 +37,27 @@ What it provides
   tilted-pattern extraction, échelle coordinates, buoyancy radius.
 * **Batch pre-whitening** (:mod:`~cuperiod.prewhiten.batch`) over CPU or GPU worker
   pools, written to Parquet/CSV.
+* **Interactive sessions** (:mod:`~cuperiod.prewhiten.session`):
+  :class:`~cuperiod.PreWhitenSession` steps the same extraction one peak at a time and
+  lets every judgement be overridden — add, remove, fix or tie frequencies, delete
+  points, fit zero points per night (:class:`~cuperiod.prewhiten.subsets.Partition`),
+  let amplitudes or phases vary per season — with undo throughout.
 """
 
 from __future__ import annotations
 
+from cuperiod.core.config import SessionSettings
 from cuperiod.prewhiten.batch import batch_prewhiten
 from cuperiod.prewhiten.combinations import Combination, identify_combinations
+from cuperiod.prewhiten.constraints import (
+    ComponentConstraint,
+    ConstraintError,
+    FitConstraints,
+    FitDetail,
+    FitStart,
+    FrequencyTie,
+    Variation,
+)
 from cuperiod.prewhiten.engine import (
     default_maximum_frequency,
     default_prewhiten_grid,
@@ -50,7 +65,16 @@ from cuperiod.prewhiten.engine import (
 )
 from cuperiod.prewhiten.fap import baluev_fap
 from cuperiod.prewhiten.fit import MultiSineFit, fit_multisine
-from cuperiod.prewhiten.result import PreWhitenResult, Sinusoid
+from cuperiod.prewhiten.result import PreWhitenResult, Sinusoid, SubsetSolution
+from cuperiod.prewhiten.session import (
+    PreWhitenSession,
+    ProjectError,
+    SessionError,
+    SessionSnapshot,
+    SessionWarning,
+    StepReport,
+    VariationResult,
+)
 from cuperiod.prewhiten.spacing import (
     PeriodSpacingSeries,
     SpacingSpectrum,
@@ -66,6 +90,7 @@ from cuperiod.prewhiten.spectrum import (
     noise_level,
     spectral_window,
 )
+from cuperiod.prewhiten.subsets import Partition, suggest_partition
 from cuperiod.prewhiten.uncertainty import (
     Uncertainties,
     analytic_uncertainties,
@@ -77,13 +102,30 @@ from cuperiod.prewhiten.uncertainty import (
 __all__ = [
     "AmplitudeSpectrum",
     "Combination",
+    "ComponentConstraint",
+    "ConstraintError",
+    "FitConstraints",
+    "FitDetail",
+    "FitStart",
+    "FrequencyTie",
     "MultiSineFit",
+    "Partition",
     "PeriodSpacingSeries",
     "PreWhitenResult",
+    "PreWhitenSession",
+    "ProjectError",
+    "SessionError",
+    "SessionSettings",
+    "SessionSnapshot",
+    "SessionWarning",
     "Sinusoid",
     "SpacingSpectrum",
     "SpectrumEngine",
+    "StepReport",
+    "SubsetSolution",
     "Uncertainties",
+    "Variation",
+    "VariationResult",
     "amplitude_spectrum",
     "analytic_uncertainties",
     "baluev_fap",
@@ -102,4 +144,5 @@ __all__ = [
     "prewhiten",
     "spacing_spectrum",
     "spectral_window",
+    "suggest_partition",
 ]

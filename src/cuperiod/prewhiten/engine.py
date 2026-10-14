@@ -17,6 +17,11 @@ settings rather than habits.
 Cost is dominated by step 1, and :class:`~cuperiod.prewhiten.spectrum.SpectrumEngine`
 makes it one NUFFT per iteration by caching everything that depends only on sampling.
 Step 3 uses variable projection, so the optimiser only ever sees the ``K`` frequencies.
+
+The loop itself is :mod:`cuperiod.prewhiten.session.stepper` — one ``step`` of a
+:class:`~cuperiod.PreWhitenSession` per iteration, so the automatic run and the
+interactive one cannot drift apart. This module keeps the grid defaults and the
+helpers both share (the acceptance test, the false-alarm probability, the S/N).
 """
 
 from __future__ import annotations
@@ -31,16 +36,25 @@ from cuperiod.core.config import PreWhitenSettings
 from cuperiod.core.errors import InsufficientDataError
 from cuperiod.core.grid import (
     GridSpec,
+    check_grid_size,
     pseudo_nyquist_frequency,
+    regular_cadence_nyquist,
     uniform_frequency_grid,
+    uniform_grid_size,
 )
 from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
-from cuperiod.prewhiten.combinations import Combination, identify_combinations
 from cuperiod.prewhiten.fap import baluev_fap
-from cuperiod.prewhiten.fit import MultiSineFit, fit_multisine
-from cuperiod.prewhiten.result import PreWhitenResult, Sinusoid, amplitude_ratio
-from cuperiod.prewhiten.spectrum import AmplitudeSpectrum, SpectrumEngine
-from cuperiod.prewhiten.uncertainty import component_uncertainties
+from cuperiod.prewhiten.fit import MultiSineFit
+from cuperiod.prewhiten.result import PreWhitenResult
+from cuperiod.prewhiten.spectrum import (
+    _SpectrumReadout,
+)
+
+# Re-exported on purpose: the session's report calls it through this module, so
+# patching engine.component_uncertainties still reaches every pre-whitening run.
+from cuperiod.prewhiten.uncertainty import (
+    component_uncertainties as component_uncertainties,
+)
 
 #: Upper bound on the prune/re-fit passes of the final solution (each strictly shrinks
 #: the component count, so this is a safety net rather than a real limit).
@@ -49,6 +63,12 @@ _MAX_PRUNE_PASSES = 20
 #: How many candidate peaks may be discarded (because their refinement merged into an
 #: existing component) before the run gives up looking for more.
 _MAX_REJECTED_CANDIDATES = 20
+
+#: Amplitudes at or below this many float64 epsilons of the largest ``|value|`` are
+#: rounding noise left by a subtraction, not signal. Measured junk on noise-free and
+#: constant curves reaches ~250 eps, so 1e4 leaves a 40x margin while sitting ~2e-12
+#: of the data's own scale — far below any photometric amplitude.
+_ROUNDOFF_EPS = 1e4
 
 #: Floor of the automatic search band (cycles/day). The median-gap pseudo-Nyquist of
 #: nightly ground-based sampling collapses to a few cycles/day — far below the
@@ -67,6 +87,14 @@ def default_maximum_frequency(time: FloatArray, nyquist_factor: int = 5) -> floa
     put the whole classical-pulsator regime out of band and the extraction would fit
     the daily aliases of the real signal instead.
 
+    A strictly regular cadence (a lattice — gaps and a smooth barycentric timing term
+    allowed, see :func:`cuperiod.core.grid.regular_cadence_nyquist`) has a true Nyquist
+    frequency ``0.5/cadence``, and the band stops there: above it the spectrum mirrors
+    the baseband, every mode has equal-height images at ``k/cadence +/- f``, and the
+    extraction reported whichever image the grid happened to sample best. Space
+    photometry is the common case; set ``maximum_frequency`` explicitly for
+    super-Nyquist work.
+
     Parameters
     ----------
     time : numpy.ndarray
@@ -79,9 +107,11 @@ def default_maximum_frequency(time: FloatArray, nyquist_factor: int = 5) -> floa
     float
         The default ``maximum_frequency`` in cycles/day.
     """
-    return max(
+    automatic = max(
         pseudo_nyquist_frequency(time, nyquist_factor), DEFAULT_MAX_FREQUENCY_FLOOR
     )
+    nyquist = regular_cadence_nyquist(np.asarray(time, dtype=np.float64))
+    return automatic if nyquist is None else min(automatic, nyquist)
 
 
 def default_prewhiten_grid(
@@ -91,9 +121,15 @@ def default_prewhiten_grid(
 
     Runs from ``1/T`` to :func:`default_maximum_frequency` — the pseudo-Nyquist of the
     sampling, floored at :data:`DEFAULT_MAX_FREQUENCY_FLOOR` so short-period pulsators
-    stay in band on sparse ground-based data — oversampled by ``samples_per_peak``
-    (10 by default — a finer grid than a plain period search needs, because each peak's
-    position seeds a non-linear fit).
+    stay in band on sparse ground-based data, and capped at the true Nyquist frequency
+    of a regular cadence — oversampled by ``samples_per_peak`` (10 by default — a finer
+    grid than a plain period search needs, because each peak's position seeds a
+    non-linear fit).
+
+    The size is checked before anything is allocated
+    (:func:`cuperiod.core.grid.check_grid_size`): one stray timestamp (a ``t = 0``
+    placeholder among Julian dates) inflates the baseline, and with it the grid, by
+    orders of magnitude.
 
     Parameters
     ----------
@@ -106,6 +142,18 @@ def default_prewhiten_grid(
     -------
     GridSpec
         A uniform frequency grid.
+
+    Raises
+    ------
+    InsufficientDataError
+        If there is no time baseline or the band is empty.
+    GridTooLargeError
+        If the grid would exceed :data:`cuperiod.core.grid.MAX_GRID_SIZE` samples.
+
+    Warns
+    -----
+    GridSizeWarning
+        If an automatic grid is very large (with a diagnosis of outlying timestamps).
     """
     cfg = settings or PreWhitenSettings()
     finite = lc.finite()
@@ -118,9 +166,31 @@ def default_prewhiten_grid(
     if minimum is None:
         minimum = 1.0 / finite.baseline
     if minimum >= maximum:
+        # An explicit minimum above the automatic maximum is a super-Nyquist request
+        # (or one above the pseudo-Nyquist): say which knob opens that band.
+        hint = (
+            "; the automatic maximum stops at the (pseudo-)Nyquist frequency of the "
+            "sampling, so set maximum_frequency to search above it"
+            if cfg.maximum_frequency is None
+            else ""
+        )
         raise InsufficientDataError(
             f"pre-whitening: empty search band ({minimum} .. {maximum} cycles/day)"
+            f"{hint}"
         )
+    check_grid_size(
+        uniform_grid_size(
+            finite.baseline,
+            maximum_frequency=maximum,
+            minimum_frequency=minimum,
+            samples_per_peak=cfg.samples_per_peak,
+        ),
+        automatic=cfg.maximum_frequency is None,
+        time=finite.time,
+        baseline=finite.baseline,
+        maximum_frequency=maximum,
+        context="pre-whitening default grid",
+    )
     return uniform_frequency_grid(
         finite.baseline,
         maximum_frequency=maximum,
@@ -187,7 +257,7 @@ def _accept(
 
 
 def _component_snr(
-    spectrum: AmplitudeSpectrum, fit: MultiSineFit, settings: PreWhitenSettings
+    spectrum: _SpectrumReadout, fit: MultiSineFit, settings: PreWhitenSettings
 ) -> FloatArray:
     """Breger signal-to-noise of every component against a residual spectrum."""
     out = np.empty(fit.n_components, dtype=np.float64)
@@ -206,7 +276,7 @@ def _component_snr(
 
 
 def _as_light_curve(
-    data: Any, columns: ColumnMap | None, domain: Domain | None
+    data: Any, columns: ColumnMap | None, domain: Domain | str | None
 ) -> LightCurve:
     """Coerce a user input to a single-band :class:`LightCurve`."""
     from cuperiod.api import to_input
@@ -220,6 +290,34 @@ def _as_light_curve(
     return lc
 
 
+def _zero_model_fit(
+    time: FloatArray, value: FloatArray, error: FloatArray | None, t_ref: float
+) -> MultiSineFit:
+    """The empty model ``y = 0`` as a :class:`MultiSineFit` (no free parameter).
+
+    The ``K = 0`` solution of a run with ``fit_mean=False``, whose values have already
+    had their weighted mean removed; :func:`fit_multisine` itself refuses an empty
+    model.
+    """
+    weight = np.ones(time.size) if error is None else 1.0 / (error * error)
+    empty = np.zeros(0, dtype=np.float64)
+    residuals = np.array(value, dtype=np.float64)
+    return MultiSineFit(
+        frequency=empty,
+        amplitude=empty.copy(),
+        phase=empty.copy(),
+        offset=0.0,
+        t_ref=t_ref,
+        residuals=residuals,
+        covariance=np.zeros((0, 0), dtype=np.float64),
+        rss=float(np.dot(weight, residuals * residuals)),
+        n_samples=int(time.size),
+        n_parameters=0,
+        weighted=error is not None,
+        fit_mean=False,
+    )
+
+
 def prewhiten(
     data: Any,
     *,
@@ -227,7 +325,7 @@ def prewhiten(
     grid: GridSpec | None = None,
     backend: str | None = None,
     columns: ColumnMap | None = None,
-    domain: Domain | None = None,
+    domain: Domain | str | None = None,
 ) -> PreWhitenResult:
     """Extract a pulsator's frequency solution automatically.
 
@@ -236,7 +334,7 @@ def prewhiten(
     data : various
         The light curve, in any form :func:`cuperiod.to_input` accepts (a
         :class:`~cuperiod.LightCurve`, a ``(t, y[, dy])`` tuple, a table, ...). Must be
-        a single band.
+        a single band. Rows may come in any order.
     settings : PreWhitenSettings, optional
         Grid, stopping, fitting and uncertainty controls. Defaults are the conservative
         published choices — see :class:`~cuperiod.PreWhitenSettings`.
@@ -257,7 +355,21 @@ def prewhiten(
     Raises
     ------
     InsufficientDataError
-        If the light curve has too few finite points or no time baseline.
+        If the light curve has too few finite points, no time baseline, or an error
+        column with no usable value.
+    GridTooLargeError
+        If the default grid would be unreasonably large (typically a stray timestamp).
+
+    Notes
+    -----
+    Besides the configured stopping criteria, the extraction always stops when another
+    component would leave fewer than half the points as degrees of freedom
+    (``2 (3K + 1) > N``: a sparse curve otherwise interpolates its own noise with
+    ever more sinusoids) and when the residuals are at numerical round-off.
+
+    With ``fit_mean=False`` the offset is not a free parameter of the fits: it is fixed
+    at the weighted mean, which is removed once up front — the same zero point the
+    amplitude spectrum uses — and reported as ``offset`` (with no error).
 
     Examples
     --------
@@ -266,271 +378,22 @@ def prewhiten(
     >>> print(solution.summary())                                  # doctest: +SKIP
     >>> solution.frequency, solution.frequency_error               # doctest: +SKIP
     """
-    cfg = settings or PreWhitenSettings()
-    lc = _as_light_curve(data, columns, domain).finite()
-    n = lc.n
-    if n < cfg.min_detections:
-        raise InsufficientDataError(
-            f"pre-whitening: {n} finite points < min_detections {cfg.min_detections}"
-        )
-    if lc.baseline <= 0.0:
-        raise InsufficientDataError("pre-whitening: no usable time baseline")
+    # The extraction is a session stepped to its stopping rule with nothing edited:
+    # each step is one iteration of the loop this function used to run inline, so
+    # the solution is the same, number for number (tests/test_prewhiten_golden.py).
+    from cuperiod.prewhiten.session import PreWhitenSession
 
-    trial_grid = grid if grid is not None else default_prewhiten_grid(lc, cfg)
-    engine = SpectrumEngine(
-        lc.time,
-        lc.error,
-        grid=trial_grid,
-        normalization=cfg.normalization,
-        backend=backend or cfg.backend,
-        device=cfg.device,
-        precision=cfg.precision,
-        eps=cfg.nufft_eps,
-        freq_batch=cfg.direct_freq_batch,
+    session = PreWhitenSession(
+        data,
+        settings=settings,
+        grid=grid,
+        backend=backend,
+        columns=columns,
+        domain=domain,
+        record=False,
     )
-    time, value, error = lc.time, lc.value, lc.error
-    f_min = float(engine.frequency[0])
-    f_max = float(engine.frequency[-1])
-    grid_low, grid_high = max(0.5 * f_min, 1e-12), f_max
-    separation = cfg.min_separation_rayleigh / lc.baseline
-    max_shift = cfg.refine_bound_rayleigh / lc.baseline
-
-    def refine_bounds(frequencies: FloatArray) -> tuple[FloatArray, FloatArray]:
-        """Per-frequency refinement box: at most one bound width from where it started.
-
-        Without this a refinement started on a modest peak can slide down the wing of a
-        much stronger neighbour and land on top of it, producing near-identical
-        frequencies with enormous, mutually cancelling amplitudes.
-        """
-        low = np.maximum(frequencies - max_shift, grid_low)
-        high = np.minimum(frequencies + max_shift, grid_high)
-        return low, np.maximum(high, np.nextafter(low, np.inf))
-
-    fit = fit_multisine(
-        time, value, error, np.zeros(0),
-        fit_mean=True, t_ref=engine.t_ref, refine="none", covariance=False,
-    )
-    initial_spectrum = engine.spectrum(value)
-    spectrum = initial_spectrum
-    faps: list[float] = []
-    deltas: list[float] = []
-    blocked: list[float] = []
-    stop_reason = f"reached max_frequencies ({cfg.max_frequencies})"
-    iterations = 0
-    max_attempts = cfg.max_frequencies + _MAX_REJECTED_CANDIDATES
-
-    while fit.n_components < cfg.max_frequencies and iterations < max_attempts:
-        iterations += 1
-        avoid = np.concatenate(
-            [fit.frequency, np.asarray(blocked, dtype=np.float64)]
-        )
-        index = spectrum.peak_index(exclude=avoid, separation=separation)
-        if index is None:
-            stop_reason = "no peak resolved from the existing components remains"
-            break
-        f_guess, _ = spectrum.refine_peak(index)
-        candidates = np.append(fit.frequency, f_guess)
-        try:
-            trial = fit_multisine(
-                time, value, error, candidates,
-                fit_mean=cfg.fit_mean,
-                t_ref=engine.t_ref,
-                refine=cfg.refine,
-                sweeps=cfg.sweeps,
-                frequency_bounds=refine_bounds(candidates),
-                max_nfev=cfg.max_nfev,
-                covariance=False,
-            )
-        except (ValueError, np.linalg.LinAlgError) as exc:  # pragma: no cover
-            stop_reason = f"fit failed: {exc}"
-            break
-        new_frequency = float(trial.frequency[-1])
-        if fit.n_components and float(
-            np.min(np.abs(trial.frequency[:-1] - new_frequency))
-        ) < separation:
-            # The refinement merged the candidate into an existing component: the peak
-            # was that component's residual, not a new mode. Block it and look further
-            # down the spectrum rather than abandoning the run.
-            blocked.append(f_guess)
-            continue
-        # Deferred until the candidate survives the collision guard: a discarded
-        # candidate never uses its false-alarm probability.
-        fap = _peak_fap(
-            time, error, float(spectrum.power[index]), f_max=f_max
-        )
-        trial_spectrum = engine.spectrum(trial.residuals)
-        amplitude = float(trial.amplitude[-1])
-        noise = trial_spectrum.noise_at(
-            new_frequency, window=cfg.snr_window, estimator=cfg.noise_estimator
-        )
-        snr = amplitude / noise if np.isfinite(noise) and noise > 0.0 else float("nan")
-        delta_bic = trial.bic - fit.bic
-        accepted, reason = _accept(
-            snr=snr, fap=fap, delta_bic=delta_bic, amplitude=amplitude, settings=cfg
-        )
-        if not accepted:
-            stop_reason = reason
-            break
-        fit, spectrum = trial, trial_spectrum
-        faps.append(fap)
-        deltas.append(delta_bic)
-    else:
-        if cfg.max_frequencies == 0:
-            stop_reason = "max_frequencies is 0"
-        elif iterations >= max_attempts:
-            stop_reason = "too many candidates merged with existing components"
-
-    def polish(frequencies: FloatArray) -> MultiSineFit:
-        """Re-fit at ``frequencies`` as accurately as the component count allows."""
-        return fit_multisine(
-            time, value, error, frequencies,
-            fit_mean=fit.fit_mean,
-            t_ref=engine.t_ref,
-            refine=(
-                "simultaneous"
-                if frequencies.size <= cfg.max_simultaneous
-                else "cyclic"
-            ),
-            sweeps=cfg.sweeps,
-            frequency_bounds=refine_bounds(frequencies),
-            max_nfev=cfg.max_nfev,
-            covariance=True,
-        )
-
-    # The loop only refines each frequency as it is extracted; the polish optimises the
-    # whole solution jointly (or, when there are too many components for that to be
-    # affordable, sweeps them cyclically) so no frequency is left at a stale value.
-    if cfg.final_refine and fit.n_components > 0:
-        fit = polish(np.ascontiguousarray(fit.frequency))
-        spectrum = engine.spectrum(fit.residuals)
-    elif fit.covariance.size == 0:
-        # Every fit inside the loop skips the covariance (it is only needed once); the
-        # accepted solution still has to carry one for the reported uncertainties.
-        fit = fit_multisine(
-            time, value, error, fit.frequency,
-            fit_mean=fit.fit_mean, t_ref=engine.t_ref, refine="none", covariance=True,
-        )
-
-    # The joint polish redistributes power between close components, so a frequency that
-    # cleared the threshold when it was extracted can end up insignificant in the final
-    # solution. Drop those and re-fit until every surviving component passes the same
-    # test it was admitted by; each pass strictly shrinks the solution, so this ends.
-    kept = list(range(fit.n_components))
-    n_pruned = 0
-    if cfg.prune and "snr" in cfg.stop_criteria and fit.n_components:
-        for _ in range(_MAX_PRUNE_PASSES):
-            measured = _component_snr(spectrum, fit, cfg)
-            survivors = [
-                i
-                for i in range(fit.n_components)
-                if measured[i] >= cfg.snr_threshold
-            ]
-            if len(survivors) == fit.n_components:
-                break
-            n_pruned += fit.n_components - len(survivors)
-            kept = [kept[i] for i in survivors]
-            if not survivors:
-                fit = fit_multisine(
-                    time, value, error, np.zeros(0),
-                    fit_mean=True, t_ref=engine.t_ref, refine="none", covariance=True,
-                )
-                spectrum = engine.spectrum(fit.residuals)
-                break
-            fit = polish(fit.frequency[survivors])
-            spectrum = engine.spectrum(fit.residuals)
-        if n_pruned:
-            stop_reason = (
-                f"{stop_reason}; {n_pruned} insignificant component"
-                f"{'' if n_pruned == 1 else 's'} pruned"
-            )
-
-    errors = component_uncertainties(
-        time, error, fit,
-        method=cfg.uncertainty,
-        correlation_correction=cfg.correlation_correction,
-        n_resamples=cfg.n_resamples,
-        seed=cfg.seed,
-        refine=cfg.refine,
-        sweeps=cfg.sweeps,
-        frequency_bounds=refine_bounds(fit.frequency),
-    )
-    snr_final = _component_snr(spectrum, fit, cfg)
-    labels = tuple(f"F{i + 1}" for i in range(fit.n_components))
-    matches: tuple[Combination, ...] = ()
-    if cfg.combinations and fit.n_components > 1:
-        matches = identify_combinations(
-            fit.frequency,
-            fit.amplitude,
-            frequency_error=errors.frequency,
-            labels=labels,
-            rayleigh=1.0 / lc.baseline,
-            max_order=cfg.combination_max_order,
-            max_parents=cfg.combination_parents,
-            tolerance_rayleigh=cfg.combination_tolerance_rayleigh,
-            n_sigma=cfg.combination_sigma,
-        )
-    by_index = {c.index: c.label for c in matches}
-
-    # The spectrum's own reading at each reported frequency: a single-frequency
-    # measurement of the data, independent of the joint fit. Where the two disagree the
-    # component's amplitude is entangled with a correlated neighbour (a close pair, or
-    # far more often an alias sidelobe of the same mode) and means little on its own.
-    direct = initial_spectrum.amplitude_at(fit.frequency)
-    ratios = [
-        amplitude_ratio(float(fit.amplitude[k]), float(direct[k]))
-        for k in range(fit.n_components)
-    ]
-
-    components = tuple(
-        Sinusoid(
-            rank=k + 1,
-            label=labels[k],
-            frequency=float(fit.frequency[k]),
-            frequency_error=float(errors.frequency[k]),
-            amplitude=float(fit.amplitude[k]),
-            amplitude_error=float(errors.amplitude[k]),
-            phase=float(fit.phase[k]),
-            phase_error=float(errors.phase[k]),
-            snr=float(snr_final[k]),
-            fap=faps[kept[k]] if kept[k] < len(faps) else float("nan"),
-            delta_bic=deltas[kept[k]] if kept[k] < len(deltas) else float("nan"),
-            combination=by_index.get(k),
-            spectrum_amplitude=float(direct[k]),
-            blended=bool(
-                ratios[k] > cfg.blend_tolerance
-                or ratios[k] < 1.0 / cfg.blend_tolerance
-            ),
-        )
-        for k in range(fit.n_components)
-    )
-    keep = cfg.store_spectra
-    return PreWhitenResult(
-        components=components,
-        combinations=matches,
-        offset=fit.offset,
-        offset_error=fit.offset_error,
-        t_ref=fit.t_ref,
-        time=time,
-        residuals=fit.residuals,
-        n_samples=n,
-        baseline=lc.baseline,
-        stop_reason=stop_reason,
-        n_iterations=iterations,
-        n_pruned=n_pruned,
-        rms=fit.rms,
-        chi2=fit.chi2,
-        reduced_chi2=fit.reduced_chi2,
-        bic=fit.bic,
-        # The D the estimator actually applied: it returns 1.0 whenever nothing was
-        # inflated, including for the bootstrap, which is never corrected.
-        correlation_factor=errors.correlation_factor,
-        uncertainty_method=cfg.uncertainty,
-        backend=engine.backend,
-        spectrum=initial_spectrum if keep else None,
-        residual_spectrum=spectrum if keep else None,
-        window=engine.window() if keep else None,
-        meta=dict(lc.meta),
-    )
+    session.run()
+    return session.finalize()
 
 
 __all__ = [

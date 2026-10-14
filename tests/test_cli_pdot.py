@@ -361,3 +361,119 @@ def test_pdot_no_ltte_skips_the_light_time_section(tmp_path: Path) -> None:
     assert "phase tracking" in result.stdout
     assert "light-time orbit" not in result.stdout
 
+
+
+# --- usage errors (BATCH-CLI-20) -------------------------------------------------
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "nan"])
+def test_pdot_rejects_a_nonpositive_period(tmp_path: Path, bad: str) -> None:
+    csv, _ = _write_drifting_csv(tmp_path / "drift.csv")
+    result = runner.invoke(
+        app, ["pdot", str(csv), "--backend", "cpu", "--period", bad]
+    )
+    assert result.exit_code == 2, result.output
+    assert "Traceback" not in result.output
+
+
+def test_pdot_batch_rejects_a_bad_period_and_device(tmp_path: Path) -> None:
+    inputs, _ = _write_batch_inputs(tmp_path, n_stars=1)
+    out = tmp_path / "summary.parquet"
+    # Fewer than 4 tracking segments can never fit the quadratic ephemeris.
+    for extra in (["--period", "0"], ["--device", "tpu"], ["--segments", "3"]):
+        result = runner.invoke(
+            app, ["pdot-batch", inputs, "--sink", str(out), "--backend", "cpu", *extra]
+        )
+        assert result.exit_code == 2, result.output
+    assert not out.exists()
+
+
+def test_pdot_missing_file_is_a_usage_error(tmp_path: Path) -> None:
+    result = runner.invoke(app, ["pdot", str(tmp_path / "missing.csv")])
+    assert result.exit_code == 2
+    assert "Traceback" not in result.output
+
+
+def test_pdot_batch_where_everything_fails_exits_1(tmp_path: Path) -> None:
+    lc_dir = tmp_path / "lightcurves"
+    lc_dir.mkdir()
+    for i in range(2):
+        _write_unusable_csv(lc_dir / f"tiny{i}.csv")
+    out = tmp_path / "summary.parquet"
+    result = runner.invoke(
+        app,
+        ["pdot-batch", str(lc_dir / "*.csv"), "--sink", str(out), "--period", "1.0",
+         "--backend", "cpu", "--workers", "1", "--no-profile", *FAST_GRID],
+    )
+    assert result.exit_code == 1, result.output
+    assert "2 failed" in result.stdout
+    assert out.exists()  # the failures are still recorded, in the status column
+
+
+def test_pdot_save_map_reports_the_file_it_wrote(tmp_path: Path) -> None:
+    csv, truth = _write_drifting_csv(tmp_path / "drift.csv")
+    target = tmp_path / "map.dat"
+    result = runner.invoke(
+        app,
+        ["pdot", str(csv), "--period", str(truth["period"]), "--backend", "cpu",
+         "--no-track", *FAST_GRID, "--save-map", str(target)],
+    )
+    assert result.exit_code == 0, result.output
+    written = tmp_path / "map.dat.npz"
+    assert written.exists() and f"Wrote {written}" in result.stdout
+
+
+def test_pdot_batch_rerun_replaces_failure_rows(tmp_path: Path) -> None:
+    # Regression (BATCH-CLI-8): a corrected re-run into the same summary file must
+    # leave one row per star, not the old failure row beside the new "ok" one.
+    import pyarrow.parquet as pq
+
+    inputs, truth = _write_batch_inputs(tmp_path, n_stars=1)
+    broken = _write_unusable_csv(tmp_path / "lightcurves" / "star1.csv")
+    out = tmp_path / "summary.parquet"
+    command = [
+        "pdot-batch", inputs, "--sink", str(out), "--period", str(truth["period"]),
+        "--backend", "cpu", "--workers", "1", "--no-profile", *FAST_GRID,
+    ]
+    first = runner.invoke(app, command)
+    assert first.exit_code == 0 and "1 failed" in first.stdout, first.output
+    _write_drifting_csv(broken)  # the bad file is fixed between the runs
+    second = runner.invoke(app, command)
+    assert second.exit_code == 0, second.output
+    rows = pq.read_table(out).to_pylist()
+    assert sorted(r["key"] for r in rows) == ["star0", "star1"]
+    assert {r["status"] for r in rows} == {"ok"}
+
+
+def test_period_law_table_prints_the_ranking_criterion(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """BIC / dBIC columns are bic_scaled, the value the laws are sorted by.
+
+    The track's errors are understated ten-fold, so bic_scaled and bic differ by
+    about a factor of a hundred and the old plain-bic table would fail here.
+    """
+    import cuperiod as cup
+    from cuperiod.cli.app import _print_period_profile
+
+    time, mag, err, truth = synthetic_period_change(
+        n=N_POINTS, span=SPAN, pdot=PDOT, seed=3
+    )
+    prof = cup.period_profile((time, mag, err), period=truth["period"])
+    fits = cup.compare_period_laws(prof.t_mid, prof.period, 0.1 * prof.period_err)
+    assert len(fits) >= 2
+    assert not np.isclose(fits[1].bic_scaled, fits[1].bic, rtol=0.1)
+    _print_period_profile(prof, fits)
+    rows = re.findall(
+        r"^\s{2}(constant|linear|exponential|singular|pejcha)\s+(\S+)\s+(\S+)\s",
+        capsys.readouterr().out, flags=re.MULTILINE,
+    )
+    assert len(rows) == len(fits)
+    best = fits[0].bic_scaled
+    for (law, bic, dbic), fit in zip(rows, fits, strict=True):
+        assert law == fit.law
+        assert float(bic) == pytest.approx(fit.bic_scaled, rel=1e-3)
+        assert float(dbic) == pytest.approx(fit.bic_scaled - best, rel=1e-2,
+                                            abs=1e-3)
+        if not fit.at_bound:
+            assert float(dbic) >= 0.0

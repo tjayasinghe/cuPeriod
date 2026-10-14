@@ -39,12 +39,15 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Final, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal, get_args
 
 import numpy as np
 
 from cuperiod.core._typing import FloatArray
 from cuperiod.prewhiten.spectrum import weighted_epoch
+
+if TYPE_CHECKING:
+    from cuperiod.prewhiten.constraints import FitConstraints, FitDetail, GroupCodes
 
 #: Frequency-refinement policy.
 Refinement = Literal["none", "last", "cyclic", "simultaneous"]
@@ -52,8 +55,15 @@ Refinement = Literal["none", "last", "cyclic", "simultaneous"]
 #: Relative rank cutoff for the linear solves and the covariance pseudo-inverse.
 _RCOND: Final = 1e-12
 
-#: Widest design still solved through the normal equations (see :func:`_solve`).
+#: Widest design solved through the normal equations without a condition estimate
+#: (see :func:`_solve`).
 _NORMAL_MAX_COLS: Final = 12
+
+#: Smallest LAPACK reciprocal-condition estimate of a wider design's Gram matrix still
+#: solved through the normal equations; anything worse goes to the pivoted QR. With
+#: one corrected-semi-normal step the solve is QR-accurate while ``cond(X)^2 * eps``
+#: stays far below one, which this guarantees.
+_NORMAL_RCOND: Final = 1e-10
 
 #: Convergence tolerances for the frequency optimiser. A frequency is worth knowing to
 #: perhaps a hundredth of its uncertainty, which is ~1e-8 relative even for a long,
@@ -67,6 +77,51 @@ _GTOL: Final = 1e-11
 _COV_BLOCK_ELEMS: Final = 1 << 20
 
 _TWO_PI: Final = 2.0 * np.pi
+
+
+def _check_inputs(
+    t: FloatArray,
+    y: FloatArray,
+    error: FloatArray | None,
+    freqs: FloatArray,
+    refine: str,
+) -> None:
+    """Reject inputs that would otherwise fail deep inside the solvers.
+
+    A zero or NaN error or a NaN value used to surface as ``LinAlgError: Eigenvalues
+    did not converge`` from the covariance, a short error array as a shape error from a
+    matrix product, and a negative start frequency was silently clipped to 1e-12 by the
+    refinement box. ``O(N)``, negligible next to building the design.
+    """
+    if refine not in get_args(Refinement):
+        raise ValueError(
+            f"unknown refine policy {refine!r}; choose from {get_args(Refinement)}"
+        )
+    if t.size == 0:
+        raise ValueError("fit_multisine needs at least one point")
+    if not (np.all(np.isfinite(t)) and np.all(np.isfinite(y))):
+        raise ValueError(
+            "time and value must be finite; drop the other points first "
+            "(LightCurve.finite() does)"
+        )
+    if error is not None:
+        dy = np.asarray(error, dtype=np.float64)
+        if dy.shape != t.shape:
+            raise ValueError("error and time must have the same length")
+        if not np.all(np.isfinite(dy) & (dy > 0.0)):
+            raise ValueError(
+                "every error must be finite and positive; drop the other points "
+                "first (LightCurve.finite() does)"
+            )
+    if not np.all(np.isfinite(freqs)):
+        raise ValueError("frequencies must be finite")
+    # A fixed negative frequency is just a sign-flipped sinusoid, but refinement boxes
+    # are built on positive frequencies.
+    if refine != "none" and np.any(freqs <= 0.0):
+        raise ValueError(
+            "frequencies to be refined must be positive (pass refine='none' to fit "
+            "fixed frequencies as given)"
+        )
 
 
 def _as_weights(
@@ -85,16 +140,18 @@ def _design(dt: FloatArray, freqs: FloatArray, fit_mean: bool) -> FloatArray:
     """The ``(N, 2K + 1)`` linear design ``[cos_1, sin_1, ..., cos_K, sin_K, 1]``.
 
     Built one frequency at a time so no ``(N, K)`` angle matrix is ever materialised —
-    the same total trigonometric work with bounded transient memory.
+    the same total trigonometric work with bounded transient memory. Column-major, so
+    each column is written in place and every per-column read (the cyclic sweep, the
+    variable-projection Jacobian) is contiguous.
     """
     n = int(dt.size)
     k = int(freqs.size)
     ncol = 2 * k + (1 if fit_mean else 0)
-    x = np.empty((n, max(ncol, 1)), dtype=np.float64)
+    x = np.empty((n, max(ncol, 1)), dtype=np.float64, order="F")
     for j in range(k):
         theta = (_TWO_PI * float(freqs[j])) * dt
-        x[:, 2 * j] = np.cos(theta)
-        x[:, 2 * j + 1] = np.sin(theta)
+        np.cos(theta, out=x[:, 2 * j])
+        np.sin(theta, out=x[:, 2 * j + 1])
     if fit_mean:
         x[:, -1] = 1.0
     return x[:, :ncol]
@@ -103,23 +160,33 @@ def _design(dt: FloatArray, freqs: FloatArray, fit_mean: bool) -> FloatArray:
 def _solve(design: FloatArray, rhs: FloatArray) -> Any:
     """Least-squares solution of ``design @ b = rhs`` (multi-RHS, rank-revealing).
 
-    Narrow designs — every evaluation of the cyclic refinement's three-column
-    sub-problem, which is where the extraction loop spends most of its time — go through
-    the normal equations with a Cholesky factorisation. Forming ``X^T X`` squares the
-    condition number, but a few trigonometric columns are conditioned like ``O(1)``
-    so the squared condition number is still negligible, and a Gram-diagonal guard
-    plus Cholesky's own positive-definiteness check catches the degenerate cases. That
-    is several times faster than a QR of the tall matrix.
+    Designs go through the normal equations with a Cholesky factorisation whenever
+    that is safe. Forming ``X^T X`` squares the condition number, but trigonometric
+    columns of resolved frequencies are conditioned like ``O(1)``, so the squared
+    condition number is still negligible: narrow designs — every evaluation of the
+    cyclic refinement's three-column sub-problem — need only a Gram-diagonal guard
+    plus Cholesky's own positive-definiteness check; wider ones (six or more
+    components) also need a LAPACK condition estimate and get one corrected
+    semi-normal refinement step. Either is several times faster than a QR of the tall
+    matrix.
 
-    Everything wider falls back to ``gelsy``, a column-pivoted QR: about the cost of a
-    plain QR — far less than the SVD-based drivers — while still truncating
+    Anything the guards doubt falls back to ``gelsy``, a column-pivoted QR: about the
+    cost of a plain QR — far less than the SVD-based drivers — while still truncating
     rank-deficient directions, which matters when two trial frequencies drift close
     enough to make the design singular.
     """
-    if design.shape[1] <= _NORMAL_MAX_COLS and design.shape[0] >= design.shape[1]:
-        solution = _solve_normal(design, rhs)
+    factor = _factor_normal(design)
+    if factor is not None:
+        solution = _solve_factored(
+            factor, design, rhs, refine=design.shape[1] > _NORMAL_MAX_COLS
+        )
         if solution is not None:
             return solution
+    return _solve_qr(design, rhs)
+
+
+def _solve_qr(design: FloatArray, rhs: FloatArray) -> Any:
+    """Rank-revealing least squares by column-pivoted QR (``gelsy``)."""
     from scipy.linalg import lstsq
 
     return lstsq(
@@ -127,10 +194,18 @@ def _solve(design: FloatArray, rhs: FloatArray) -> Any:
     )[0]
 
 
-def _solve_normal(design: FloatArray, rhs: FloatArray) -> Any:
-    """Normal-equation solve, or ``None`` when the design looks degenerate."""
-    from scipy.linalg import LinAlgError, cho_factor, cho_solve
+def _factor_normal(design: FloatArray) -> Any:
+    """Cholesky factor of ``design.T @ design``, or ``None`` when that is not safe.
 
+    ``None`` for a design with fewer rows than columns, a non-finite or tiny Gram
+    diagonal, a Gram matrix Cholesky rejects, or — for designs wider than
+    :data:`_NORMAL_MAX_COLS` — a LAPACK reciprocal-condition estimate below
+    :data:`_NORMAL_RCOND` (two frequencies that drifted together).
+    """
+    from scipy.linalg import LinAlgError, cho_factor
+
+    if design.shape[0] < design.shape[1]:
+        return None
     gram = design.T @ design
     diagonal = np.diag(gram)
     if not np.all(np.isfinite(diagonal)):
@@ -140,9 +215,42 @@ def _solve_normal(design: FloatArray, rhs: FloatArray) -> Any:
         return None
     try:
         factor = cho_factor(gram, lower=True, check_finite=False)
-        solution = cho_solve(factor, design.T @ rhs, check_finite=False)
     except (LinAlgError, ValueError):
         return None
+    if design.shape[1] > _NORMAL_MAX_COLS and not (
+        _reciprocal_condition(factor, gram) > _NORMAL_RCOND
+    ):
+        return None
+    return factor
+
+
+def _reciprocal_condition(factor: Any, gram: FloatArray) -> float:
+    """LAPACK ``dpocon`` estimate of ``1/cond_1(gram)`` from its Cholesky factor."""
+    anorm = float(np.abs(gram).sum(axis=0).max())
+    try:
+        from scipy.linalg.lapack import dpocon
+    except ImportError:  # pragma: no cover - every supported SciPy ships it
+        values = np.linalg.eigvalsh(gram)
+        return float(values[0] / values[-1]) if values[-1] > 0.0 else 0.0
+    rcond, info = dpocon(factor[0], anorm, uplo="L")
+    return float(rcond) if info == 0 else 0.0
+
+
+def _solve_factored(
+    factor: Any, design: FloatArray, rhs: FloatArray, *, refine: bool
+) -> Any:
+    """Solve with a :func:`_factor_normal` factor; ``None`` if the result is not finite.
+
+    ``refine`` adds one corrected-semi-normal-equations step (Björck), which restores
+    QR-level accuracy for the conditioning :func:`_factor_normal` admits.
+    """
+    from scipy.linalg import cho_solve
+
+    solution = cho_solve(factor, design.T @ rhs, check_finite=False)
+    if refine:
+        solution = solution + cho_solve(
+            factor, design.T @ (rhs - design @ solution), check_finite=False
+        )
     return solution if np.all(np.isfinite(solution)) else None
 
 
@@ -163,7 +271,9 @@ class _VarPro:
     built *lazily*: the residual costs one multi-column least-squares solve, the
     Jacobian projection a second, ``K``-column one, and a trust-region step the
     optimiser rejects only ever asks for the residual — so rejected steps (frequent in
-    tightly bounded fits near close pairs) never pay for derivatives.
+    tightly bounded fits near close pairs) never pay for derivatives. Both solves share
+    one design matrix, so the projection reuses the residual's Cholesky factor rather
+    than factorising the design a second time.
     """
 
     def __init__(
@@ -175,6 +285,7 @@ class _VarPro:
         self._fit_mean = fit_mean
         self._key: bytes | None = None
         self._jac_key: bytes | None = None
+        self._factor: Any = None
         self._design: FloatArray = np.zeros((0, 0), dtype=np.float64)
         self._design_w: FloatArray = np.zeros((0, 0), dtype=np.float64)
         self._beta: FloatArray = np.zeros(0, dtype=np.float64)
@@ -187,9 +298,21 @@ class _VarPro:
             return
         design = _design(self._dt, freqs, self._fit_mean)
         design_w = design * self._sw[:, None]
-        beta = _solve(design_w, self._yw)
+        factor = _factor_normal(design_w)
+        beta = (
+            None
+            if factor is None
+            else _solve_factored(
+                factor, design_w, self._yw,
+                refine=design_w.shape[1] > _NORMAL_MAX_COLS,
+            )
+        )
+        if beta is None:
+            factor = None
+            beta = _solve_qr(design_w, self._yw)
         self._residual = self._yw - design_w @ beta
         self._design, self._design_w, self._beta = design, design_w, beta
+        self._factor = factor
         self._key = key
 
     def fun(self, freqs: FloatArray) -> FloatArray:
@@ -205,15 +328,20 @@ class _VarPro:
             n = int(self._dt.size)
             a, b, _ = _split_linear(self._beta, k, self._fit_mean)
             # d/df_k of the k-th component: 2*pi*dt * (b_k cos - a_k sin).
-            deriv = np.empty((n, k), dtype=np.float64)
+            deriv = np.empty((n, k), dtype=np.float64, order="F")
             scaled_dt = (_TWO_PI * self._dt) * self._sw
             for j in range(k):
                 deriv[:, j] = scaled_dt * (
                     b[j] * self._design[:, 2 * j] - a[j] * self._design[:, 2 * j + 1]
                 )
-            self._jacobian = -(
-                deriv - self._design_w @ _solve(self._design_w, deriv)
+            coef = (
+                None
+                if self._factor is None
+                else _solve_factored(self._factor, self._design_w, deriv, refine=False)
             )
+            if coef is None:
+                coef = _solve_qr(self._design_w, deriv)
+            self._jacobian = -(deriv - self._design_w @ coef)
             self._jac_key = self._key
         return self._jacobian
 
@@ -288,18 +416,24 @@ def _cyclic_refine(
     max_nfev: int,
     sweeps: int,
     indices: Sequence[int] | None = None,
-) -> FloatArray:
+) -> tuple[FloatArray, FloatArray]:
     """Block coordinate descent over the frequencies (see the module docstring).
 
     ``indices`` restricts the sweep to a subset — the ``"last"`` policy passes just the
     newest frequency — while the linear parameters are always re-solved for *all* of
     them.
+
+    Returns the refined frequencies and the design at them: its refined columns were
+    rebuilt in place from the same expressions :func:`_design` uses, so the caller's
+    final joint solve needs no second pass of ``2K`` trigonometric columns.
     """
     freqs = np.ascontiguousarray(freqs, dtype=np.float64).copy()
     k = int(freqs.size)
     targets = range(k) if indices is None else indices
+    # Built once: every refined column is rewritten in place below from the expression
+    # _design uses, so the design stays current across sweeps without a rebuild.
+    design = _design(dt, freqs, fit_mean)
     for _ in range(max(1, sweeps)):
-        design = _design(dt, freqs, fit_mean)
         beta = _solve(design * sw[:, None], yw)
         model = design @ beta
         for j in targets:
@@ -327,7 +461,7 @@ def _cyclic_refine(
             design[:, 2 * j + 1] = sub_design[:, 1]
             beta[2 * j] = sub_beta[0]
             beta[2 * j + 1] = sub_beta[1]
-    return freqs
+    return freqs, design
 
 
 def _normal_matrix(
@@ -376,22 +510,87 @@ def _covariance(
     Scaling by the reduced chi-square is deliberate: it makes the uncertainties correct
     when no error bars were supplied (the noise level comes from the fit itself) and
     robust to the common case of survey error bars mis-scaled by a constant factor.
+
+    The pseudo-inverse is taken of the *Jacobi-scaled* matrix ``D^-1 G D^-1`` with
+    ``D = sqrt(diag G)``. The natural parameters differ wildly in scale — ``d/df`` grows
+    like ``2 pi A T``, ``d/dA`` is ~1, ``d/dphi`` ~A — so the raw eigenvalues of ``G``
+    span many decades even when the parameters are perfectly well determined, and a
+    relative cutoff on them silently zeroed the variance of a weak mode's phase on a
+    long baseline, or of every amplitude in flux units. Scaled, the matrix has a
+    condition number of order one and the cutoff only removes genuinely degenerate
+    directions. A parameter whose column is identically zero (the frequency and phase
+    of a component of exactly zero amplitude) is undetermined: NaN, not zero.
     """
     if gram.size == 0:
         return gram
     dof = n_samples - n_parameters
     scale = rss / dof if dof > 0 else float("nan")
-    values, vectors = np.linalg.eigh(gram)
+    norms = np.sqrt(np.clip(np.diag(gram), 0.0, None))
+    live = norms > 0.0
+    norms = np.where(live, norms, 1.0)
+    values, vectors = np.linalg.eigh(gram / np.outer(norms, norms))
     cutoff = _RCOND * float(max(values.max(), 0.0))
     keep = values > cutoff
     inverse_values = np.where(keep, 1.0 / np.where(keep, values, 1.0), 0.0)
-    covariance: FloatArray = (vectors * inverse_values) @ vectors.T
+    covariance: FloatArray = ((vectors * inverse_values) @ vectors.T) / np.outer(
+        norms, norms
+    )
+    if not np.all(live):
+        dead = ~live
+        covariance[dead, :] = np.nan
+        covariance[:, dead] = np.nan
     return covariance * scale
 
 
-@dataclass(frozen=True)
+def _parameter_covariance(
+    dt: FloatArray,
+    w: FloatArray,
+    sw: FloatArray,
+    freqs: FloatArray,
+    amps: FloatArray,
+    phases: FloatArray,
+    fit_mean: bool,
+    *,
+    rss: float,
+    n_samples: int,
+    n_parameters: int,
+) -> FloatArray:
+    """Covariance of ``[f, A, phi(, c0)]`` with the phases referenced to ``dt = 0``.
+
+    The normal matrix is accumulated about the weighted-mean epoch, where each phase
+    is uncorrelated with its frequency, and the result is carried back to the caller's
+    epoch exactly: ``phi_ref = phi_c - 2 pi f D`` for an epoch ``D`` days earlier,
+    i.e. ``C_ref = T C_c T^T`` with ``T[phi_k, f_k] = -2 pi D``. Built directly about a
+    distant epoch (``t_ref = 0`` on Julian dates) the phase and frequency columns are
+    collinear to working precision and the frequency error itself collapsed.
+    """
+    total = float(w.sum())
+    shift = float(np.dot(w, dt) / total) if total > 0.0 and dt.size else 0.0
+    gram = _normal_matrix(
+        dt - shift, sw, freqs, amps, phases + _TWO_PI * freqs * shift, fit_mean
+    )
+    cov = _covariance(gram, rss=rss, n_samples=n_samples, n_parameters=n_parameters)
+    k = int(freqs.size)
+    if cov.size == 0 or k == 0 or shift == 0.0:
+        return cov
+    # T C T^T for T = I + s E (E picks f_k into phi_k), written as row and column
+    # updates: a matrix product would spread an undetermined parameter's NaN through
+    # 0 * NaN into every entry.
+    lever = -_TWO_PI * shift
+    freq_rows, phase_rows = slice(0, k), slice(2 * k, 3 * k)
+    cov[phase_rows, :] += lever * cov[freq_rows, :]
+    cov[:, phase_rows] += lever * cov[:, freq_rows]
+    return cov
+
+
+# Equality is identity (eq=False): the generated __eq__ would compare the arrays and
+# raise on their ambiguous truth value, and frozen+eq would make hash() fail on them.
+@dataclass(frozen=True, eq=False)
 class MultiSineFit:
     """The fitted multi-sinusoid solution for one light curve.
+
+    Compares (and hashes) by identity; compare the arrays to test two fits for equal
+    content.
 
     Attributes
     ----------
@@ -414,6 +613,15 @@ class MultiSineFit:
         Sample and free-parameter counts (``M = 3K + 1``).
     weighted : bool
         Whether inverse-variance weights were used.
+    fit_mean : bool
+        Whether the fit had a free constant (or per-subset zero points).
+    detail : FitDetail or None
+        What a constrained fit knows beyond these fields (per-subset values, flags,
+        the covariance of the free natural parameters); ``None`` for an unconstrained
+        fit. Under constraints ``frequency``/``amplitude``/``phase`` are headline
+        values, ``amplitude`` is negative only under a fixed phase, ``offset`` is the
+        weight-averaged zero point and ``n_parameters`` counts the *free* natural
+        parameters, so a fixed or tied parameter costs nothing in the BIC.
     """
 
     frequency: FloatArray
@@ -428,6 +636,7 @@ class MultiSineFit:
     n_parameters: int
     weighted: bool
     fit_mean: bool = True
+    detail: FitDetail | None = None
 
     @property
     def n_components(self) -> int:
@@ -516,12 +725,72 @@ class MultiSineFit:
         theta = _TWO_PI * float(self.frequency[index]) * dt + float(self.phase[index])
         return float(self.amplitude[index]) * np.sin(theta)
 
-    def model(self, time: FloatArray, *, include_offset: bool = True) -> FloatArray:
-        """The full model evaluated at ``time``."""
+    def model(
+        self,
+        time: FloatArray,
+        *,
+        include_offset: bool = True,
+        offset_groups: GroupCodes | None = None,
+        variation_groups: GroupCodes | None = None,
+    ) -> FloatArray:
+        """The full model evaluated at ``time``.
+
+        Without group arrays this is the headline model (one amplitude, phase and
+        offset per component). For a constrained fit with per-subset zero points or
+        amplitudes/phases, pass the subset codes of the points in ``time``
+        (``offset_groups``, ``variation_groups``, as given to the fit) to evaluate the
+        exact model.
+        """
+        if self.detail is None or (offset_groups is None and variation_groups is None):
+            t = np.asarray(time, dtype=np.float64)
+            out = np.full(
+                t.shape, self.offset if include_offset else 0.0, dtype=np.float64
+            )
+            for k in range(self.n_components):
+                out += self.component(k, t)
+            return out
+        return self._exact_model(
+            time, include_offset=include_offset, offset_groups=offset_groups,
+            variation_groups=variation_groups,
+        )
+
+    def _exact_model(
+        self,
+        time: FloatArray,
+        *,
+        include_offset: bool,
+        offset_groups: GroupCodes | None,
+        variation_groups: GroupCodes | None,
+    ) -> FloatArray:
+        """The model with per-subset zero points, amplitudes and phases."""
+        detail = self.detail
+        assert detail is not None
         t = np.asarray(time, dtype=np.float64)
-        out = np.full(t.shape, self.offset if include_offset else 0.0, dtype=np.float64)
+        dt = t - self.t_ref
+        out = np.zeros(t.shape, dtype=np.float64)
+        if include_offset:
+            if offset_groups is not None and detail.subset_offset is not None:
+                codes = np.asarray(offset_groups).astype(np.int64)
+                out += detail.subset_offset[codes]
+            else:
+                out += self.offset
+        constraints = detail.constraints
+        vcodes = (
+            np.asarray(variation_groups).astype(np.int64)
+            if variation_groups is not None and detail.subset_amplitude is not None
+            else None
+        )
         for k in range(self.n_components):
-            out += self.component(k, t)
+            comp = constraints.component(k)
+            theta = _TWO_PI * float(self.frequency[k]) * dt
+            if vcodes is not None and comp.variation != "none":
+                assert detail.subset_amplitude is not None
+                assert detail.subset_phase is not None
+                amp = detail.subset_amplitude[k][vcodes]
+                phase = detail.subset_phase[k][vcodes]
+                out += amp * np.sin(theta + phase)
+            else:
+                out += float(self.amplitude[k]) * np.sin(theta + float(self.phase[k]))
         return out
 
 
@@ -538,6 +807,7 @@ def fit_multisine(
     frequency_bounds: tuple[Any, Any] | None = None,
     max_nfev: int = 200,
     covariance: bool = True,
+    constraints: FitConstraints | None = None,
 ) -> MultiSineFit:
     """Fit ``y = c0 + sum_k A_k sin(2 pi f_k (t - t_ref) + phi_k)``.
 
@@ -572,10 +842,28 @@ def fit_multisine(
         Optimiser evaluation cap per non-linear solve.
     covariance : bool, default True
         Compute the parameter covariance (the source of the reported uncertainties).
+    constraints : FitConstraints, optional
+        Fixed frequencies, amplitudes and phases, frequency ties, per-subset zero
+        points, amplitudes and phases, and relative point weights (see
+        :mod:`cuperiod.prewhiten.constraints`). ``None`` or a trivial set (all free, no
+        arrays) runs the unconstrained fit above unchanged; anything else is solved by
+        the general variable-projection kernel and the result carries
+        :attr:`MultiSineFit.detail`.
 
     Returns
     -------
     MultiSineFit
+
+    Raises
+    ------
+    ValueError
+        For mismatched lengths, no points, a non-finite time or value, an error that
+        is not finite and positive (drop such points first, e.g. with
+        :meth:`cuperiod.LightCurve.finite`), a non-finite frequency, a non-positive
+        frequency to be refined, or an unknown ``refine`` policy.
+    ConstraintError
+        For constraints that are contradictory, cyclic or unsupported by the data (a
+        subclass of ``ValueError``).
 
     Examples
     --------
@@ -587,8 +875,18 @@ def fit_multisine(
     if t.shape != y.shape:
         raise ValueError("time and value must have the same length")
     freqs = np.ascontiguousarray(np.asarray(frequencies, dtype=np.float64)).ravel()
+    if constraints is not None and not constraints.is_trivial():
+        from cuperiod.prewhiten._constrained import fit_constrained
+
+        return fit_constrained(
+            t, y, error, freqs, constraints=constraints, fit_mean=fit_mean,
+            t_ref=t_ref, refine=refine, sweeps=sweeps,
+            frequency_bounds=frequency_bounds, max_nfev=max_nfev,
+            covariance=covariance,
+        )
     if freqs.size == 0 and not fit_mean:
         raise ValueError("fit_multisine needs at least one frequency or fit_mean=True")
+    _check_inputs(t, y, error, freqs, refine)
     n = int(t.size)
     w, sw, weighted = _as_weights(n, error)
     ref = weighted_epoch(t, w) if t_ref is None else float(t_ref)
@@ -606,20 +904,22 @@ def fit_multisine(
         raw_bounds = (1e-12, 1.0)
     bounds = _normalize_bounds(raw_bounds, int(freqs.size))
 
+    design: FloatArray | None = None
     if freqs.size and refine == "simultaneous":
         freqs = _optimize_frequencies(
             dt, yw, sw, freqs,
             fit_mean=fit_mean, bounds=bounds, scale=rayleigh, max_nfev=max_nfev,
         )
     elif freqs.size and refine in {"cyclic", "last"}:
-        freqs = _cyclic_refine(
+        freqs, design = _cyclic_refine(
             dt, y, yw, sw, freqs,
             fit_mean=fit_mean, bounds=bounds, scale=rayleigh,
             max_nfev=max_nfev, sweeps=1 if refine == "last" else sweeps,
             indices=(int(freqs.size) - 1,) if refine == "last" else None,
         )
 
-    design = _design(dt, freqs, fit_mean)
+    if design is None:
+        design = _design(dt, freqs, fit_mean)
     beta = _solve(design * sw[:, None], yw)
     a, b, offset = _split_linear(beta, int(freqs.size), fit_mean)
     amplitude = np.hypot(a, b)
@@ -629,9 +929,9 @@ def fit_multisine(
     n_parameters = int(3 * freqs.size + (1 if fit_mean else 0))
 
     if covariance:
-        gram = _normal_matrix(dt, sw, freqs, amplitude, phase, fit_mean)
-        cov = _covariance(
-            gram, rss=rss, n_samples=n, n_parameters=n_parameters
+        cov = _parameter_covariance(
+            dt, w, sw, freqs, amplitude, phase, fit_mean,
+            rss=rss, n_samples=n, n_parameters=n_parameters,
         )
     else:
         cov = np.zeros((0, 0), dtype=np.float64)

@@ -70,6 +70,27 @@ class Sinusoid:
     blended : bool
         Whether :attr:`amplitude_ratio` falls outside the run's
         :attr:`~cuperiod.PreWhitenSettings.blend_tolerance`.
+    fixed : str
+        Which of frequency, amplitude and phase were held fixed in an interactive
+        session: a subset of ``"fAp"`` (``""`` when nothing was).
+    tied : str or None
+        The tie expression (``"F1 + F2"``) when the frequency was tied.
+    variation : str
+        ``"none"``, or which of ``"amplitude"``, ``"phase"`` or ``"both"`` took one
+        value per subset; the headline :attr:`amplitude` and :attr:`phase` are then
+        the coherent (phasor-mean) values.
+    amplitude_rms : float or None
+        The RMS of the per-subset amplitudes of a varying component — what its S/N and
+        blend check use; ``None`` for a common component.
+    flags : tuple of str
+        Diagnostics of the constrained fit (``"fixed_phi"``, ``"tied"``,
+        ``"negative_amplitude"``, ``"low_frequency"``, ...).
+
+    Notes
+    -----
+    :attr:`amplitude` is never negative. A fit with a fixed phase can return a negative
+    amplitude (the data want the opposite phase); the reported component is then
+    ``|A|`` with the fixed phase plus pi and the flag ``"negative_amplitude"``.
     """
 
     rank: int
@@ -86,6 +107,11 @@ class Sinusoid:
     combination: str | None = None
     spectrum_amplitude: float = float("nan")
     blended: bool = False
+    fixed: str = ""
+    tied: str | None = None
+    variation: str = "none"
+    amplitude_rms: float | None = None
+    flags: tuple[str, ...] = ()
 
     @property
     def period(self) -> float:
@@ -118,8 +144,33 @@ class Sinusoid:
         """
         return amplitude_ratio(self.amplitude, self.spectrum_amplitude)
 
-    def to_dict(self) -> dict[str, Any]:
-        """Flatten to a plain dict (also the batch/CSV row layout)."""
+    @property
+    def has_constraint(self) -> bool:
+        """Whether the component was fixed, tied or allowed to vary per subset."""
+        return bool(self.fixed) or self.tied is not None or self.variation != "none"
+
+    def to_dict(self, *, constraints: bool = False) -> dict[str, Any]:
+        """Flatten to a plain dict (also the batch/CSV row layout).
+
+        Parameters
+        ----------
+        constraints : bool, default False
+            Append the interactive-session keys (``fixed``, ``tied``, ``variation``,
+            ``amplitude_rms``, ``flags`` as one comma-separated string). The default
+            keeps the v1.3 row layout.
+        """
+        row = self._base_dict()
+        if constraints:
+            row.update(
+                fixed=self.fixed,
+                tied=self.tied,
+                variation=self.variation,
+                amplitude_rms=self.amplitude_rms,
+                flags=",".join(self.flags),
+            )
+        return row
+
+    def _base_dict(self) -> dict[str, Any]:
         return {
             "rank": self.rank,
             "label": self.label,
@@ -141,9 +192,98 @@ class Sinusoid:
         }
 
 
-@dataclass(frozen=True)
+def _float_list(values: FloatArray) -> list[Any]:
+    """Nested float lists of an array (NaN stays a float NaN)."""
+    out: list[Any] = np.asarray(values, dtype=np.float64).tolist()
+    return out
+
+
+@dataclass(frozen=True, eq=False)
+class SubsetSolution:
+    """Per-subset zero points, amplitudes and phases of an interactive session.
+
+    Two partitions of the points can be in use at once: one supplies a fitted zero
+    point per subset (``offsets_by``, e.g. nights), the other per-subset amplitudes
+    and/or phases of the components told to vary (``variation_by``, e.g. seasons).
+    Either may be absent. Per-subset amplitudes are *signed*: a negative entry is a
+    real pi reversal of that subset relative to the headline phase.
+
+    Attributes
+    ----------
+    offsets_by : str or None
+        Name of the zero-point partition.
+    offset_labels : tuple of str
+        Its subset labels.
+    offset, offset_error : numpy.ndarray
+        ``(S_o,)`` zero points and their errors (NaN for a subset with no point in use).
+    variation_by : str or None
+        Name of the variation partition.
+    variation_labels : tuple of str
+        Its subset labels.
+    amplitude, amplitude_error, phase, phase_error : numpy.ndarray
+        ``(K, S_v)``, one row per component; NaN where a quantity does not vary.
+    """
+
+    offsets_by: str | None
+    offset_labels: tuple[str, ...]
+    offset: FloatArray
+    offset_error: FloatArray
+    variation_by: str | None
+    variation_labels: tuple[str, ...]
+    amplitude: FloatArray
+    amplitude_error: FloatArray
+    phase: FloatArray
+    phase_error: FloatArray
+
+    def to_dict(self) -> dict[str, Any]:
+        """Plain nested lists (NaN stays a float), inverted by :meth:`from_dict`."""
+        return {
+            "offsets_by": self.offsets_by,
+            "offset_labels": list(self.offset_labels),
+            "offset": _float_list(self.offset),
+            "offset_error": _float_list(self.offset_error),
+            "variation_by": self.variation_by,
+            "variation_labels": list(self.variation_labels),
+            "amplitude": _float_list(self.amplitude),
+            "amplitude_error": _float_list(self.amplitude_error),
+            "phase": _float_list(self.phase),
+            "phase_error": _float_list(self.phase_error),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> SubsetSolution:
+        """Rebuild from :meth:`to_dict` output."""
+        n_v = len(data["variation_labels"])
+
+        def matrix(name: str) -> FloatArray:
+            out = np.asarray(data[name], dtype=np.float64)
+            # An empty list loses its second axis in JSON; restore (0, S_v).
+            return out if out.ndim == 2 else out.reshape(0, n_v)
+
+        return cls(
+            offsets_by=data["offsets_by"],
+            offset_labels=tuple(data["offset_labels"]),
+            offset=np.asarray(data["offset"], dtype=np.float64),
+            offset_error=np.asarray(data["offset_error"], dtype=np.float64),
+            variation_by=data["variation_by"],
+            variation_labels=tuple(data["variation_labels"]),
+            amplitude=matrix("amplitude"),
+            amplitude_error=matrix("amplitude_error"),
+            phase=matrix("phase"),
+            phase_error=matrix("phase_error"),
+        )
+
+
+# Equality is identity (eq=False), as for LightCurve: the generated __eq__ would compare
+# the residual arrays and raise on their ambiguous truth value, and frozen+eq would make
+# hash() fail on them. Sinusoid and Combination stay value-comparable.
+@dataclass(frozen=True, eq=False)
 class PreWhitenResult:
     """The frequency solution of one light curve.
+
+    Compares (and hashes) by identity, so results can be kept in sets, dict keys and
+    undo histories. To check two runs for the same solution, compare
+    :attr:`components` (value-comparable) or :meth:`to_dict` instead.
 
     Attributes
     ----------
@@ -152,7 +292,9 @@ class PreWhitenResult:
     combinations : tuple of Combination
         Components identified as integer combinations of stronger ones.
     offset, offset_error : float
-        The fitted constant term and its uncertainty.
+        The fitted constant term and its uncertainty, by the same estimator and
+        correlation inflation as the component errors (with ``fit_mean=False`` the
+        offset is the fixed weighted mean and its error is NaN).
     t_ref : float
         Epoch the phases are referenced to (days).
     time, residuals : numpy.ndarray
@@ -185,6 +327,12 @@ class PreWhitenResult:
         when spectra are not kept).
     meta : Mapping
         Free-form metadata carried from the light curve.
+    subsets : SubsetSolution or None
+        Per-subset zero points, amplitudes and phases of an interactive session that
+        used them; ``None`` otherwise.
+    n_deleted : int
+        Points an interactive session left out of the fit (deleted points and
+        excluded subsets); :attr:`time` and :attr:`residuals` hold only the points used.
     """
 
     components: tuple[Sinusoid, ...]
@@ -210,6 +358,8 @@ class PreWhitenResult:
     residual_spectrum: AmplitudeSpectrum | None = None
     window: AmplitudeSpectrum | None = None
     meta: Mapping[str, Any] = field(default_factory=dict)
+    subsets: SubsetSolution | None = None
+    n_deleted: int = 0
 
     # -- convenience views -------------------------------------------------------
     def __len__(self) -> int:
@@ -299,9 +449,19 @@ class PreWhitenResult:
         return out
 
     # -- serialization -----------------------------------------------------------
-    def to_table(self) -> list[dict[str, Any]]:
-        """The component list as plain dicts, one row per component."""
-        return [c.to_dict() for c in self.components]
+    def to_table(self, *, constraints: bool | None = None) -> list[dict[str, Any]]:
+        """The component list as plain dicts, one row per component.
+
+        Parameters
+        ----------
+        constraints : bool, optional
+            Include the interactive-session keys (see :meth:`Sinusoid.to_dict`).
+            ``None`` includes them only when some component was fixed, tied or
+            allowed to vary, so an automatic solution keeps the v1.3 layout.
+        """
+        if constraints is None:
+            constraints = any(c.has_constraint for c in self.components)
+        return [c.to_dict(constraints=constraints) for c in self.components]
 
     def to_dataframe(self) -> Any:
         """The component list as a pandas ``DataFrame`` (requires pandas)."""
@@ -383,4 +543,4 @@ class PreWhitenResult:
         )
 
 
-__all__ = ["PreWhitenResult", "Sinusoid", "amplitude_ratio"]
+__all__ = ["PreWhitenResult", "Sinusoid", "SubsetSolution", "amplitude_ratio"]

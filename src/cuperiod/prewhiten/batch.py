@@ -7,35 +7,54 @@ frequency catalogue wants: filter on ``snr``, group by ``key``, join on ``label`
 light curve that yields no component still contributes one row, so nothing silently
 disappears from the catalogue.
 
-Directory sinks are resumable exactly as in the periodogram batch: a re-run skips chunks
-whose part file already exists.
+Directory sinks are resumable exactly as in the periodogram batch. A file sink is
+resumable per light curve too: a re-run skips every key the file already holds and
+appends only the new ones.
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from cuperiod.batch.io import InputItem, load_source, resolve_inputs, write_rows
+from cuperiod.batch.io import (
+    InputItem,
+    csv_safe,
+    load_source,
+    resolve_inputs,
+    write_rows,
+)
 from cuperiod.batch.runner import (
     BatchSummary,
     _chunked,
     _classify_sink,
     _dir_manifest_guard,
-    _finalize_file,
     _part_path,
     _pending_chunks,
+    _read_existing_rows,
     _run_pool,
 )
-from cuperiod.batch.sizing import cpu_worker_count, pin_worker_threads
-from cuperiod.core.columns import ColumnMap, Domain
+from cuperiod.batch.sizing import (
+    cpu_worker_count,
+    init_worker_threads,
+    numba_threads_per_worker,
+    pinned_worker_threads,
+)
+from cuperiod.core.backend import cpu_pool_backend
+from cuperiod.core.columns import ColumnMap, Domain, coerce_domain
 from cuperiod.core.config import PreWhitenSettings
 from cuperiod.core.device import free_gpu_memory, suggest_gpu_workers
 from cuperiod.core.lightcurve import MultiBandLightCurve
 from cuperiod.prewhiten.engine import prewhiten
 from cuperiod.prewhiten.result import PreWhitenResult, Sinusoid
+
+#: Tasks per worker the CPU pool aims for when chunks are free to shrink (no
+#: directory sink pins their layout): enough that one slow light curve does not leave
+#: the other workers idle at the end, few enough that per-task overhead stays small.
+_TASKS_PER_WORKER = 4
 
 
 @dataclass(frozen=True)
@@ -147,15 +166,26 @@ def _process_chunk(
     return rows, errors
 
 
+def _pool_chunk_size(n_items: int, chunk_size: int, n_workers: int) -> int:
+    """Light curves per task for a CPU pool whose chunk layout is not pinned.
+
+    One task per chunk means ``ceil(n / chunk_size)`` tasks: a batch smaller than
+    ``chunk_size`` ran on a single worker however many were asked for. Aim for
+    :data:`_TASKS_PER_WORKER` tasks per worker instead, never above ``chunk_size``.
+    """
+    per_task = math.ceil(n_items / (_TASKS_PER_WORKER * max(1, n_workers)))
+    return max(1, min(chunk_size, per_task))
+
+
 def batch_prewhiten(
     inputs: Any,
     *,
     settings: PreWhitenSettings | None = None,
-    backend: str = "auto",
+    backend: str | None = None,
     device: str = "cpu",
     workers: int | None = None,
     columns: ColumnMap | None = None,
-    domain: Domain | None = None,
+    domain: Domain | str | None = None,
     sink: str | Path | None = None,
     max_components: int | None = None,
     resume: bool = True,
@@ -173,8 +203,13 @@ def batch_prewhiten(
         Extraction settings applied to every light curve. ``store_spectra`` is forced
         off — catalogue rows never carry spectra, so keeping them would only waste
         worker memory.
-    backend : str, default "auto"
-        Amplitude-spectrum backend.
+    backend : str, optional
+        Amplitude-spectrum backend. ``None`` (the default) takes
+        ``settings.backend`` (also settable as ``CUPERIOD_PREWHITEN_BACKEND``), as
+        :func:`cuperiod.prewhiten` does. With ``device="cpu"``, ``"auto"`` means the
+        best *CPU* backend — a CPU pool never opens a CUDA context per worker — and
+        a GPU-only backend (``"gpu"``, ``"cufinufft"``) raises ``ValueError``.
+        ``device="gpu"`` always requests the GPU.
     device : {"cpu", "gpu"}, default "cpu"
         Where to run the workers.
     workers : int, optional
@@ -187,14 +222,29 @@ def batch_prewhiten(
     max_components : int, optional
         Store only this many components per light curve.
     resume : bool, default True
-        Skip chunks already written (directory sink).
+        Skip light curves already written: those a directory sink's part files hold,
+        or whose key a file sink already holds (rows of a key are never replaced, so
+        re-run with ``resume=False`` after changing settings). A light curve that
+        failed wrote no row and is retried.
     chunk_size : int, default 64
-        Light curves per chunk/task.
+        Light curves per chunk/task. A directory sink uses exactly this (its part
+        files are numbered by chunk); a resumed one may use a different size, since
+        it skips the keys already written whatever part holds them. Otherwise a CPU
+        pool treats it as an upper bound and shrinks chunks so every worker gets
+        several tasks.
 
     Returns
     -------
     BatchSummary
-        ``methods`` is reported as ``("PREWHITEN",)``.
+        ``methods`` is reported as ``("PREWHITEN",)``. ``n_done`` counts the
+        component rows computed in this run (for a file sink, the rows appended),
+        ``n_skipped`` the light curves resume left alone. Rows and errors are in
+        input order.
+
+    Raises
+    ------
+    ValueError
+        For an unknown ``device``, or a GPU-only backend with ``device="cpu"``.
 
     Examples
     --------
@@ -202,13 +252,21 @@ def batch_prewhiten(
     """
     if device not in {"cpu", "gpu"}:
         raise ValueError("device must be 'cpu' or 'gpu'")
+    # A misspelt domain is never read for in-memory inputs, so it would otherwise
+    # surface only on the first file or table input, deep in a worker.
+    domain = coerce_domain(domain)
+    base = settings if settings is not None else PreWhitenSettings()
+    # The backend handed to every worker. An explicit request wins, else the settings'
+    # pin (prewhiten() itself does `backend or settings.backend`, so forwarding the old
+    # truthy default 'auto' silently discarded it). On a CPU pool 'auto' must become
+    # 'cpu': resolved inside each worker it picks cufinufft on a CUDA box, one GPU
+    # context per core.
+    worker_backend = "gpu" if device == "gpu" else cpu_pool_backend(backend, base)
     # Catalogue rows never carry spectra, so keeping them would only make each worker
     # hold (and ship nothing from) megabytes of grid arrays per star: force them off.
     cfg = _ChunkConfig(
-        settings=(settings or PreWhitenSettings()).model_copy(
-            update={"store_spectra": False}
-        ),
-        backend="gpu" if device == "gpu" else backend,
+        settings=base.model_copy(update={"store_spectra": False}),
+        backend=worker_backend,
         columns=columns,
         domain=domain,
         max_components=max_components,
@@ -216,14 +274,45 @@ def batch_prewhiten(
 
     sink_kind, sink_dir, sink_file = _classify_sink(sink)
     items = resolve_inputs(inputs, columns=columns, domain=domain)
-    chunks = _chunked(items, max(1, chunk_size))
-    if sink_kind == "dir":
-        _dir_manifest_guard(sink_dir, max(1, chunk_size), resume)
-    pending = _pending_chunks(chunks, sink_kind, sink_dir, resume)
-    n_skipped = len(items) - sum(len(chunks[i]) for i in pending)
+    n_inputs = len(items)
 
-    all_rows: list[dict[str, Any]] = []
-    errors: list[tuple[str, str]] = []
+    # A file sink is merged at the end, keeping the rows already in it, so computing
+    # a light curve the file already holds only threw the result away (while n_done
+    # still counted it). Drop those keys before any work is scheduled.
+    n_skipped = 0
+    existing_rows: list[dict[str, Any]] = []
+    if sink_kind == "file" and resume and sink_file.exists():
+        existing_rows = _read_existing_rows(sink_file)
+        done = {str(row.get("key")) for row in existing_rows}
+        # A CSV sink stores text cells formula-escaped; compare keys as stored.
+        csv_sink = sink_file.suffix.lower() == ".csv"
+        items = [
+            item
+            for item in items
+            if (str(csv_safe(item[0])) if csv_sink else item[0]) not in done
+        ]
+        n_skipped = n_inputs - len(items)
+
+    if device == "gpu":
+        n_workers = workers if workers is not None else suggest_gpu_workers("GLS")
+    else:
+        n_workers = cpu_worker_count(workers)
+    size = max(1, chunk_size)
+    if device == "cpu" and n_workers > 1 and sink_kind != "dir":
+        size = _pool_chunk_size(len(items), size, n_workers)
+    chunks = _chunked(items, size)
+    if sink_kind == "dir":
+        # Resume is by key (_pending_chunks skips written keys and re-chunks the
+        # rest past the last part), so a different chunk_size is safe and the
+        # manifest no longer pins it, as in batch_periodograms.
+        _dir_manifest_guard(sink_dir, None, resume)
+    pending = _pending_chunks(chunks, sink_kind, sink_dir, resume)
+    n_skipped += len(items) - sum(len(chunks[i]) for i in pending)
+
+    # Results are buffered per chunk and flattened in chunk order at the end: a pool
+    # finishes chunks in completion order, and rows/errors should follow the inputs.
+    rows_by_chunk: dict[int, list[dict[str, Any]]] = {}
+    errors_by_chunk: dict[int, list[tuple[str, str]]] = {}
     n_done = 0
 
     def absorb(
@@ -231,35 +320,46 @@ def batch_prewhiten(
     ) -> None:
         nonlocal n_done
         n_done += len(rows)
-        errors.extend(errs)
+        errors_by_chunk[idx] = errs
         if sink_kind == "dir":
-            if rows:
+            if rows:  # written at once, so an interrupted run keeps finished chunks
                 write_rows(rows, _part_path(sink_dir, idx))
         else:
-            all_rows.extend(rows)
+            rows_by_chunk[idx] = rows
 
-    if device == "gpu":
-        n_workers = workers if workers is not None else suggest_gpu_workers("GLS")
-        if n_workers <= 1:
-            for idx in pending:
-                absorb(idx, *_process_chunk(chunks[idx], cfg))
+    if n_workers <= 1 or not pending:
+        for idx in pending:
+            absorb(idx, *_process_chunk(chunks[idx], cfg))
+            if device == "gpu":
                 free_gpu_memory()
-        else:
-            _run_pool(chunks, pending, cfg, absorb, n_workers, worker=_process_chunk)
+    elif device == "gpu":
+        _run_pool(chunks, pending, cfg, absorb, n_workers, worker=_process_chunk)
     else:
-        n_workers = cpu_worker_count(workers)
-        if n_workers <= 1:
-            for idx in pending:
-                absorb(idx, *_process_chunk(chunks[idx], cfg))
-        else:
-            pin_worker_threads()
-            _run_pool(chunks, pending, cfg, absorb, n_workers, worker=_process_chunk)
+        pool_size = min(n_workers, len(pending))
+        # BLAS/OpenMP pinned to one thread only while the pool exists (the parent
+        # session keeps its threads afterwards); numba gets its share per worker.
+        with pinned_worker_threads():
+            _run_pool(
+                chunks,
+                pending,
+                cfg,
+                absorb,
+                pool_size,
+                worker=_process_chunk,
+                initializer=init_worker_threads,
+                initargs=(numba_threads_per_worker(pool_size),),
+            )
 
-    if sink_kind == "file":
-        _finalize_file(all_rows, sink_file, resume)
+    all_rows = [row for idx in sorted(rows_by_chunk) for row in rows_by_chunk[idx]]
+    errors = [err for idx in sorted(errors_by_chunk) for err in errors_by_chunk[idx]]
+
+    # The kept rows first, then this run's (their keys never overlap: resume dropped
+    # the known ones). An up-to-date file is left untouched.
+    if sink_kind == "file" and (all_rows or not sink_file.exists()):
+        write_rows([*existing_rows, *all_rows], sink_file)
 
     return BatchSummary(
-        n_inputs=len(items),
+        n_inputs=n_inputs,
         n_done=n_done,
         n_failed=len(errors),
         n_skipped=n_skipped,
