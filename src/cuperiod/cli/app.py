@@ -43,6 +43,7 @@ from cuperiod.prewhiten.result import PreWhitenResult
 
 if TYPE_CHECKING:  # annotations only — the pdot modules load inside the command.
     from cuperiod import (
+        LTTESearchResult,
         PdotSearchResult,
         PeriodLawFit,
         PeriodProfile,
@@ -571,6 +572,11 @@ def pdot(
     track: bool = typer.Option(
         True, "--track/--no-track", help="Measure dP/dt by segmented phase tracking."
     ),
+    ltte: bool = typer.Option(
+        True,
+        "--ltte/--no-ltte",
+        help="Search the tracked O-C for a cyclic (light-travel-time) variation.",
+    ),
     profile: bool = typer.Option(
         False,
         "--profile",
@@ -640,6 +646,15 @@ def pdot(
         else:
             _print_phase_track(tracked)
 
+    cyclic: LTTESearchResult | None = None
+    if tracked is not None and ltte:
+        try:
+            cyclic = tracked.ltte_search(settings=settings)
+        except (InsufficientDataError, ValueError) as exc:
+            typer.echo(f"\nlight-time orbit search skipped: {exc}")
+        else:
+            _print_ltte(cyclic)
+
     prof: PeriodProfile | None = None
     laws: list[PeriodLawFit] = []
     if profile:
@@ -660,6 +675,8 @@ def pdot(
         payload = result.to_dict()
         if tracked is not None:
             payload["track"] = tracked.to_dict()
+        if cyclic is not None:
+            payload["ltte"] = cyclic.to_dict()
         if prof is not None:
             payload["profile"] = prof.to_dict()
             payload["laws"] = [fit.to_dict() for fit in laws]
@@ -718,6 +735,39 @@ def _print_phase_track(res: PhaseTrackResult) -> None:
         typer.echo(
             "  ! wrap risk: consecutive segment delays jump by more than 0.3 period; "
             "the cycle count may have slipped (retry with fewer --segments)"
+        )
+
+
+def _print_ltte(res: LTTESearchResult) -> None:
+    """The cyclic O-C block: the light-time orbit found in the tracked delays."""
+    best = res.best
+    typer.echo(f"\nlight-time orbit search over the O-C  ({res.n_used} points)")
+    typer.echo(
+        f"  {'outer period':<15} {best.outer_period_yr:.3f} +- "
+        f"{best.outer_period_err_yr:.3f} yr   ({res.n_cycles:.2f} cycles covered)"
+    )
+    typer.echo(
+        f"  {'amplitude':<15} {best.amplitude_s:.1f} +- {best.amplitude_err_s:.1f} s"
+        f"   (a sin i = {best.a_sini_au:.3f} au, f(m) = {best.mass_function:.4f} Msun)"
+    )
+    typer.echo(
+        f"  {'dBIC':<15} {res.delta_bic:+.1f}   (positive favours the cycle over the "
+        f"polynomial alone; F-test p = {res.f_test_p:.2g}, searched)"
+    )
+    typer.echo(
+        f"  {'secular dP/dt':<15} {best.pdot_s_per_yr:+.4g} +- "
+        f"{best.pdot_err_scaled * _SECONDS_PER_YEAR:.2g} s/yr   "
+        f"(parabola alone: {res.null.pdot_s_per_yr:+.4g})"
+    )
+    if best.at_grid_edge:
+        typer.echo(
+            "  ! the best outer period sits at the edge of the scan; the cycle "
+            "may be longer or shorter than the range searched"
+        )
+    if res.n_cycles < 1.0:
+        typer.echo(
+            "  ! less than one outer cycle covered: a light-time orbit and a "
+            "parabola are nearly degenerate here"
         )
 
 
@@ -809,6 +859,9 @@ def pdot_batch_cmd(
     profile: bool = typer.Option(
         True, "--profile/--no-profile", help="Measure the model-free P(t) track."
     ),
+    ltte: bool = typer.Option(
+        True, "--ltte/--no-ltte", help="Search each O-C for a light-time orbit."
+    ),
     laws: str = typer.Option(
         "auto",
         "--laws",
@@ -870,6 +923,7 @@ def pdot_batch_cmd(
         detrend_method=_trend_method(detrend_method),
         profile=profile,
         laws=_period_laws(laws),
+        ltte=ltte,
         points_per_interval=points_per_interval,
         period_window=period_window,
         backend=backend,

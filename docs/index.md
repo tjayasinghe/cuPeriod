@@ -61,7 +61,8 @@ frequency solution with uncertainties, combination frequencies, and period spaci
 
 :::{grid-item-card} ⏱️ Measure period changes
 {doc}`Period-change tools <guide/period-change>` search jointly over (P, dP/dt),
-automate the O−C diagram, and test drift against random wander.
+automate the O−C diagram, fit light-time orbits to cyclic O−C, and test drift
+against random wander.
 :::
 
 :::{grid-item-card} 🔬 Trust the numbers
@@ -100,9 +101,12 @@ g-mode period-spacing tools — over the same inputs and backends. See
 
 And a periodogram assumes the period is *constant*. When it is not — mass-transfer
 binaries, decaying hot-Jupiter orbits, evolving pulsators, wandering Miras —
-{func}`cuperiod.pdot_search` turns any of the eight methods into a joint (P, dP/dt)
-search by time-warping, and {func}`cuperiod.phase_track` measures the derivative with an
-automated O−C analysis. See {doc}`guide/period-change`.
+{func}`cuperiod.pdot_search` turns GLS, MHAOV, PDM, CE, String-Length, or SuperSmoother
+into a joint (P, dP/dt)
+search by time-warping, {func}`cuperiod.phase_track` measures the derivative with an
+automated O−C analysis, and {func}`cuperiod.ltte_search` fits the light-travel-time
+orbit of a third body when the O−C turns out to be cyclic rather than secular. See
+{doc}`guide/period-change`.
 
 ## Install
 

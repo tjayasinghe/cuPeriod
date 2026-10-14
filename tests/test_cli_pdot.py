@@ -332,3 +332,32 @@ def test_pdot_batch_plots_without_matplotlib_fails_up_front(
     assert result.exit_code == 1
     assert 'pip install "cuperiod[plot]"' in result.output
     assert not out.exists()
+
+
+def test_pdot_runs_the_light_time_search_by_default(tmp_path: Path) -> None:
+    csv, truth = _write_drifting_csv(tmp_path / "drift.csv")
+    out = tmp_path / "pdot.json"
+    result = runner.invoke(
+        app,
+        ["pdot", str(csv), "--period", str(truth["period"]), "--backend", "cpu",
+         *FAST_GRID, "--out", str(out)],
+    )
+    assert result.exit_code == 0, result.output
+    assert "light-time orbit search" in result.stdout
+    assert "outer period" in result.stdout
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["ltte"]["best"]["outer_period_yr"] > 0.0
+    assert "delta_bic" in payload["ltte"]
+
+
+def test_pdot_no_ltte_skips_the_light_time_section(tmp_path: Path) -> None:
+    csv, truth = _write_drifting_csv(tmp_path / "drift.csv")
+    result = runner.invoke(
+        app,
+        ["pdot", str(csv), "--period", str(truth["period"]), "--backend", "cpu",
+         *FAST_GRID, "--no-ltte"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "phase tracking" in result.stdout
+    assert "light-time orbit" not in result.stdout
+

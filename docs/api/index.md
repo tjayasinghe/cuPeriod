@@ -62,7 +62,8 @@ follow it (see {doc}`../guide/prewhitening`).
 
 Joint (period, dP/dt) searching, automated O−C phase tracking, ephemeris fitting,
 model-free P(t) tracks and the laws fitted to them, time-resolved maps, the
-random-wander test, and the catalogue-scale driver
+random-wander test, the light-travel-time (cyclic O−C) search, the physical
+interpretation and sensitivity helpers, and the catalogue-scale driver
 (see {doc}`../guide/period-change`).
 
 ```{eval-rst}
@@ -95,6 +96,16 @@ random-wander test, and the catalogue-scale driver
    WWZResult
    eddington_plakidis
    EddingtonPlakidisResult
+   ltte_search
+   LTTESearchResult
+   LTTEFit
+   detectable_pdot
+   PdotSensitivity
+   mass_loss_rate
+   mass_transfer_rate
+   pdot_from_mass_loss
+   pdot_from_mass_transfer
+   convert_pdot
    batch_pdot
    weighted_epoch
 ```

@@ -101,6 +101,11 @@ class PdotBest:
         return self.pdot * DAYS_PER_MYR
 
     @property
+    def pdot_d_per_yr(self) -> float:
+        """dP/dt in days per year (the eclipsing-binary survey unit)."""
+        return self.pdot * 365.25
+
+    @property
     def dlnp_dt_per_yr(self) -> float:
         """Fractional rate d(ln P)/dt per year (the Mira / delta Sct unit)."""
         return self.pdot_over_p * 365.25
@@ -120,6 +125,7 @@ class PdotBest:
             "pdot_s_per_yr": self.pdot_s_per_yr,
             "pdot_ms_per_yr": self.pdot_ms_per_yr,
             "pdot_d_per_myr": self.pdot_d_per_myr,
+            "pdot_d_per_yr": self.pdot_d_per_yr,
             "dlnp_dt_per_yr": self.dlnp_dt_per_yr,
             "frequency": self.frequency,
             "fdot": self.fdot,

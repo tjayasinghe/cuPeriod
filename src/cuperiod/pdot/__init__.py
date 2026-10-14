@@ -23,6 +23,12 @@ The v1.3 subsystem for measuring period *derivatives*:
   tables, an O-C catalogue, and optional diagnostic figures.
 - :func:`detrend` — running-median removal of the slow brightness trend that
   otherwise aliases onto the search grid.
+- :func:`ltte_search` — the cyclic O-C: a light-travel-time orbit (a third
+  body) fitted jointly with the ephemeris polynomial, so a non-monotonic O-C
+  is not mistaken for a secular rate.
+- :func:`mass_loss_rate` / :func:`mass_transfer_rate` / :func:`detectable_pdot`
+  — what a secular rate would mean physically, and how small a one the
+  timing data could have measured.
 
 :mod:`cuperiod.pdot.plots` draws the matching diagnostic figures; it needs
 matplotlib (``pip install "cuperiod[plot]"``) and so is imported on demand
@@ -38,7 +44,18 @@ from cuperiod.pdot.laws import (
     compare_period_laws,
     fit_period_law,
 )
+from cuperiod.pdot.ltte import LTTEFit, LTTESearchResult, ltte_delay, ltte_search
 from cuperiod.pdot.models import PeriodModel, available_models, get_model
+from cuperiod.pdot.physics import (
+    PdotSensitivity,
+    convert_pdot,
+    detectable_pdot,
+    mass_loss_rate,
+    mass_transfer_rate,
+    pdot_from_mass_loss,
+    pdot_from_mass_transfer,
+    pdot_units,
+)
 from cuperiod.pdot.profile import PeriodPoint, PeriodProfile, period_profile
 from cuperiod.pdot.result import (
     DAYS_PER_MYR,
@@ -66,8 +83,11 @@ __all__ = [
     "SECONDS_PER_YEAR",
     "EddingtonPlakidisResult",
     "EphemerisFit",
+    "LTTEFit",
+    "LTTESearchResult",
     "PdotBest",
     "PdotSearchResult",
+    "PdotSensitivity",
     "PeriodLawFit",
     "PeriodModel",
     "PeriodPoint",
@@ -81,14 +101,23 @@ __all__ = [
     "available_models",
     "batch_pdot",
     "compare_period_laws",
+    "convert_pdot",
+    "detectable_pdot",
     "detrend",
     "eddington_plakidis",
     "fit_ephemeris",
     "fit_period_law",
     "fit_template",
     "get_model",
+    "ltte_delay",
+    "ltte_search",
+    "mass_loss_rate",
+    "mass_transfer_rate",
+    "pdot_from_mass_loss",
+    "pdot_from_mass_transfer",
     "pdot_search",
     "pdot_to_rows",
+    "pdot_units",
     "period_profile",
     "phase_track",
     "running_median",

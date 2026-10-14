@@ -17,10 +17,18 @@ pulsar-style coherent search. cuPeriod v1.3 covers the ground in between:
 - {func}`cuperiod.period_profile` / {func}`cuperiod.fit_period_law` —
   **when one rate will not do**: the period measured independently in
   consecutive intervals, and parametric P(t) laws fitted to that track.
+- {func}`cuperiod.ltte_search` — **when the O−C is not monotonic**: a
+  light-travel-time orbit (a third body — or a magnetic cycle) fitted jointly
+  with the ephemeris, so a cycle shorter than the baseline is not averaged
+  into a spurious rate.
 - {func}`cuperiod.sliding_periodogram` / {func}`cuperiod.wwz` — **explore**:
   time-resolved maps for period wander that is not a clean secular trend.
 - {func}`cuperiod.eddington_plakidis` — **vet**: the classical test that a
   smooth-looking O−C is not just an accumulating random walk.
+- {func}`cuperiod.detectable_pdot` / {func}`cuperiod.mass_loss_rate` /
+  {func}`cuperiod.mass_transfer_rate` — **interpret**: how small a rate the
+  timing data could have measured, and what a secular one would mean as mass
+  loss or mass transfer.
 - {func}`cuperiod.batch_pdot` — **scale**: the whole chain over a catalogue,
   with per-star tables and optional diagnostic figures.
 
@@ -131,6 +139,29 @@ assigning each event the nearest cycle of your trial ephemeris. Watch its
 ambiguous, the classical O−C failure (a one-cycle error anywhere invalidates
 the diagram).
 
+Timing lists exist for thousands of eclipsing binaries. The AAVSO hosts the
+late Bob Nelson's database of over 5800 O−C files — one spreadsheet of minima
+per star, linked from <https://www.aavso.org/bob-nelsons-o-c-files> — and the
+Czech Variable Star and Exoplanet Section's O−C gateway at
+<https://var.astro.cz> holds some 320,000 minima (registration required).
+Both are the natural input to {func}`~cuperiod.fit_ephemeris` and
+{func}`~cuperiod.ltte_search`, after the time-system conversion discussed
+below.
+
+:::{admonition} Contact binaries: the half-period branch
+:class: note
+A light curve with two equal minima is almost perfectly symmetric under a
+half-period shift, so a segment's best template shift lands on either branch
+by noise, and the O−C would jump by P/2 between segments. The tracker
+measures the template's fold symmetry ({attr}`~cuperiod.PhaseTrackResult.symmetry_order`,
+2 for such a star) and unwraps consecutive delays in steps of
+`period / symmetry_order`: cycle continuity is the only information that
+separates the branches, and the O−C is then defined modulo that step. This
+was found on OGLE bulge contact binaries, where it turned hour-scale
+"amplitudes" into the few-hundred-second light-time orbits their published
+timings show.
+:::
+
 Three conventions for "the period derivative" coexist in the literature, and
 mixing them up has reached refereed journals (a published hot-Jupiter decay
 rate was once wrong by the period squared — the conversion was multiplied
@@ -141,6 +172,106 @@ instead of divided). cuPeriod reports all of them:
 | dP/dt | per unit time, dimensionless | most of this page | `pdot` (+ `pdot_s_per_yr`, `pdot_ms_per_yr`, `pdot_d_per_myr`) |
 | dP/dE | per cycle: {math}`P \dot P` | eclipse-timing ephemerides, `T_0 + PE + QE^2` with {math}`Q = \tfrac{1}{2} P \dot P` | `2 * quadratic term` — tested as {math}`\dot P = 2Q/P` |
 | {math}`\dot P / P` | fractional rate, 1/time | theory; the search's own axis | `pdot_over_p`, `dlnp_dt_per_yr` |
+
+## A third body: the cyclic O−C
+
+A close binary with a distant companion orbits their common centre of mass,
+and its eclipses arrive early or late by the light-travel time across that
+orbit — the light-travel-time effect (LTTE; Irwin 1952). The binary's period
+is constant; the O−C is not, and it is *periodic*:
+
+```{math}
+\mathrm{O\!-\!C}(t) = \sum_k c_k\,\Delta t^k
+  + A\left[\frac{1-e^2}{1+e\cos\nu}\,\sin(\nu+\omega) + e\sin\omega\right],
+\qquad A = \frac{a_{12}\sin i}{c},
+```
+
+with {math}`\nu` the true anomaly at the outer period {math}`P_2`. Which of
+two regimes you are in is decided by the baseline:
+
+- **{math}`P_2 \gg` baseline.** Less than one cycle is sampled and the
+  sinusoid is indistinguishable from a parabola. This is how WASP-4b's
+  "orbital decay" became a companion (see below); only curvature beyond a
+  parabola — the cubic in the ephemeris ladder,
+  {attr}`~cuperiod.EphemerisFit.pddot` — or an independent radial-velocity
+  jerk can break it.
+- **{math}`P_2 \lesssim` baseline.** The O−C is *not monotonic*, and the rate
+  a parabola reports is a baseline-weighted average of a wobble: its value
+  and its sign depend on which part of the cycle the data happen to cover.
+  This regime is common. With 15 years of OGLE bulge photometry, Hong et al.
+  (2022) found 307 of 14,127 contact binaries with a sinusoidal O−C and 104
+  with a sinusoid on top of a parabola, at outer periods of 5–14 yr; Hajdu et
+  al. (2019) list 992 LTTE candidates in OGLE-IV; Pietrukowicz et al. (2017)
+  recognised 35 cyclic systems among the 22,462 OGLE-III binaries they
+  searched for merger precursors; and Gazeas et al. (2021) find a cycle *and*
+  a negative trend together in ultra-short-period contact binaries.
+
+{func}`~cuperiod.ltte_search` fits the cycle and the ephemeris polynomial
+*together*. At every trial outer period the model is linear in
+{math}`A\cos\omega`, {math}`A\sin\omega` and the polynomial, so the scan is
+a floating-polynomial periodogram of the O−C — the χ² improvement over the
+polynomial alone at each trial — and the best trial is polished by nonlinear
+least squares, with Irwin's eccentric terms freed on request (`eccentric=True`).
+It takes a {class}`~cuperiod.PhaseTrackResult`, a list of event times (cycles
+assigned like {func}`~cuperiod.fit_ephemeris`), or explicit O−C values:
+
+```python
+track = cup.phase_track((time, flat, err), period=0.445851,
+                        settings=cup.PdotSettings(n_segments=40))
+res = track.ltte_search()                       # or cup.ltte_search(track)
+best = res.best
+print(best.outer_period_yr, best.amplitude_s, res.delta_bic)
+print(res.null.pdot_d_per_yr, best.pdot_d_per_yr)    # parabola alone vs joint
+print(best.mass_function, best.minimum_third_mass(1.5))
+```
+
+```text
+OGLE-BLG-ECL-289126: 14.3 yr of OGLE-III+IV photometry, 40 segments
+  parabola alone  : dP/dt = -1.3e-7 +- 2.0e-7 d/yr         chi2_r = 58
+  light-time orbit: P2 = 6.43 +- 0.09 yr   A = 660 +- 17 s   dBIC = +2085
+                    (published: 6.2 +- 0.2 yr, Hong et al. 2022)
+  secular dP/dt   : +1.5e-7 +- 0.5e-7 d/yr                  chi2_r = 1.3
+  f(m) = 0.056 Msun  ->  m3 >= 0.63 Msun for a 1.5 Msun binary
+```
+
+The second number pair is the point. `res.null` is the polynomial-only fit —
+the quadratic ephemeris {func}`~cuperiod.phase_track` already reported — and
+`best.pdot` is the *secular* rate with the cycle removed; `res.pdot_change` is
+how far the parabola sat from it. On six of Hong et al.'s triples
+(`benchmarks/pdot_ogle_triples.py`, written up with figures in
+`benchmarks/REPORT_ogle_triples.md`; raw survey photometry, no per-season
+binary modelling) all six recovered outer periods agree with the published
+ones within 2σ (median offset 4%), while the parabola alone claimed a ≥ 3σ
+dP/dt in three of the six. On synthetic light curves
+(`benchmarks/pdot_ltte_recovery.py`, 120–600 s orbits, no secular drift):
+
+| {math}`P_2` / baseline | parabola alone: ≥ 3σ "dP/dt" | cycle detected (ΔBIC > 10) | {math}`P_2` within 10% |
+| --- | --- | --- | --- |
+| 0.25–0.5 | 0% | 89% | 100% |
+| 0.5–0.75 | 11% | 83% | 83% |
+| 0.75–1 | 64% | 82% | 45% |
+| 1–1.5 | 73% | 12% | degenerate |
+
+with no false cycle and no false rate on the 40 stars without an orbit. Read
+the last row as the first regime above: once the baseline holds less than a
+cycle the joint fit can no longer separate the two either, and only the
+curvature test or outside data can.
+
+What comes back with the orbit: `amplitude_s`, `a_sini_au`, the mass
+function {math}`f(m_3) = (a_{12}\sin i)^3/P_2^2` in solar units and
+{meth}`~cuperiod.LTTEFit.minimum_third_mass` for a given inner mass;
+{meth}`~cuperiod.LTTEFit.period_at`, the *apparent* instantaneous period the
+orbit produces — a light-time orbit shows up in {func}`~cuperiod.period_profile`
+as a sinusoidal P(t) of semi-amplitude {math}`2\pi A P/P_2`, not as a trend;
+and `n_cycles`, `at_grid_edge`, `delta_bic` and `f_test_p` to read the
+detection by. Two cautions. The outer period was *searched*, so with a dozen
+points the F-test and ΔBIC are indicative rather than calibrated — Hong et al.
+required a Bayes factor above 10 *and* visual inspection. And an O−C alone
+cannot tell a third body from a magnetic activity cycle (Applegate 1992),
+whose amplitudes and quasi-periods fall in the same range; a mass function
+that implies a companion brighter than the binary, or a cycle that is not
+strictly periodic, argues for the latter, and only radial velocities or a
+brightness/colour modulation in step with the O−C settle it.
 
 ## When one rate is not enough
 
@@ -257,6 +388,100 @@ diagnostics: the coherent tools above are an order of magnitude more
 sensitive to a genuinely secular trend, but they will happily average over a
 reversal that a map shows at a glance.
 
+## How small a rate can you measure?
+
+Not as small as a phase-shift rule of thumb suggests, and not as easily as the
+baseline alone suggests. {func}`~cuperiod.detectable_pdot` gives the formal
+floor of the quadratic-ephemeris method for a timing precision, a number of
+timings and a baseline — or for the actual epochs of your timing points, since
+a dense modern season on a sparse archival tail is a very different design
+from uniform coverage. For uniform sampling of {math}`n` timings of precision
+{math}`\sigma_t` over {math}`T`,
+
+```{math}
+\sigma(\dot P) \simeq 4\sqrt{45}\,\frac{P\,\sigma_t}{T^2\sqrt{n}}
+  \approx 27\,\frac{P\,\sigma_t}{T^2\sqrt{n}},
+```
+
+improving with the *square* of the baseline and only with the root of the
+number of timings:
+
+```python
+s = cup.detectable_pdot(0.4, 0.001, n_timings=15, baseline=15 * 365.25)
+print(s.sigma_pdot_d_per_yr, s.threshold(3) * 365.25)   # 3.0e-8, 9.0e-8 d/yr
+print(s.sigma_amplitude(6 * 365.25) * 86400)             # ~33 s light-time floor
+```
+
+The familiar estimate "a phase shift of 0.1 cycle accumulated over the
+baseline", {math}`\dot P \sim 0.2\,P^2/T^2`, corresponds to a *single*
+timing good to 0.1 P at one end of the span. Real eclipse timings reach
+{math}`10^{-3}P` and there are dozens of them, which is why survey detections
+sit two orders of magnitude lower: Hong et al. (2022)'s 13,716 parabolic rates
+lie mostly within {math}`\pm 5\times10^{-6}` d/yr with errors down to
+{math}`4\times10^{-9}` d/yr (the largest, −1.4 × 10⁻⁵ d/yr for
+OGLE-BLG-ECL-169991; Pietrukowicz et al. 2017's strongest is −1.9 × 10⁻⁴ d/yr
+in a 2.8-day detached binary), and a "typical" detected 10⁻⁶ d/yr is
+2.7 × 10⁻⁹ s/s — {func}`~cuperiod.convert_pdot` moves between the units, and
+every result now carries `pdot_d_per_yr` next to `pdot_s_per_yr`. The floor is
+formal: real O−C diagrams scatter beyond their timing errors (an evolving light
+curve, spots, genuine wander), which is what `pdot_err_scaled` inflates for.
+
+## What a secular rate would mean
+
+Two textbook channels change an orbital period secularly, and both follow from
+Kepler's third law and angular-momentum bookkeeping. Isotropic (Jeans-mode)
+mass loss widens the orbit,
+
+```{math}
+\frac{\dot P}{P} = 2\,\frac{\dot M_{\rm loss}}{M}
+\quad\Longrightarrow\quad
+\dot P = 2\times10^{-6}\left(\frac{P}{1\ \mathrm{yr}}\right)
+\left(\frac{\dot M_{\rm loss}}{10^{-6}\,M_\odot\,\mathrm{yr^{-1}}}\right)
+\left(\frac{M_\odot}{M}\right),
+```
+
+so a mass-losing system *lengthens* its period; conservative transfer from a
+donor {math}`M_d` to an accretor {math}`M_a` gives (Kwee 1958)
+
+```{math}
+\frac{\dot P}{P} = 3\,\dot M_{\rm tr}\left(\frac{1}{M_d} - \frac{1}{M_a}\right)
+  = 3\,\frac{\dot M_{\rm tr}}{M_d}\,(1 - q), \qquad q = M_d/M_a,
+```
+
+lengthening the period when the donor is the less massive star and shortening
+it when it is the more massive one — and, when one star dominates the mass,
+reducing to the same {math}`\dot P \sim (2\text{–}3)\,P\,\dot M/M` as the
+wind. {func}`~cuperiod.mass_loss_rate`, {func}`~cuperiod.mass_transfer_rate`
+and their inverses {func}`~cuperiod.pdot_from_mass_loss`,
+{func}`~cuperiod.pdot_from_mass_transfer` do the arithmetic, in solar masses
+per year with the period in days:
+
+```python
+pdot = cup.convert_pdot(1e-6, "d/yr", "d/d")
+cup.mass_loss_rate(pdot, 0.4, 1.5)             # 1.9e-6 Msun/yr, if a wind did it
+cup.mass_transfer_rate(pdot, 0.4, 0.4, 1.1)    # 5.2e-7 Msun/yr from the 0.4 Msun star
+cup.pdot_from_mass_loss(1e-6, 365.25, 1.0)     # 2e-6: the scaling above
+```
+
+Use them for the *sign* check and for limits more than for measurements. A
+negative rate returned by `mass_loss_rate` means the period is shortening,
+which no wind can do; a negative `mass_transfer_rate` means the measured sign
+is incompatible with the assumed donor. Schaefer (2024) collected dP/dt for 52
+cataclysmic variables and found 44% of them positive — impossible under
+magnetic-braking evolution — and the rest more negative than evolution allows
+by two orders of magnitude; King & Lasota (2024) conclude that an O−C rate is,
+in almost every case, dominated by something other than the secular evolution.
+The two stellar mergers caught in the act make the same point from the other
+side: V1309 Sco's decay (the `singular` law above) was recognised only in
+hindsight, and the one prediction made in advance — KIC 9832227, an
+exponentially shrinking contact-binary period extrapolated to a 2022 merger
+(Molnar et al. 2017) — fell to archival timings: a 2003 Vulcan eclipse time and
+an NSVS one disagreed with the decay model by up to an hour (Socia et al. 2018).
+Pietrukowicz et al. (2017) found no V1309 analogue among 22,462 OGLE-III
+binaries. What a non-detection *does* deliver is a limit: a 3σ threshold from
+{func}`~cuperiod.detectable_pdot` through {func}`~cuperiod.mass_loss_rate` is
+an upper bound on the wind a wide eclipsing binary can be driving.
+
 ## Before you believe your dP/dt
 
 Parabolas are cheap. The literature's graveyard of retracted period-change
@@ -278,7 +503,19 @@ indistinguishable from a quadratic. Of the three famous hot-Jupiter decay
 claims, two dissolved this way (WASP-4b's "decay" is a ~7 M_Jup companion at
 8 au; Kepler-1658 "b" is a bound eclipsing binary) — only WASP-12b survives.
 An RV *trend* bound is not enough to exclude it; the curvature (jerk) is what
-breaks the degeneracy.
+breaks the degeneracy. A companion whose orbit is *shorter* than the baseline
+does the opposite: a non-monotonic O−C that a parabola averages into a rate of
+arbitrary sign — {func}`~cuperiod.ltte_search` fits the cycle and the rate
+together (see above).
+
+**Archival timings can be wrong by hours.** A decade-old minimum from a
+different survey, time system, or typographic tradition anchors the far end of
+the parabola with enormous leverage. KIC 9832227's merger prediction survived
+every modern data set and died on a 2003 Vulcan timing and an NSVS one that
+disagreed with the decay model by up to an hour (Socia et al. 2018); whether
+those points or the model were wrong, the lesson is that an O−C built across
+archives needs its oldest points re-derived from the original photometry, not
+transcribed.
 
 **Eclipsing binaries: watch the secondary.** Apsidal motion in an eccentric
 orbit and migrating starspots both move eclipse times by hundreds of seconds
@@ -342,6 +579,10 @@ Useful cuts on the summary table:
 | `law`, `law_delta_bic` | The winning P(t) law and its margin over the runner-up. |
 | `law_at_bound` | The winning law ran onto a constraint — treat its parameters and its BIC as meaningless. |
 | `search_ridge_correlation` | How strongly P and dP/dt trade off at the peak. |
+| `ltte_delta_bic`, `ltte_f_test_p` | Is the O−C cyclic? Positive ΔBIC favours a light-time orbit over the polynomial alone. |
+| `ltte_outer_period_yr`, `ltte_amplitude_s`, `ltte_mass_function` | The orbit, if there is one. |
+| `ltte_pdot`, `ltte_pdot_change` | The secular rate with the cycle removed, and how far the parabola-only rate sat from it. |
+| `ltte_n_cycles`, `ltte_at_grid_edge` | Fewer than one cycle covered, or an outer period pinned at the scan's edge: treat the orbit as unresolved. |
 | `wrap_risk`, `profile_at_window_edge` | Cycle-count slip, and periods clipped by the search window. |
 
 `plots=` writes a six-panel diagnostic per star (light curve, drift-corrected
@@ -373,6 +614,10 @@ keeps its own settings via `method_settings=`.
 | `profile_points_per_interval` | 50 | Target points per P(t) interval (the subsample size of the published V1309 Sco analysis). |
 | `profile_min_points` | 15 | Fewest points an interval may hold and still be measured. |
 | `profile_period_window` | 0.05 | Fractional half-width of each interval's period search. Must exceed the total period change; too wide invites 1 c/d aliases. |
+| `ltte_min_points` | 8 | Fewest O−C points the cyclic search accepts (the batch chain skips it below this). |
+| `ltte_samples_per_peak` | 10 | Oversampling of the outer-frequency grid relative to 1/baseline. |
+| `ltte_degree` | 2 | Ephemeris polynomial fitted with the cycle (2 = parabola + sinusoid; 1 = sinusoid on a linear ephemeris). |
+| `ltte_min_cycles` | 1.0 | The scan's longest trial outer period is `baseline / ltte_min_cycles`; below one cycle a light-time orbit and a parabola are nearly degenerate. |
 
 ## References
 
@@ -391,6 +636,15 @@ keeps its own settings via `method_settings=`.
 - Winn, J. N., & Stefánsson, G. 2025, PSJ 6, 300 — light-travel time masquerading as decay.
 - Eastman, J., Siverd, R., & Gaudi, B. S. 2010, PASP 122, 935 — time standards.
 - Deeg, H. J. 2021, Galaxies 9, 1 — modern eclipse-minimum timing errors.
+- Irwin, J. B. 1952, ApJ 116, 211 — the light-time orbit fitted by `ltte_search`.
+- Applegate, J. H. 1992, ApJ 385, 621 — magnetic activity cycles as an alternative source of cyclic O−C.
+- Kwee, K. K. 1958, BAN 14, 131 — the conservative mass-transfer period-change relation.
+- Hong, K., et al. 2022, AJ 163, 157 — period changes of 14,127 OGLE bulge contact binaries; the 307 sinusoidal (LTTE) systems the OGLE benchmark draws from.
+- Hajdu, T., et al. 2019, MNRAS 485, 2562 — 992 LTTE triple candidates among OGLE-IV bulge eclipsing binaries.
+- Pietrukowicz, P., et al. 2017, AcA 67, 115 — the search for V1309 Sco analogues among 22,462 OGLE-III binaries.
+- Gazeas, K., et al. 2021, MNRAS 502, 2879 — the CoBiToM project: contact binaries towards merging, with cyclic O−C plus a negative trend.
+- Molnar, L. A., et al. 2017, ApJ 840, 1 — the KIC 9832227 red-nova prediction; Socia, Q. J., et al. 2018, ApJ 864, L32 — its negation by archival timings.
+- Schaefer, B. E. 2024, ApJ 966, 155 — dP/dt of 52 cataclysmic variables, 44% of the wrong sign; King, A., & Lasota, J.-P. 2024, "The Perils of Pdot" (arXiv:2406.03948).
 
 ---
 

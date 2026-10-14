@@ -33,6 +33,7 @@ import numpy as np
 
 from cuperiod.core._typing import FloatArray
 from cuperiod.pdot.laws import PeriodLawFit
+from cuperiod.pdot.ltte import LTTEFit
 from cuperiod.pdot.models import get_model
 from cuperiod.pdot.profile import PeriodProfile
 from cuperiod.pdot.result import SECONDS_PER_YEAR, PdotSearchResult
@@ -381,6 +382,7 @@ def plot_oc(
     ax: Any,
     track: PhaseTrackResult,
     *,
+    ltte: LTTEFit | None = None,
     t_offset: float = DEFAULT_T_OFFSET,
     degree_overlays: Sequence[int] = (2,),
 ) -> None:
@@ -399,6 +401,11 @@ def plot_oc(
         Axes to draw into.
     track : PhaseTrackResult
         The result of :func:`cuperiod.phase_track`.
+    ltte : LTTEFit, optional
+        The best fit of :func:`cuperiod.ltte_search` over the same delays.
+        Overlaid as the joint polynomial + light-time curve, with the outer
+        period in the label — a cycle shorter than the baseline is what makes
+        the O-C non-monotonic, and the parabola alone then averages over it.
     t_offset : float, default 2450000.0
         Subtracted from the epochs before plotting.
     degree_overlays : sequence of int, default ``(2,)``
@@ -450,6 +457,18 @@ def plot_oc(
                 "--",
                 lw=1.2,
                 label=f"degree {degree}",
+            )
+        if ltte is not None:
+            ax.plot(
+                grid - t_offset,
+                _floats(ltte.predict(grid)) * _HOURS_PER_DAY,
+                "-",
+                color="C2",
+                lw=1.4,
+                label=(
+                    f"+ light-time orbit, P2 = {ltte.outer_period_yr:.2f} yr, "
+                    f"A = {ltte.amplitude_s:.0f} s"
+                ),
             )
         ax.legend(fontsize=8)
     if track.wrap_risk:
@@ -719,6 +738,7 @@ def pdot_figure(
     track: PhaseTrackResult | None = None,
     profile: PeriodProfile | None = None,
     law: PeriodLawFit | None = None,
+    ltte: LTTEFit | None = None,
     title: str = "",
     path: str | Path | None = None,
     dpi: int = 140,
@@ -749,6 +769,8 @@ def pdot_figure(
     law : PeriodLawFit, optional
         From :func:`cuperiod.fit_period_law`. Overlaid on the profile panel, and
         the source of the decay-timescale panel.
+    ltte : LTTEFit, optional
+        The best fit of :func:`cuperiod.ltte_search`, overlaid on the O-C panel.
     title : str, default ""
         Figure suptitle (typically the star's name).
     path : str or pathlib.Path, optional
@@ -804,7 +826,9 @@ def pdot_figure(
     if search is not None:
         panels.append(lambda ax: plot_search_map(ax, search))
     if track is not None:
-        panels.append(lambda ax: plot_oc(ax, track, t_offset=t_offset))
+        panels.append(
+            lambda ax: plot_oc(ax, track, ltte=ltte, t_offset=t_offset)
+        )
     if profile is not None:
         panels.append(
             lambda ax: plot_period_profile(ax, profile, law=law, t_offset=t_offset)

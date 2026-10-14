@@ -66,6 +66,9 @@ def test_in_memory_summary_carries_every_stage() -> None:
     assert row["track_f_test_p"] < 1e-3
     assert row["law"] in {"singular", "pejcha", "exponential", "linear"}
     assert row["n_intervals"] > 2
+    # The cyclic-O-C stage ran and its columns are in the schema.
+    assert np.isfinite(row["ltte_outer_period_yr"])
+    assert isinstance(row["ltte_at_grid_edge"], bool)
 
 
 def test_the_measured_change_matches_the_generating_law() -> None:

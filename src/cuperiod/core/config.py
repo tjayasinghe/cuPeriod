@@ -921,6 +921,38 @@ class PdotSettings(BaseSettings):
             "when the drift itself smears the initial fold."
         ),
     )
+    # -- cyclic O-C / light-travel-time search (ltte_search) ---------------------
+    ltte_min_points: int = Field(
+        default=8,
+        ge=6,
+        description=(
+            "Fewest O-C points ltte_search accepts (the batch chain skips the "
+            "cyclic fit below it)."
+        ),
+    )
+    ltte_samples_per_peak: int = Field(
+        default=10,
+        ge=1,
+        description="Oversampling of the outer-frequency grid relative to 1/baseline.",
+    )
+    ltte_degree: int = Field(
+        default=2,
+        ge=1,
+        le=3,
+        description=(
+            "Degree of the ephemeris polynomial fitted jointly with the cycle "
+            "(2 = parabola + sinusoid; 1 = sinusoid on a linear ephemeris)."
+        ),
+    )
+    ltte_min_cycles: float = Field(
+        default=1.0,
+        gt=0.0,
+        description=(
+            "Fewest outer cycles the baseline must cover: the scan's longest "
+            "trial outer period is baseline / ltte_min_cycles. Below one cycle a "
+            "light-time orbit and a parabola are nearly degenerate."
+        ),
+    )
     # -- interval profiling (period_profile) --------------------------------------
     profile_points_per_interval: int = Field(
         default=50,

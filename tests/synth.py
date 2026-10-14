@@ -186,3 +186,90 @@ def synthetic_eclipser(
     flux += rng.normal(0.0, noise, n)
     err = np.full(n, noise)
     return t, flux, err
+
+
+def _true_anomaly_reference(mean_anomaly: FloatArray, e: float) -> FloatArray:
+    """Kepler's equation by bisection-free fixed-point iteration (test-side)."""
+    m = np.mod(mean_anomaly, 2.0 * np.pi)
+    ecc = m.copy()
+    for _ in range(200):
+        ecc = m + e * np.sin(ecc)
+    return 2.0 * np.arctan2(
+        np.sqrt(1.0 + e) * np.sin(0.5 * ecc), np.sqrt(1.0 - e) * np.cos(0.5 * ecc)
+    )
+
+
+def ltte_delay_reference(
+    dt: FloatArray,
+    outer_period: float,
+    amplitude: float,
+    omega: float,
+    eccentricity: float = 0.0,
+    t_periastron: float = 0.0,
+) -> FloatArray:
+    """Irwin's (1952) light-time delay, written independently of the package."""
+    m = 2.0 * np.pi * (dt - t_periastron) / outer_period
+    nu = _true_anomaly_reference(m, eccentricity)
+    e = eccentricity
+    return amplitude * (
+        (1.0 - e * e) / (1.0 + e * np.cos(nu)) * np.sin(nu + omega) + e * np.sin(omega)
+    )
+
+
+def synthetic_ltte(
+    *,
+    n: int = 2500,
+    span: float = 3000.0,
+    period: float = 0.5,
+    outer_period: float = 800.0,
+    amplitude: float = 0.004,
+    omega: float = 0.7,
+    eccentricity: float = 0.0,
+    t_periastron_frac: float = 0.2,
+    pdot: float = 0.0,
+    amp: float = 0.30,
+    amp2: float = 0.10,
+    noise: float = 0.03,
+    base_jd: float = 2455000.0,
+    seed: int = 0,
+) -> tuple[FloatArray, FloatArray, FloatArray, dict[str, float]]:
+    """A two-harmonic signal whose arrivals carry a light-travel-time delay.
+
+    The binary sits in an outer orbit: what is observed at ``t`` was emitted
+    at ``t - delay(t)`` with Irwin's (1952) delay from an independent Kepler
+    solver, so the O-C is ``+delay`` (positive = late) plus the constant-dP/dt
+    parabola when ``pdot`` is nonzero. ``truth`` carries ``outer_period``,
+    ``amplitude`` (days), ``omega``, ``eccentricity``, ``t_periastron``,
+    ``period``, ``pdot`` and ``t_ref``; compare *delay curves* rather than
+    phase parameters, which are degenerate for a circular orbit.
+    """
+    rng = np.random.default_rng(seed)
+    t = np.sort(rng.uniform(0.0, span, n)) + base_jd
+    t_ref = float(t.mean())
+    dt = t - t_ref
+    t_peri = t_ref + t_periastron_frac * outer_period
+    delay = ltte_delay_reference(
+        dt, outer_period, amplitude, omega, eccentricity, t_peri - t_ref
+    )
+    a = pdot / period
+    retarded = dt - delay
+    tau = np.log1p(a * retarded) / a if pdot != 0.0 else retarded
+    f0 = 1.0 / period
+    mag = (
+        13.0
+        + amp * np.sin(2 * np.pi * f0 * tau)
+        + amp2 * np.sin(4 * np.pi * f0 * tau + 1.0)
+        + rng.normal(0.0, noise, n)
+    )
+    err = np.full(n, noise)
+    truth = {
+        "period": period,
+        "pdot": pdot,
+        "outer_period": outer_period,
+        "amplitude": amplitude,
+        "omega": omega,
+        "eccentricity": eccentricity,
+        "t_periastron": t_peri,
+        "t_ref": t_ref,
+    }
+    return t, mag, err, truth

@@ -60,6 +60,7 @@ from cuperiod.core.device import free_gpu_memory, suggest_gpu_workers
 from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
 from cuperiod.pdot.detrend import TrendMethod, detrend
 from cuperiod.pdot.laws import AUTO_LAWS, PeriodLawFit, compare_period_laws
+from cuperiod.pdot.ltte import LTTESearchResult, ltte_search
 from cuperiod.pdot.profile import PeriodProfile, period_profile
 from cuperiod.pdot.result import PdotSearchResult
 from cuperiod.pdot.track import (
@@ -100,6 +101,7 @@ class _ChunkConfig:
     detrend_width: float | None
     detrend_method: TrendMethod
     do_profile: bool
+    do_ltte: bool
     laws: tuple[str, ...]
     points_per_interval: int | None
     period_window: float | None
@@ -135,6 +137,11 @@ _LAW_FIELDS: tuple[str, ...] = (
     "bic", "delta_bic", "chi2_reduced", "rms", "total_fractional_change",
     "timescale_first_yr", "timescale_last_yr",
 )
+_LTTE_FIELDS: tuple[str, ...] = (
+    "outer_period_yr", "outer_period_err_yr", "amplitude_s", "amplitude_err_s",
+    "delta_bic", "f_test_p", "n_cycles", "mass_function", "pdot", "pdot_err",
+    "pdot_s_per_yr", "pdot_change", "chi2_reduced",
+)
 
 
 def pdot_to_rows(
@@ -145,6 +152,7 @@ def pdot_to_rows(
     ladder: Sequence[EphemerisFit] = (),
     profile: PeriodProfile | None = None,
     laws: Sequence[PeriodLawFit] = (),
+    ltte: LTTESearchResult | None = None,
     status: str = "ok",
     n_samples: int = 0,
     baseline: float = float("nan"),
@@ -165,6 +173,8 @@ def pdot_to_rows(
         Polynomial ephemeris fits of increasing degree over the same O-C points.
     laws : sequence of PeriodLawFit
         Period-law fits over the ``P(t)`` track, best (lowest BIC) first.
+    ltte : LTTESearchResult, optional
+        The cyclic (light-travel-time) O-C search over the track's delays.
     status : str, default "ok"
         ``"ok"``, or ``"<ExceptionType>: message"`` for a light curve that
         failed. Failed rows still carry ``key`` and whatever stages completed.
@@ -197,6 +207,7 @@ def pdot_to_rows(
         "law_runner_up": "",
         "law_at_bound": False,
         "implied_model": "",
+        "ltte_at_grid_edge": False,
         "figure": figure,
     }
     row.update(_nan_block(_SEARCH_FIELDS, "search_"))
@@ -206,6 +217,7 @@ def pdot_to_rows(
     row.update(_nan_block(_LAW_FIELDS, "law_"))
     row.update(_nan_block(_LAW_PARAMS, "law_"))
     row.update(_nan_block(_LAW_PARAMS, "law_err_"))
+    row.update(_nan_block(_LTTE_FIELDS, "ltte_"))
 
     oc_rows: list[dict[str, Any]] = []
     profile_rows: list[dict[str, Any]] = []
@@ -330,6 +342,29 @@ def pdot_to_rows(
             row["law_timescale_first_yr"] = float(first)
             row["law_timescale_last_yr"] = float(last)
 
+    if ltte is not None:
+        cyc = ltte.best
+        row.update(
+            {
+                "ltte_outer_period_yr": cyc.outer_period_yr,
+                "ltte_outer_period_err_yr": cyc.outer_period_err_yr,
+                "ltte_amplitude_s": cyc.amplitude_s,
+                "ltte_amplitude_err_s": cyc.amplitude_err_s,
+                "ltte_delta_bic": ltte.delta_bic,
+                "ltte_f_test_p": ltte.f_test_p,
+                "ltte_n_cycles": ltte.n_cycles,
+                "ltte_mass_function": cyc.mass_function,
+                # The secular rate with the cycle removed, and how far the
+                # parabola-only rate sat from it.
+                "ltte_pdot": cyc.pdot,
+                "ltte_pdot_err": cyc.pdot_err_scaled,
+                "ltte_pdot_s_per_yr": cyc.pdot_s_per_yr,
+                "ltte_pdot_change": ltte.pdot_change,
+                "ltte_chi2_reduced": cyc.chi2_reduced,
+                "ltte_at_grid_edge": bool(cyc.at_grid_edge),
+            }
+        )
+
     return {
         "summary": (row,),
         "oc": tuple(oc_rows),
@@ -430,6 +465,15 @@ def _analyze_one(
     except Exception:  # noqa: BLE001 - a star too sparse to track still has a search
         track = None
 
+    # The cyclic O-C: a third body's light-travel time, or a magnetic cycle.
+    # Without it a parabola averages over any cycle shorter than the baseline.
+    cyclic: LTTESearchResult | None = None
+    if cfg.do_ltte and track is not None:
+        try:
+            cyclic = ltte_search(track, settings=cfg.settings)
+        except Exception:  # noqa: BLE001 - too few segments is normal, not fatal
+            cyclic = None
+
     profile: PeriodProfile | None = None
     laws: list[PeriodLawFit] = []
     if cfg.do_profile:
@@ -456,7 +500,9 @@ def _analyze_one(
     if cfg.plots_dir is not None and (
         cfg.plot_keys is None or key in cfg.plot_keys
     ):
-        figure = _write_figure(key, finite, search, track, profile, laws, cfg)
+        figure = _write_figure(
+            key, finite, search, track, profile, laws, cyclic, cfg
+        )
 
     return pdot_to_rows(
         key,
@@ -465,6 +511,7 @@ def _analyze_one(
         ladder=ladder,
         profile=profile,
         laws=laws,
+        ltte=cyclic,
         n_samples=n_samples,
         baseline=baseline,
         figure=figure,
@@ -478,6 +525,7 @@ def _write_figure(
     track: PhaseTrackResult | None,
     profile: PeriodProfile | None,
     laws: Sequence[PeriodLawFit],
+    cyclic: LTTESearchResult | None,
     cfg: _ChunkConfig,
 ) -> str:
     """Write one diagnostic figure; a plotting failure never fails the analysis."""
@@ -492,6 +540,7 @@ def _write_figure(
             track=track,
             profile=profile,
             law=laws[0] if laws else None,
+            ltte=cyclic.best if cyclic is not None else None,
             title=key,
             path=path,
         )
@@ -547,6 +596,7 @@ def batch_pdot(
     detrend_method: TrendMethod = "median",
     profile: bool = True,
     laws: Sequence[str] | None = AUTO_LAWS,
+    ltte: bool = True,
     points_per_interval: int | None = None,
     period_window: float | None = None,
     backend: str = "auto",
@@ -596,6 +646,12 @@ def batch_pdot(
     laws : sequence of str, optional
         Period laws to rank on each track; ``None`` skips the law fitting but
         keeps the track.
+    ltte : bool, default True
+        Also search each star's O-C for a cyclic (light-travel-time) variation
+        with :func:`cuperiod.ltte_search`, reporting the outer period,
+        amplitude, and the secular ``dP/dt`` with the cycle removed
+        (``ltte_*`` columns). Skipped silently for stars with fewer than
+        ``settings.ltte_min_points`` segments.
     points_per_interval, period_window : optional
         Passed to :func:`cuperiod.period_profile`.
     backend : str, default "auto"
@@ -667,6 +723,7 @@ def batch_pdot(
         detrend_width=detrend_width,
         detrend_method=detrend_method,
         do_profile=profile,
+        do_ltte=ltte,
         laws=tuple(laws) if laws else (),
         points_per_interval=points_per_interval,
         period_window=period_window,

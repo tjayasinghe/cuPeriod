@@ -181,6 +181,53 @@ All notable changes to cuPeriod are documented here. The format is based on
   The `singular` law's `b` and `t0` are individually degenerate here (they trade off
   strongly, and the fit reports errors that say so) while the P(t) they predict over the
   observed span is not — which is why the comparison above is made on the predictions.
+- **The cyclic O−C: light-travel-time orbits** (`cuperiod.ltte_search`,
+  `LTTESearchResult`, `LTTEFit`, `PhaseTrackResult.ltte_search`): a distant third
+  body makes the O−C *periodic* through the light-travel time across the outer
+  orbit (Irwin 1952), and when that outer period is comparable to or shorter than
+  the baseline the O−C is not monotonic — the rate a parabola reports is then a
+  baseline-weighted average of a wobble whose value and sign depend on which part
+  of the cycle the data cover. Hong et al. (2022) found 307 such systems (plus 104
+  with a parabola as well) among 14,127 OGLE bulge contact binaries, at outer
+  periods of 5–14 yr on a 15-yr baseline. `ltte_search` fits the cycle *jointly*
+  with the ephemeris polynomial: at every trial outer period the model is linear in
+  `A cos ω`, `A sin ω` and the polynomial (a floating-polynomial periodogram of the
+  O−C), the best trial is polished by nonlinear least squares — with Irwin's
+  eccentric elements freed on request — and the result carries the outer period,
+  amplitude, `a sin i`, mass function and minimum third mass, the *secular* `dP/dt`
+  with the cycle removed next to the parabola-only one (`pdot_change`), ΔBIC and an
+  F-test against the polynomial alone, and the `n_cycles` / `at_grid_edge` flags
+  that mark the degenerate regime. It accepts a `phase_track` result, a timing list,
+  or explicit O−C values; the batch chain runs it per star (`ltte=`, `ltte_*`
+  columns), the CLI exposes `--ltte/--no-ltte`, and the O−C panel of the diagnostic
+  figure overlays the orbit. Planted circular and eccentric orbits are recovered
+  within their errors against an independent Kepler solver, and a planted 800-day
+  cycle that the parabola alone turned into a 2σ "drift" comes out null in the joint
+  fit (`tests/test_pdot_ltte.py`).
+- **What a rate means physically, and how small a one is measurable**
+  (`cuperiod.mass_loss_rate`, `mass_transfer_rate`, `pdot_from_mass_loss`,
+  `pdot_from_mass_transfer`, `detectable_pdot`, `PdotSensitivity`, `convert_pdot`;
+  `pdot_d_per_yr` on every result): the Jeans-mode wind relation
+  `(dP/dt)/P = 2 mdot/M` — `dP/dt = 2e-6 (P/yr)(mdot/1e-6 Msun/yr)(Msun/M)` — and
+  Kwee's (1958) conservative-transfer relation `(dP/dt)/P = 3 mdot (1/M_d − 1/M_a)`,
+  both directions, with the sign checks that Schaefer (2024) found failing for 44% of
+  cataclysmic variables built in (a negative implied loss or transfer rate is
+  reported as such, not silently absolute-valued). `detectable_pdot` is the formal
+  floor of the quadratic-ephemeris method, `σ(dP/dt) ≈ 27 P σ_t / (T² √n)` for uniform
+  sampling or from the actual epochs, plus the light-time amplitude floor at a given
+  outer period — the 0.1-cycle rule of thumb overestimates the floor by two orders
+  of magnitude because eclipse timings reach 1e-3 P and there are dozens of them,
+  which is why survey detections sit at ~1e-6 d/yr (3e-9 s/s). Pinned against a Monte
+  Carlo of the fit and the closed form (`tests/test_pdot_physics.py`).
+- **Symmetry-aware cycle unwrapping in `phase_track`** (`PhaseTrackResult.symmetry_order`):
+  a contact binary with equal minima has a template that is almost perfectly
+  symmetric under a half-period shift, so a segment's best shift lands on either
+  branch by noise and the O−C jumped by P/2 between segments (on four of the six
+  OGLE stars below, for up to two thirds of the segments, which the template
+  re-derivation then turned into hour-scale garbage). The
+  tracker now measures the template's fold symmetry (harmonics outside the multiples
+  of `m` below 5% of the power) and unwraps consecutive delays by `period / m`;
+  `wrap_risk` is scaled the same way. Found on real data by the OGLE benchmark below.
 
 ### Fixed
 

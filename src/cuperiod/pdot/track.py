@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -42,12 +42,21 @@ from cuperiod.core.lightcurve import LightCurve
 from cuperiod.pdot.models import PeriodModel, get_model
 from cuperiod.pdot.result import SECONDS_PER_YEAR
 
+if TYPE_CHECKING:  # ltte imports this module; the annotation needs no runtime import.
+    from cuperiod.pdot.ltte import LTTESearchResult
+
 #: Shift-scan sampling: the coarse grid must resolve the sharpest template
 #: feature (scale P / (2 * harmonics)), with margin.
 _SCAN_PER_HARMONIC: int = 32
 _SCAN_MIN: int = 128
 #: Newton polish iterations after the parabolic seed.
 _NEWTON_STEPS: int = 6
+#: A template whose harmonics outside the multiples of ``m`` carry less than this
+#: fraction of its power is ``m``-fold symmetric: a shift by ``P/m`` is nearly as
+#: good as the true one, so segment delays are unwrapped by ``P/m``.
+_SYMMETRY_POWER_FRACTION: float = 0.05
+#: Symmetry orders tested, highest first (2 = the equal-minima contact binary).
+_SYMMETRY_ORDERS: tuple[int, ...] = (4, 3, 2)
 
 
 # --- template ----------------------------------------------------------------
@@ -375,6 +384,11 @@ class EphemerisFit:
         return self.pdot * SECONDS_PER_YEAR * 1e3
 
     @property
+    def pdot_d_per_yr(self) -> float:
+        """dP/dt in days per year (the eclipsing-binary survey unit)."""
+        return self.pdot * 365.25
+
+    @property
     def dlnp_dt_per_yr(self) -> float:
         """Fractional rate d(ln P)/dt per year (the Mira / delta Sct unit)."""
         return (self.pdot / self.period_ref) * 365.25
@@ -396,6 +410,7 @@ class EphemerisFit:
             "pdot_err_scaled": self.pdot_err_scaled,
             "pdot_s_per_yr": self.pdot_s_per_yr,
             "pdot_ms_per_yr": self.pdot_ms_per_yr,
+            "pdot_d_per_yr": self.pdot_d_per_yr,
             "dlnp_dt_per_yr": self.dlnp_dt_per_yr,
             "pddot": self.pddot,
             "pddot_err": self.pddot_err,
@@ -616,11 +631,21 @@ class PhaseTrackResult:
     linear_fit, quadratic_fit : EphemerisFit
         The competing ephemeris models over the segment delays.
     wrap_risk : bool
-        True when consecutive segment delays jump by more than 0.3 period —
-        the cycle-count assignment may have slipped; re-run with fewer/longer
-        segments or seed ``pdot=`` from :func:`cuperiod.pdot_search`.
+        True when consecutive segment delays jump by more than 0.3 of the
+        unwrap period (``period / symmetry_order``) — the cycle-count
+        assignment may have slipped; re-run with fewer/longer segments or seed
+        ``pdot=`` from :func:`cuperiod.pdot_search`.
     meta : Mapping
         Provenance plus light-curve metadata.
+    symmetry_order : int
+        ``m`` when the template is ``m``-fold symmetric (harmonics outside the
+        multiples of ``m`` carry under 5% of its power) and 1 otherwise. A
+        contact binary with equal minima is 2-fold symmetric: a shift by half
+        a period fits almost as well as the true one, and a segment's best
+        shift can land on either branch. Delays are therefore unwrapped to
+        the branch nearest their predecessor in steps of ``period / m`` —
+        cycle continuity is the only information that separates the branches
+        — and the O-C is only defined modulo that step.
     """
 
     period: float
@@ -636,6 +661,7 @@ class PhaseTrackResult:
     quadratic_fit: EphemerisFit
     wrap_risk: bool
     meta: Mapping[str, Any] = field(default_factory=dict)
+    symmetry_order: int = 1
 
     @property
     def pdot(self) -> float:
@@ -662,6 +688,11 @@ class PhaseTrackResult:
         return self.pdot * SECONDS_PER_YEAR
 
     @property
+    def pdot_d_per_yr(self) -> float:
+        """Total dP/dt in days per year."""
+        return self.pdot * 365.25
+
+    @property
     def f_test_p(self) -> float:
         """p-value of the quadratic (dP/dt) term against the linear model."""
         return self.quadratic_fit.f_test_p
@@ -671,6 +702,18 @@ class PhaseTrackResult:
         """Number of usable segments."""
         return int(self.t_mid.size)
 
+    def ltte_search(self, **kwargs: Any) -> LTTESearchResult:
+        """Search these delays for a cyclic (light-travel-time) O-C.
+
+        A convenience for :func:`cuperiod.ltte_search` on this result; the
+        keyword arguments are passed through. A quadratic alone averages over
+        a cycle shorter than the baseline, so when the O-C is not monotonic
+        this is where the *secular* rate should be read from.
+        """
+        from cuperiod.pdot.ltte import ltte_search
+
+        return ltte_search(self, **kwargs)
+
     def to_dict(self) -> dict[str, Any]:
         """Serialize scalars plus the O-C table."""
         return {
@@ -679,10 +722,12 @@ class PhaseTrackResult:
             "pdot_err": self.pdot_err,
             "pdot_err_scaled": self.pdot_err_scaled,
             "pdot_s_per_yr": self.pdot_s_per_yr,
+            "pdot_d_per_yr": self.pdot_d_per_yr,
             "pdot_seed": self.pdot_seed,
             "model": self.model,
             "f_test_p": self.f_test_p,
             "wrap_risk": self.wrap_risk,
+            "symmetry_order": self.symmetry_order,
             "t_ref": self.t_ref,
             "n_segments": self.n_segments,
             "n_harmonics": self.template.n_harmonics,
@@ -841,6 +886,8 @@ def phase_track(
             "pdot_bulk_removed": bulk,
             "template_passes": passes,
             "model": pmodel.name,
+            "symmetry_order": result.symmetry_order,
+            "unwrap_period": period / result.symmetry_order,
         },
         **dict(finite.meta),
     }
@@ -858,6 +905,7 @@ def phase_track(
         quadratic_fit=quad,
         wrap_risk=result.wrap_risk,
         meta=meta,
+        symmetry_order=result.symmetry_order,
     )
 
 
@@ -873,6 +921,23 @@ class _TrackPass:
     linear: EphemerisFit
     quadratic: EphemerisFit
     wrap_risk: bool
+    symmetry_order: int
+
+
+def _symmetry_order(template: PhaseTemplate) -> int:
+    """The template's fold symmetry ``m`` (1 when none reaches the threshold)."""
+    power = np.asarray(template.amplitudes, dtype=np.float64) ** 2
+    total = float(power.sum())
+    if total <= 0.0:
+        return 1
+    harmonic = np.arange(1, power.size + 1)
+    for m in _SYMMETRY_ORDERS:
+        if m > power.size:
+            continue
+        outside = float(power[harmonic % m != 0].sum())
+        if outside < _SYMMETRY_POWER_FRACTION * total:
+            return m
+    return 1
 
 
 def _track_pass(
@@ -944,11 +1009,17 @@ def _track_pass(
         )
 
     # Cycle continuity: unwrap each delay to the branch nearest its predecessor.
+    # A near-symmetric template (equal-minima contact binary: power in the
+    # even harmonics only) fits a shift by P/2 almost as well as the true one,
+    # and a segment's global best lands on either branch by noise — so the
+    # unwrap step is the template's ambiguity period P/m, not P.
+    symmetry = _symmetry_order(template)
+    unwrap = period / symmetry
     delays = np.array([s.delay for s in shifts], dtype=np.float64)
     for k in range(1, delays.size):
-        delays[k] -= period * np.round((delays[k] - delays[k - 1]) / period)
+        delays[k] -= unwrap * np.round((delays[k] - delays[k - 1]) / unwrap)
     steps = np.abs(np.diff(delays))
-    wrap_risk = bool(steps.size and float(steps.max()) > 0.3 * period)
+    wrap_risk = bool(steps.size and float(steps.max()) > 0.3 * unwrap)
 
     t_mids = np.array([s.t_mid for s in shifts], dtype=np.float64)
     delay_errs = np.array([s.delay_err for s in shifts], dtype=np.float64)
@@ -963,6 +1034,7 @@ def _track_pass(
         linear=linear,
         quadratic=quad,
         wrap_risk=wrap_risk,
+        symmetry_order=symmetry,
     )
 
 

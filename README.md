@@ -82,7 +82,13 @@ Every implementation is validated against the standard reference (astropy
   template timing per segment, quadratic ephemeris fits with honest uncertainties, an
   F-test for the drift, plus the Eddington–Plakidis test that separates a real secular
   change from random cycle-to-cycle wander. `fit_ephemeris` runs the same fits on your
-  own times-of-minimum lists.
+  own times-of-minimum lists. When the O−C is *cyclic* rather than monotonic — a third
+  body's light-travel time, on an outer orbit shorter than the baseline — `ltte_search`
+  fits the orbit jointly with the ephemeris (outer period, amplitude, mass function) so
+  the secular rate is measured with the cycle removed instead of averaged over it; on six
+  OGLE bulge triples it recovers the published outer periods from raw survey photometry.
+  `detectable_pdot` says how small a rate your timings could have measured, and
+  `mass_loss_rate` / `mass_transfer_rate` what a secular one would mean.
 
 ## Status
 
