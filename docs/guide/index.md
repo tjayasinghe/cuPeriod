@@ -37,6 +37,11 @@ Automated, uncertainty-aware frequency extraction for δ Scuti, γ Dor, and SPB
 pulsators — with combination frequencies and g-mode period spacings.
 :::
 
+:::{grid-item-card} {doc}`interactive-prewhitening`
+Period04-style pre-whitening by hand, in the GUI or with `PreWhitenSession`: steps,
+ties, fixes, outliers, nightly zero points, undo, projects and reproducing scripts.
+:::
+
 :::{grid-item-card} {doc}`period-change`
 Detect and measure period derivatives: the joint (P, dP/dt) search, automated O−C
 tracking, dynamic maps, and the random-wander test.
@@ -63,8 +68,8 @@ The `cuperiod` command line: `run`, `batch`, `pdot`, `prewhiten`, `batch-prewhit
 :::
 
 :::{grid-item-card} {doc}`gui`
-The `cuperiod-gui` desktop explorer: run any method and fold the light curve live as you
-drag across peaks.
+The `cuperiod-gui` desktop explorer: run any method, fold the light curve live as you
+move across peaks, and pre-whiten interactively — keyboard-operable throughout.
 :::
 
 ::::
@@ -85,4 +90,7 @@ sibling {func}`cuperiod.batch_periodograms` does the same for many light curves 
 
 A multiperiodic pulsator needs more than the best period, so {func}`cuperiod.prewhiten`
 runs that same three-step machinery in a loop — extract, fit, subtract, repeat — with
-principled stopping criteria and propagated uncertainties ({doc}`prewhitening`).
+principled stopping criteria and propagated uncertainties ({doc}`prewhitening`). When a
+light curve needs a hand on the wheel, the same loop runs one action at a time in a
+{class}`~cuperiod.PreWhitenSession` — undoable, saved as a project, and exportable as a
+script ({doc}`interactive-prewhitening`).

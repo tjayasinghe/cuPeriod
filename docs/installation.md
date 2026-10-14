@@ -10,8 +10,10 @@ pip install cuperiod
 ```
 
 This pulls in the core dependencies — `numpy`, `scipy`, `astropy`, `finufft`,
-`array-api-compat`, `pydantic`, `typer`, and `pyarrow` — and gives you every method on the
-CPU, the command line, and batch processing over a process pool.
+`array-api-compat`, `pydantic`, `typer`, and `pyarrow` (at least 14.0.1: earlier releases
+unpickle extension-type metadata while reading Parquet, CVE-2023-47248, and cuPeriod opens
+user-supplied `.parquet` files) — and gives you every method on the CPU, the command line,
+and batch processing over a process pool.
 
 ## Optional extras
 
@@ -42,7 +44,13 @@ kernels for PDM, CE, String-Length, MHAOV, TLS, and SuperSmoother — to in-hous
 JIT kernels. Nothing else about your code changes: the results match the fallbacks to
 round-off (BLS still matches astropy), they just arrive much sooner (~20× for BLS over
 astropy; ~25–300× for the others over their numpy paths). (Note that `numba` currently caps
-`numpy < 2.5`, so installing it may downgrade numpy slightly.)
+`numpy < 2.5`, so installing it may downgrade numpy slightly.) The kernels are compiled
+once per install and cached on disk; files named `supersmoother._numba_ss_kernel…` left in
+`cuperiod/methods/__pycache__` by earlier versions, which recompiled in every process,
+can be deleted.
+
+Backends are probed once per process. If you install a GPU or torch extra into a running
+session (a notebook, say), call `cuperiod.core.backend.refresh_backends()` to probe again.
 
 ## GPU requirements
 
@@ -59,7 +67,8 @@ same code runs on both. See {doc}`guide/backends`.
 :::{note}
 On Windows, the cufinufft wheel needs the CUDA-12 runtime DLLs on the search path.
 cuPeriod adds the `nvidia-*-cu12` wheel directories automatically when a GPU backend is
-first used, so no manual `PATH` editing is needed. cupy may print a benign
+first used — only directories of the installed wheels, never a folder that merely happens
+to be called `nvidia` — so no manual `PATH` editing is needed. cupy may print a benign
 *"CUDA path could not be detected"* warning when it uses the pip wheels rather than a
 system toolkit — this is harmless.
 :::
@@ -147,14 +156,46 @@ To work on cuPeriod itself (tests, linting, type-checking) the project uses
 ```bash
 uv venv --python 3.12
 uv pip install -e ".[dev]"
-uv run pytest -q          # GPU tests auto-skip without a device
+uv run pytest -q -m "not gpu"   # the CPU suite; never touches a GPU
+uv run pytest -q                # everything; GPU tests skip without a device
 ```
 
-To build these docs locally, install the `docs` extra and run Sphinx:
+GPU tests carry the `gpu` marker. `-m "not gpu"` deselects them **and** hides the GPUs
+from the rest of the run (`CUDA_VISIBLE_DEVICES` / `HIP_VISIBLE_DEVICES=-1` and CPU-only
+device discovery), so tests that use the default `backend="auto"` or a bare `"torch"` run
+on the CPU and the run never loads a GPU that is busy with other work. A plain `pytest`
+lets those tests use a visible GPU; with the GPU stack installed but no device, the GPU
+tests skip instead of failing.
+
+To build these docs locally, install the `docs` extra and run Sphinx (the build treats
+every warning as an error, as Read the Docs does):
 
 ```bash
 uv pip install -e ".[docs]"
-sphinx-build -b html docs docs/_build/html
+sphinx-build -b html -W --keep-going docs docs/_build/html
 ```
+
+The GUI's keyboard-shortcut tables are generated from its command registry at build
+time; the `gui` extra is not needed for that.
+
+### Releasing
+
+1. Bump `version` in `pyproject.toml` and merge.
+2. Push the tag `v<version>`. The release workflow builds the package and refuses to
+   publish when the tag does not equal the built version (tagging `v1.3.0` while
+   `pyproject.toml` still says `1.3.0.dev0`, for example).
+3. For a dry run, start the workflow by hand (`workflow_dispatch`): a manual run only
+   ever publishes to TestPyPI, even when started on a tag.
+
+The `pypi` deployment environment should require a reviewer and allow only `v*` tags.
+Every GitHub Action is pinned to a full commit SHA and Dependabot moves those pins; the
+rest is bumped by hand: the uv pin in `release.yml` is two inputs that change together —
+`version` and `checksum`, the SHA-256 of `uv-x86_64-unknown-linux-gnu.tar.gz` for that
+version (published beside it as `….tar.gz.sha256`), keeping the trailing
+`# uv-x86_64-unknown-linux-gnu.tar.gz <version>` comment that `tests/test_supply_chain.py`
+checks — and the twine pin with its `--exclude-newer` date and the hash-pinned hatchling
+build backend are refreshed with the `uv pip compile` command in the header of
+`.github/build-constraints.txt`. A stale checksum fails the release build; it never
+passes silently.
 
 Next: the {doc}`quickstart`.

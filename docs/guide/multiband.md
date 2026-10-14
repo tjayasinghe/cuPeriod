@@ -48,7 +48,22 @@ pg = cup.periodogram(mb, "GLS")
 The band column is auto-detected (`band`, `filter`, `passband`, `fid`, …) when you don't
 name it, and the time/value/error columns resolve exactly as for a single
 {doc}`light curve <light-curves>` (with {class}`~cuperiod.ColumnMap` if needed). Bands keep
-their first-appearance order.
+their first-appearance order. `from_dataframe` also accepts astropy and pyarrow tables
+and `{column: array}` mappings, and it and `from_file` read the same table identically:
+
+- band labels are normalised — padding stripped, and `1`, `"1"` and `1.0` are one band
+  `"1"` (integer filter ids stored as floats lose the `.0`);
+- rows without a label are dropped with a `UserWarning` (they used to form phantom
+  bands such as `N/A` or `999999`);
+- a {class}`~cuperiod.MultiBandLightCurve` refuses a band that is not a
+  {class}`~cuperiod.LightCurve` (`TypeError`) and bands in different brightness domains
+  (`ValueError`) — pass the `{band: LightCurve}` mapping with `domain=` to
+  {func}`~cuperiod.periodogram` or {func}`~cuperiod.to_input` to unify them. `domain=`
+  converts every band.
+
+A table passed to {func}`~cuperiod.periodogram` with `columns=ColumnMap(band=...)` is
+split the same way; without a band column it is read as one pooled light curve (with a
+warning when it has a multi-label band column).
 
 The same switch works from the command line and in batch:
 
@@ -79,7 +94,19 @@ spectrum, and serialization all work as in {doc}`results`.
 
 The default grid is built from the **stacked** baseline of all bands (their combined time
 span), so the frequency resolution reflects all your data; override it with `grid=`
-({doc}`tuning`).
+({doc}`tuning`). For the fold methods the stacked default grid stays bounded when bands
+are observed nearly simultaneously — the multi-exposure ceiling of {doc}`tuning` (a
+Stripe-82 five-band stack: 50 million → 500 000 trial frequencies, every RR Lyrae still
+in band).
+
+**Errors and weights.** A multi-band method uses the error bars only when every
+contributing band has them; a set mixing bands with and without errors runs every band
+unweighted (BLS then uses each band's own robust flux scatter, 1.4826 × MAD, as its
+error). `meta["bands"]` lists only the bands that contributed, matching `n_samples`, and
+an exactly constant band contributes zero power (it is left out of MHAOV and
+SuperSmoother). `min_detections` applies to every multi-band method, counted over the
+bands that pass the method's per-band floor, and raises
+{exc}`~cuperiod.InsufficientDataError` as the single-band methods do.
 
 ## The three GLS models
 
@@ -204,7 +231,7 @@ Practical guidance:
 ## The fold-based methods
 
 PDM, conditional entropy, String-Length, and SuperSmoother join the existing MHAOV (pooled
-`F`) and BLS (shared ephemeris, stacked depth-SNR) with the same structure: **each band
+`F`) and BLS (shared period, stacked depth-SNR) with the same structure: **each band
 keeps its own mean curve, histogram, or normalization**, and only the resulting statistics
 are pooled.
 
@@ -225,8 +252,8 @@ absolute deviation — so pooling needs no separate standardization step.
 | **CE** | conditional entropy `H_k` | `n_k` (makes `H_mb` the entropy per observation) |
 | **String-Length** | string length `L_k` | `n_k` (a string over `n_k` points is `n_k` steps) |
 | **SuperSmoother** | smoother score `S_k` | `B_k`, band `k`'s baseline error (its mean absolute standardized deviation about its own mean) |
-| **MHAOV** | pooled `F`-statistic | — |
-| **BLS** | stacked depth-SNR, shared ephemeris | — |
+| **MHAOV** | pooled `F`-statistic: each band's regression and residual sums in that band's own variance units | — |
+| **BLS** | `Σ_k max(SNR_k, 0)²` of independent per-band box searches; only the period is shared | — |
 
 ```python
 pg = cup.periodogram(mb, "PDM")            # dof-weighted mean of the per-band Theta
@@ -248,6 +275,18 @@ SuperSmoother's weights are gatspy's `SuperSmootherMultiband`: `B_k` is the deno
 band `k`'s own score, so the combined statistic is the *total* fractional reduction in mean
 absolute deviation across all bands, a noisy or flat band contributes little weight, and
 with one band it collapses to the single-band score.
+
+**MHAOV** centres each band and divides it by its own standard deviation before pooling
+the regression and residual sums, so a noisier or larger-scale band cannot decide the
+period on its own (with one band fifteen times noisier: 3 of 40 periods recovered
+before, 40 of 40 now). Every MHAOV power with two or more bands differs from cuPeriod
+1.2; a single band is unchanged.
+
+**BLS** shares only the **period** across bands, not a (period, duration, t0)
+ephemeris: each band is searched on its own and the statistic is the sum of each band's
+best squared depth-SNR. The reported box (depth, duration, t0) is that of the strongest
+band, named by `extras["band_index"]` (an index into `meta["bands"]`). A user `grid=` is
+searched exactly, segmented like single-band BLS.
 
 :::{note}
 SuperSmoother pools **scores, not phases** — being non-parametric there is no shared-phase
@@ -297,21 +336,30 @@ print(pg.meta["fap_level_10pct"], pg.meta["fap_level_1pct"])
 ```
 
 :::{note}
-The smallest resolvable false-alarm probability is `1 / (n_bootstrap + 1)`; asking
-{meth}`~cuperiod.MultibandFAP.level` for anything below it raises rather than
-extrapolating. `meta["fap_level_1pct"]` appears only from `n_bootstrap >= 99`. Because the
-level of a *maximum* depends on the grid that maximum was taken over, calibrate on the
-same grid you searched (the default does) — and with the same `mb_model`: pass the same
-{class}`~cuperiod.GLSSettings` as `multiband_fap`'s second argument, e.g.
-`cup.multiband_fap(mb, cup.GLSSettings(mb_model="flex"))`.
+The smallest resolvable false-alarm probability is `1 / (n_bootstrap + 1)`.
+{meth}`MultibandFAP.level(p) <cuperiod.MultibandFAP.level>` is the k-th largest null
+maximum with `k = floor(p (R + 1))` — the order statistic `fap()` implies, so any power
+above it has `fap <= p` — and asking for less than the floor raises rather than
+extrapolating. `meta["fap_level_10pct"]` is written only from `mb_fap_bootstrap >= 9` and
+`meta["fap_level_1pct"]` from `>= 99`; `fap(nan)` is `NaN`, and a best peak on the grid
+edge gets a finite FAP. Because the level of a *maximum* depends on the grid that
+maximum was taken over, calibrate on the same grid you searched (the default does) — and
+with the same `mb_model`: pass the same {class}`~cuperiod.GLSSettings` as
+`multiband_fap`'s second argument, e.g.
+`cup.multiband_fap(mb, cup.GLSSettings(mb_model="flex"))`. `n_bootstrap < 1` raises,
+and `multiband_fap(backend="auto")` honours `settings.backend`.
 :::
 
 For the `"offsets"` model on a NUFFT backend the bootstrap is nearly free: the times never
 change, so every resample reuses the same nonuniform points and the whole batch runs as
 multi-transform NUFFTs — the same `K + 2` transforms as one power evaluation, each
-carrying a stack of bootstrap strengths. The `"perband"` and `"flex"` models and the torch
-backend fall back to an explicit loop over resamples, which is still native speed per
-iteration but scales linearly in `n_bootstrap`.
+carrying a stack of bootstrap strengths, drawn batch by batch so host memory stays
+bounded (about 160 MB) whatever `n_bootstrap` and the light-curve length. The `"perband"`
+and `"flex"` models and the torch backend fall back to an explicit loop over resamples,
+which is still native speed per iteration but scales linearly in `n_bootstrap`. On the
+`astropy` backend or a non-uniform grid, `mb_fap_bootstrap` reruns that route once per
+resample (`n_bootstrap` astropy evaluations); a calibration on a non-uniform grid is
+labelled `backend="astropy"`.
 
 `multiband_fap` also accepts a single-band {class}`~cuperiod.LightCurve`, which gives an
 honest bootstrap FAP for the ordinary GLS.

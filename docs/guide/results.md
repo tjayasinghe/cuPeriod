@@ -34,17 +34,29 @@ peaks = pg.best_periods(10)
 best = pg.best_period()          # shorthand for the single best period (a float, days)
 ```
 
-Parameters:
+Parameters (the defaults come from the method's settings — `n_peaks`,
+`peak_separation_rayleigh`, `harmonic_max`, `alias_freq_tolerance` — for a result of
+{func}`~cuperiod.periodogram`, the batch drivers or the GUI; explicit arguments win):
 
-- **`n`** (default 10) — maximum number of peaks to return.
+- **`n`** (default 10) — maximum number of peaks to return; `0` or less returns none.
 - **`min_separation_rayleigh`** (default 3.0) — minimum spacing between peaks, in Rayleigh
   widths (`1/baseline`). Raise it to thin out closely-spaced peaks; lower it to resolve
   them.
 - **`alias_diverse`** (default `False`) — when `True`, skip candidates that are aliases or
-  harmonics of a peak already chosen. **Recommended for box searches (BLS/TLS)**, where the
-  same transit shows up at 2×/½× the period.
+  harmonics of a peak already chosen (solar-day offsets included). **Recommended for box
+  searches (BLS/TLS)**, where the same transit shows up at 2×/½× the period.
 - **`harmonic_max`** (default 8) — the highest harmonic order considered when
   `alias_diverse` is set.
+- **`alias_tolerance`** — how close a candidate must be to a predicted alias or harmonic
+  to be skipped, separate from the duplicate-peak separation: the BLS/TLS settings'
+  `alias_freq_tolerance` (0.0035 c/d), or one Rayleigh width for a bare `Periodogram`.
+  Real second signals on short baselines are therefore no longer discarded (a 27-day
+  two-planet BLS search reports the second planet at rank 2). Rank 1 never changes.
+
+A `NaN` or infinite sample next to the true maximum no longer hides that peak.
+{func}`cuperiod.best_periods(result) <cuperiod.best_periods>` defaults to the result's
+own peak count. `pg.peak_defaults` shows the defaults a result carries and
+`pg.with_peak_defaults(settings)` attaches another set.
 
 ```python
 # Box search: get physically distinct candidates, not harmonics of one transit.
@@ -71,9 +83,9 @@ The `extra` dict carries quantities a method computes at each peak:
 
 | Method | `extra` keys |
 | --- | --- |
-| GLS | `fap` (false-alarm probability) |
-| BLS | `depth`, `duration`, `t0` (mid-transit time), `depth_snr`, `sde` |
-| TLS | transit shape scalars (depth, duration, …) |
+| GLS | `fap` (false-alarm probability; for a peak on the grid edge, a conservative upper bound) |
+| BLS | `depth`, `duration`, `t0` (mid-transit time), `depth_snr`, `sde`; multi-band also `band_index` |
+| TLS | `sr` (signal residue: the χ² reduction of the best level + transit fit), `depth` (mid-transit depth, flux units), `duration` (days), `t0` (absolute mid-transit time of the first transit at or after the first observation, on the input time axis like BLS's; the first timestamp where no dip is found); the power is the SDE |
 | others | method-specific where applicable |
 
 ```python
@@ -102,6 +114,9 @@ being diagnosed", on both objective senses. Harmonics and subharmonics are liste
 never make a result `ambiguous` — `2f` is expected structure in any non-sinusoidal signal.
 Omit the light curve and the classic ground-based suspects (sidereal day, solar day,
 synodic month, year) stand in for a measured window. See {class}`~cuperiod.AliasReport`.
+A `frequency=` to diagnose must be finite and inside the periodogram's range (else
+`ValueError`); a run shorter than `2 / window_max_frequency` simply has no measurable
+window peaks; and a predicted alias is never matched to the diagnosed peak itself.
 
 ## The raw spectrum
 
@@ -119,6 +134,10 @@ For a compact, plot-ready version, {meth}`~cuperiod.Periodogram.downsample` retu
 ```python
 freq, power = pg.downsample(2000)    # float32 arrays of length ~2000
 ```
+
+The default length is the settings' `downsample_points`. For the minimised statistics
+(PDM, CE, String-Length) each bin keeps its **minimum**, so the detection survives; spectra
+stored by cuPeriod 1.2 and earlier for these methods kept the maximum and lost it.
 
 ## Serializing
 
@@ -143,10 +162,17 @@ res = cup.periodogram(lc, ["GLS", "BLS"])
 
 res["GLS"]                       # the GLS Periodogram (keys are case-insensitive)
 list(res.keys())                 # ['GLS', 'BLS']
+"string-length" in res           # `in`, get() and values() match keys like [] does
 res.best_periods(5)              # {'GLS': [...], 'BLS': [...]}
 res["BLS"].best_periods(5, alias_diverse=True)
 res.to_dict(n_best=10)           # every method serialized
 ```
+
+`Periodogram`, `GridSpec` and `MultiResult` compare and hash by **identity** (comparing
+two spectra element-wise used to raise); compare `pg.power` arrays or `to_dict()` output
+for content. A `Peak` compares by value and is hashable. `Periodogram.from_spectrum`
+raises `ValueError` when `power` or an `extras` array does not match `frequency`'s shape,
+or when `objective_sense` is not `"max"` or `"min"`.
 
 ---
 

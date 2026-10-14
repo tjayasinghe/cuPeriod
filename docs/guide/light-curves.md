@@ -20,6 +20,26 @@ and normalizes it internally, so you rarely have to reshape anything by hand.
 Times are in **days** throughout cuPeriod (JD/HJD/BJD/MJD all work — periodograms are
 invariant to the time origin). Values may be **magnitude or flux**.
 
+- **Calendar times** are converted: `datetime64` values (pandas datetimes — tz-aware
+  ones taken in UTC — and pyarrow timestamps) become MJD days, `NaT` becomes `NaN`, and
+  `timedelta64` / `TimeDelta` become days. astropy `Time` columns (`TimeSeries`,
+  lightkurve, ECSV round trips, `(Time, flux)` tuples) keep their values in the
+  jd / mjd / btjd / bkjd formats and are converted to MJD otherwise. Calendar values in
+  a value or error column raise `TypeError`.
+- **Units are not applied**: the number in a time column is taken as days, so an
+  astropy `Quantity` or a QTable/FITS column in seconds must be converted first.
+- **Missing values** — numpy masked arrays, astropy masked columns, pandas `NA` and
+  pyarrow nulls — become `NaN` on every input route and are dropped by `finite()`;
+  masked integer, boolean and short text columns load too.
+- A table with a band/filter column read as a single light curve is **pooled** into one
+  curve, with a warning pointing to {class}`~cuperiod.MultiBandLightCurve` /
+  `ColumnMap(band=...)`; passing `columns=ColumnMap(band=...)` to
+  {func}`~cuperiod.periodogram` or {func}`~cuperiod.to_input` gives a multi-band light
+  curve directly (see {doc}`multiband`).
+- A bare `(t, y)` / `(t, y, dy)` tuple is read as **magnitudes**. BLS and TLS warn when
+  such a tuple looks like a normalised flux (median 0.5–1.5), because in magnitudes every
+  dip would be a brightening; pass `domain="flux"`.
+
 ## Building a `LightCurve` directly
 
 For full control, construct a {class}`~cuperiod.LightCurve`:
@@ -40,7 +60,9 @@ Useful attributes and transforms:
 :::{note}
 cuPeriod does **not** shift your time origin. Periodograms are invariant to it, and each
 method references times to their own minimum internally for numerical stability, so the
-container keeps your input times verbatim.
+container keeps your input times verbatim. (One small exception: the fold methods' default
+grids place the last sample on a phase-bin edge, so JD and MJD inputs can differ at the
+O(1/N) level there.)
 :::
 
 ## Loading from a file
@@ -54,7 +76,10 @@ lc = LightCurve.from_file("star.csv")
 lc = LightCurve.from_fits("lightcurve.fits", hdu=1)
 ```
 
-The originating path is recorded in `lc.meta["source"]`.
+The originating path is recorded in `lc.meta["source"]`. Compressed FITS
+(`.fits.gz`, `.fits.bz2`, `.fits.xz`) and `.fts` files are recognised. Parquet
+categorical columns with nulls read correctly, and a column that cannot be converted is
+named in the error (`time column 'date' could not be converted to float64: ...`).
 
 ## Column auto-detection with `ColumnMap`
 
@@ -90,7 +115,9 @@ pg = cup.periodogram(df, "GLS", columns=cmap)
 
 Any field left `None` is auto-detected; a non-`None` field is honored verbatim (and
 raises {exc}`~cuperiod.ColumnResolutionError` if that column is absent). Only `time` and
-`value` are required; `error` and `band` are optional.
+`value` are required; `error` and `band` are optional. Columns may also be named by
+position for tables whose labels are integers — `pd.read_csv(..., header=None)` loads
+with `ColumnMap(time=0, value=1, error=2)`.
 
 ## Supported surveys
 
@@ -171,15 +198,18 @@ surveys, so a downloaded table usually needs **no column hints** — `cup.period
 
 ¹ ATLAS's single-character `F` filter isn't auto-detected (to avoid clashing with a flux
 `f`); pass `ColumnMap(band="F")` if you need it for multi-band. The value defaults to the
-flux (`uJy`); pin `ColumnMap(value="m")` for magnitudes. ² LSST DP0.2 uses the older
+flux (`uJy`); `domain="magnitude"` picks `m`/`dm` instead (as does pinning
+`ColumnMap(value="m")`). ² LSST DP0.2 uses the older
 `midPointTai` / `psFlux` / `psFluxErr` / `filterName`, which are also detected. ³ MACHO's
 raw per-column header spellings are not consistently documented; if a file uses
 non-standard names, pass an explicit {class}`~cuperiod.ColumnMap`.
 
 :::{note}
 **Headerless files** — OGLE `.dat` photometry (and some raw ASAS-3 dumps) have no column
-names to detect. Read them positionally instead, e.g. with
-[`numpy.loadtxt`](https://numpy.org/doc/stable/reference/generated/numpy.loadtxt.html):
+names to detect. Read them positionally instead — with `pd.read_csv(path,
+header=None, sep=r"\s+")` and `ColumnMap(time=0, value=1, error=2)`, or with
+[`numpy.loadtxt`](https://numpy.org/doc/stable/reference/generated/numpy.loadtxt.html)
+(the GUI's import dialog recognises such files on its own):
 
 ```python
 import numpy as np
@@ -193,14 +223,21 @@ pg = cup.periodogram(LightCurve.from_arrays(hjd, mag, err), "GLS")
 ## Magnitude vs flux: the `Domain`
 
 A value column is either a **magnitude** or a **flux**. cuPeriod infers which from the
-column name (`flux`/`fnu` → flux, `mag`/… → magnitude), defaulting to magnitude, and you
-can always state it explicitly:
+column name (`flux`/`fnu`/a bare `f` → flux, `mag`/… → magnitude), defaulting to
+magnitude, and you can always state it explicitly:
 
 ```python
 from cuperiod import Domain
 
 pg = cup.periodogram(df, "GLS", domain=Domain.FLUX)     # or domain="flux"
 ```
+
+The string form is exactly equivalent and ignores case and surrounding spaces
+(`" Flux "`); an unknown string raises `ValueError`. An explicit `domain=` also chooses
+the auto-detected column: on a table that carries both kinds (ASAS-SN, Gaia, ATLAS),
+`domain="magnitude"` reads the magnitude column and its error rather than relabelling
+the flux, and a `UserWarning` fires when the table has no column of the requested
+domain. For multi-band input `domain=` applies to every band.
 
 Why it matters: **box/transit methods (BLS, TLS) work in flux**, where an eclipse or
 transit is a *dip*. If you hand them magnitudes, cuPeriod converts to flux automatically
@@ -225,6 +262,12 @@ lc = LightCurve.from_file("messy.csv").finite()
 
 Methods also enforce a minimum point count (`min_detections` in their settings) and raise
 {exc}`~cuperiod.InsufficientDataError` on too-sparse curves.
+
+An error column of placeholders — all `0`, `-1` or `NaN` — would empty the curve, so
+every method (and the period-change and pre-whitening tools) reports it as the cause
+instead of "no usable time baseline". {meth}`LightCurve.unusable_reason()
+<cuperiod.LightCurve.unusable_reason>` returns that reason (or `None`), and
+`cuperiod.core.raise_if_unusable(lc, what)` raises it as `InsufficientDataError`.
 
 ---
 

@@ -12,6 +12,11 @@ as Read the Docs.
 from __future__ import annotations
 
 import importlib.metadata
+import sys
+from pathlib import Path
+
+# Local extensions (the GUI's shortcut table, generated from its command registry).
+sys.path.insert(0, str(Path(__file__).parent / "_ext"))
 
 # -- Project information ------------------------------------------------------
 
@@ -37,6 +42,7 @@ extensions = [
     "myst_parser",
     "sphinx_copybutton",
     "sphinx_design",
+    "cuperiod_shortcuts",
 ]
 
 templates_path = ["_templates"]

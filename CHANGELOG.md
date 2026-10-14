@@ -8,6 +8,173 @@ All notable changes to cuPeriod are documented here. The format is based on
 
 ### Added
 
+- **Interactive, Period04-style pre-whitening** (`cuperiod.PreWhitenSession`): the
+  extraction loop one action at a time. `step()` is exactly one iteration of the
+  automatic loop; `advance()`, `run()`, `polish()`, `prune()`, `renumber()` and
+  `finalize()` complete the automatic path. Manual edits: `add` (snapped to the residual
+  peak), `add_peak` (tallest peak, no acceptance test), `remove` (`cascade=True`
+  dissolves the ties of a parent's children), `set_active`, `fix` / `set_values`, `tie`,
+  `set_variation`, `calculate`, `improve` (all, or selected rows with the rest held) and
+  `set_note`. Data edits: `delete_points` / `restore_points`, `exclude_subsets`,
+  `define_partition` / `drop_partition`, `use_offsets` (a fitted zero point per night,
+  sector or band), `set_subset_weights` / `use_weights` (with the 1/rms² helper
+  `subset_rms_weights`), `use_variation` and `configure`. Every action is logged with
+  the arguments it really used and undoable in groups (`undo`, `redo`, `goto`,
+  `group()`, `history`, `log_entries`, `history_cursor`); an edit no fit could honour is
+  refused before it commits. One entry point, `do(op, **args)`, never raises for bad
+  input: it returns a `refused` `StepReport` and changes nothing.
+- **Errors from Calculate and Improve.** Calculate (F8, `PreWhitenSession.calculate()`)
+  and Improve (all or selected) solve with the covariance, so the frequency table shows
+  frequency, amplitude and phase errors straight away (0 for a fixed quantity); the
+  automatic re-calculation after each edit stays fast and shows "–" until Calculate or
+  Improve. Each action's history line says it once ("Restored 22 points", not "Restore
+  22 point(s): restored 22 points").
+- **`cup.prewhiten` is now a session run to its stopping rule and finalized.** Its
+  results are unchanged, held bitwise by a 47-case golden corpus and frozen copies of
+  the v1.3.0 numerics.
+- **Bitwise replay on any backend.** Steps log their peak seed and grid index, so
+  `run(seeds=...)`, `PreWhitenSession.replay()` and `load(verify=True)` repeat a session
+  exactly on any spectrum backend (a finufft session verifies on numpy).
+- **Pre-whitening projects** (`*.cupw.json`, schema version 1): `save()` / `load()`
+  write and read the creation arguments, the current solution and the seeded action
+  log, with the light curve embedded or referenced next to the project and pinned by a
+  SHA-256. Projects are safe to open from anyone (see Security); `snapshot()` /
+  `restore()` keep and re-attach a session in memory, undo states included, without a
+  re-run.
+- **Reproducing scripts**: `to_script()` / `export_script()` write a Python script that
+  uses only the public API, reloads and hash-checks the data, repeats every action
+  (consecutive steps as one `run(seeds=[...])`) and reports whether it reproduced the
+  session. `PreWhitenSession.from_csv` reads the data file it writes when the source
+  cannot be re-read exactly.
+- **Amplitude/phase variation tests**: `PreWhitenSession.variations()` fits per-subset
+  amplitudes and/or phases of selected components and returns Wald constancy tests (χ²
+  with S−1 degrees of freedom), p-values and the BIC change (`VariationResult`), with
+  the frequencies held; `set_variation` puts the variation into the model.
+- **Constrained multi-sine fits** (`fit_multisine(constraints=...)`, `FitConstraints`,
+  `ComponentConstraint`, `FrequencyTie`, `FitStart`, `ConstraintError`): fixed
+  frequencies, amplitudes and phases; integer frequency ties (`"F3 = F1 + F2"`, `"2F1"`,
+  parsed, never evaluated); one fitted zero point per subset; per-subset amplitudes
+  and/or phases on an independent partition; and relative point weights, solved by a
+  general variable-projection kernel. Unconstrained calls never reach it.
+  `MultiSineFit.detail` (`FitDetail`) carries per-subset values with errors, flags
+  (`fixed_f`, `fixed_a`, `fixed_phi`, `tied`, `negative_amplitude`, `degenerate`,
+  `at_bound`, …), the covariance, rank and condition; the uncertainty estimators honour
+  the constraints and `bootstrap_uncertainties` / `component_uncertainties` accept
+  `should_stop=`.
+- **Partitions** (`cuperiod.Partition`, `cuperiod.prewhiten.suggest_partition`): nights,
+  TESS sectors, chunks, seasons, label columns, time ranges and crossings of the points,
+  with the recipe recorded and hand edits kept run by run.
+- **Result additions**: `Sinusoid` gains `fixed`, `tied`, `variation`, `amplitude_rms`
+  and `flags`; `PreWhitenResult` gains `subsets` (`SubsetSolution`: zero points and
+  per-subset amplitudes and phases with errors) and `n_deleted`; `to_table(constraints=)`
+  adds the constraint columns only when a component carries a constraint, so automatic
+  results keep the v1.3 layout. `AmplitudeSpectrum.noise_curve()` gives the local noise
+  at every grid frequency; `SpectrumEngine.release()` drops GPU plans.
+- `cup.SessionSettings` (`CUPERIOD_SESSION_*`): undo depth, caches, implicit
+  recalculation, prune protection and project limits. `PreWhitenSession.from_bands()`
+  pre-whitens all bands merged (each centred, as the GUI does) with a root `band`
+  partition, via `cuperiod.core.lightcurve.stack_bands()`.
+- **CLI**: `cuperiod prewhiten --save-project FILE --export-script FILE`, and a
+  `cuperiod session` group — `verify` (replay a project's log against its stored
+  solution), `script` (export a reproducing script) and `replay` (re-create a project,
+  optionally saving it with its full history).
+- **GUI: interactive pre-whitening.** Compute in pre-whitening runs a session (the
+  numbers of `cup.prewhiten`) that stays open for Step (F7), Add peak (F6), edits and
+  undo; a cached solution comes back with its exact session, without a re-run. The data
+  spectrum appears shortly after a curve is loaded, computed on the CPU; when it cannot
+  be computed the spectrum pane says why and the session commands stay off (Run and
+  Step still try, and report the error).
+- **GUI: the spectrum as a workbench.** A pick cursor separate from the fold; Shift+click
+  (Ctrl+Shift: exactly) or A / Insert adds a peak; N jumps to the next candidate, drawn
+  as a hollow "next" triangle; component markers show their state by shape (circle free,
+  square fixed, diamond tied, hollow not used); the S/N acceptance limit is drawn; edits
+  keep the zoom.
+- **GUI: editable Frequencies table and session bar.** Use / fix f / fix A / fix ph check
+  boxes, typed frequencies, amplitudes, phases and periods, ties typed as `=F1+F2` or
+  `2f1` (or by double-clicking an identified combination), per-subset variation and
+  notes; Space, L, Shift+L, T, Del and Shift+I act on every selected row. The session bar
+  holds Auto, Step, Add peak, Calculate, Improve all / selected, Delete, Undo, Redo and
+  Stop, a chip with the candidate Step would try next, and an Add-frequency field that
+  takes c/d, µHz, periods and combinations. A session's CSV export lists every component
+  with its constraints.
+- **GUI: point editing in the raw light curve.** Data / Residuals / Data + model; points
+  coloured and shaped by subset; Pan / Rectangle / Lasso selection (Shift-drag in Pan,
+  Ctrl adds); Delete / Restore / Clear; *Select beyond N σ* per zero-point subset;
+  deleted points stay visible as grey crosses and can be restored. A click (or Left /
+  Right on the focused plot) puts a time cursor where Subsets ▸ *Split at* cuts.
+- **GUI: Subsets, Variations and History panes.** Split by nights, TESS sectors, Kepler
+  quarters, seasons, chunks, bands, a label column or time ranges; zero points, weights
+  (by hand, equal or 1/rms²) and per-subset amplitude/phase per partition; leave out,
+  rename, merge, split and cross subsets. Variation tests plotted per subset with an
+  *Apply to model*. The History pane shows every action (groups collapsible and titled
+  in words), returns to any state, and copies an action as Python.
+- **GUI: projects.** Open / Save / Save as `*.cupw.json`, Export script, Verify project;
+  the title bar reads `cuPeriod — star.csv — star.cupw.json*`; a project whose data file
+  moved asks for it. Unsaved sessions survive switching source, band or analysis
+  (File ▸ Unsaved sessions), and closing, New session or opening other data asks Save /
+  Discard / Cancel; both name a demo or batch source by its label, not its key.
+- **GUI: menu bar and command registry.** File, Edit, Pre-whitening, Data, View and Help,
+  with Alt mnemonics on every menu and item, built from one registry that also drives
+  the buttons, the keyboard shortcuts and the F1 sheet; File gains Open folder
+  (Ctrl+Shift+F), Open recent, Load demo, Unsaved sessions, Verify project and Quit
+  (Ctrl+Q); View gains Analysis, Panes, Show raw light curve (Ctrl+R), theme (Ctrl+T),
+  Zoom and Reset layout; Help has Keyboard shortcuts (F1), What's This? (Shift+F1),
+  Documentation and About.
+- **GUI: Stop (Esc).** Ends Auto after its current step and keeps what it found; releases
+  a running periodogram at once (the run finishes in the background and is cached, not
+  shown). The info bar says what runs and for how long.
+- **GUI: import dialog** for Open, drops, Open recent and a batch file that failed to
+  load (*Choose columns…*): time / brightness / error / band pickers, magnitudes or
+  fluxes, the delimiter and header row of text tables, an *As loaded* tab at full
+  precision, a note on the time scale the numbers look like, and Load disabled with the
+  reason while the choice cannot work. Headerless JD/mag/err tables (OGLE, Period04),
+  semicolon-separated files and unrecognised headers such as `HJD, V, e_V` now load.
+- **GUI: keyboard-operable spectrum.** A click folds at the nearest peak within 12 px
+  (Alt: exactly there), also with the markers hidden; Left / Right move between local
+  maxima (Ctrl: marked peaks, Shift: one sample), Home, Enter, + / − / 0 and the Menu
+  key work on the focused plot, which screen readers describe. The phased view gains ×2,
+  ÷2 and a typed period.
+- **GUI: accessibility and zoom.** A visible 2 px focus ring on every control; WCAG 2.1
+  AA contrast in both themes; drawn arrows, ticks and grips and larger pointer targets;
+  Zoom in / out / reset (Ctrl++ or Ctrl+=, Ctrl+−, Ctrl+0) for text and plot fonts,
+  remembered (an application font above 13 px also enlarges the interface); band colours
+  that stay distinct under colour-vision deficiencies plus a marker shape per band
+  (`ThemePalette.band_symbol()`, `ThemePalette.residual`); accessible names, status tips
+  and What's This? help on every option, and a help line under the Options form; 24 px
+  pane Float / Close buttons; panes hidden behind a tab leave the Tab order; Ctrl+1 … 5
+  focus the panes. New theme API: `apply_theme(..., font_scale=)`, `stylesheet()`,
+  `font_scale()`, `step_font_scale()`, `contrast_ratio()`.
+- **Grid policy, public** (`cup.GridTooLargeError`, `cup.GridSizeWarning`,
+  `cup.default_frequency_grid`, `cup.pseudo_nyquist_frequency`,
+  `cup.regular_cadence_nyquist`, `cup.check_grid_size`, `cup.uniform_grid_size`; also in
+  `cuperiod.core` with `coerce_domain` and `raise_if_unusable`): every default grid is
+  sized before allocation — above 5 million automatic samples it warns (naming outlying
+  epochs when they inflate the baseline), above `MAX_GRID_SIZE` (250 million) it raises
+  (`max_size=` for a deliberate larger grid). `regular_cadence_nyquist(time)` returns
+  `0.5/cadence` for lattice sampling, or `None`.
+- **Peak defaults that travel with a result**: `Periodogram.peak_defaults`,
+  `with_peak_defaults()` and `cuperiod.core.result.peak_defaults_from_settings`;
+  `best_periods(alias_tolerance=)`; `MultiResult` gains `in`, `get()` and `values()`.
+- **Calendar times** in the time column: `datetime64` (pandas, tz-aware in UTC, pyarrow
+  timestamps) becomes MJD, `NaT` becomes NaN, `timedelta64` / `TimeDelta` become days,
+  and astropy `Time` columns keep jd / mjd / btjd / bkjd values and become MJD otherwise.
+  Units on `Quantity` columns are not applied: the number is taken as days.
+- `LightCurve.unusable_reason()`, `MultiBandLightCurve.unusable_reason()` and
+  `cuperiod.core.lightcurve.raise_if_unusable()`, which name a placeholder error column
+  as the reason a light curve is empty.
+- Backend helpers: `cuperiod.core.backend.refresh_backends()` (re-probe after installing
+  an extra mid-session), `cpu_backends()`, `cpu_pool_backend()`, `requested_backend()`,
+  `normalize_backend()`; `PeriodogramMethod.resolve_backend_for()`;
+  `cuperiod.methods.base.select_settings()`; batch sizing helpers in
+  `cuperiod.batch.sizing`; and `cuperiod.methods.gls.FinufftGLS`, a plan-reusing CPU GLS
+  engine (`make_engine("finufft")`, one per thread or process).
+- `cuperiod.wwz(..., backend="auto" | "cpu" | "numba" | "numpy")` with a multicore numba
+  kernel; multi-band BLS reports `extras["band_index"]`; `EphemerisFit.pddot_err_scaled`;
+  `PeriodLawFit.bic_scaled` and `.weighted`; `SlidingPeriodogram.n_window_points`;
+  `batch_pdot`'s `law_bic_scaled` column; `BatchSummary.n_workers`; a `source` column in
+  batch rows; `--chunk-size` on `cuperiod batch` and `batch-prewhiten`.
+- `cuperiod.core` re-exports `PdotSettings`, `PreWhitenSettings`, `SpacingSettings`,
+  `SuperSmootherSettings` and `SessionSettings`.
 - **Joint (period, dP/dt) searching for every method** (`cuperiod.pdot_search`,
   `cuperiod.PdotSettings`): a drifting period defocuses a constant-period search, and a
   constant dP/dt has exactly the phase `f * ln(1 + (Pdot/P) * dt) / (Pdot/P)` (Mikulášek
@@ -143,6 +310,508 @@ All notable changes to cuPeriod are documented here. The format is based on
   pyplot, so it is safe to call from batch workers, and matplotlib is imported lazily so
   everything else works without it.
 
+### Changed
+
+Results that move when you upgrade — read these first:
+
+- **Default bands on regular cadences.** On strictly regular sampling (constant cadence;
+  gaps, dropped cadences and barycentric timing allowed — TESS, Kepler) the GLS default
+  grid and the automatic pre-whitening band stop at the true Nyquist frequency
+  `0.5/cadence` instead of running past it into mirror images. Set `maximum_frequency`
+  (or, for GLS, `nyquist_factor`) for super-Nyquist work. Irregular and nightly sampling
+  are unchanged.
+- **Multi-exposure ceiling.** When most gaps fall inside visits of at most ten
+  back-to-back exposures (dithered triplets, filter sequences, stacked near-simultaneous
+  bands), the automatic frequency ceiling of PDM, CE, MHAOV, String-Length,
+  SuperSmoother, pre-whitening, WWZ and the GUI is 1e5 Rayleigh widths — about 55 c/d on
+  a 5-year baseline and 27 c/d on a 10-year survey (ASAS-SN-like triplets: 20.5M → 500k
+  trial frequencies). The capped grid is a prefix of the old one; a `nyquist_factor`
+  above 5 widens it in proportion, `maximum_frequency` restores any band.
+- **GLS FAP.** A best peak on the grid edge now gets a FAP (a conservative upper bound;
+  it was NaN), FAPs are computed on relative times (absolute JDs gave wrong or NaN FAPs
+  for runs shorter than a day), the data are centred in float64 before the transform,
+  power is clipped to [0, 1], and a constant light curve has zero power.
+- **MHAOV centring.** Every backend fits mean-centred values: float64 values move by up
+  to ~1e-5 relative on magnitude-like data, towards the exact least-squares value.
+  Multi-band MHAOV pools each band in its own variance units, so every power with two or
+  more bands changes.
+- **BLS likelihood floor.** Boxes holding all or none of the inverse-variance weight are
+  rejected by a relative floor instead of astropy's absolute `DBL_EPSILON`, which removes
+  fabricated likelihood peaks of ~1e6 on clustered sampling and makes results
+  independent of the flux and error scale. `power()` now searches exactly the grid it is
+  given (custom grids in log-period segments with period-scaled durations). Multi-band
+  BLS shares only the period (statistic Σ max(SNR_k, 0)²), and a band set with any band
+  lacking errors uses each band's robust flux scatter as its error instead of raw flux
+  weighting (power, `depth_snr` and `sde` change for such input).
+- **TLS grid density, depths and epochs.** The default period grid step is
+  `min(grid_duration_frac, 2 × duration_min_frac) / (oversample × baseline)`, 2.5×
+  denser at the defaults, so the shortest searched transit is resolved; an explicit
+  `grid_duration_frac` above `2 × duration_min_frac` is capped. The out-of-transit level
+  is fitted jointly with the depth (depths unbiased; SR/SDE move by ~1%, up to ~14% for
+  long durations), and `extras["t0"]` (and the batch `t0_N` columns) is an absolute
+  mid-transit time like BLS's — code that added `t.min()` must stop.
+- **SuperSmoother** scores a constant light curve 0 (it scored 1.0, the maximum), and
+  breaks tied phases identically on every backend and row order; numba scores at
+  tied-phase frequencies change to match numpy/torch.
+- **Pre-whitening uncertainties.** The bootstrap is a wild (sign-flip) residual bootstrap
+  with a `sqrt(N/(N−M))` correction and replicates refined like the final polish, so
+  seeded bootstrap values differ. `offset_error` goes through the selected estimator and
+  the `sqrt(D)` inflation (it grows by `sqrt(D)` at the defaults). The covariance is the
+  pseudo-inverse of the Jacobi-scaled normal matrix about the weighted-mean epoch, and a
+  parameter of a zero-amplitude component is NaN rather than 0. Two stops are always on:
+  the degrees-of-freedom guard (`2(3K+1) > N`) and residuals at numerical round-off.
+- **Period-change error calibration.** `fit_ephemeris(errors=None)` estimates the timing
+  error from the scatter about the fitted quadratic (`pdot_err` was 10–40× too large and
+  depended on the trial period; `chi2_reduced` is now 1 by construction).
+  `phase_track` / `fit_template` choose the template order with the scale-free BIC
+  (`weighted` no longer affects it). `period_profile` converges each interval on the χ²
+  minimum, so interval periods and errors change. `compare_period_laws` and
+  `law="auto"` rank on `PeriodLawFit.bic_scaled`, and without `period_err` the laws are
+  compared on the residuals' own scale. `eddington_plakidis` errors are the estimator's
+  exact covariance (they were 13–26× too small) and `slope_significance` is a calibrated
+  z-score. `ltte_search` without `errors=` uses the concentrated likelihood for
+  `aic` / `bic` / `delta_bic`. `WWZResult.period_trend()` counts independent windows
+  (its error grows up to ~6× on overlapping tau grids). `ladder_pddot_err` is inflated
+  by `sqrt(chi2_reduced)` like `ladder_pdot_cubic_err`. An explicit
+  `pdot_over_p_range` spanning zero is laid on a zero-anchored lattice (an exact
+  dP/dt = 0 row; values differ and may gain a row or two). `running_median` /
+  `detrend(method="binned")` honour `min_points`, so binned trends change where a bin
+  holds one or two points.
+- **Batch resume semantics.** File and directory sinks resume **by key**: a re-run
+  computes only the (light curve, method) pairs not yet in the sink and retries failures
+  — adding, removing or reordering inputs no longer drops or duplicates light curves, and
+  a different `chunk_size` is fine. A directory records its request: adding a method is
+  allowed, while changed settings, `n_best`, `store_raw`, columns or grid raise
+  `ValueError` once it holds part files. `resume=False` first removes the directory's
+  `part-*.parquet` files. `batch_prewhiten` resumes the same way, and `batch_pdot`
+  resumes per light curve across its three tables, retrying failed stars and replacing a
+  recomputed star's rows in every table (one summary row per key).
+- **CPU pools never touch the GPU.** `device="cpu"` maps `"auto"` to CPU backends in
+  `batch_periodograms`, `batch_prewhiten` and `batch_pdot` and rejects GPU-only backends
+  (`"gpu"`, `"cupy"`, `"cufinufft"`); every CPU-pool worker used to open its own CUDA
+  context on CUDA machines. Such batches now run float64 CPU kernels: values can move by
+  ~1e-6 and the rows' `backend` column changes. `device="gpu"` keeps a concrete GPU
+  backend (torch, cupy, cufinufft) and rejects CPU-only ones.
+- **`settings.backend` is the default backend.** `cup.periodogram(..., backend="auto")`
+  (or `None`) defers to the method settings' `backend` and `CUPERIOD_<METHOD>_BACKEND`;
+  an explicit backend wins. The batch drivers, LINCC adapters, `pdot_search`,
+  `sliding_periodogram`, `multiband_fap`, `batch_prewhiten(backend=None)` (the new
+  default) and the CLI follow it. A settings pin of `"gpu"` on a machine without one
+  raises `BackendUnavailableError` instead of silently running on the CPU.
+- **Peak settings are live.** `n_peaks`, `peak_separation_rayleigh`, `harmonic_max`,
+  `alias_freq_tolerance` and `downsample_points` now default `best_periods()`,
+  `downsample()` and `to_dict()` on results of `cup.periodogram`, the batch drivers, the
+  LINCC adapters and the GUI (explicit arguments win). `best_periods(alias_diverse=True)`
+  uses an alias/harmonic tolerance separate from the duplicate-peak separation — the
+  BLS/TLS `alias_freq_tolerance` (0.0035 c/d), else one Rayleigh width — and treats
+  solar-day offsets as aliases: rank 1 is unchanged, lower ranks can differ (a 27-day
+  two-planet BLS search now reports the second planet at rank 2).
+
+Other changes:
+
+- **Settings selection is strict.** A settings object of the wrong class raises
+  `TypeError` (it was replaced by defaults); mapping keys match like method names
+  (`"String-Length"`, `"string_length"`), a key naming no method raises
+  `UnknownMethodError`, and two keys for one method raise `ValueError`. Settings validate
+  their values: finite frequency bounds with `minimum_frequency >= 0` (pre-whitening
+  `> 0`), BLS/TLS duration fractions below 1, TLS `u1 + u2 <= 1`, finite non-negative
+  thresholds, positive spacing bounds, `PdotSettings.n_segments >= 4`.
+- **Domains and columns.** `domain="flux"` as a string behaves exactly like
+  `Domain.FLUX` everywhere (case and spaces ignored; an unknown string raises); an
+  explicit `domain=` also chooses the auto-detected column on tables carrying both kinds
+  (with a warning when the requested kind is missing); a bare `f` column is flux;
+  `domain=` applies to every band of multi-band input, and bands in different domains
+  raise unless it is given. BLS/TLS warn when a bare `(t, y, dy)` tuple looks like a
+  normalised flux. `ColumnMap(band=...)` on a table given to `cup.periodogram` /
+  `to_input` (and on `(DataFrame, group)` batch inputs) gives a multi-band light curve; a
+  table with a multi-label band column read as one curve warns that the bands are
+  pooled.
+- **Band labels** are normalised identically by `MultiBandLightCurve.from_dataframe` and
+  `from_file` (`1`, `"1"` and `1.0` are one band `"1"`); rows without a label are dropped
+  with a warning instead of forming phantom bands. `from_dataframe` accepts astropy and
+  pyarrow tables and `{column: array}` mappings; a `MultiBandLightCurve` refuses
+  non-`LightCurve` bands and mixed domains. `meta["bands"]` lists only the bands that
+  contributed, and multi-band methods use errors only when every contributing band has
+  them.
+- **Identity equality.** `Periodogram`, `GridSpec`, `MultiResult`, `PreWhitenResult`,
+  `MultiSineFit`, `AmplitudeSpectrum`, `Uncertainties`, `SpacingSpectrum` and
+  `PeriodSpacingSeries` compare and hash by identity (`==` used to raise on their
+  arrays); `Peak` keeps value equality and is hashable.
+- **Validation of grids and spectra.** `GridSpec` rejects unknown kinds, non-finite,
+  descending, negative-frequency or non-positive-period values and `uniform=True` on a
+  non-arithmetic progression (rounding-level steps back are accepted); the grid builders
+  name the bad argument; `Periodogram.from_spectrum` checks shapes and
+  `objective_sense`; `alias_diagnostics` refuses a non-finite or out-of-range
+  `frequency=`.
+- **`WWZResult` API.** `peak_frequency`, `peak_period` and `peak_wwa` are arrays
+  (properties) instead of methods, and `to_dict` takes `include_map=` (was
+  `include_maps=`), as on `SlidingPeriodogram`. `SlidingPeriodogram.window_periodogram(i)`
+  reports the window's own baseline and point count (the run's move to
+  `meta["run_baseline"]` / `meta["run_n_samples"]`). `wwz` raises for a non-finite `c` or
+  `min_neff` below 3, and `sliding_periodogram` for a non-finite window, step or period
+  or a period longer than the window.
+- **Pre-whitening details.** `fit_mean=False` fits the weighted-mean-subtracted values
+  and reports that mean as `offset`; combination identifications have order ≥ 2 and
+  `expected_false` counts only positive in-band predictions (it overstated chance matches
+  ~6×); the default period-spacing trial range comes from the bulk of the values; an
+  explicit `minimum_frequency` above the automatic maximum names `maximum_frequency` in
+  its error.
+- **Batch details.** `chunk_size` defaults to automatic (about four tasks per worker, at
+  most 256); `grid=` is honoured; rows, errors and file sinks are in input order; every
+  row carries `{extra}_{k}` for each per-peak extra (NaN where absent), so directory
+  parts share one schema; colliding file stems become path-qualified keys (with a
+  warning and a `source` column); a glob matching nothing raises `FileNotFoundError` and
+  an existing path is always literal; a batch with no inputs leaves its sink untouched;
+  the default worker count follows the CPUs the process may use, and pools are capped at
+  61 on Windows. `batch_pdot` validates `method`, `model`, `detrend_method`, `domain` and
+  law names up front, matches catalogue keys as strings (a missing, NaN or non-positive
+  entry means a blind search; a catalogue matching no key warns), counts a bare string
+  for `laws=` / `plot_keys=` as one name, and measures `law_delta_bic` on `bic_scaled`.
+- **CLI.** User errors (missing file, unknown method / backend / device, bad sink suffix,
+  non-positive `--period`, empty `-m`, `--n-best` < 1, `--segments` < 4, a GPU-only
+  backend with `--device cpu`) are usage errors (exit 2) without a traceback; batch
+  commands exit 1 when every light curve that ran failed, list every failure in
+  `<sink>.errors.csv` (`_errors.csv` in a directory sink) and print the worker count;
+  `prewhiten` / `batch-prewhiten` `--backend` default to the settings
+  (`CUPERIOD_PREWHITEN_BACKEND`); `pdot --profile` prints `bic_scaled` and its gap to
+  the best law and marks fits at a bound; `run --out` saves the same alias-diverse BLS/TLS
+  peaks it prints. The `--resume/--no-resume` help of `batch-prewhiten` and `pdot-batch`
+  says what resume does now: skip the light curves already in the sink and retry
+  failures, matched by key.
+- **LINCC interop.** `nested=None` is the new default (the preset's nest, else `"lc"`);
+  an explicit `nested=` wins over a preset; a `value=` naming another column than the
+  preset's drops the preset's error column and domain; `append_columns=True` onto
+  existing result columns raises, pointing at `prefix=`.
+- **GUI.** The Options form is grouped into collapsible sections (search range first,
+  Advanced collapsed, Multiband only when a joint fit runs) with units, a Reset to
+  defaults button, stop-criterion check boxes and editable SuperSmoother spans; it shows
+  the values that run (samples per peak 10, explicit values honoured,
+  `CUPERIOD_<METHOD>_<FIELD>` overrides applied) and no longer offers `n_peaks`,
+  `store_spectra` or `downsample_points`. Results are cached by a fingerprint of the
+  data, not the file name, in caches bounded at 512 MiB. A loaded curve is drawn at once;
+  errors are explained in plain language with the full text on demand; the Backend and
+  Band choices persist; the spectrum remembers its x-axis and log choice per kind of
+  result; clicking a marker selects the whole peak (BLS/TLS t0 included); the Peaks
+  table shows frequency and names each method's statistic; both tables have Copy /
+  Export CSV buttons and a column chooser; the Frequencies CSV has one fixed header and a
+  pre-whitening spectrum CSV names its column `amplitude`; plot axes no longer rescale
+  by SI prefixes; the window sizes itself to the screen and keeps its layout, analysis
+  and options; plot toolbars wrap, a pane wider than its dock scrolls instead of
+  squeezing the plots, and the raw view stacks under the fold when there is no room
+  beside it.
+- **Release process.** The release workflow refuses to publish when the pushed `v*` tag
+  differs from the built version, and a manually started run publishes to TestPyPI only.
+- **Development.** GPU tests carry the registered `gpu` marker: `pytest -m "not gpu"`
+  deselects them and hides the GPUs from the rest of the run (default-backend tests run
+  on the CPU); with the GPU stack but no device, GPU tests skip.
+- **Docs.** New guide page on interactive pre-whitening, with the GUI's shortcut tables
+  generated from its command registry at build time; `BatchSettings` is documented as
+  reserved (nothing reads it yet; `CUPERIOD_BATCH_*` has no effect).
+
+### Deprecated
+
+- `PreWhitenSettings.downsample_points` never had an effect; setting it now warns
+  (`DeprecationWarning`), and it will be removed.
+
+### Fixed
+
+- **The (period, dP/dt) axes are not orthogonal for skewed sampling**, contrary to what
+  the module and guide claimed. Referencing to the weighted mean epoch zeroes the first
+  moment of the times — which is what decouples phase from frequency — but the residual
+  frequency–drift correlation is set by the sampling's *third* central moment and
+  vanishes only for observations symmetric about that epoch. V1309 Sco (skew −1.29, its
+  cadence densifying steeply toward the merger) shows the resulting tilted ridge plainly
+  in its search map. The claim is now stated correctly: the tilt widens the joint
+  uncertainty without biasing the best cell, and `PdotBest.ridge_correlation` now
+  measures it.
+- **`backend="auto"` raised `ModuleNotFoundError` when the CUDA fast path was
+  half-installed** — cupy present but cufinufft unimportable. Resolution now probes the
+  GPU path before selecting it and falls back to the CPU backend, instead of choosing a
+  backend it cannot load. This made 46 tests fail on any CPU-only machine, and would
+  have made `batch_pdot` fail on every star at its own defaults.
+- **A finite-time singularity would chase the worst point on a flat track.** Keeping
+  `singular`'s `t0` merely *outside* the observed span is not enough: nothing stopped it
+  converging to within a hair of the nearest point, where `b/(t - t0)` becomes a spike
+  on that one measurement — a three-parameter outlier absorber that beat `constant` on
+  BIC on a track with no period change in it at all. Found on a 12.7-year ASAS-SN EW
+  binary whose period is constant to 5 parts in 10^8 per year, where `singular` was
+  buying Δχ² = 21 from a single 3.8σ point. Two guards now: `t0` is held at least one
+  median point-spacing from the data (closer than that the divergence is unresolvable by
+  construction), and any fit whose variation is still dominated by a single end step is
+  flagged `PeriodLawFit.at_bound` and ranked *below* every unpinned fit by
+  `compare_period_laws` and `law="auto"`, whatever its BIC. The same check retires the
+  manual caveat about `pejcha` winning with its exponent pinned at a bound — it is now
+  detected rather than described. V1309 Sco's genuine singular fit is untouched, and the
+  batch summary carries the flag as `law_at_bound`.
+- **Harmonic-order selection over-fitted whenever the quoted errors were optimistic.**
+  Weighted BIC (`chi2 + k*ln(n)`) is right when the errors are right and catastrophic
+  when they are not — every harmonic looks like a bargain and the selection runs to
+  `max_harmonics`. On OGLE's V1309 Sco photometry (chi2_reduced ≈ 115 against the stated
+  errors) that produced a 10-harmonic template on 50-point intervals, whose jagged
+  chi-squared then locked onto sampling aliases and scattered the P(t) track beyond use.
+  `period_profile` now selects on the scale-free criterion `n*ln(chi2/n) + k*ln(n)`,
+  against a frequency refined inside the interval, and takes the median over five
+  intervals — which is stable at 2 harmonics across every interval size tried.
+- **Inputs.** Masked entries are NaN on every input route — numpy masked arrays,
+  astropy `MaskedColumn` / `Masked`, pandas NA, pyarrow nulls — so tuples and
+  `LightCurve.from_arrays` no longer analyse the fill values under a mask; masked integer,
+  boolean and short text columns load (they raised `Cannot convert fill_value nan` or
+  `could not convert string to float: 'n'`). Compressed FITS (`.fits.gz`, `.bz2`, `.xz`)
+  and `.fts` files are read as FITS; integer-labelled frames (`pd.read_csv(header=None)`)
+  load with `ColumnMap(time=0, value=1, error=2)`; Parquet categorical columns with nulls
+  no longer take a neighbouring category; conversion errors name the column. A
+  placeholder error column (all 0, −1 or NaN) is reported as such by every method, the
+  multi-band path, `sliding_periodogram`, `pdot_search`, `phase_track` and pre-whitening,
+  instead of "no usable time baseline".
+- **Backends.** Selectors ignore case and surrounding spaces and the unknown-backend
+  error lists `auto` / `cpu` / `gpu` / `torch[:<device>]`; `is_gpu_backend("torch")` is
+  true only when torch has a GPU, so a CPU-only torch run is no longer labelled GPU; a
+  one-sample trial grid of the opposite kind no longer crashes the torch backends.
+- **Peaks and spectra.** `downsample()` (and `to_dict(include_raw=True)`, batch
+  `store_raw=True`) kept each bin's maximum for minimised statistics, erasing the PDM /
+  CE / String-Length detection — it now keeps the minimum (spectra stored by earlier
+  versions for these methods are affected); a NaN next to the true maximum no longer
+  hides that peak or wins its bin; `best_periods(0)` returns no peak.
+  `alias_diagnostics` no longer raises for runs shorter than ~26 minutes and never
+  matches a predicted alias to the diagnosed peak itself (a false *ambiguous*).
+- **GLS.** A period grid flagged uniform is evaluated by astropy instead of raising.
+- **BLS.** The flux is median-centred in float64 (ppm-level float32 / MPS errors);
+  durations round half away from zero as in astropy; the default grid no longer holds a
+  period below `min_period_days` from an `np.arange` overshoot; a frequency grid
+  containing 0 raises a clear `ValueError`; multi-band BLS resolves the torch device and
+  records `torch:<device>`.
+- **TLS.** An exactly constant flux gives an all-zero spectrum (rounding of the mean
+  produced SDE values up to ~11); float32 backends no longer return a silent all-zero
+  spectrum for fluxes in small or large physical units (rescaled internally; all outputs
+  float64).
+- **PDM, CE, String-Length, MHAOV.** MHAOV in float32 (torch; automatic on Apple MPS)
+  returned an all-zero spectrum once the mean exceeded ~90× the scatter, and PDM's
+  float32 path lost the within-bin variance (negative θ) — values are now centred on
+  every backend. The CUDA String-Length kernel no longer raises for curves just above a
+  shared-memory power of two (8193–8277 points on 99 KB devices, 4097–5290 on 64 KB). A
+  NaN/inf trial frequency or a 0/NaN trial period gave the numba MHAOV kernel
+  uninitialised values and could make the CUDA String-Length sort read out of bounds;
+  the low-level kernels return NaN there. PDM, CE and String-Length on numpy/torch no
+  longer use memory linear in the light-curve length (~4 GiB at 65k points). MHAOV's
+  numpy backend no longer requires NumPy ≥ 2.0, and it reports `min_detections` and the
+  harmonic-order limit separately.
+- **Multi-band.** Multi-band BLS searches a user `grid=` instead of rebuilding its
+  default. `min_detections` is enforced by multi-band PDM, CE, String-Length, MHAOV and
+  BLS (batch runs now skip such objects). `GLSSettings(mb_fap_bootstrap=N)` is no longer
+  ignored on the astropy backend or a non-uniform grid. Exactly constant bands give zero
+  multi-band GLS power in every model (the offsets model reported up to 0.44, flex 1.0),
+  and near-constant bands are left out of SuperSmoother and MHAOV. `MultibandFAP.fap(nan)`
+  is NaN, `level(p)` is the order statistic `fap()` implies and no longer raises at the
+  documented floor, `fap_level_10pct` is written only from 9 resamples, and a best peak
+  on the grid edge gets a finite FAP; `n_bootstrap < 1` raises, and
+  `multiband_fap(backend="auto")` honours `settings.backend`.
+- **Pre-whitening.** No more giant spurious components where the sampling barely
+  separates a sinusoid from the constant (near multiples of a regular cadence, near 1,
+  2, … c/d for nightly data, f → 0): the spectrum reports the bounded power-equivalent
+  amplitude there and the criteria judge such candidates on the variance they explain.
+  Covariance errors no longer collapse to ~0 on long baselines, in flux units or with a
+  distant `t_ref`. Sparse light curves no longer run away to `max_frequencies` with an
+  interpolating solution, and constant or noise-free ones no longer yield round-off
+  components. `fit_mean=False` no longer fits un-centred data. The correlation factor
+  `D` uses the residuals in time order (row order changed it); analytic errors use the
+  weighted rms of weighted fits. `SpectrumEngine`, `amplitude_spectrum`,
+  `spectral_window` and `fit_multisine` raise `ValueError` for non-finite times, values
+  or errors and non-positive errors (a NaN time crashed the interpreter inside finufft),
+  and `fit_multisine` rejects non-finite or non-positive frequencies and unknown refine
+  policies. Float32 direct-path spectra keep their phase accuracy at large f·T, and the
+  default grid is size-checked before allocation. `identify_combinations` no longer
+  reports order-1 `Fk = Fj` identities.
+- **Period change: search and tracking.** `fit_ephemeris` pairs each timing error with
+  its own event (unsorted lists with unequal errors gave a wrong `pdot` and an
+  understated error) and drops a non-finite time with its error. `f_test_p` is NaN, not
+  0, when both ephemerides fit exactly. `pdot_search` on fewer than ~80 cycles with the
+  weighted epoch near one end no longer fails at its defaults (the axis is trimmed to
+  the model's domain; under ~1 cycle it raises `InsufficientDataError`), and the default
+  axis has exactly 201 rows (rounding gave 203 for ~30% of inputs). `pdot_search`,
+  `phase_track` and `fit_ephemeris` reject a NaN or infinite period with a clear
+  `ValueError`; `phase_track` explains when it cannot form the four segments it needs;
+  `pdot_search(backend="auto")` honours the method's settings backend. Binned
+  detrending visits only occupied bins (one stray epoch allocated gigabytes or
+  overflowed), and `running_median`, `detrend` and `fit_ephemeris` treat masked entries
+  as missing.
+- **Period change: P(t) tracks and laws.** `period_profile` intervals no longer scatter
+  2–4× beyond `period_err` for many-harmonic or high-S/N curves (which made `compare()`
+  prefer a period change on constant stars); `PeriodPoint.amplitude` is the
+  fundamental's semi-amplitude; unweighted errors no longer depend on the units; bad
+  arguments raise `ValueError` and a constant light curve `InsufficientDataError`.
+  `fit_period_law` / `compare_period_laws` without `period_err` always picked `constant`
+  and quoted errors for σ = 1 d. `at_bound` measures the law against the track's
+  resolution. `pejcha` errors include the exponent's dependence; unconstrained or
+  bound-held parameters report NaN, not 0; unknown law names and mismatched lengths
+  raise; `PeriodLawFit == PeriodLawFit` no longer raises.
+- **Period change: wander, light time, sensitivity.** `eddington_plakidis` reports 0
+  (not inf) for an exactly periodic series, rejects a NaN period or `t0`, forms no n×n
+  matrices and compares by value. `ltte_search`'s default scan floor uses distinct
+  epochs (repeated or clustered timings collapsed it), masked entries are dropped,
+  multi-column input is refused, NaN periods, empty input and `minimum_third_mass(0)` are
+  handled, and Kepler's equation is solved up to e → 1. `PdotSensitivity.sigma_amplitude`
+  is inf for outer periods the epochs cannot constrain; `detectable_pdot` drops a NaN
+  epoch together with its error and needs degree + 1 distinct epochs.
+- **Period change: time-resolved maps.** `wwz` centres the values (a constant curve gave
+  Z values of several hundred; large offsets corrupted cells), keeps rows whose unused
+  error is blank or zero (AAVSO visual estimates were dropped), refines the ridge in the
+  right direction on a descending frequency axis and copies explicit axes.
+  `sliding_periodogram` honours the method's settings backend, keeps its frequency axis
+  ascending (a grid stored in another order mirrored every row) and no longer drops the
+  last observation when the final window ends one ulp short (~2% of light curves).
+- **Period change: batch and figures.** `batch_pdot(period=...)` honours NumPy scalars,
+  0-d arrays, pandas Series and integer-keyed mappings (they were ignored, so every star
+  ran a blind search and could lock onto an alias with status `ok`); failed rows record
+  the light curve's `n_samples` and `baseline`; figures of flux light curves are no
+  longer drawn inverted and labelled magnitude; distinct keys that sanitise to the same
+  file name (`fieldA/lc_0000` vs `fieldA_lc_0000`) get a digest suffix instead of
+  overwriting each other's figures. `cuperiod.pdot.plots` honours masks, its
+  drift-corrected fold uses the track's fitted ephemeris, `plot_phase_fold` raises for an
+  unknown model and says *(unwarped)* when the rate is outside the model's domain.
+  `cuperiod pdot --profile` no longer prints negative ΔBIC for lower-ranked laws.
+- **Batch.** An existing path containing `[` is no longer read as a glob, and a glob
+  matching nothing is no longer a silent success (with `--no-resume` it emptied the
+  sink). `(key, light curve)` pairs with NumPy integer keys are accepted. An unguarded
+  script running a pooled batch fails with a message explaining
+  `if __name__ == "__main__":` and `workers=1` instead of pages of child tracebacks and a
+  bare `BrokenProcessPool`. A file-sink resume recomputed every light curve and then
+  discarded the results (`batch_prewhiten` still counted them as done). An existing
+  directory or uncreatable location given as a file sink is refused before the batch
+  instead of after it, and a failed final rename names the temporary file holding the
+  result. A directory whose earlier run failed entirely is not locked to that request.
+  `cuperiod run --out` saved different BLS peaks from the ones it printed.
+- **LINCC interop.** `nested_periodogram` on a zero-row frame returns typed float64
+  result columns; `backend="auto"` defers to the settings' backend and the `period_i`
+  columns follow the settings' peak fields, as in `cup.periodogram`.
+- **GUI: data and caching.** Opening another curve while a computation runs no longer
+  applies the old run's spectrum, fold or error to the new one, and returning to a
+  source whose run is in flight no longer computes it twice. A band column splits the
+  curve in every format (it was ignored for ECSV, FITS and ASCII), each file is parsed
+  once, rows without a label are reported, and a band column with more than 32 labels no
+  longer freezes the window. NaN timestamps (gap cadences in Kepler/TESS files) no longer
+  blank the fold or turn the grid hint into `nan`. A band named `combined` or `stacked`
+  no longer takes over the all-bands choice. Same-named files and files rewritten on
+  disk no longer share cached results. Number fields keep full precision. The file
+  preview shows full-precision times, counts rows correctly and flags header-only and
+  wide one-row-per-object files. A batch source with no data rows is reported as such.
+- **GUI: navigation and window.** Prev/Next and the arrow keys skip a batch source that
+  failed to load; a new batch whose first source fails no longer shows the previous
+  batch; loading a batch clears the source filter. The Sources pane no longer comes back
+  empty on the next launch, and a corrupt saved window state no longer stops the window
+  from opening. Dropped files load after the drop returns (Explorer froze behind the
+  preview), and mixed drops load what they can. Closing the window during a computation
+  no longer freezes it for 2 s or leaves the process running. The *runs on* hint and the
+  device badge say CPU for a torch CPU run (and *GPU (MPS)* / *GPU (XPU)* for other
+  devices); the grid hint describes the band that will be analysed; guidance text names
+  the button that is actually there; the Options fields follow the pickers in Tab order;
+  right-click menus no longer block the window.
+- **GUI: plots and tables.** The spectrum is drawn end to end on a period or log axis
+  (index-based decimation dropped the long-period end and its peaks) and re-binned on
+  zoom; the phased and raw views draw around NaN values and accept empty curves; stop
+  reasons containing `<` show verbatim; a BLS/TLS marker click keeps the peak's t0 and
+  the tables follow selections made in the spectrum; PNG exports append `.png` and report
+  failures, as CSV exports do; the Peaks table keeps locale-independent formats (a t0
+  near JD 2459001.9 read `2.459e+06`) and exports full precision; the Frequencies ID
+  column sorts F1…F12 in order; Ctrl+C in a table acts only while it has the focus and
+  Tab leaves it; échelle points follow a theme switch; strokes keep their width on HiDPI
+  screens; the crosshair readout no longer resizes the panes; log-axis tick labels no
+  longer overprint, the top peak's label is not clipped, and legends have a background.
+- **GUI: keyboard and feedback.** Tab no longer gets stuck in the Options after Run /
+  Compute, the Options scroll to the field it lands on, and tab-bar scroll arrows stay
+  out of the Tab order. Step says so in the status bar when it adds nothing (rejected,
+  blocked or at the stopping rule), and so do Renumber, Restore all and an Improve with
+  nothing to do; refusals name the window's own controls (*Add exactly here*, untie
+  first) instead of keyword arguments.
+- **GUI: layout.** The Subsets, Variations and Period-spacing panes and the session bar
+  wrap their controls instead of hiding them in a narrow dock; zooming keeps the status
+  chips, the Run button and the Frequencies ID column whole, and the window's minimum
+  size follows what its panes need; the spectrum, fold, Peaks and Frequencies *Export…*
+  buttons use the window's file dialog. Smaller: the spectrum readout keeps its start
+  and reads c/d, no empty period badge, "no components yet", automatic option values to
+  six significant digits, checked boxes in disabled tables keep their tick, and the
+  import dialog no longer claims a header row a file does not have.
+
+### Security
+
+- **Pre-whitening projects are untrusted input.** A `*.cupw.json` file is read as JSON
+  only (no pickle, no `eval`), size-checked before it is read (64 MiB by default), with
+  `NaN` / `Infinity`, overflowing numbers and duplicate keys refused, every object
+  validated by a strict model (`extra="forbid"`, no coercion), every cross reference
+  checked, the log length and point count capped, and data references confined to the
+  project's folder; anything wrong raises `ProjectError`. Tie expressions are parsed,
+  never evaluated, and exported scripts carry every value as a Python literal and free
+  text only as sanitised comments.
+- The core dependency floor is `pyarrow>=14.0.1`: earlier releases unpickle
+  extension-type metadata while reading Parquet / IPC files (CVE-2023-47248), and
+  cuPeriod opens user-supplied `.parquet` light curves in the CLI, the batch runner and
+  the GUI.
+- **Batch sinks.** CSV sinks escape text cells a spreadsheet would run as formulas (`=`,
+  `+`, `-`, `@`, tab, CR; plain numbers untouched); an unreadable existing sink or part
+  is moved aside to `<name>.corrupt-<timestamp>` instead of being overwritten; sinks are
+  written through a unique, exclusively created, dot-prefixed temporary file, never a
+  fixed `<sink>.tmp`.
+- **GUI.** File-derived text (column headers, band names, file names, errors quoting
+  them) is shown as plain text in banners, dialogs, previews, tooltips and plot legends,
+  never as Qt rich text, so a header such as `<img src=//host/...>` is neither rendered
+  nor fetched. The header revision is read from cuPeriod's own checkout without running
+  git (on Windows a `git.exe` in the launch folder was executed), and demo data are
+  looked up only in the checkout or `CUPERIOD_EXAMPLE_DATA`, never in ancestor folders.
+- The Windows CUDA DLL shim adds only the directories of installed nvidia wheels; a
+  folder named `nvidia` next to a script can no longer supply DLLs.
+- **CI and releases.** Every GitHub Action is pinned to a full commit SHA and kept current
+  by Dependabot; both workflows default to a read-only token and checkout no longer
+  leaves the token in `.git/config`; the release build pins uv (0.11.20, tarball SHA-256
+  verified), twine (7.0.0, dependencies frozen with `--exclude-newer`) and the hatchling
+  build backend by hash (`.github/build-constraints.txt`), and restores no cache.
+- **Benchmark downloads.** `download_ogle_triples.py` and `download_v1309sco.py` fetch
+  the OGLE archive over HTTPS instead of plaintext FTP, `download_s82_rrlyrae.py` reads
+  astroML-data at a pinned commit with a 120 s timeout, and all three verify a pinned
+  SHA-256 for every file, on download and for cached copies.
+
+### Performance
+
+- **Pre-whitening** runs about 1.7× faster end to end (amplitude-only in-loop spectra
+  with cached normal-equation terms, guarded Cholesky solves with factor reuse, reused
+  designs across cyclic sweeps, window-only engines, no CUDA probing for explicit CPU
+  backends, a vectorised combination search). CPU spectra of small transforms (points +
+  frequencies ≤ 150 000) run on one thread, up to ~7× faster per spectrum. Constrained
+  fits project zero points per group out of every solve: 3.5–6.4× faster with 100
+  nights (N = 2e4–1e5), 18× with 300 groups, identical to round-off.
+- **GLS**: small finufft transforms run on one thread (4–11× faster single-curve GLS
+  and `pdot_search` on many-core CPUs); `FinufftGLS` reuses its plan across scans,
+  sliding windows and batches; the multi-band offsets model computes its per-band sums in
+  one batched transform (1.6–2.5×).
+- **BLS**: the numba kernel screens out boxes that provably cannot win — 3.5–6× faster on
+  sparse survey light curves, bit-identical — and the numpy/torch batch is capped by a
+  memory budget (512 MiB host, 1 GiB device).
+- **Fold methods**: numpy PDM 2.4–2.8×, CE 2.2–3.4× and String-Length 1.2–1.3× faster
+  (bit-identical folds); numba String-Length 2.3–4.6× (an O(N) stable bucket sort);
+  MHAOV on uniform grids sums its harmonics by type-1 NUFFT (numpy 2–90×, numba 4–6×
+  above 64 points per thread; agrees to ~1e-11). Trial-period chunks are capped at
+  ~128 MiB host / 512 MiB device.
+- **TLS**: the numba kernel is 2.2–4.5× faster (bit-identical to numpy) and the
+  numpy/torch batch is memory-capped (N = 80 000: 629 → 117 MiB peak). **SuperSmoother**:
+  the numba kernel is 1.5–2.1× faster, and its on-disk cache now works across processes
+  — every CLI run, GUI session and batch worker spent 4–9 s recompiling it.
+- **Period change**: `phase_track` 6–28× faster (Gram-form shift scan, shared
+  trigonometry, one QR for the whole harmonic ladder); `running_median` 15–20× (sliding
+  sorted window); singular and Pejcha laws fitted in milliseconds instead of 1–4 s;
+  `period_profile`'s interval scan 1.4–2.7×; `ltte_search`'s scan 3–5×; `wwz` 50–85×
+  with numba and 2.7–7× on the NumPy path.
+- **Core**: backend discovery is memoised per process (~1 ms → ~1 µs; small PDM/CE
+  periodograms up to 3× faster), explicit CPU requests no longer import cupy (~0.25 s per
+  process or batch worker), default settings are no longer rebuilt from the environment
+  on every call, and peak-preserving downsampling is vectorised (12–23×; batch rows with
+  `store_raw=True` ~12×).
+- **Batch**: CPU pools spread small batches over all workers (16 light curves on 4
+  workers: `batch_pdot` 13.9 s → 2.2 s), pin BLAS/OpenMP threads only while the pool
+  exists and give numba `cores // workers` threads per worker. The nested-pandas
+  partition tier no longer imports cupy for a CPU GLS partition.
+- **GUI**: light curves above 20 000 points are drawn as a fixed random subset and the
+  hidden raw panel builds only when shown (refolds of 1e5–5e5-point curves: 0.2–2 s →
+  ~30 ms); the Load demo menu fills when first opened (~0.8 s off start-up); the lasso
+  hit test stays well under a second on million-point curves.
+
 ### Validated
 
 - **End-to-end injection-recovery of the dP/dt chain**
@@ -246,46 +915,6 @@ All notable changes to cuPeriod are documented here. The format is based on
   no false rates on the nulls. Beyond one baseline the cycle is detected in 12%: the
   degenerate regime, stated as such.
 
-### Fixed
-
-- **The (period, dP/dt) axes are not orthogonal for skewed sampling**, contrary to what
-  the module and guide claimed. Referencing to the weighted mean epoch zeroes the first
-  moment of the times — which is what decouples phase from frequency — but the residual
-  frequency–drift correlation is set by the sampling's *third* central moment and
-  vanishes only for observations symmetric about that epoch. V1309 Sco (skew −1.29, its
-  cadence densifying steeply toward the merger) shows the resulting tilted ridge plainly
-  in its search map. The claim is now stated correctly: the tilt widens the joint
-  uncertainty without biasing the best cell, and `PdotBest.ridge_correlation` now
-  measures it.
-- **`backend="auto"` raised `ModuleNotFoundError` when the CUDA fast path was
-  half-installed** — cupy present but cufinufft unimportable. Resolution now probes the
-  GPU path before selecting it and falls back to the CPU backend, instead of choosing a
-  backend it cannot load. This made 46 tests fail on any CPU-only machine, and would
-  have made `batch_pdot` fail on every star at its own defaults.
-- **A finite-time singularity would chase the worst point on a flat track.** Keeping
-  `singular`'s `t0` merely *outside* the observed span is not enough: nothing stopped it
-  converging to within a hair of the nearest point, where `b/(t - t0)` becomes a spike
-  on that one measurement — a three-parameter outlier absorber that beat `constant` on
-  BIC on a track with no period change in it at all. Found on a 12.7-year ASAS-SN EW
-  binary whose period is constant to 5 parts in 10^8 per year, where `singular` was
-  buying Δχ² = 21 from a single 3.8σ point. Two guards now: `t0` is held at least one
-  median point-spacing from the data (closer than that the divergence is unresolvable by
-  construction), and any fit whose variation is still dominated by a single end step is
-  flagged `PeriodLawFit.at_bound` and ranked *below* every unpinned fit by
-  `compare_period_laws` and `law="auto"`, whatever its BIC. The same check retires the
-  manual caveat about `pejcha` winning with its exponent pinned at a bound — it is now
-  detected rather than described. V1309 Sco's genuine singular fit is untouched, and the
-  batch summary carries the flag as `law_at_bound`.
-- **Harmonic-order selection over-fitted whenever the quoted errors were optimistic.**
-  Weighted BIC (`chi2 + k*ln(n)`) is right when the errors are right and catastrophic
-  when they are not — every harmonic looks like a bargain and the selection runs to
-  `max_harmonics`. On OGLE's V1309 Sco photometry (chi2_reduced ≈ 115 against the stated
-  errors) that produced a 10-harmonic template on 50-point intervals, whose jagged
-  chi-squared then locked onto sampling aliases and scattered the P(t) track beyond use.
-  `period_profile` now selects on the scale-free criterion `n*ln(chi2/n) + k*ln(n)`,
-  against a frequency refined inside the interval, and takes the median over five
-  intervals — which is stable at 2 harmonics across every interval size tried.
-
 ### Known limitations
 
 - The (P, dP/dt) map is a localization tool, not an inference tool: the wrapped
@@ -297,6 +926,19 @@ All notable changes to cuPeriod are documented here. The format is based on
   measured P(t) track rather than searched, and for wander the right tool is still a
   time-resolved map. Period-law parameters can be strongly degenerate on short
   baselines even where their predictions are not — read the reported errors.
+- **Interactive pre-whitening**: Period04 frequency-list import and export are not
+  supported; after `load` only the stored state is in memory (the rest of a project's
+  history is re-created by replaying it, as *Verify project* does); and a session's
+  spectrum backend is fixed when it is created (`load` / `restore` / `replay` take
+  `backend=`).
+- Several published benchmark figures predate this release's fixes and are being
+  re-measured: the batch throughput (it ignored `grid=`, and its "CPU pool" arm ran on
+  the GPU on CUDA hosts), the TLS and SuperSmoother timings, and the multi-band MHAOV
+  results.
+- The fold methods' default grids are not exactly invariant to the time origin: the last
+  sample sits on a phase-bin edge, so JD and MJD inputs differ at the O(1/N) level.
+- `BatchSettings` is reserved: no batch driver reads it yet, so `CUPERIOD_BATCH_*` has no
+  effect.
 
 ## [1.2.0] - 2026-08-30
 

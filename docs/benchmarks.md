@@ -18,6 +18,24 @@ suite. SuperSmoother, new in this release, is pinned in the unit tests against t
 `supersmoother` package and `gatspy` ({doc}`guide/methods`), joins the performance sweep
 in §3, and is validated on real data alongside every other multi-band method in §7.
 
+:::{admonition} Figures awaiting re-measurement
+:class: caution
+Several results below predate fixes in the upcoming release and are being re-run:
+
+- **§3 timings** for TLS and SuperSmoother on the numba tier (the TLS kernel is now
+  2.2–4.5× faster but searches a 2.5× denser default grid; SuperSmoother's is 1.5–2.1×
+  faster and compiles once per install), and the numpy PDM / CE / MHAOV and numba
+  String-Length rows, which all got faster.
+- **§5 batch throughput**: those runs ignored `grid=` (every light curve used its default
+  grid), and on the CUDA host the "CPU pool" arm with the default backend actually ran
+  cufinufft/cupy in every worker. CPU pools now never touch the GPU.
+- **§7 multi-band MHAOV**: MHAOV now pools each band in its own variance units, which
+  changes every power with two or more bands.
+
+The download scripts that fetch the real-data sets verify a pinned SHA-256 for every file
+(on download and for cached copies) and fetch the OGLE archive over HTTPS.
+:::
+
 ## 1. Numerical validation
 
 Every method runs the **same grid** through cuPeriod's CPU and GPU backends and through an

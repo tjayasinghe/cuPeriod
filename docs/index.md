@@ -56,7 +56,9 @@ resumable across runs.
 
 :::{grid-item-card} 🎵 Analyse a pulsator
 {doc}`Automated pre-whitening <guide/prewhitening>` extracts a δ Scuti or γ Dor
-frequency solution with uncertainties, combination frequencies, and period spacings.
+frequency solution with uncertainties, combination frequencies, and period spacings —
+or {doc}`take the wheel <guide/interactive-prewhitening>` Period04-style, with undo,
+projects and reproducing scripts.
 :::
 
 :::{grid-item-card} ⏱️ Measure period changes
@@ -71,8 +73,9 @@ survey data.
 :::
 
 :::{grid-item-card} 🖥️ Explore interactively
-The {doc}`desktop GUI <guide/gui>` runs any method and folds the light curve live as
-you drag across peaks — `pip install "cuperiod[gui]"`, then `cuperiod-gui`.
+The {doc}`desktop GUI <guide/gui>` runs any method, folds the light curve live as
+you move across peaks, and pre-whitens interactively — keyboard-operable, with a menu
+bar and shortcuts for everything. `pip install "cuperiod[gui]"`, then `cuperiod-gui`.
 :::
 
 ::::
@@ -97,7 +100,8 @@ Multiperiodic pulsators need more than a single best period. {func}`cuperiod.pre
 extracts the whole frequency solution — iterative sinusoid fitting with principled
 stopping criteria, propagated uncertainties, combination-frequency identification, and
 g-mode period-spacing tools — over the same inputs and backends. See
-{doc}`guide/prewhitening`.
+{doc}`guide/prewhitening`, and {doc}`guide/interactive-prewhitening` for steering the
+extraction by hand with {class}`cuperiod.PreWhitenSession` or the GUI.
 
 And a periodogram assumes the period is *constant*. When it is not — mass-transfer
 binaries, decaying hot-Jupiter orbits, evolving pulsators, wandering Miras —
@@ -139,6 +143,7 @@ guide/results
 guide/backends
 guide/tuning
 guide/prewhitening
+guide/interactive-prewhitening
 guide/period-change
 guide/multiband
 guide/interop

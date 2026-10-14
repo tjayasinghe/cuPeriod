@@ -74,7 +74,11 @@ Every implementation is validated against the standard reference (astropy
   whole Period04-style loop — GPU/NUFFT amplitude spectrum, iterative sinusoid extraction,
   simultaneous re-fitting, principled stopping criteria, propagated uncertainties,
   combination-frequency identification, and g-mode period-spacing tools — for one star or
-  a million.
+  a million. When a star needs a hand on the wheel, `PreWhitenSession` (and the GUI) runs
+  the same loop **interactively**: step peak by peak, add, fix and tie frequencies,
+  delete outliers, fit nightly zero points and weights, test amplitude/phase variations,
+  undo anything — then save a `*.cupw.json` project that verifies by replay, or export a
+  script that reproduces it.
 - **Period *changes*, not just periods.** `pdot_search` turns any of the methods into a
   joint (P, dP/dt) search by evaluating it on exactly time-warped data — a drift that
   buries a signal in an ordinary periodogram (GLS power 0.19) stands out at the correct
@@ -251,29 +255,57 @@ Every judgement call an interactive session leaves to the operator is an explici
 and the result records **why the extraction stopped**. See the
 [pre-whitening guide](https://cuperiod.readthedocs.io/en/latest/guide/prewhitening.html).
 
+To steer the extraction yourself, Period04-style, open a session — the same loop, one
+undoable action at a time (`cup.prewhiten` is exactly a session run to its stopping rule):
+
+```python
+session = cup.PreWhitenSession((time, mag, mag_err))
+session.run()                                  # Auto: step until the stopping rule fires
+session.tie("F3", "F1 + F2")                   # a combination follows its parents
+session.delete_points(outliers)                # undoable; nothing is ever lost
+nights = cup.Partition.from_gaps(session.data.time, min_gap=0.3)
+session.define_partition(nights)
+session.use_offsets(nights.name)               # one fitted zero point per night
+session.undo(); session.redo()
+result = session.finalize()
+
+session.save("star.cupw.json")                 # a project: verify it later by replay
+session.export_script("star_session.py")       # or a script that reproduces it
+```
+
+Bad input never raises: every action returns a report, and a refused one changes nothing.
+Projects are plain, strictly validated JSON — safe to open from anyone — and
+`cuperiod session verify|replay|script` works on them from the command line. See the
+[interactive pre-whitening guide](https://cuperiod.readthedocs.io/en/latest/guide/interactive-prewhitening.html).
+
 ## Batch processing (millions of light curves)
 
 ```python
-# CPU pool across cores, written to Parquet:
-cup.batch_periodograms("lightcurves/*.parquet", ["GLS", "BLS"],
-                       device="cpu", workers=8, sink="results/")
+if __name__ == "__main__":   # worker pools start fresh processes on every OS
+    # CPU pool across cores, written to Parquet:
+    cup.batch_periodograms("lightcurves/*.parquet", ["GLS", "BLS"],
+                           device="cpu", workers=8, sink="results/")
 
-# GPU, with an auto-sized worker count:
-cup.batch_periodograms(df_groups, "GLS", device="gpu",
-                       workers=cup.suggest_gpu_workers("GLS"), sink="out.parquet")
+    # GPU, with an auto-sized worker count:
+    cup.batch_periodograms(df_groups, "GLS", device="gpu",
+                           workers=cup.suggest_gpu_workers("GLS"), sink="out.parquet")
 ```
 
 Inputs can be an iterable of light curves, a glob, a directory, or a `(DataFrame,
-group_column)` pair. A directory sink is **resumable** — re-running skips chunks already
-written. `suggest_gpu_workers` sizes the GPU pool from probed device memory.
+group_column)` pair. Sinks are **resumable by light curve** — re-running computes only the
+light curves (and methods) not yet in the sink and retries failures, so adding inputs
+never drops or duplicates one. A CPU pool never touches the GPU. `suggest_gpu_workers`
+sizes the GPU pool from probed device memory.
 
 ## Command line
 
 ```bash
 cuperiod run star.csv --method GLS,BLS --n-best 10
 cuperiod batch "lcs/*.csv" --method GLS --device gpu --out results/
-cuperiod prewhiten star.csv --snr 4.6 -n 30 --spacing
+cuperiod prewhiten star.csv --snr 4.6 -n 30 --spacing --save-project star.cupw.json
+cuperiod session verify star.cupw.json   # replay a project's log against its solution
 cuperiod batch-prewhiten "lcs/*.csv" --out modes.parquet
+cuperiod pdot star.csv --period 0.5168   # joint (P, dP/dt) search + O-C measurement
 cuperiod methods                 # list methods and backends
 cuperiod gpu-info                # device + suggested worker counts
 cuperiod doctor                  # backends, torch devices, precision, auto-resolution
@@ -290,19 +322,28 @@ option yet).
 
 An interactive explorer ships with the `[gui]` extra — run any method with all of its
 options, explore the full-resolution spectrum, and watch the phased light curve update
-live as you drag across peaks. Single curves or a whole folder in batch mode, multi-band
-overlays, and a dark/light theme remembered across launches. An **Analysis** picker
-switches the same window to pre-whitening: the amplitude spectrum with the residual
-overlaid, a frequency table with uncertainties, and a g-mode period-spacing explorer.
+live as you move across peaks. Single curves or a whole folder in batch mode, multi-band
+overlays, an import dialog for any table layout, and a dark/light theme remembered across
+launches. An **Analysis** picker switches the same window to **interactive
+pre-whitening**, Period04-style: Auto, Step and add-at-cursor in the spectrum, an editable
+frequency table (fix, tie, per-subset amplitudes), lasso deletes in the light curve,
+nightly zero points and weights, amplitude/phase variation tests, a History pane with
+undo to any state, `*.cupw.json` projects and script export.
+
+Everything is reachable from the **keyboard** — a menu bar with mnemonics, shortcuts for
+every pre-whitening action (F1 lists them), a keyboard-operable spectrum — with visible
+focus, WCAG AA contrast in both themes, screen-reader names and descriptions, nothing
+conveyed by colour alone, and an interface zoom (Ctrl++ / Ctrl+-).
 
 ```bash
 pip install "cuperiod[gui]"      # add [gpu] or [torch] for accelerated backends
 cuperiod-gui                     # or:  python -m cuperiod.gui
 ```
 
-The toolbar's **Load demo** menu always offers a synthetic multi-band curve, so there's
-something to explore on first launch. In a source checkout (or with `CUPERIOD_EXAMPLE_DATA`
-pointed at `examples/data`) it also lists a *Kepler* transit and six ASAS-SN variables.
+The **Load demo** menu always offers a synthetic multi-band curve, so there's something to
+explore on first launch. In a source checkout (or with `CUPERIOD_EXAMPLE_DATA` pointed at
+`examples/data`) it also lists a *Kepler* transit and six ASAS-SN variables. See the
+[GUI guide](https://cuperiod.readthedocs.io/en/latest/guide/gui.html).
 
 ## Light-curve inputs
 

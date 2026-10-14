@@ -91,7 +91,16 @@ conditional entropy; SuperSmoother's smallest span). The default extent is set
 in accumulated drift *cycles* (`max_cycle_drift`), which keeps the row count
 baseline-independent while reaching every drift big enough to defocus a
 constant-period search — and means the physical dP/dt coverage adapts to your
-baseline, from ms/yr on a decade of eclipse timing to d/yr for a Mira.
+baseline, from ms/yr on a decade of eclipse timing to d/yr for a Mira. The default
+axis has exactly `4 × samples_per_drift × max_cycle_drift × harmonic_scale + 1` rows
+(201 at the defaults); on a baseline of fewer than about 80 cycles it is trimmed to the
+model's domain, and a baseline under about one cycle raises
+{exc}`~cuperiod.InsufficientDataError`. An explicit `pdot_over_p_range` that spans zero
+is laid on a zero-anchored lattice — it contains an exact dP/dt = 0 row, reaches the
+wider bound exactly and never steps coarser than the derived step — so
+`best.zero_pdot_power` is the true constant-period row; a range that excludes zero is
+sampled end to end. `backend="auto"` defers to the wrapped method's settings backend
+(`CUPERIOD_<METHOD>_BACKEND`), as {func}`~cuperiod.periodogram` does.
 
 Every registered method works, single- or multi-band, except BLS and TLS
 (their trial grids carry box/transit structure a plain frequency window cannot
@@ -126,7 +135,13 @@ linear and quadratic ephemerides:
 
 with the F-test between the two models (Pringle 1975; Sterken 2005) and
 ΔBIC = `linear_fit.bic − quadratic_fit.bic` (positive favors the drift; > 10
-is conventionally strong) both reported. A drift left in the fold would smear
+is conventionally strong) both reported. The F-test's `f_test_p` is `NaN` — not
+"infinitely significant" — when both models fit the O−C exactly or a χ² is not
+finite. The template's harmonic order is chosen with the scale-free BIC
+{math}`N\ln(\chi^2/N) + k\ln N` whether or not errors are given, so optimistic error
+bars cannot push it to `max_harmonics`. Tracking needs at least four segments (the
+quadratic ephemeris needs four O−C points); when the data cannot form them the error
+says which floor to relax. A drift left in the fold would smear
 the template, so the tracker re-derives the template on drift-corrected times
 until self-consistent; when the accumulated drift exceeds a cycle or so, pass
 the search's `best.pdot` as the starting guess. Results are always reported
@@ -137,7 +152,12 @@ For timing lists — decades of published minima, TESS mid-eclipse times —
 assigning each event the nearest cycle of your trial ephemeris. Watch its
 `worst_phase_residual`: values approaching 0.5 mean cycle counts are becoming
 ambiguous, the classical O−C failure (a one-cycle error anywhere invalidates
-the diagram).
+the diagram). Timings may come in any order, each keeping its own error, and a
+non-finite time is dropped together with its error. With `errors=None` the common
+timing error is estimated from the scatter about the fitted quadratic (so the
+quadratic's `chi2_reduced` is 1 by construction); the errors of a cubic and higher
+ladder steps are inflated by `sqrt(chi2_reduced)` when that exceeds 1
+(`pdot_err_scaled`, `pddot_err_scaled`).
 
 Timing lists exist for thousands of eclipsing binaries. The AAVSO hosts the
 late Bob Nelson's database of over 5800 O−C files — one spreadsheet of minima
@@ -273,6 +293,15 @@ that implies a companion brighter than the binary, or a cycle that is not
 strictly periodic, argues for the latter, and only radial velocities or a
 brightness/colour modulation in step with the O−C settle it.
 
+Without `errors=`, the noise is estimated from the joint fit: `delta_bic`, `aic` and
+`bic` come from the concentrated likelihood {math}`n\ln(\mathrm{RSS}/n) + k\ln n`,
+`chi2_reduced` is 1 by construction, and `meta["errors"]` says which applied. The
+default shortest trial outer period follows the spacing of *distinct* epochs
+(`meta["epoch_spacing"]`, `meta["n_epochs"]`), so repeated or clustered timings do
+not collapse it. {meth}`PdotSensitivity.sigma_amplitude()
+<cuperiod.PdotSensitivity.sigma_amplitude>` is `inf` for outer periods the epochs
+cannot constrain (aliased with the cadence, or far beyond the baseline).
+
 ## When one rate is not enough
 
 Everything above fits a *single* rate over the whole baseline. When the rate
@@ -306,19 +335,32 @@ flat = cup.detrend(time, mag, 40.0)          # see below — real data needs it
 prof = cup.period_profile((time, flat, err), period=1.4456,
                           points_per_interval=50)
 for fit in prof.compare():
-    print(fit.law, fit.bic, fit.params)
+    print(fit.law, fit.bic_scaled, fit.params)
 best = prof.fit("singular")
 print(best.fractional_change(time[0], time[-1]))    # total change over the run
 print(best.timescale_yr_at([time[0], time[-1]]))    # P/|dP/dt|, start and end
 ```
 
+Each interval's frequency is converged on the χ² minimum (a bounded Brent search inside
+a harmonic-scaled scan), so the track's scatter matches its error bars even for
+many-harmonic, high-S/N light curves; `PeriodPoint.amplitude` is the fundamental's
+semi-amplitude.
+
 The registered laws are `constant`, `linear` (constant dP/dt), `exponential`
 (constant d ln P/dt), `singular` — {math}`P = P_0 \exp(b/(t - t_0))`, a
 finite-time singularity, the description Tylenda et al. (2011) fitted to V1309
 Scorpii's orbital decay through its merger — and `pejcha`, which lets the
-exponent of that singularity float (Pejcha 2014). BIC ranks them;
-`law="auto"` picks the best of all but `pejcha`, which needs an exceptionally
-well-sampled track.
+exponent of that singularity float (Pejcha 2014). They are ranked by
+{attr}`~cuperiod.PeriodLawFit.bic_scaled`: the χ² divided by the excess scatter of the
+most flexible free law (floored at 1), so understated period errors no longer buy a
+period change (errors understated k-fold used to inflate BIC differences by k²), and
+the "ΔBIC ≳ 10 is decisive" rule applies to it; `.bic` is still reported. Without
+`period_err` the laws are compared on the residuals' own scale (the concentrated
+likelihood), and `PeriodLawFit.weighted` says which applied. `law="auto"` picks the best
+of all but `pejcha`, which needs an exceptionally well-sampled track. Singular and
+Pejcha laws are fitted in coordinates about the mid-epoch (milliseconds instead of
+seconds per fit); a singular fit in the exponential limit reports `t0 = ±inf`, and a
+parameter the data do not constrain, or one held at a bound, reports `NaN`.
 
 :::{admonition} A singularity will chase your worst point
 :class: warning
@@ -331,8 +373,10 @@ track that is not changing at all, that three-parameter spike will out-score
 Two things stop it. `t0` is held at least one median point-spacing away from the
 data — closer than that, the divergence is unresolvable by construction — and
 any fit whose variation is still dominated by a single end step is flagged
-`at_bound` and ranked *below* every unpinned fit, whatever its BIC. Check that
-flag before believing a singular law, and read
+`at_bound` and ranked *below* every unpinned fit, whatever its BIC. Precisely, the flag
+means the law changes by more over the first or last resolution element (one median
+point spacing) than over half its whole swing, wherever the last samples happen to
+fall. Check that flag before believing a singular law, and read
 {attr}`~cuperiod.PeriodLawFit.at_bound` in the batch table as
 `law_at_bound`.
 :::
@@ -368,6 +412,13 @@ flat = cup.detrend(time, mag, 40.0)              # 40-day window
 trend = cup.running_median(time, mag, 40.0)      # or the trend itself
 ```
 
+The exact running median uses a sliding sorted window and handles ~10⁵-point curves
+quickly. `method="binned"` is the faster approximation: it visits only occupied bins (a
+stray epoch such as a `0` among Julian dates no longer allocates gigabytes), and a bin
+with fewer than `min_points` points (3 by default) is not an interpolation node — it
+takes the trend interpolated from its populated neighbours, or the global median.
+Masked or NA entries count as missing.
+
 Nothing detrends automatically: the width is a physical judgement about a
 particular star, too narrow a window eats the signal, and silently reshaping a
 light curve before measuring its period is not a library's decision to make.
@@ -387,6 +438,31 @@ resolve fractional period changes below {math}`\sim P/W` — and both expose a
 diagnostics: the coherent tools above are an order of magnitude more
 sensitive to a genuinely secular trend, but they will happily average over a
 reversal that a map shows at a glance.
+
+```python
+res = cup.wwz((time, mag), frequency=freqs)     # or cup.sliding_periodogram(...)
+res.peak_period                                 # the ridge: an array, one per tau
+res.period_trend()                              # a rough dP/dt from the ridge
+res.to_dict(include_map=True)                   # same spelling on both maps
+```
+
+- The ridge is a property on both maps — `res.peak_frequency`, `res.peak_period` and
+  (WWZ) `res.peak_wwa` are arrays, not methods.
+- {func}`~cuperiod.wwz` runs a multicore numba kernel when the `[fast]` extra is
+  installed and a vectorised NumPy path otherwise (`backend="auto" | "cpu" | "numba" |
+  "numpy"`; the one that ran is in `meta["wwz"]["backend"]`) — 50–85× faster than before
+  with numba. It centres the values first (a constant light curve gives an all-`NaN`
+  map), and it keeps rows whose unused error is missing, zero or negative, such as
+  AAVSO visual estimates.
+- `WWZResult.period_trend()` counts its degrees of freedom in independent windows, so
+  its error no longer shrinks with a denser tau grid, and it is `inf` when the taus span
+  less than about one window.
+- `SlidingPeriodogram.window_periodogram(i)` reports that window's own `baseline` and
+  point count (`n_window_points`), so `best_periods()` separates peaks at the window's
+  resolution; the run's values are in `meta["run_baseline"]` / `meta["run_n_samples"]`.
+  {func}`~cuperiod.sliding_periodogram` honours the method's settings backend, never
+  drops the last observation, and raises `ValueError` for a non-finite window, step or
+  period, or a period longer than the window.
 
 ## How small a rate can you measure?
 
@@ -496,6 +572,10 @@ overtones) and most Miras show non-evolutionary wander. Run
 slope in its lag profile says the wander is real, and its `epsilon` measures
 it (Eddington & Plakidis 1929 — o Ceti's period fluctuates by ~1.4% per
 cycle; the estimator here corrects the classical recipe's detrending bias).
+`slope_significance` is a z-score under the no-wander null (about N(0, 1)), not a
+t-statistic, and `epsilon_err` / `alpha_err` are the estimator's own uncertainties:
+they scale with the estimate, so read them in log space. An exactly periodic series
+reports 0.
 
 **A distant companion mimics a decaying orbit.** The light-travel-time effect
 of a third body sampled over less than its orbital period is
@@ -548,25 +628,41 @@ tables, because a period-change catalogue is genuinely three-shaped:
 | `profile_sink` | P(t) interval | The model-free track: period, error, χ², and the window-edge flag. |
 
 ```python
-summary = cup.batch_pdot(
-    "lightcurves/*.csv",
-    period=known_periods,          # a float, or a {key: period} mapping
-    detrend_width=40.0,
-    sink="pdot.parquet",
-    oc_sink="oc.parquet",
-    profile_sink="profile.parquet",
-    plots="figures/", plot_keys=candidates,
-    workers=8,
-)
-print(summary.n_done, summary.n_failed)
+if __name__ == "__main__":         # worker pools start fresh processes (see the batch guide)
+    summary = cup.batch_pdot(
+        "lightcurves/*.csv",
+        period=known_periods,      # a float, or a {key: period} catalogue
+        detrend_width=40.0,
+        sink="pdot.parquet",
+        oc_sink="oc.parquet",
+        profile_sink="profile.parquet",
+        plots="figures/", plot_keys=candidates,
+        workers=8,
+    )
+    print(summary.n_done, summary.n_failed)
 ```
 
-Sinks accept `.parquet`/`.csv` files or directories (resumable, one part per
-chunk — the three must be *different* directories). Every stage is wrapped so
-one pathological star cannot kill a survey run: a failure still contributes a
-summary row whose `status` carries the reason, so nothing disappears from the
-catalogue, and every law's parameter columns are present and NaN-filled in
-every part so a directory sink reads back with one schema.
+Sinks accept `.parquet`/`.csv` files or directories (one part per chunk — the three
+must be *different* directories), in any mix. Every stage is wrapped so one
+pathological star cannot kill a survey run: a failure still contributes a summary row
+whose `status` carries the reason (and the light curve's `n_samples` and `baseline`),
+so nothing disappears from the catalogue, and every law's parameter columns are present
+and NaN-filled in every part so a directory sink reads back with one schema.
+
+**Resuming** works per light curve across the three tables: a star is skipped only when
+its summary row is `ok` for the same method and every requested table holds all of its
+rows, so interrupted runs, deleted part files and a long-table sink added later all heal
+on the next call. Stars that failed are retried, and a recomputed star replaces its rows
+in every table — the summary keeps one row per key, and a run with a different method
+replaces the earlier rows. An identical re-run into a file sink computes nothing.
+
+`period=` takes a float or a catalogue: a `{key: period}` mapping (integer keys
+included), a pandas Series, NumPy scalars or 0-d arrays. Catalogue keys are matched as
+strings, as batch keys are; a missing, `NaN` or non-positive entry means a blind search
+for that star, and a catalogue that matches no input key warns. `method` (BLS and TLS
+are refused), `model`, `detrend_method`, `domain` and law names are checked before any
+light curve or sink is touched; a bare string for `laws=` or `plot_keys=` counts as one
+name.
 
 Useful cuts on the summary table:
 
@@ -575,8 +671,8 @@ Useful cuts on the summary table:
 | `track_f_test_p` | Is the drift real at all? |
 | `track_pdot_snr` | `|dP/dt|` over its χ²-inflated error — the honest significance. |
 | `ladder_curvature_ratio` | O−C residual, cubic over quadratic. Near 1: a constant rate is adequate. Well below: the rate is evolving. |
-| `implied_model` | Which law the fitted `pddot` favours. |
-| `law`, `law_delta_bic` | The winning P(t) law and its margin over the runner-up. |
+| `implied_model` | Which law the fitted `pddot` favours. `ladder_pddot_err` and `ladder_pdot_cubic_err` are inflated by `sqrt(chi2_reduced)` of the cubic fit when that exceeds 1. |
+| `law`, `law_delta_bic`, `law_bic_scaled` | The winning P(t) law, its margin over the runner-up in `bic_scaled` (the ranking criterion; plain BIC for fits without one), and its `bic_scaled`. |
 | `law_at_bound` | The winning law ran onto a constraint — treat its parameters and its BIC as meaningless. |
 | `search_ridge_correlation` | How strongly P and dP/dt trade off at the peak. |
 | `ltte_delta_bic`, `ltte_f_test_p` | Is the O−C cyclic? Positive ΔBIC favours a light-time orbit over the polynomial alone. |
@@ -588,8 +684,13 @@ Useful cuts on the summary table:
 `plots=` writes a six-panel diagnostic per star (light curve, drift-corrected
 fold, search map, O−C, P(t) track with the fitted law, and the decay
 timescale). It needs matplotlib — `pip install "cuperiod[plot]"` — and is slow
-enough at catalogue scale that it is worth pairing with `plot_keys`. The same
-figure is available directly as {func}`cuperiod.pdot.plots.pdot_figure`, and
+enough at catalogue scale that it is worth pairing with `plot_keys`. The summary row's
+`figure` column gives each file's path. A key that is not plain `[A-Za-z0-9_.-]` (a
+path-qualified `fieldA/lc_0000`), is longer than 120 characters or names a Windows
+device gets a `-<8 hex>` digest suffix, so distinct keys never overwrite each other's
+figures. Figures follow the brightness domain (flux light curves are labelled `flux`,
+not drawn inverted), and the drift-corrected fold uses the track's fitted ephemeris.
+The same figure is available directly as {func}`cuperiod.pdot.plots.pdot_figure`, and
 its panel helpers can be composed into your own layout.
 
 ## Settings
@@ -605,8 +706,8 @@ keeps its own settings via `method_settings=`.
 | `max_cycle_drift` | 10 | Half-range of the dP/dt axis, in accumulated drift cycles at the half-baseline. |
 | `samples_per_drift` | 5 | dP/dt oversampling (worst-case template mismatch ~0.9/s²: 3.5% at 5; use 2 for survey speed at ~22%). |
 | `harmonic_scale` | auto | Extra dP/dt-step refinement for sharp-featured methods; `None` derives it from the method. |
-| `pdot_over_p_range` | auto | Explicit (lo, hi) for the dP/dt axis, in 1/day. |
-| `n_segments` | auto | Phase-tracking segment count. |
+| `pdot_over_p_range` | auto | Explicit (lo, hi) for the dP/dt axis, in 1/day; a range spanning zero always contains an exact dP/dt = 0 row. |
+| `n_segments` | auto | Phase-tracking segment count; at least 4 (the quadratic ephemeris needs four O−C points). |
 | `min_segment_points`, `min_segment_cycles` | 20, 3 | Segment floors (raise the cycles floor for beating-prone multiperiodic stars). |
 | `harmonics`, `max_harmonics` | auto, 10 | Template order, or the cap on its BIC selection. |
 | `segment_offsets` | on | Free magnitude offset per segment (calibration-drift protection). |

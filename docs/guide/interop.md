@@ -44,9 +44,17 @@ out[["best_period", "best_power", "fap"]].head()
 ```
 
 The result columns are `best_period`, `best_power`, `fap` (NaN when the method reports
-none), plus `period_2 … period_n` when you ask for `n_best > 1`. `prefix=` prepends a
-string to every one of them, so several methods can live in one frame;
-`append_columns=False` returns only the results.
+none), plus `period_2 … period_n` when you ask for `n_best > 1`; the ranked periods follow
+the settings' peak fields (`peak_separation_rayleigh`, `alias_freq_tolerance`, …) exactly
+as in {func}`~cuperiod.periodogram`. `prefix=` prepends a string to every one of them, so
+several methods can live in one frame; `append_columns=False` returns only the results.
+Appending onto a frame that already has a column of the same name raises `ValueError`
+pointing at `prefix=` (duplicate labels used to break column selection and Parquet
+export), and an empty frame gives typed, empty float64 result columns.
+
+`nested=None` (the default) means the preset's nest, or `"lc"` without a preset; an
+explicit `nested=` always wins. `backend="auto"` defers to the method settings' backend
+(`CUPERIOD_<METHOD>_BACKEND`).
 
 On a lazy lsdb `Catalog` nothing changes except that you call `.compute()` at the end:
 
@@ -109,7 +117,10 @@ inside the worker, on that worker's own device, and released when the partition 
 ## Column presets
 
 Survey layouts are stable enough to name. `preset=` fills in every column parameter you
-did not set yourself; anything you pass explicitly wins.
+did not set yourself; anything you pass explicitly wins. One exception keeps a mixed
+request consistent: a `value=` naming another column than the preset's drops the preset's
+error column and domain, so the value pairs with its own error and a domain inferred from
+its name (`psfMag` under a `psfFlux` preset is searched in magnitudes with `psfMagErr`).
 
 | Preset | Nest | Time | Value / error | Band | Domain |
 | --- | --- | --- | --- | --- | --- |

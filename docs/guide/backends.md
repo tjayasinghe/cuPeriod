@@ -20,6 +20,22 @@ The selectors:
 | `"torch"` / `"torch:<device>"` | Force the portable PyTorch backend; `<device>` is `cpu`, `cuda`, `mps`, or `xpu` (bare `"torch"` picks the best present). Needs the `[torch]` extra. |
 | a concrete name | Force a specific implementation, e.g. `"finufft"`, `"astropy"`, `"numpy"`, `"cupy"`, `"cufinufft"`, `"numba"`. |
 
+Selectors ignore case and surrounding spaces (`"CPU"`, `" Auto "`).
+
+**The settings' backend is the default.** Every settings model has a `backend` field
+(`CUPERIOD_<METHOD>_BACKEND` in the environment). `cup.periodogram(..., backend="auto")`
+— or `None` — defers to it, and any other `backend=` overrides it; the batch drivers, the
+LINCC adapters, {func}`~cuperiod.pdot_search`, {func}`~cuperiod.sliding_periodogram`,
+{func}`~cuperiod.multiband_fap` and the GUI follow the same rule. A settings pin of
+`"gpu"` on a machine without one raises {exc}`~cuperiod.BackendUnavailableError` instead
+of silently running on the CPU, and bare `"torch"` counts as a GPU backend only when torch
+actually has a GPU (or `settings.device` pins one).
+
+Backend discovery is memoised per process (resolving a backend costs about a
+microsecond), and an explicit CPU request never imports cupy. After installing an extra
+into a running session, `cuperiod.core.backend.refresh_backends()` probes again. Batch
+CPU pools resolve `"auto"` to CPU backends only, so they never open a GPU ({doc}`batch`).
+
 ## What each method can run
 
 ```{list-table}
@@ -205,6 +221,20 @@ How to read this:
 - cuPeriod's **CPU** path already beats the established reference tools it was checked
   against — GLS ~3× astropy, BLS ~20× astropy's `BoxLeastSquares`, and PDM's numba kernel
   over 2,000× PyAstronomy's pure-Python `pyPDM` (the numpy PDM path alone is already ~4×).
+- Small finufft transforms — `n_trans × N + n_modes ≤ 150 000`, single GLS curves,
+  `pdot_search` rows, pre-whitening spectra — run on one thread, where thread start-up
+  would otherwise dominate (GLS 4–11× faster, pre-whitening spectra up to ~7× on many-core
+  CPUs); larger ones use every core (`OMP_NUM_THREADS`). The crossover was measured on a
+  32-thread Windows desktop and is machine-dependent.
+
+:::{note}
+The table above predates this release's CPU work, which mostly changes the CPU column:
+the numba TLS kernel is 2.2–4.5× faster but its default period grid is 2.5× denser (it
+now resolves the shortest transit searched); the numba SuperSmoother kernel is
+1.5–2.1× faster and no longer recompiles in every process; numpy PDM, CE and MHAOV and
+numba String-Length are faster too, and MHAOV on uniform grids uses NUFFT sums. The
+benchmark figures are being re-measured.
+:::
 
 :::{tip}
 Write `backend="auto"` and let cuPeriod choose. Reach for `"cpu"`/`"gpu"` or a concrete

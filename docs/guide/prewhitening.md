@@ -7,7 +7,12 @@ sinusoid, subtract it, look again — and it is traditionally an interactive Per
 session, one star at a time, with the stopping decision left to the operator's eye.
 
 {func}`cuperiod.prewhiten` automates the loop end to end and makes every judgement call
-an explicit, recorded setting.
+an explicit, recorded setting. When a light curve needs a hand on the wheel — a peak
+taken by hand, a tied combination, deleted outliers, nightly zero points — the same loop
+runs one action at a time in a {class}`~cuperiod.PreWhitenSession`, in a script or in the
+desktop app, with undo, project files and reproducing scripts: see
+{doc}`interactive-prewhitening`. `cup.prewhiten(...)` *is* such a session run to its
+stopping rule and finalized, so the two routes give the same numbers.
 
 ```python
 import cuperiod as cup
@@ -35,7 +40,11 @@ residuals and their spectrum, the fit statistics, and — crucially — **why it
 1. **Amplitude spectrum of the current residuals.** Not power: pulsation work is done in
    millimagnitudes, and the signal-to-noise criterion below is defined on amplitudes. The
    default is the weighted least-squares amplitude, evaluated through the same NUFFT
-   machinery as {doc}`GLS <methods>` (see {doc}`backends`).
+   machinery as {doc}`GLS <methods>` (see {doc}`backends`). Where the sampling barely
+   separates a sinusoid from the constant — near multiples of a regular cadence, near
+   1, 2, … c/d for nightly sampling, towards zero frequency — it is replaced by the
+   bounded amplitude of the variance the sinusoid explains (zero where the sampling
+   carries no information), so such frequencies cannot pose as giant components.
 2. **Pick the tallest peak** that is resolved from everything already extracted — at
    least `min_separation_rayleigh` (1.5 by default, after Loumos & Deeming 1978) Rayleigh
    widths away — and locate its apex by parabolic interpolation.
@@ -75,6 +84,20 @@ still admits roughly 0.2 spurious frequencies per light curve. For catalogue wor
 to `stop_criteria`, which control the false-alarm rate directly.
 :::
 
+Two stops are always on, whatever `stop_criteria` says:
+
+- **degrees of freedom** — the run stops when another component would leave fewer than
+  half the points as degrees of freedom (`2(3K + 1) > N` for K components), because past
+  that a sparse light curve interpolates its own noise with ever more sinusoids
+  (`stop_reason` *too few points (N) to constrain another component (M parameters)*);
+- **numerical round-off** — a noise-free or constant light curve stops instead of
+  fitting rounding error (*residuals are at numerical round-off*).
+
+The run also ends at `max_frequencies` (*reached max_frequencies (30)*). On sparse light
+curves — below about a hundred points — the S/N criterion alone is unreliable, because
+the residual spectrum it is measured against is itself thinned by every fit; add `"fap"`
+to `stop_criteria` there.
+
 The false-alarm probability is evaluated natively from Baluev's (2008) closed form —
 matching astropy's `false_alarm_probability(method="baluev")` while staying accurate for
 raw Julian dates — and every component's value is reported whether or not `"fap"` is a
@@ -98,18 +121,32 @@ Reported errors are 1-sigma and come from one of three estimators, set by `uncer
 
 `"analytic"`
 : The closed-form expressions of Montgomery & O'Donoghue (1999) — the numbers most
-  pulsation papers quote.
+  pulsation papers quote — with the weighted residual rms for weighted fits.
 
 `"bootstrap"`
-: Resample the residuals, re-fit `n_resamples` times, take the scatter. No linearity
-  assumption, at the price of that many extra fits. Every replicate re-optimises *all*
-  frequencies, boxed by the same per-frequency bounds as the fit it characterises.
+: A wild (sign-flip) residual bootstrap: each of `n_resamples` replicates flips the
+  sign of every residual at random (so heteroscedastic error bars are respected),
+  scaled by the degrees-of-freedom correction `sqrt(N/(N − M))`, and is refined like
+  the final polish (simultaneously, or with at least three cyclic sweeps), boxed by the
+  same per-frequency bounds as the fit it characterises. No linearity assumption, at the
+  price of that many extra fits; seeded values differ from cuPeriod 1.2's.
 
 The covariance and analytic errors are inflated by `sqrt(D)` with `D` the
 Schwarzenberg-Czerny (1991) correlation factor (`correlation_correction`, on by default),
 because real photometry has residuals that are correlated point to point and the formal
 errors are correspondingly optimistic. The bootstrap is left alone — it already resamples
-the residuals as they are. `D = 1` means the residuals look white.
+the residuals as they are. `D = 1` means the residuals look white; it is computed from
+the residuals in time order, so the row order of the input does not matter. The
+`offset_error` goes through the same estimator and the same `sqrt(D)` inflation.
+
+The covariance is the pseudo-inverse of the Jacobi-scaled normal matrix, built about the
+weighted-mean epoch, so it stays accurate on long baselines, in flux units and far from
+the epoch; a parameter the data cannot determine (for example of a zero-amplitude
+component) reports `NaN` rather than `0`.
+
+With `fit_mean=False` the offset is not a free parameter: the weighted mean — the same
+zero point the amplitude spectrum uses — is removed once up front and reported as
+`offset`, with no error (`NaN`).
 
 Phases are referenced to `solution.t_ref`, the **weighted mean of the observation times**.
 That epoch is not arbitrary: it is the one at which a phase is uncorrelated with its own
@@ -135,9 +172,14 @@ modes = solution.independent()   # the candidate independent-mode list
 
 A peak is only ever explained by frequencies *stronger* than itself, and the match must
 fall inside `max(3σ, 0.25/T)` where σ is the **propagated** uncertainty of the predicted
-combination. Each identification also carries `expected_false`, the number of chance
-matches expected for the coefficient vectors that were searched — if that approaches 1,
-the identification means nothing, and you should know that without having to work it out.
+combination. Combinations have order Σ|nᵢ| ≥ 2 (a component is never "identified" as
+another one), up to `combination_max_order`; `combination_max_order=1` switches the
+search off. Each identification also carries `expected_false`, the rate at which a
+random frequency in the band of the extracted frequencies would match one of the
+coefficient vectors searched — if that approaches 1, the identification means nothing,
+and you should know that without having to work it out. To make an identified
+combination *follow* its parents in the fit, tie it in a session
+({doc}`interactive-prewhitening`).
 
 ## Is an amplitude trustworthy on its own?
 
@@ -197,6 +239,10 @@ overlays it scaled to the tallest peak (the Period04 convention), and
 Keeping the window costs nothing: its sums are already part of the cached normal
 equations that make each pre-whitening iteration a single NUFFT.
 
+{meth}`AmplitudeSpectrum.noise_curve() <cuperiod.AmplitudeSpectrum.noise_curve>` gives
+the local noise level (the S/N criterion's denominator) at every grid frequency; times
+`snr_threshold` it is the acceptance limit the GUI draws over the residual spectrum.
+
 ## g-mode period spacings
 
 For γ Dor and SPB stars the next question is the period spacing, whose mean value fixes
@@ -224,7 +270,10 @@ x, y = cup.echelle(series.periods, series.mean_spacing)
 ```
 
 The same functions work on frequencies, where a regular spacing is the p-mode large
-separation or a rotational splitting.
+separation or a rotational splitting. By default the trial spacings come from the bulk
+of the values — twice their interquartile range, widened to at least eight median gaps
+and capped at the full range — so one far outlier (a slow signal among g modes) cannot
+hide the comb; non-finite values are dropped together with their weights.
 
 ## Many stars at once
 
@@ -233,16 +282,28 @@ DataFrame with the same worker machinery as {doc}`batch`, and writes **one row p
 extracted component** — the shape a frequency catalogue wants.
 
 ```python
-cup.batch_prewhiten(
-    "lightcurves/*.csv",
-    settings=cup.PreWhitenSettings(max_frequencies=20),
-    device="cpu",
-    sink="modes.parquet",
-)
+if __name__ == "__main__":      # worker pools start fresh processes on every OS
+    cup.batch_prewhiten(
+        "lightcurves/*.csv",
+        settings=cup.PreWhitenSettings(max_frequencies=20),
+        device="cpu",
+        sink="modes.parquet",
+    )
 ```
 
 **`batch_prewhiten` forces `store_spectra=False`**: the full amplitude spectra are large
 and rarely wanted a million times over.
+
+- `backend=None` (the default) takes `settings.backend` — and so
+  `CUPERIOD_PREWHITEN_BACKEND` — as `cup.prewhiten` does. With `device="cpu"`, `"auto"`
+  means the best CPU backend and a GPU-only backend (`"gpu"`, `"cupy"`, `"cufinufft"`)
+  raises `ValueError` before any work: CPU-pool workers never open a GPU.
+- Resuming is **by key**: a file or directory sink skips the light curves already in it
+  and retries the ones that failed, so adding inputs, reordering them or resuming with
+  another `chunk_size` neither drops nor duplicates a star. After changing the settings,
+  run again with `resume=False`.
+- Rows and errors come back in input order; `chunk_size` is an upper bound (small
+  batches are spread over all workers).
 
 ## From the command line
 
@@ -254,9 +315,12 @@ cuperiod prewhiten star.csv --snr 4.6 -n 30 --spacing --csv modes.csv
 cuperiod batch-prewhiten "lightcurves/*.csv" --out modes.parquet --workers 8
 ```
 
-See {doc}`cli` for the full option list, and {doc}`gui` for the interactive version —
-the desktop app runs the same analysis with the amplitude spectrum, the residual overlay,
-the frequency table and a period-spacing explorer side by side.
+`--save-project star.cupw.json` keeps the run as a project to open, edit or verify
+later, and `--export-script star.py` writes a script that reproduces it
+({doc}`interactive-prewhitening`). See {doc}`cli` for the full option list, and
+{doc}`gui` for the desktop app, which runs the same analysis with the amplitude
+spectrum, the residual overlay, an editable frequency table and a period-spacing
+explorer side by side.
 
 ## Settings reference
 
@@ -270,12 +334,40 @@ Every field of {class}`~cuperiod.PreWhitenSettings` is documented in the
 | `snr_threshold` | 4.0 | The Breger criterion (see the note above). |
 | `min_separation_rayleigh` | 1.5 | Resolution guard between components. |
 | `samples_per_peak` | 10 | Frequency oversampling of the search grid. |
-| `maximum_frequency` | max(pseudo-Nyquist, 50 /d) | Top of the search band. The floor matters: the median-gap pseudo-Nyquist of nightly ground-based sampling is a few c/d, and a band capped there sees only the *daily aliases* of a δ Scuti or HADS star. |
+| `maximum_frequency` | regular cadence: 0.5/cadence; otherwise max(5 × pseudo-Nyquist, 50 /d) | Top of the search band (see [below](#the-automatic-search-band)). |
 | `uncertainty` | `"covariance"` | Error estimator. |
 | `blend_tolerance` | 2.0 | Factor beyond which a fitted amplitude is flagged as blended. |
 | `refine` | `"last"` | Per-iteration refinement; the final polish is simultaneous. |
-| `combination_max_order` | 2 | Largest `Σ|nᵢ|` in the combination search. |
+| `combination_max_order` | 2 | Largest `Σ|nᵢ|` in the combination search; 1 switches it off. |
 | `backend` | `"auto"` | GPU when available (see {doc}`backends`). |
+
+`downsample_points` had no effect and is deprecated: setting it warns
+(`DeprecationWarning`), and it will be removed.
+
+### The automatic search band
+
+- On a **strictly regular cadence** — space photometry such as TESS or Kepler, with
+  gaps, dropped cadences and barycentric timing allowed — the band stops at the true
+  Nyquist frequency `0.5/cadence`. Above it the spectrum mirrors the baseband, every
+  mode has equal-height images at `k/cadence ± f`, and the extraction would report
+  whichever image the grid happens to sample best. For **super-Nyquist** work set
+  `maximum_frequency` explicitly; an explicit `minimum_frequency` alone above the
+  automatic maximum raises `InsufficientDataError` naming the setting to change.
+- On **irregular** sampling it is five times the median-gap pseudo-Nyquist frequency,
+  but at least 50 c/d. The floor matters: the median-gap pseudo-Nyquist of nightly
+  ground-based sampling is a few c/d, and a band capped there sees only the *daily
+  aliases* of a δ Scuti or HADS star. On multi-exposure cadences (dithered triplets,
+  filter sequences) the automatic ceiling is limited to 1e5 Rayleigh widths (see
+  {doc}`tuning`).
+- The grid's size is checked before it is allocated: a stray timestamp (a `0` among
+  Julian dates, a JD/MJD mix-up) gives a `GridSizeWarning` naming the outlying epochs,
+  or a `GridTooLargeError` above 250 million samples, instead of a multi-GiB allocation.
+
+:::{note}
+Results, spectra, fits and uncertainty objects (`PreWhitenResult`, `MultiSineFit`,
+`AmplitudeSpectrum`, `Uncertainties`, `SpacingSpectrum`, `PeriodSpacingSeries`) compare
+and hash by identity; compare `result.components` or `to_dict()` for content.
+:::
 
 ## References
 

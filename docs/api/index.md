@@ -58,6 +58,38 @@ follow it (see {doc}`../guide/prewhitening`).
    buoyancy_radius
 ```
 
+## Interactive pre-whitening
+
+The Period04-style session — stepping, manual edits, data edits, undo, projects and
+scripts — and the constraint model behind it (see {doc}`../guide/interactive-prewhitening`).
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   PreWhitenSession
+   StepReport
+   VariationResult
+   SessionSnapshot
+   Partition
+   prewhiten.suggest_partition
+   prewhiten.SubsetSolution
+   FitConstraints
+   ComponentConstraint
+   FrequencyTie
+   FitStart
+   prewhiten.FitDetail
+```
+
+A session's behaviour (undo depth, caches, project limits) is set by
+{class}`SessionSettings`, listed under [Settings](#settings). The session's errors and
+warning: {class}`SessionError` (an operation the session cannot
+take outside {meth}`PreWhitenSession.do`, which reports it as ``refused`` instead),
+{class}`ProjectError` (anything wrong with a project file or its replay),
+{class}`ConstraintError` (an impossible constraint) and {class}`SessionWarning` — listed
+under [Exceptions](#exceptions).
+
 ## Period change
 
 Joint (period, dP/dt) searching, automated O−C phase tracking, ephemeris fitting,
@@ -170,6 +202,9 @@ Containers for the data, and the column/domain mapping that ingests heterogeneou
    MultiBandLightCurve
    ColumnMap
    Domain
+   core.coerce_domain
+   core.raise_if_unusable
+   core.lightcurve.stack_bands
 ```
 
 ## Results
@@ -206,12 +241,20 @@ Per-method tuning models (see {doc}`../guide/tuning`).
    PreWhitenSettings
    PdotSettings
    SpacingSettings
+   SessionSettings
    BatchSettings
 ```
 
+:::{note}
+`BatchSettings` is **reserved**: no batch driver reads it yet, so `CUPERIOD_BATCH_*`
+environment variables have no effect. Pass `device`, `workers`, `n_best`, `store_raw`
+and `resume` to {func}`batch_periodograms` directly.
+:::
+
 ## Grids
 
-Trial frequency/period grids and their builders (see {doc}`../guide/tuning`).
+Trial frequency/period grids, their builders, and the size guard every default grid
+goes through (see {doc}`../guide/tuning`).
 
 ```{eval-rst}
 .. autosummary::
@@ -221,7 +264,14 @@ Trial frequency/period grids and their builders (see {doc}`../guide/tuning`).
    GridSpec
    uniform_frequency_grid
    log_period_grid
+   default_frequency_grid
+   pseudo_nyquist_frequency
+   regular_cadence_nyquist
+   uniform_grid_size
+   check_grid_size
 ```
+
+`GridTooLargeError` and `GridSizeWarning` are listed under [Exceptions](#exceptions).
 
 ## Method registry
 
@@ -253,6 +303,26 @@ GPU discovery, memory management, and batch worker sizing (see {doc}`../guide/ba
    free_gpu_memory
 ```
 
+## Backend resolution
+
+How a backend request becomes a concrete backend, for code that drives methods itself
+(see {doc}`../guide/backends`). These live in submodules, not at the top level.
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   core.backend.refresh_backends
+   core.backend.cpu_backends
+   core.backend.cpu_pool_backend
+   core.backend.requested_backend
+   core.backend.normalize_backend
+   methods.base.select_settings
+   methods.base.PeriodogramMethod
+   methods.gls.FinufftGLS
+```
+
 ## Batch
 
 The batch run summary (see {doc}`../guide/batch`).
@@ -263,6 +333,21 @@ The batch run summary (see {doc}`../guide/batch`).
    :nosignatures:
 
    BatchSummary
+```
+
+Worker sizing for CPU pools lives in `cuperiod.batch.sizing`:
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   batch.sizing.usable_cpu_count
+   batch.sizing.cpu_worker_count
+   batch.sizing.clamp_pool_workers
+   batch.sizing.numba_threads_per_worker
+   batch.sizing.pinned_worker_threads
+   batch.sizing.init_worker_threads
 ```
 
 ## LINCC interoperability
@@ -301,4 +386,19 @@ family; each also derives from the closest built-in (`ValueError`/`RuntimeError`
    ColumnResolutionError
    InsufficientDataError
    UnknownMethodError
+   GridTooLargeError
+   ConstraintError
+   SessionError
+   ProjectError
+```
+
+Warnings (subclasses of {class}`UserWarning`):
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   GridSizeWarning
+   SessionWarning
 ```
