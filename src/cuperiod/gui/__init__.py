@@ -14,7 +14,9 @@ def main() -> None:
     Sets the Windows OpenMP duplicate-load workaround (so a torch backend can import
     after numpy/MKL — mirrors the test/CLI stance) *before* importing the GUI, then
     launches it. If the ``[gui]`` extra is missing, exits with an actionable message
-    rather than a raw ImportError traceback.
+    rather than a raw ImportError traceback. Closing the window ends the process even
+    while a computation is still running (it cannot be interrupted, and would
+    otherwise keep a windowless process busy until it finished).
     """
     import os
 
@@ -27,7 +29,7 @@ def main() -> None:
             "    pip install 'cuperiod[gui]'\n"
             f"(could not import: {exc.name})"
         ) from exc
-    raise SystemExit(run_app())
+    raise SystemExit(run_app(exit_when_closed=True))
 
 
 __all__ = ["main"]

@@ -2,22 +2,49 @@
 
 from __future__ import annotations
 
+import contextlib
+import os
 import sys
 
-from cuperiod.gui.qt import QtWidgets
+from cuperiod.gui.compute import compute_active
+from cuperiod.gui.qt import QtCore, QtWidgets
 from cuperiod.gui.theme import ThemeName, app_icon
 
 #: Theme used on first launch (overridden by a persisted choice once one exists).
 DEFAULT_THEME: ThemeName = "dark"
 
 
-def run_app(argv: list[str] | None = None) -> int:
+def _finish(code: int, *, hard_exit: bool) -> int:
+    """Return the event loop's exit code, or end the process if a worker still runs.
+
+    A periodogram or pre-whitening run cannot be interrupted once started, and its
+    worker thread keeps the interpreter alive after the window has closed: the
+    process would linger, windowless and still busy, until the computation ends.
+    With ``hard_exit`` (the console entry point only), a still-running worker ends
+    the process instead, after flushing the output streams and persisted settings
+    (``os._exit`` skips atexit handlers and Qt's own teardown). Embedded use, such as
+    IPython or a test session, must never be killed, so ``run_app`` defaults to off.
+    """
+    if hard_exit and compute_active():
+        QtCore.QSettings().sync()
+        for stream in (sys.stdout, sys.stderr):
+            with contextlib.suppress(AttributeError, OSError, ValueError):
+                stream.flush()  # a stream may be closed or missing (pythonw)
+        os._exit(code)
+    return code
+
+
+def run_app(argv: list[str] | None = None, *, exit_when_closed: bool = False) -> int:
     """Create the application, show the main window, and run the Qt event loop.
 
     Parameters
     ----------
     argv : list of str, optional
         Command-line arguments; defaults to :data:`sys.argv`.
+    exit_when_closed : bool, default False
+        End the process as soon as the window closes, even while a computation is
+        still running on a worker (it cannot be interrupted). Only the console entry
+        point sets this; an embedding application keeps its process.
 
     Returns
     -------
@@ -40,7 +67,7 @@ def run_app(argv: list[str] | None = None) -> int:
 
     window = MainWindow(app, theme=DEFAULT_THEME)
     window.show()
-    return app.exec()
+    return _finish(app.exec(), hard_exit=exit_when_closed)
 
 
 __all__ = ["DEFAULT_THEME", "run_app"]

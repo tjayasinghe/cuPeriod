@@ -8,17 +8,61 @@ multiband / what's its natural domain?" — without importing registry internals
 
 from __future__ import annotations
 
+from typing import Final, TypeVar, cast
+
 from pydantic_settings import BaseSettings
 
+from cuperiod.core import backend as _backend
 from cuperiod.core._typing import FloatArray
 from cuperiod.core.columns import Domain
 from cuperiod.core.config import GLSSettings, MHAOVSettings, PreWhitenSettings
 from cuperiod.core.errors import BackendUnavailableError
 from cuperiod.core.grid import pseudo_nyquist_frequency
+from cuperiod.core.result import PEAK_DEFAULT_FIELDS
 from cuperiod.methods.base import get_method, method_names
+
+_S = TypeVar("_S", bound=BaseSettings)
 
 #: Box/transit methods where alias-diverse peak selection is the sensible default.
 _ALIAS_DIVERSE_METHODS = frozenset({"BLS", "TLS"})
+
+#: The GUI's frequency oversampling: denser than the library's 5 samples per peak, for
+#: smoother, better-resolved spectra (the jagged look on a period axis at long
+#: periods). It is the value the options form *shows* by default, so what is displayed
+#: is what runs, and an explicit 5 (or anything else) is honoured as typed.
+GUI_SAMPLES_PER_PEAK: Final = 10
+
+#: Settings fields that only steer peak selection on a finished spectrum (the keys of
+#: :data:`cuperiod.core.result.PEAK_DEFAULT_FIELDS`). The GUI applies them after the
+#: compute, so they are left out of the cache key: editing one re-selects peaks from
+#: the cached spectrum instead of recomputing it.
+PEAK_ONLY_FIELDS: Final[frozenset[str]] = frozenset(PEAK_DEFAULT_FIELDS.values())
+
+
+def gui_default_settings(model_cls: type[_S]) -> _S:
+    """The settings the GUI starts a form from: the library's, plus GUI defaults.
+
+    The model is instantiated normally, so documented ``CUPERIOD_<METHOD>_<FIELD>``
+    environment overrides apply exactly as they do for :func:`cuperiod.periodogram`;
+    an invalid override falls back to the class defaults instead of breaking the
+    controls panel (pydantic's ``ValidationError`` and pydantic-settings'
+    ``SettingsError`` are both ``ValueError``). On top of that, a ``samples_per_peak``
+    left at a default below :data:`GUI_SAMPLES_PER_PEAK` is raised to it; one set in
+    the environment is kept.
+    """
+    try:
+        base = model_cls()
+    except ValueError:
+        base = cast(_S, model_cls.model_construct())
+    if (
+        "samples_per_peak" in model_cls.model_fields
+        and "samples_per_peak" not in base.model_fields_set
+        and getattr(base, "samples_per_peak", GUI_SAMPLES_PER_PEAK)
+        < GUI_SAMPLES_PER_PEAK
+    ):
+        base = base.model_copy(update={"samples_per_peak": GUI_SAMPLES_PER_PEAK})
+    return base
+
 
 #: The GUI's auto grid reaches at least this short a period (days) for the fold-based
 #: methods (PDM, CE, string-length), which pay a full fold of the light curve per
@@ -109,32 +153,63 @@ def prewhiten_backend_options() -> list[str]:
     return options
 
 
-def resolved_prewhiten_backend(backend: str) -> tuple[str, bool] | None:
-    """``(concrete_backend, is_gpu)`` for a pre-whitening backend request, or None."""
+def _torch_runs_on_gpu(resolved: str, settings: BaseSettings | None) -> bool:
+    """Whether a resolved torch backend name will run on a GPU.
+
+    ``torch:<device>`` names its device. Bare ``torch`` runs on ``settings.device`` when
+    that pins one, else on the best device torch sees -- the CPU on a machine whose
+    torch has no GPU, which the hint must say rather than "GPU".
+    """
+    if resolved.startswith("torch:"):
+        return resolved != "torch:cpu"
+    device = str(getattr(settings, "device", "auto"))
+    if device != "auto":
+        return device != "cpu"
+    return _backend.torch_gpu_available()
+
+
+def resolved_prewhiten_backend(
+    backend: str, settings: BaseSettings | None = None
+) -> tuple[str, bool] | None:
+    """``(concrete_backend, is_gpu)`` for a pre-whitening backend request, or None.
+
+    ``settings`` (optional) supplies the ``device`` a bare ``torch`` request runs on.
+    """
     from cuperiod.prewhiten.spectrum import resolve_spectrum_backend
 
     try:
         resolved = resolve_spectrum_backend(backend)
     except BackendUnavailableError:
         return None
-    is_gpu = resolved == "cufinufft" or (
-        resolved.startswith("torch") and resolved != "torch:cpu"
-    )
-    return resolved, is_gpu
+    if resolved == "torch" or resolved.startswith("torch:"):
+        return resolved, _torch_runs_on_gpu(resolved, settings)
+    return resolved, resolved == "cufinufft"
 
 
-def resolved_backend(name: str, backend: str) -> tuple[str, bool] | None:
+def resolved_backend(
+    name: str, backend: str, settings: BaseSettings | None = None
+) -> tuple[str, bool] | None:
     """The concrete backend ``backend`` resolves to for ``name`` and whether it's a GPU.
 
     Returns ``(resolved_name, is_gpu)``, or None if it cannot resolve here. Lets the UI
     show, e.g., ``auto -> cufinufft (GPU)`` so ``cpu``/``gpu`` are unambiguous.
+
+    Resolved exactly as the run resolves it: ``auto`` defers to ``settings.backend``
+    (the ``CUPERIOD_<METHOD>_BACKEND`` override included), and a bare ``torch`` runs on
+    ``settings.device`` or else the best device torch sees. ``settings`` defaults to
+    the method's environment-configured defaults.
     """
     method = get_method(name)
+    if settings is None:
+        try:
+            settings = method.coerce_settings(None)
+        except ValueError:  # an invalid environment override; the run reports it
+            settings = None
     try:
-        resolved = method.resolve_backend(backend)
+        resolved = method.resolve_backend_for(backend, settings)
     except BackendUnavailableError:
         return None
-    return resolved, method.is_gpu_backend(resolved)
+    return resolved, method.is_gpu_backend(resolved, settings)
 
 
 def backend_options(name: str) -> list[str]:
@@ -159,11 +234,14 @@ def backend_options(name: str) -> list[str]:
 
 
 __all__ = [
+    "GUI_SAMPLES_PER_PEAK",
     "MIN_PERIOD_FLOOR_DAYS",
+    "PEAK_ONLY_FIELDS",
     "alias_diverse_default",
     "auto_max_frequency",
     "backend_options",
     "default_settings",
+    "gui_default_settings",
     "method_display_names",
     "multiband_method_names",
     "natural_domain",

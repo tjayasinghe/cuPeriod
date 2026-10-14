@@ -56,3 +56,25 @@ def test_epoch_for_peak_falls_back_to_min_time() -> None:
     peak = Peak(period=1.0, frequency=1.0, power=1.0, rank=1, extra={})
     assert epoch_for_peak(peak, time) == 5.0
     assert epoch_for_peak(None, time) == 5.0
+
+
+# -- GUI-A-4: a NaN timestamp (a FITS gap cadence) must not blank the fold ----------
+
+
+def test_epoch_for_peak_ignores_non_finite_times() -> None:
+    time = np.array([np.nan, 5.0, 6.0, np.inf])
+    assert epoch_for_peak(None, time) == 5.0
+    no_t0 = Peak(period=1.0, frequency=1.0, power=1.0, rank=1, extra={})
+    assert epoch_for_peak(no_t0, time) == 5.0
+
+
+def test_epoch_for_peak_with_no_finite_time_is_zero() -> None:
+    assert epoch_for_peak(None, np.array([np.nan, np.nan])) == 0.0
+    assert epoch_for_peak(None, np.array([], dtype=np.float64)) == 0.0
+
+
+def test_fold_phase_default_epoch_skips_nan_times() -> None:
+    time = np.array([np.nan, 1.0, 1.25, 1.5])
+    phase = fold_phase(time, 1.0)
+    assert np.isnan(phase[0])  # the gap cadence itself has no phase
+    np.testing.assert_allclose(phase[1:], [0.0, 0.25, 0.5])
