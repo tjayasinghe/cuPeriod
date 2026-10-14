@@ -69,6 +69,15 @@ re-downloads; it does not cache. Because the pool of catalog candidates can
 shift slightly between ASAS-SN deployments, results may vary a small amount
 run to run, but the query criteria and quality cuts are fixed and documented
 above so results are reproducible in spirit.
+
+Integrity
+---------
+The Sky Patrol client (``pyasassn``) talks to its API servers over plain HTTP:
+the service offers no HTTPS endpoint and publishes no checksums, so this script
+has nothing to pin or verify a transfer against. Treat its output as untrusted
+until reviewed: it goes to a separate extension file that a maintainer inspects
+before merging, and the committed parquet files are the reviewed copies (their
+integrity is git's). Prefer re-running it on a trusted network.
 """
 
 from __future__ import annotations

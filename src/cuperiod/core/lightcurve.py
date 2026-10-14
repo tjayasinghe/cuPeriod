@@ -31,7 +31,11 @@ import numpy as np
 from cuperiod.core._coerce import arrow_to_numpy, as_float_array
 from cuperiod.core._typing import FloatArray
 from cuperiod.core.columns import ColumnMap, Domain, ResolvedColumns
-from cuperiod.core.errors import ColumnResolutionError, InsufficientDataError
+from cuperiod.core.errors import (
+    ColumnResolutionError,
+    InsufficientDataError,
+    _user_stacklevel,
+)
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -651,7 +655,9 @@ def _warn_pooled_bands(column_name: str, column: Any) -> None:
 
     ``LightCurve`` cannot split a table, so a long-format table read through it
     mixes every filter into one curve -- their different zero points and amplitudes
-    then dominate any period search. Only the single-band table path calls this;
+    then dominate any period search. Reading it that way is the documented default,
+    so this warns rather than splits, and names the exact argument that asks for the
+    multi-band analysis. Only the single-band table path calls this;
     :class:`MultiBandLightCurve` builds its per-band curves from already-split
     columns and never sees the band column here.
     """
@@ -663,11 +669,14 @@ def _warn_pooled_bands(column_name: str, column: Any) -> None:
         shown += ", ..."
     warnings.warn(
         f"band column {column_name!r} holds {len(labels)} labels ({shown}) but the "
-        "table was read as one light curve that pools them; use "
-        "MultiBandLightCurve.from_dataframe/from_file, or pass ColumnMap(band=...) "
-        "to periodogram()/to_input(), to keep the bands apart",
+        "table was read as one light curve that pools them. For a multi-band "
+        f"analysis pass columns=ColumnMap(band={column_name!r}) to periodogram() or "
+        f"to_input() (band_column={column_name!r} to the batch functions), or build "
+        "a MultiBandLightCurve.from_dataframe/from_file; to read one pooled band "
+        "deliberately, drop the column.",
         UserWarning,
-        stacklevel=4,
+        # The same read is reached from from_dataframe, to_input and periodogram.
+        stacklevel=_user_stacklevel(),
     )
 
 

@@ -564,6 +564,11 @@ def component_uncertainties(
             subsets = (fit.detail.subset_amplitude_error,
                        fit.detail.subset_phase_error, fit.detail.subset_offset_error)
 
+    if method != "covariance" and fit.detail is not None:
+        sigma_f, sigma_a, sigma_phase, subsets = _undetermined_as_nan(
+            fit, (sigma_f, sigma_a, sigma_phase), subsets
+        )
+
     factor = 1.0
     if correlation_correction and method != "bootstrap":
         ordered = _time_ordered(time, np.asarray(fit.residuals, dtype=np.float64))
@@ -583,6 +588,51 @@ def component_uncertainties(
         subset_phase=sub_p,
         subset_offset=sub_o,
     )
+
+
+def _undetermined_as_nan(
+    fit: MultiSineFit,
+    headline: tuple[FloatArray, FloatArray, FloatArray],
+    subsets: tuple[FloatArray | None, FloatArray | None, FloatArray | None],
+) -> tuple[
+    FloatArray, FloatArray, FloatArray,
+    tuple[FloatArray | None, FloatArray | None, FloatArray | None],
+]:
+    """NaN wherever the constrained fit found a parameter unidentifiable.
+
+    The covariance reports a parameter the data do not determine -- the phase of an
+    amplitude at round-off, two collinear components -- as NaN with the component
+    flagged ``degenerate`` (spec 1.8). The analytic formulae divide by the
+    amplitude and the bootstrap measures the scatter of replicate fits; neither
+    notices, and both reported a finite number for such a phase. Every estimator now
+    reports it the same way. Only flagged components are touched, so a fit whose
+    covariance is NaN for another reason (no degrees of freedom) keeps its analytic
+    and bootstrap errors.
+    """
+    detail = fit.detail
+    assert detail is not None
+    flagged = np.array(["degenerate" in flags for flags in detail.flags], dtype=bool)
+    if not flagged.any():
+        return (*headline, subsets)
+    reference = (fit.frequency_error, fit.amplitude_error, fit.phase_error)
+    out: list[FloatArray] = []
+    for sigma, covariance in zip(headline, reference, strict=True):
+        values = np.array(sigma, dtype=np.float64, copy=True)
+        values[flagged & np.isnan(covariance)] = np.nan
+        out.append(values)
+    per_subset: list[FloatArray | None] = []
+    for subset_sigma, subset_covariance in zip(
+        subsets,
+        (detail.subset_amplitude_error, detail.subset_phase_error, None),
+        strict=True,
+    ):
+        if subset_sigma is None or subset_covariance is None:
+            per_subset.append(subset_sigma)
+            continue
+        table = np.array(subset_sigma, dtype=np.float64, copy=True)
+        table[flagged[:, None] & np.isnan(subset_covariance)] = np.nan
+        per_subset.append(table)
+    return out[0], out[1], out[2], (per_subset[0], per_subset[1], per_subset[2])
 
 
 def _analytic_constrained(

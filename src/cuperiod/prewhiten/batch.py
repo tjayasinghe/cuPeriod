@@ -25,6 +25,7 @@ from cuperiod.batch.io import (
     csv_safe,
     load_source,
     resolve_inputs,
+    source_label,
     write_rows,
 )
 from cuperiod.batch.runner import (
@@ -36,6 +37,9 @@ from cuperiod.batch.runner import (
     _pending_chunks,
     _read_existing_rows,
     _run_pool,
+    _source_clash,
+    _warn_dead_batch_env,
+    _warn_source_clashes,
 )
 from cuperiod.batch.sizing import (
     cpu_worker_count,
@@ -69,7 +73,11 @@ class _ChunkConfig:
 
 
 def prewhiten_to_rows(
-    key: str, result: PreWhitenResult, *, max_components: int | None = None
+    key: str,
+    result: PreWhitenResult,
+    *,
+    max_components: int | None = None,
+    source: str | None = None,
 ) -> list[dict[str, Any]]:
     """Flatten a solution to catalogue rows — one per component (or one empty row).
 
@@ -84,13 +92,19 @@ def prewhiten_to_rows(
         The solution to flatten.
     max_components : int, optional
         Keep only the first ``max_components`` components.
+    source : str, optional
+        Provenance written as a ``source`` column (an absolute path, or ``""`` for
+        an in-memory light curve; see :func:`cuperiod.batch.io.source_label`).
+        :func:`batch_prewhiten` always writes it.
 
     Returns
     -------
     list of dict
     """
-    summary = {
-        "key": key,
+    summary: dict[str, Any] = {"key": key}
+    if source is not None:
+        summary["source"] = source
+    summary |= {
         "n_components": result.n_components,
         "n_pruned": result.n_pruned,
         "n_samples": result.n_samples,
@@ -159,7 +173,14 @@ def _process_chunk(
                 raise ValueError("pre-whitening needs single-band light curves")
             result = prewhiten(lc, settings=cfg.settings, backend=cfg.backend)
             rows.extend(
-                prewhiten_to_rows(key, result, max_components=cfg.max_components)
+                prewhiten_to_rows(
+                    key,
+                    result,
+                    max_components=cfg.max_components,
+                    # Rows name their file, so a resume can tell a same-named
+                    # light curve from another folder apart from the one it holds.
+                    source=source_label(source),
+                )
             )
         except Exception as exc:  # one bad light curve must not kill the batch
             errors.append((key, f"{type(exc).__name__}: {exc}"))
@@ -225,7 +246,8 @@ def batch_prewhiten(
         Skip light curves already written: those a directory sink's part files hold,
         or whose key a file sink already holds (rows of a key are never replaced, so
         re-run with ``resume=False`` after changing settings). A light curve that
-        failed wrote no row and is retried.
+        failed wrote no row and is retried. Rows record their file (``source``), so
+        a key the sink holds from a different file is reported (and still skipped).
     chunk_size : int, default 64
         Light curves per chunk/task. A directory sink uses exactly this (its part
         files are numbered by chunk); a resumed one may use a different size, since
@@ -246,12 +268,21 @@ def batch_prewhiten(
     ValueError
         For an unknown ``device``, or a GPU-only backend with ``device="cpu"``.
 
+    Warns
+    -----
+    UserWarning
+        When input keys repeat (the repeats are renamed ``key#2``, ...), or when a
+        resumed sink holds a key from a different source file.
+    DeprecationWarning
+        When a ``CUPERIOD_BATCH_*`` variable is set: nothing reads them.
+
     Examples
     --------
     >>> cup.batch_prewhiten("lightcurves/*.csv", sink="modes.parquet")  # doctest: +SKIP
     """
     if device not in {"cpu", "gpu"}:
         raise ValueError("device must be 'cpu' or 'gpu'")
+    _warn_dead_batch_env()
     # A misspelt domain is never read for in-memory inputs, so it would otherwise
     # surface only on the first file or table input, deep in a worker.
     domain = coerce_domain(domain)
@@ -283,14 +314,21 @@ def batch_prewhiten(
     existing_rows: list[dict[str, Any]] = []
     if sink_kind == "file" and resume and sink_file.exists():
         existing_rows = _read_existing_rows(sink_file)
-        done = {str(row.get("key")) for row in existing_rows}
+        done: dict[str, str] = {}  # stored key -> the source file it was read from
+        for row in existing_rows:
+            done.setdefault(str(row.get("key")), str(row.get("source") or ""))
         # A CSV sink stores text cells formula-escaped; compare keys as stored.
         csv_sink = sink_file.suffix.lower() == ".csv"
-        items = [
-            item
-            for item in items
-            if (str(csv_safe(item[0])) if csv_sink else item[0]) not in done
-        ]
+        todo: list[InputItem] = []
+        clashes: list[tuple[str, str, str]] = []
+        for key, src in items:
+            stored = done.get(str(csv_safe(key)) if csv_sink else key)
+            if stored is None:
+                todo.append((key, src))
+            elif _source_clash(stored, label := source_label(src), csv_sink=csv_sink):
+                clashes.append((key, stored, label))
+        _warn_source_clashes(clashes)
+        items = todo
         n_skipped = n_inputs - len(items)
 
     if device == "gpu":

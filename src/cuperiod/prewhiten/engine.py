@@ -64,12 +64,6 @@ _MAX_PRUNE_PASSES = 20
 #: existing component) before the run gives up looking for more.
 _MAX_REJECTED_CANDIDATES = 20
 
-#: Amplitudes at or below this many float64 epsilons of the largest ``|value|`` are
-#: rounding noise left by a subtraction, not signal. Measured junk on noise-free and
-#: constant curves reaches ~250 eps, so 1e4 leaves a 40x margin while sitting ~2e-12
-#: of the data's own scale — far below any photometric amplitude.
-_ROUNDOFF_EPS = 1e4
-
 #: Floor of the automatic search band (cycles/day). The median-gap pseudo-Nyquist of
 #: nightly ground-based sampling collapses to a few cycles/day — far below the
 #: delta Scuti / HADS frequencies (periods down to ~0.02 d) this tool exists to

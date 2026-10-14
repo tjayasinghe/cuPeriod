@@ -34,7 +34,7 @@ and is shown with ``open()``: the import dialog (columns, scale, delimiter), fil
 folder pickers, the Save / Discard / Cancel question for unsaved sessions, the
 keyboard-shortcut sheet and About. Closing, *New session*, opening a curve, a batch or a
 project ask that question first when a session with unsaved work would be dropped. The
-title bar reads ``cuPeriod — data — project.cupw.json*``; the ``*`` marks unsaved work.
+title bar reads ``data — project.cupw.json* — cuPeriod``; the ``*`` marks unsaved work.
 
 Every string that can carry file content — a load error quoting the file's column
 headers, a source label, a file name — is shown as plain text, never as Qt rich text,
@@ -57,7 +57,7 @@ import re
 from collections.abc import Callable, Mapping, Sequence
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 from pydantic_settings import BaseSettings
@@ -80,7 +80,8 @@ from cuperiod.gui.loaders import (
     preview_file,
 )
 from cuperiod.gui.models import COMBINED_BAND, STACKED_BAND, LoadedCurve, SourceItem
-from cuperiod.gui.qt import Qt, QtCore, QtGui, QtWidgets
+from cuperiod.gui.qt import Qt, QtCore, QtGui, QtWidgets, pg
+from cuperiod.gui.refusals import Refusal, gui_wording, refusal_offer, refusal_text
 from cuperiod.gui.state import (
     PROJECT_FILTER,
     PROJECT_PREFIX,
@@ -247,43 +248,6 @@ def _shorten(text: str) -> str:
     return short
 
 
-#: Library refusals name keyword arguments a GUI user cannot pass; say what to do
-#: here instead (the scripting API still has them).
-_GUI_WORDING: tuple[tuple[str, str], ...] = (
-    (
-        r"add it with refine='none' or allow_close=True",
-        "add it exactly instead: Ctrl+Shift+click, or Add exactly here in the "
-        "spectrum's right-click menu",
-    ),
-    (
-        r"add it with refine='none'",
-        "add it exactly: Ctrl+Shift+click, or Add exactly here in the spectrum's "
-        "right-click menu",
-    ),
-    (
-        r"pass allow_close=True to (add|tie) it anyway",
-        r"too close to tell apart at this baseline (a script can still \1 it "
-        "with allow_close=True)",
-    ),
-    (
-        r"remove with cascade=True to dissolve the tie",
-        "untie it first (select it, T, clear the tie) or delete both",
-    ),
-    (
-        r"zero points per subset need fit_mean=True \(configure it first\)",
-        "zero points per subset need a floating mean: tick “floating mean” in "
-        "the Options",
-    ),
-)
-
-
-def gui_wording(text: str) -> str:
-    """``text`` with library advice ("pass allow_close=True") put in GUI terms."""
-    for pattern, replacement in _GUI_WORDING:
-        text = re.sub(pattern, replacement, text)
-    return text
-
-
 def explain_failure(message: str) -> tuple[str, str]:
     """Split a failure ``message`` into ``(summary, details)`` for display.
 
@@ -303,6 +267,25 @@ def explain_failure(message: str) -> tuple[str, str]:
         return summary, text
     summary = _shorten(text)
     return summary, ("" if summary == text else text)
+
+
+#: The application's name, last in every window title.
+APP_TITLE = "cuPeriod"
+
+
+def window_title(data: str, project: str = "") -> str:
+    """The main window's title: ``star.csv — star.cupw.json[*] — cuPeriod``.
+
+    The document comes first and the application's name once, last; ``[*]`` is
+    Qt's placeholder for the unsaved-work ``*`` (see
+    :meth:`QWidget.setWindowModified`). A name that contains ``[*]`` itself is
+    escaped, so a file called ``a[*].csv`` cannot move the marker. With no data
+    the title just names the application.
+    """
+    names = [name.replace("[*]", "[*][*]") for name in (data, project) if name]
+    if not names:
+        return f"{APP_TITLE} — periodogram & pre-whitening explorer"
+    return " — ".join(names) + f"[*] — {APP_TITLE}"
 
 
 def _saved_ui_scale() -> float | None:
@@ -465,7 +448,50 @@ def _glyph_icon(kind: str, color: str, size: int = 16) -> QtGui.QIcon:
 
 #: The phased and raw views sit side by side only from this width on: each needs
 #: about 450 px for its toolbar to fit on one or two rows and leave room to plot.
+#: Narrower, they take turns under the Phased / Raw light curve tabs.
 _SIDE_BY_SIDE_WIDTH = 900
+
+#: The tabs of the light-curve views (see _build_lc_tabs).
+_PHASED_TAB, _RAW_TAB = 0, 1
+_LC_TABS_TIP = (
+    "The pane is too narrow for the phased and the raw light curve side by side: "
+    "pick one here (Left/Right while the bar has the focus). Widen the window or "
+    "narrow the panes on the right to see both."
+)
+
+#: How the lower pane shows the light curves: the raw curve alone before a result,
+#: the fold alone, the two side by side, or the two as tabs.
+LcLayout = Literal["preview", "single", "side", "tabs"]
+
+
+def _chrome_height(view: QtWidgets.QWidget, width: int) -> int:
+    """The height ``view`` needs besides its plot at ``width``.
+
+    Its toolbars and labels (the rows a wrapping toolbar takes at that width
+    included) and the spacing between them, from their size hints: the views need
+    not be laid out, or even shown, to be measured.
+    """
+    layout = view.layout()
+    if layout is None:
+        return 0
+    margins = layout.contentsMargins()
+    inner = max(1, width - margins.left() - margins.right())
+    total = margins.top() + margins.bottom()
+    shown = 0
+    for index in range(layout.count()):
+        item = layout.itemAt(index)
+        if item is None or item.isEmpty():
+            continue
+        shown += 1
+        if isinstance(item.widget(), pg.PlotWidget):
+            continue
+        total += (
+            item.heightForWidth(inner)
+            if item.hasHeightForWidth()
+            else item.sizeHint().height()
+        )
+    return total + max(0, shown - 1) * max(0, layout.spacing())
+
 
 #: The narrowest a result dock gets by default; wider panels scroll sideways.
 _DOCK_MIN_WIDTH = 300
@@ -564,6 +590,8 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
         #: A tidy of the dock tab bars is queued (see _style_dock_tabs).
         self._tabs_pending = False
+        #: A fit of the light-curve pane is queued (see _fit_lc_area).
+        self._lc_fit_queued = False
         self._app = app
         saved = str(QtCore.QSettings().value("theme", theme))
         self._theme: ThemeName = "light" if saved == "light" else "dark"
@@ -579,6 +607,16 @@ class MainWindow(QtWidgets.QMainWindow):
         #: "Show Raw LC" per analysis (the preview overrides it). Choosing a point
         #: tool (Data menu, X / G) shows it, since that is where points are picked.
         self._raw_pref = {"periodogram": False, "prewhiten": False}
+        #: How the lower pane shows the light curves now (see _fit_lc_area).
+        self._lc_layout: LcLayout = "preview"
+        #: The spectrum / light-curve split the user had before the raw view came
+        #: in (it gets more of the height then); put back when it goes again.
+        self._split_before_raw: list[int] | None = None
+        #: The split could not be shared yet (the pane had no height): on the next fit.
+        self._split_pending = False
+        #: The user dragged the spectrum / light-curve split since it was last
+        #: shared: it stays where they put it until the layout changes.
+        self._split_user = False
         #: Bumped on every load, so a batch selection can tell whether it loaded.
         self._load_count = 0
         #: The batch source the controller just reported as unloadable; the failure
@@ -792,8 +830,10 @@ class MainWindow(QtWidgets.QMainWindow):
         center = QtWidgets.QWidget()
         center.setMinimumWidth(360)
         self._center_layout = QtWidgets.QVBoxLayout(center)
-        self._center_layout.setContentsMargins(8, 8, 8, 8)
-        self._center_layout.setSpacing(8)
+        # Tight above and below: in a 768 px tall window every pixel of chrome is a
+        # pixel less of plot (the info bar keeps a margin of its own).
+        self._center_layout.setContentsMargins(8, 4, 8, 4)
+        self._center_layout.setSpacing(4)
         self._center_layout.addWidget(self._info)
 
         self._banner_container = QtWidgets.QWidget()
@@ -862,8 +902,17 @@ class MainWindow(QtWidgets.QMainWindow):
         plot_split.setChildrenCollapsible(False)
         plot_split.addWidget(self._spectrum)
         # The phased and raw views sit side by side when there is room for both and
-        # one above the other when there is not (see _fit_lc_split): side by side in a
-        # narrow window the raw view used to get an unreadable 89 px sliver.
+        # take turns under a tab bar when there is not (see _fit_lc_area): side by
+        # side in a narrow window the raw view got an unreadable 89 px sliver, and
+        # one above the other each plot was 45 px tall in a 1366 x 768 window.
+        lc_area = QtWidgets.QWidget()
+        lc_area.setObjectName("lc_area")
+        lc_column = QtWidgets.QVBoxLayout(lc_area)
+        lc_column.setContentsMargins(0, 0, 0, 0)
+        lc_column.setSpacing(0)  # the tabs sit on the view they show
+        self._lc_column = lc_column
+        self._lc_tabs = self._build_lc_tabs()
+        lc_column.addWidget(self._lc_tabs)
         lc_split = QtWidgets.QSplitter(Qt.Orientation.Horizontal)
         lc_split.setObjectName("splitter_lc")
         lc_split.setChildrenCollapsible(False)
@@ -871,13 +920,39 @@ class MainWindow(QtWidgets.QMainWindow):
         lc_split.addWidget(self._raw)
         self._raw.setVisible(False)
         self._lc_split = lc_split
-        plot_split.addWidget(lc_split)
+        lc_column.addWidget(lc_split, 1)
+        self._lc_area = lc_area
+        # The pane's width decides side by side or tabs, and it changes without the
+        # window resizing too (a dock dragged wider, the Controls splitter).
+        lc_area.installEventFilter(self)
+        plot_split.addWidget(lc_area)
         plot_split.setStretchFactor(0, 3)
         plot_split.setStretchFactor(1, 2)
         plot_split.setSizes([520, 340])
+        # Only a drag of the handle (setSizes never emits it).
+        plot_split.splitterMoved.connect(self._on_plot_split_moved)
         self._plot_split = plot_split
         column.addWidget(plot_split, 1)
         return page
+
+    def _build_lc_tabs(self) -> QtWidgets.QTabBar:
+        """The Phased / Raw light curve tabs of a pane too narrow for both at once."""
+        tabs = QtWidgets.QTabBar()
+        tabs.setObjectName("lc_tabs")
+        tabs.addTab("Phased light curve")
+        tabs.addTab("Raw light curve")
+        tabs.setTabToolTip(_PHASED_TAB, "The light curve folded on the selected period")
+        tabs.setTabToolTip(_RAW_TAB, "The unfolded light curve (Ctrl+R hides it)")
+        tabs.setExpanding(False)
+        tabs.setDrawBase(False)
+        tabs.setElideMode(Qt.TextElideMode.ElideNone)
+        tabs.setAccessibleName("Light-curve views")
+        tabs.setToolTip(_LC_TABS_TIP)
+        tabs.setStatusTip(_LC_TABS_TIP)
+        tabs.setWhatsThis(_LC_TABS_TIP)
+        tabs.setVisible(False)
+        tabs.currentChanged.connect(self._on_lc_tab_changed)
+        return tabs
 
     def _build_result_docks(self) -> None:
         """The result docks, tabbed together on the right.
@@ -972,6 +1047,11 @@ class MainWindow(QtWidgets.QMainWindow):
             QtCore.QEvent.Type.Move,
         ):
             self._queue_tab_tidy()
+        elif (
+            watched is getattr(self, "_lc_area", None)
+            and event.type() == QtCore.QEvent.Type.Resize
+        ):
+            self._queue_lc_fit()
         return super().eventFilter(watched, event)
 
     def _result_docks(self) -> list[QtWidgets.QDockWidget]:
@@ -1349,7 +1429,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if isinstance(value, str):
                 data = QtCore.QByteArray.fromBase64(value.encode("ascii"))
                 restored = splitter.restoreState(data) or restored
-        # The lc splitter's orientation follows the width, not the saved state.
+        # The fold and the raw curve sit side by side or take turns as tabs, never
+        # one above the other (older versions saved a vertical split).
         self._lc_split.setOrientation(Qt.Orientation.Horizontal)
         return restored
 
@@ -1365,8 +1446,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_analysis(self._controls.analysis)
         self._main_split.setSizes([340, max(400, self.width() - 340)])
         self._plot_split.setSizes([520, 340])
+        self._split_before_raw = None
         self._default_dock_widths()
-        self._fit_lc_split(force=True)
+        self._fit_lc_area(force=True)
         self._show_status("Layout reset.")
 
     # =================================================================================
@@ -1437,6 +1519,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ctl.session_changed.connect(self._on_session_changed)
         ctl.session_progress.connect(self._on_session_progress)
         ctl.session_message.connect(self._on_session_message)
+        ctl.session_refused.connect(self._on_session_refused)
         ctl.session_busy.connect(self._info.set_working)
         ctl.variations_ready.connect(self._variation_panel.set_result)
         ctl.components_selected.connect(self._on_components_selected)
@@ -1883,8 +1966,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _use_tool(self, tool: str) -> None:
         """A point tool: show the light curve it works in, then pick the tool."""
-        if not self._raw.isVisible():
-            self._raw_action.setChecked(True)
+        self._bring_raw_forward()
         self._raw.set_tool(tool)  # type: ignore[arg-type]
 
     def _improve_all(self) -> None:
@@ -2032,8 +2114,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._history_panel.tree.setFocus(Qt.FocusReason.ShortcutFocusReason)
 
     def _focus_light_curve(self) -> None:
-        if not self._raw.isVisible():
-            self._raw_action.setChecked(True)
+        self._bring_raw_forward()
         self._raw.focus_plot()
 
     # -- recent files ----------------------------------------------------------------
@@ -2193,9 +2274,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stack.setCurrentIndex(1)
         self._placeholder.setVisible(True)
         self._spectrum.setVisible(False)
-        self._phased.setVisible(False)
-        self._raw.setVisible(True)
-        self._lc_split.setOrientation(Qt.Orientation.Horizontal)
+        self._fit_lc_area()
         self._refresh_guidance()
 
     def _show_results(self) -> None:
@@ -2204,50 +2283,124 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stack.setCurrentIndex(1)
         self._placeholder.setVisible(False)
         self._spectrum.setVisible(True)
-        self._phased.setVisible(True)
-        self._raw.setVisible(self._phased._show_raw.isChecked())
-        self._fit_lc_split(force=True)
+        self._fit_lc_area()
 
     def _on_show_raw_toggled(self, checked: bool) -> None:
         self._raw_pref[self._controls.analysis] = checked
         if self._raw_action.isChecked() != checked:
             self._raw_action.setChecked(checked)
-        if self._showing_result:
-            self._raw.setVisible(checked)
-            self._fit_lc_split(force=True)
+        if checked:
+            # Asked for: in front, also when it shares the pane with the fold.
+            self._lc_tabs.setCurrentIndex(_RAW_TAB)
+        self._fit_lc_area()
 
     def _on_raw_action(self, checked: bool) -> None:
         if self._phased._show_raw.isChecked() != checked:
             self._phased._show_raw.setChecked(checked)
 
-    def _fit_lc_split(self, *, force: bool = False) -> None:
-        """Phased and raw side by side when both fit, else one above the other.
+    def _bring_raw_forward(self) -> None:
+        """Show the raw light curve, in front of the fold when they share the pane
+        (a point tool, Focus light curve)."""
+        if not self._raw.isVisible() and not self._phased._show_raw.isChecked():
+            self._raw_action.setChecked(True)
+        self._lc_tabs.setCurrentIndex(_RAW_TAB)
 
-        Each needs its toolbar's width; with less room than two of them, a
-        horizontal split gives the raw view a sliver nobody can read (UX-05).
+    def _on_lc_tab_changed(self, _index: int) -> None:
+        if self._lc_layout == "tabs":
+            self._fit_lc_area()
+
+    @property
+    def lc_layout(self) -> LcLayout:
+        """How the light curves are laid out now: ``"preview"`` (the raw curve
+        alone, before a result), ``"single"`` (the fold alone), ``"side"`` (fold
+        and raw curve side by side) or ``"tabs"`` (the two as tabs)."""
+        return self._lc_layout
+
+    def _lc_mode(self) -> LcLayout:
+        if not self._showing_result:
+            return "preview"
+        if not self._phased._show_raw.isChecked():
+            return "single"
+        return "side" if self._lc_area.width() >= _SIDE_BY_SIDE_WIDTH else "tabs"
+
+    def _queue_lc_fit(self) -> None:
+        if not self._lc_fit_queued:
+            self._lc_fit_queued = True
+            QtCore.QTimer.singleShot(0, self, self._fit_lc_area)
+
+    def _fit_lc_area(self, *, force: bool = False) -> None:
+        """Lay the light curves out for the room there is, and share the height.
+
+        Before a result the raw curve fills the pane alone. After one the fold
+        shows, with the raw curve (when it is on) beside it where the pane is wide
+        enough for both toolbars and as a second tab where it is not: one above the
+        other, each plot got 45 px in a 1366 x 768 window (UX-05). While the raw
+        curve is on, the spectrum and the light curve get plots of the same height,
+        also as the window or the panes change size, until the user drags the split
+        (it then stays where they put it until the layout changes); turning the raw
+        curve off gives the spectrum back the share it had.
         """
-        if not (self._showing_result and self._raw.isVisibleTo(self._lc_split)):
-            return
-        width = self._lc_split.width()
-        orientation = (
-            Qt.Orientation.Horizontal
-            if width >= _SIDE_BY_SIDE_WIDTH
-            else Qt.Orientation.Vertical
+        self._lc_fit_queued = False
+        previous, mode = self._lc_layout, self._lc_mode()
+        self._lc_layout = mode
+        raw_tab = self._lc_tabs.currentIndex() == _RAW_TAB
+        self._lc_tabs.setVisible(mode == "tabs")
+        self._phased.setVisible(
+            mode in ("single", "side") or (mode == "tabs" and not raw_tab)
         )
-        if orientation != self._lc_split.orientation() or force:
-            self._lc_split.setOrientation(orientation)
-            # Stacked, the raw view needs the larger share (its tools take rows of
-            # their own) and the pair needs more of the column than the spectrum.
-            plots = max(2, sum(self._plot_split.sizes()))
-            if orientation == Qt.Orientation.Horizontal:
-                lc_share, low_share = 0.5, 0.4
-            else:
-                lc_share, low_share = 0.4, 0.5
-            low = int(plots * low_share)
-            self._plot_split.setSizes([plots - low, low])
-            extent = width if orientation == Qt.Orientation.Horizontal else low
-            first = max(1, int(extent * lc_share))
-            self._lc_split.setSizes([first, max(1, extent - first)])
+        self._raw.setVisible(
+            mode in ("preview", "side") or (mode == "tabs" and raw_tab)
+        )
+        if mode == "side" and (previous != "side" or force):
+            self._lc_split.setSizes([1000, 1000])  # half each
+        with_raw = ("side", "tabs")
+        if mode in with_raw:
+            if previous == "single" and self._split_before_raw is None:
+                self._split_before_raw = self._plot_split.sizes()
+            if previous != mode or force:
+                self._split_user = False
+            if not self._split_user or self._split_pending:
+                self._split_pending = not self._share_plot_height()
+        elif mode == "single" and previous in with_raw:
+            saved, self._split_before_raw = self._split_before_raw, None
+            if saved is not None and len(saved) == 2 and min(saved) > 0:
+                self._plot_split.setSizes(saved)
+
+    def _on_plot_split_moved(self, _pos: int, _index: int) -> None:
+        self._split_user = True
+
+    def _share_plot_height(self) -> bool:
+        """Give the spectrum and the light curve plots of the same height.
+
+        Each pane keeps what its toolbars need at its width (rows they wrap onto
+        included) and the plots split the rest evenly; in the tabs the taller of
+        the two views counts, so switching tabs never moves the split. False when
+        the pane has no height yet.
+        """
+        total = sum(self._plot_split.sizes())
+        width = self._plot_split.width()
+        if total < 100 or width < 100:
+            return False
+        top = _chrome_height(self._spectrum, width)
+        if self._lc_layout == "side":
+            handle = self._lc_split.handleWidth()
+            half = max(1, (self._lc_area.width() - handle) // 2)
+            bottom = max(
+                _chrome_height(self._phased, half), _chrome_height(self._raw, half)
+            )
+        else:
+            bottom = (
+                self._lc_tabs.sizeHint().height()
+                + max(0, self._lc_column.spacing())
+                + max(
+                    _chrome_height(self._phased, width),
+                    _chrome_height(self._raw, width),
+                )
+            )
+        plot = max(0, (total - top - bottom) // 2)
+        first = min(total - 1, top + plot)
+        self._plot_split.setSizes([first, total - first])
+        return True
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:  # noqa: N802
         super().showEvent(event)
@@ -2267,7 +2420,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: N802
         super().resizeEvent(event)
-        QtCore.QTimer.singleShot(0, self, self._fit_lc_split)
+        self._queue_lc_fit()
 
     def _refresh_guidance(self, *, busy: bool = False) -> None:
         """Rewrite the preview line for the current analysis (and run state).
@@ -2621,7 +2774,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._info.set_activity(text)
 
     def _on_session_message(self, severity: str, text: str) -> None:
-        """Refusals and notices go to the status bar; errors also to the banner.
+        """Warnings, refusals and notices go to the status bar; errors also to the
+        banner.
 
         A refused edit leaves the table showing the user's change (a check box keeps
         its click), so the table is put back to the session's values.
@@ -2632,6 +2786,31 @@ class MainWindow(QtWidgets.QMainWindow):
             self._solution_panel.resync()
         if severity == "error":
             self._show_banner(text)
+
+    def _on_session_refused(self, refusal: object) -> None:
+        """A refused edit: why, in the window's terms (from the library's remedy
+        code, else by rewording its message), and — when the remedy is one the
+        window can carry out — the offer to do it, asked through the dialogs."""
+        if not isinstance(refusal, Refusal):
+            return
+        self._on_session_message("warning", refusal_text(refusal))
+        offer = refusal_offer(refusal, self._offer_rows(refusal))
+        if offer is None:
+            return
+
+        def answered(accepted: bool) -> None:
+            if accepted:
+                self._controller.retry_refused(refusal)
+            else:
+                self._show_status("Nothing was changed.")
+
+        self._dialogs.confirm(offer.title, offer.text, offer.accept, answered)
+
+    def _offer_rows(self, refusal: Refusal) -> Sequence[Any]:
+        """The components of the refused session (a tie parent's children are named
+        from them), or none when another session is on show."""
+        view = self._session_view()
+        return view.rows if view is not None and view.key == refusal.key else ()
 
     def _on_components_selected(self, ids: object) -> None:
         chosen = tuple(int(i) for i in ids) if isinstance(ids, Sequence) else ()
@@ -2680,14 +2859,22 @@ class MainWindow(QtWidgets.QMainWindow):
         """The lazy spectrum preview failed: say so where the spectrum would be.
 
         The session commands go off (state 4.9, from the controller's
-        ``preview_error``). Before any result the spectrum pane comes up above the
-        light curve with the text inside it, and the guidance line repeats it; a
-        result already on show stays, and the status bar says it.
+        ``preview_error``). The spectrum pane comes up above the light curve with
+        the text inside it, and the guidance line repeats it. A result still on show
+        is taken down first: it belongs to another session (the band picked before,
+        say), as the displayed one is the session that could not open, and the
+        failure used to reach only the status bar under it.
         """
         self._show_status(text)
         self._sync_commands()
         if self._showing_result:
-            return
+            self._leave_session_views()
+            self._solution_panel.clear()
+            self._spacing_panel.clear()
+            self._spectrum.clear()
+            self._phased.clear_fold()  # the curve stays; only the fold was a result
+            self._info.set_idle("not computed yet")
+            self._show_preview()
         detail = f"{self._loaded_detail}\n" if self._loaded_detail else ""
         self._placeholder.setVisible(True)
         self._placeholder.setText(f"{detail}{text}")
@@ -2744,20 +2931,17 @@ class MainWindow(QtWidgets.QMainWindow):
             status.showMessage(message)
 
     def _update_title(self) -> None:
-        """``cuPeriod — data — project.cupw.json*`` (``*``: unsaved session work)."""
-        parts = ["cuPeriod"]
-        if self._data_name:
-            parts.append(self._data_name)
-        state = self._controller.state
-        path = state.project_path
-        if path:
-            parts.append(Path(path).name)
-        title = " — ".join(parts)
-        if self._controller.is_session_dirty():
-            title += "*"
-        if len(parts) == 1:
-            title = "cuPeriod — periodogram & pre-whitening explorer"
-        self.setWindowTitle(title)
+        """``data — project.cupw.json* — cuPeriod`` (``*``: unsaved session work).
+
+        The ``*`` is Qt's modified marker (``[*]``), which macOS shows as the dot
+        in the close button instead.
+        """
+        path = self._controller.state.project_path
+        project = Path(path).name if path else ""
+        self.setWindowTitle(window_title(self._data_name, project))
+        # Only a title naming data has the marker (Qt warns about one without).
+        named = bool(self._data_name or project)
+        self.setWindowModified(named and self._controller.is_session_dirty())
 
     def _warning_box(self, message: str) -> QtWidgets.QMessageBox:
         """The warning dialog for ``message``: plain text, a short summary, details.
@@ -3007,11 +3191,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
 __all__ = [
+    "APP_TITLE",
     "DOCS_URL",
     "MAX_RECENT",
+    "LcLayout",
     "MainWindow",
     "assign_mnemonics",
     "explain_failure",
+    "gui_wording",
     "import_choice_from_json",
     "import_choice_to_json",
+    "window_title",
 ]

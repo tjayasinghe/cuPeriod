@@ -88,6 +88,12 @@ def running_median(
         raise ValueError("time and value must have the same length")
     if not np.isfinite(width) or width <= 0.0:
         raise ValueError(f"width must be positive and finite, got {width}")
+    # A NaN threshold failed every `count >= min_points` test and silently returned
+    # the global median everywhere.
+    if not (
+        np.isfinite(min_points) and float(min_points).is_integer() and min_points >= 1
+    ):
+        raise ValueError(f"min_points must be an integer >= 1, got {min_points}")
     if method not in ("median", "binned"):
         raise ValueError(f"method must be 'median' or 'binned', got {method!r}")
 

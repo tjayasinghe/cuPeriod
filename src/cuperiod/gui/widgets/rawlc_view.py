@@ -9,8 +9,9 @@ and draws a large curve as a fixed subset (see :class:`DisplayPoints`).
 During interactive pre-whitening (:meth:`RawLightCurveView.set_session_view`) the
 view edits the session's points: it shows the data, the residuals or the data with
 the model, coloured and shaped by subset; the Rectangle and Lasso tools (and Shift-drag
-in Pan mode) select points, a selection bar deletes or restores them, and "Select
-beyond N σ" selects the outliers of every zero-point subset from the keyboard. Deleted
+in Pan mode) select points, Delete and Restore act on the selection (its count is on
+the title line), and "Select beyond N σ" selects the outliers of every zero-point
+subset from the keyboard. The controls take one compact row that wraps. Deleted
 points stay on the plot as hollow grey crosses, so they can be selected and restored.
 The view only asks:
 :attr:`~RawLightCurveView.delete_requested` and
@@ -47,7 +48,7 @@ from cuperiod.gui.theme import (
     palette,
     plot_label_style,
 )
-from cuperiod.gui.widgets._view_helpers import legend_label, stroke_width
+from cuperiod.gui.widgets._view_helpers import ElidedLabel, legend_label, stroke_width
 from cuperiod.gui.widgets.phased_view import (
     MAX_DRAWN_POINTS,
     THINNED_TOOLTIP,
@@ -181,12 +182,23 @@ class RawLightCurveView(QtWidgets.QWidget):
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
-        self._title = QtWidgets.QLabel(_TITLE)
+        layout.setSpacing(2)  # tight, like the other plot panes
+        # One line: the title with the counts (elided, never wrapping) and, in a
+        # session, the point selection's count at its right end.
+        title_row = QtWidgets.QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 6, 0)
+        title_row.setSpacing(12)
+        self._title = ElidedLabel(_TITLE)
         self._title.setObjectName("muted")
-        layout.addWidget(self._title)
+        self._title.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Preferred
+        )
+        title_row.addWidget(self._title, 1)
+        layout.addLayout(title_row)
         self._session_bar = self._build_session_bar()
         self._session_bar.setVisible(False)
+        title_row.addWidget(self._selection_label)
+        self._selection_label.setVisible(False)
         layout.addWidget(self._session_bar)
 
         self._box = _PointsViewBox()
@@ -223,19 +235,32 @@ class RawLightCurveView(QtWidgets.QWidget):
 
     # -- the session toolbar --------------------------------------------------------
     def _build_session_bar(self) -> QtWidgets.QWidget:
-        bar = QtWidgets.QWidget()
-        rows = QtWidgets.QVBoxLayout(bar)
-        rows.setContentsMargins(6, 0, 6, 0)
-        rows.setSpacing(2)
+        """The session controls: one wrapping row of four groups.
 
+        What to plot, the drag tools, the outlier selection and Delete / Restore /
+        Clear each stay together, and the row wraps between groups when the pane is
+        narrow (UX-04); the selection's count sits on the title line. They used to
+        take three rows of their own: under the fold in a 1366 x 768 window that
+        left the plot 45 px tall.
+        """
         from cuperiod.gui.widgets.info_bar import FlowLayout
 
-        tools_row = QtWidgets.QWidget()
-        # Wraps in a narrow pane instead of crushing the tools (UX-04).
-        tools = FlowLayout(hspacing=6, vspacing=4)
-        tools_row.setLayout(tools)
+        bar = QtWidgets.QWidget()
+        bar.setObjectName("plotToolbar")  # compact controls (theme sheets)
+        flow = FlowLayout(hspacing=12, vspacing=2)
+        flow.setContentsMargins(6, 0, 6, 0)
+        bar.setLayout(flow)
+
+        def group(*widgets: QtWidgets.QWidget) -> None:
+            box = QtWidgets.QWidget()
+            row = QtWidgets.QHBoxLayout(box)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(4)
+            for widget in widgets:
+                row.addWidget(widget)
+            flow.addWidget(box)
+
         show_label = QtWidgets.QLabel("Show:")
-        tools.addWidget(show_label)
         self._mode_combo = QtWidgets.QComboBox()
         for key, text in Y_MODES:
             self._mode_combo.addItem(text, key)
@@ -246,7 +271,7 @@ class RawLightCurveView(QtWidgets.QWidget):
         self._mode_combo.setAccessibleName("Light curve y values")
         self._mode_combo.currentIndexChanged.connect(self._on_y_mode_changed)
         show_label.setBuddy(self._mode_combo)
-        tools.addWidget(self._mode_combo)
+        group(show_label, self._mode_combo)
 
         self._tool_group = QtWidgets.QButtonGroup(bar)
         self._tool_group.setExclusive(True)
@@ -265,8 +290,8 @@ class RawLightCurveView(QtWidgets.QWidget):
             button.clicked.connect(lambda _=False, m=mode: self.set_tool(m))
             self._tool_group.addButton(button)
             self._tool_buttons[mode] = button
-            tools.addWidget(button)
         self._tool_buttons["pan"].setChecked(True)
+        group(*self._tool_buttons.values())
 
         self._beyond_button = QtWidgets.QPushButton("Select beyond")
         self._beyond_button.setToolTip(
@@ -275,7 +300,6 @@ class RawLightCurveView(QtWidgets.QWidget):
         )
         self._beyond_button.setAccessibleName("Select outliers beyond sigma")
         self._beyond_button.clicked.connect(lambda: self.select_beyond())
-        tools.addWidget(self._beyond_button)
         self._sigma_spin = QtWidgets.QDoubleSpinBox()
         self._sigma_spin.setRange(1.0, 20.0)
         self._sigma_spin.setSingleStep(0.5)
@@ -284,16 +308,11 @@ class RawLightCurveView(QtWidgets.QWidget):
         self._sigma_spin.setSuffix(" σ")
         self._sigma_spin.setToolTip("Outlier threshold in robust sigmas")
         self._sigma_spin.setAccessibleName("Outlier threshold in sigma")
-        tools.addWidget(self._sigma_spin)
-        rows.addWidget(tools_row)
+        group(self._beyond_button, self._sigma_spin)
 
-        selection = QtWidgets.QHBoxLayout()
-        selection.setSpacing(6)
         self._selection_label = QtWidgets.QLabel("No points selected")
         self._selection_label.setObjectName("muted")
         self._selection_label.setAccessibleName("Point selection")
-        selection.addWidget(self._selection_label)
-        selection.addStretch(1)
         self._delete_button = QtWidgets.QPushButton("Delete")
         self._delete_button.setToolTip(
             "Leave the selected points out of the analysis (Del). They stay on the "
@@ -313,8 +332,7 @@ class RawLightCurveView(QtWidgets.QWidget):
         ):
             push.setAccessibleName(name)
             push.setStatusTip(push.toolTip())
-            selection.addWidget(push)
-        rows.addLayout(selection)
+        group(self._delete_button, self._restore_button, self._clear_button)
         self._sync_selection_bar()
         return bar
 
@@ -431,6 +449,7 @@ class RawLightCurveView(QtWidgets.QWidget):
         self._plot.setStatusTip(_GESTURES_SESSION)
         self._plot.setWhatsThis(_GESTURES_SESSION)
         self._session_bar.setVisible(True)
+        self._selection_label.setVisible(True)
         self._sync_selection_bar()
         self._refresh()
 
@@ -455,6 +474,7 @@ class RawLightCurveView(QtWidgets.QWidget):
         self._plot.setStatusTip("")
         self._plot.setWhatsThis("")
         self._session_bar.setVisible(False)
+        self._selection_label.setVisible(False)
         self._emit_selection()
         self._sync_selection_bar()
         self._drop_time_cursor()

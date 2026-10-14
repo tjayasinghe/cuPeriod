@@ -246,9 +246,10 @@ Per-method tuning models (see {doc}`../guide/tuning`).
 ```
 
 :::{note}
-`BatchSettings` is **reserved**: no batch driver reads it yet, so `CUPERIOD_BATCH_*`
-environment variables have no effect. Pass `device`, `workers`, `n_best`, `store_raw`
-and `resume` to {func}`batch_periodograms` directly.
+`BatchSettings` is **deprecated**: no batch driver reads it, so building one raises a
+`DeprecationWarning`, and the batch functions warn when a `CUPERIOD_BATCH_*` environment
+variable is set (it has no effect). Pass `device`, `workers`, `n_best`, `store_raw` and
+`resume` to {func}`batch_periodograms` directly.
 :::
 
 ## Grids

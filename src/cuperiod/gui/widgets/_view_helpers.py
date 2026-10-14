@@ -160,6 +160,52 @@ def install_column_chooser(table: QtWidgets.QTableWidget) -> None:
     header.customContextMenuRequested.connect(show_menu)
 
 
+class ElidedLabel(QtWidgets.QLabel):
+    """A one-line label that elides its text at the right end to the width it gets.
+
+    A plain label clips text it has no room for, and its minimum width (the whole
+    text) widens the row it sits in. :meth:`text` and the accessible description
+    keep the full text; give the label an ``Ignored`` horizontal size policy so the
+    layout hands it whatever room is left.
+    """
+
+    def __init__(self, text: str = "") -> None:
+        super().__init__()
+        self._full = ""
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setText(text)
+
+    def setText(self, text: str) -> None:  # noqa: N802 - Qt override
+        self._full = text
+        self.setAccessibleDescription(text)
+        self._elide()
+
+    def text(self) -> str:
+        """The full (unelided) text."""
+        return self._full
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._elide()
+
+    def changeEvent(self, event: QtCore.QEvent) -> None:  # noqa: N802
+        super().changeEvent(event)
+        if event.type() in (
+            QtCore.QEvent.Type.FontChange,
+            QtCore.QEvent.Type.StyleChange,
+        ):
+            self._elide()
+
+    def _elide(self) -> None:
+        margins = self.contentsMargins()
+        room = max(16, self.width() - margins.left() - margins.right())
+        shown = self.fontMetrics().elidedText(
+            self._full, Qt.TextElideMode.ElideRight, room
+        )
+        if shown != super().text():
+            super().setText(shown)
+
+
 def is_connected(owner: QObject, signal: Any) -> bool:
     """Whether anything listens to ``signal`` (a signal instance of ``owner``)."""
     return bool(owner.isSignalConnected(QtCore.QMetaMethod.fromSignal(signal)))
@@ -275,25 +321,38 @@ def ask_save_path(
 
 
 def confirm_overwrite(
-    parent: QtWidgets.QWidget, chosen: str, target: Path
-) -> bool:
-    """Ask before overwriting a file the save dialog never showed the user.
+    parent: QtWidgets.QWidget,
+    provider: Any,
+    chosen: str,
+    target: Path,
+    then: Callable[[], None],
+) -> None:
+    """Call ``then()`` unless it would overwrite a file the save dialog never showed.
 
     The dialog's own overwrite prompt covered ``chosen``; when a suffix had to be
-    appended, ``target`` is a different file that may already exist.
+    appended, ``target`` is a different file that may already exist, so ask first.
+    Through ``provider`` (the window's
+    :class:`~cuperiod.gui.dialogs.DialogProvider`, a question shown with ``open()``)
+    when the window gave the view one; a view used on its own falls back to the
+    static message box, as :func:`ask_save_path` does for its file dialog.
     """
     if str(target) == chosen or not target.exists():
-        return True
-    answer = QtWidgets.QMessageBox.question(
-        parent,
-        "cuPeriod",
-        f"{target.name} already exists. Replace it?",
-    )
-    return answer == QtWidgets.QMessageBox.StandardButton.Yes
+        then()
+        return
+    question = f"{target.name} already exists. Replace it?"
+    if provider is not None:
+        provider.confirm(
+            "Replace file", question, "Replace", lambda yes: then() if yes else None
+        )
+        return
+    answer = QtWidgets.QMessageBox.question(parent, "cuPeriod", question)
+    if answer == QtWidgets.QMessageBox.StandardButton.Yes:
+        then()
 
 
 __all__ = [
     "LEGEND_MAX_CHARS",
+    "ElidedLabel",
     "NumericItem",
     "ask_save_path",
     "column_menu",

@@ -550,6 +550,17 @@ def sliding_periodogram(
     stride = 0.5 * win if step is None else float(step)
     if not (math.isfinite(stride) and stride > 0.0):
         raise ValueError(f"step must be positive and finite, got {stride}")
+    # A NaN floor skipped no window (every comparison is False) and an infinite one
+    # every window, reported as "too few usable windows".
+    if not (
+        math.isfinite(min_window_points)
+        and float(min_window_points).is_integer()
+        and min_window_points >= 0
+    ):
+        raise ValueError(
+            f"min_window_points must be a non-negative integer, got "
+            f"{min_window_points}"
+        )
 
     row_settings = _row_settings(msettings)
 

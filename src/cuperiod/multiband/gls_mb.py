@@ -70,6 +70,7 @@ from cuperiod.methods.gls import (
     _trig_sums,
     lombscargle_power,
     lombscargle_power_torch,
+    shared_cufinufft_engine,
 )
 
 #: A band needs this many finite points to get its own sinusoid (perband model).
@@ -946,6 +947,10 @@ def gls_multiband_power(
     else:
         f0, df, nf = grid.uniform_frequency_params()
         frequency = f0 + df * np.arange(nf, dtype=np.float64)
+        if backend == "cufinufft" and not isinstance(engine, CufinufftGLS):
+            # A one-off call reuses the process-wide plans rather than planning
+            # every one of the K + 2 (or harmonic) transforms afresh.
+            engine = shared_cufinufft_engine(settings.nufft_eps)
         is_torch = backend == "torch" or backend.startswith("torch:")
         if settings.mb_model == "perband":
             if is_torch:

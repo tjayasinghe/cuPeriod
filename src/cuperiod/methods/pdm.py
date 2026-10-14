@@ -184,6 +184,10 @@ extern "C" __global__ void pdm_block(
 {
     const int pidx = blockIdx.x;
     if (pidx >= n_periods) return;
+    // blockIdx.y selects one of several re-timed copies of the curve, stored row by
+    // row (PDMMethod.power_rows); a plain launch has one row.
+    tau += (size_t)blockIdx.y * n_points;
+    o_theta += (size_t)blockIdx.y * n_periods;
     const int tid = threadIdx.x;
     const int nth = blockDim.x;
     const REAL period = periods[pidx];
@@ -276,22 +280,89 @@ def _pdm_cuda(
     if n_periods == 0:
         return np.zeros(0, dtype=np.float64)
     out = cp.empty(n_periods, dtype=cp.float64)
+    _launch_pdm(
+        tau_d, y_d, per_d, out, n_points=int(tau_d.size), n_rows=1,
+        n_bins=n_bins, n_covers=n_covers, sigma2=sigma2, precision=precision,
+        block=block,
+    )
+    return np.asarray(cp.asnumpy(out), dtype=np.float64)
+
+
+def _launch_pdm(
+    tau_d: Any,
+    y_d: Any,
+    per_d: Any,
+    out: Any,
+    *,
+    n_points: int,
+    n_rows: int,
+    n_bins: int,
+    n_covers: int,
+    sigma2: float,
+    precision: str,
+    block: int = CUDA_BLOCK,
+) -> None:
+    """Launch the PDM kernel over ``n_rows`` time rows x every period (no sync)."""
     from cuperiod.core.backend import ensure_shared_memory
 
+    n_periods = int(per_d.size)
     smem = 3 * n_bins * n_covers * 8
     kernel = _pdm_kernel(block, precision)
     ensure_shared_memory(kernel, smem, method="PDM", hint="n_bins / n_covers")
     kernel(
-        (n_periods,),
+        (n_periods, n_rows),
         (block,),
         (
             tau_d, y_d, per_d,
-            np.int32(tau_d.size), np.int32(n_periods),
+            np.int32(n_points), np.int32(n_periods),
             np.int32(n_bins), np.int32(n_covers), np.float64(sigma2), out,
         ),
         shared_mem=smem,
     )
-    return np.asarray(cp.asnumpy(out), dtype=np.float64)
+
+
+#: Largest number of rows one batched PDM launch takes (the grid's y extent).
+_MAX_GRID_ROWS: Final = 65_535
+
+
+def _pdm_cuda_rows(
+    taus: FloatArray,
+    y: FloatArray,
+    periods: FloatArray,
+    *,
+    n_bins: int,
+    n_covers: int,
+    sigma2: float,
+    precision: str = "float64",
+) -> FloatArray:
+    """:func:`_pdm_cuda` for many time rows: one upload, one launch, one download.
+
+    ``taus`` is ``(n_rows, N)`` (each row already ``t - t.min()``); the values and
+    periods are shared. Every block computes exactly what the single-row launch
+    computes for its period, so each row is bit-identical to :func:`_pdm_cuda`.
+    """
+    import cupy as cp
+
+    rdtype = np.float32 if precision == "float32" else np.float64
+    n_rows, n_points = (int(v) for v in taus.shape)
+    y_d = cp.asarray(np.ascontiguousarray(y, dtype=rdtype))
+    per_d = cp.asarray(np.ascontiguousarray(periods, dtype=rdtype))
+    n_periods = int(per_d.size)
+    out_host = np.empty((n_rows, n_periods), dtype=np.float64)
+    if n_periods == 0 or n_rows == 0:
+        return out_host
+    # Rows per launch: ~64 MB of times, within the grid's y limit.
+    chunk = max(1, min(n_rows, _MAX_GRID_ROWS, (1 << 23) // max(1, n_points)))
+    for start in range(0, n_rows, chunk):
+        stop = min(start + chunk, n_rows)
+        tau_d = cp.asarray(np.ascontiguousarray(taus[start:stop], dtype=rdtype))
+        out = cp.empty((stop - start, n_periods), dtype=cp.float64)
+        _launch_pdm(
+            tau_d, y_d, per_d, out, n_points=n_points, n_rows=stop - start,
+            n_bins=n_bins, n_covers=n_covers, sigma2=sigma2, precision=precision,
+        )
+        out_host[start:stop] = cp.asnumpy(out)
+    return out_host
 
 
 # --- CPU fast path: numba-parallel, one loop-iteration per trial period -------
@@ -553,6 +624,60 @@ class PDMMethod(PeriodogramMethod):
             baseline=finite.baseline,
             meta=finite.meta,
         )
+
+    def supports_power_rows(self, grid: GridSpec, backend: str) -> bool:
+        """The cupy kernel has the batched rows path (any grid)."""
+        return backend == "cupy"
+
+    def power_rows(  # type: ignore[override]
+        self,
+        grid: GridSpec,
+        lc: LightCurve,
+        times: FloatArray,
+        settings: PDMSettings,
+        backend: str,
+        engine: object | None = None,
+    ) -> FloatArray | None:
+        """Batched rows on cupy (one upload, one launch, one download), else None.
+
+        The rows are bit-identical to :meth:`power` of each re-timed copy: the same
+        kernel per (row, period) block, the same per-row time origin and centred
+        values, and the same ascending-frequency order. A grid with a period that
+        cannot be folded falls back to the per-row loop (``None``).
+        """
+        if not self.supports_power_rows(grid, backend):
+            return None
+        n = lc.n
+        if n < settings.min_detections:
+            raise InsufficientDataError(
+                f"PDM: {n} finite points < min_detections {settings.min_detections}"
+            )
+        times = np.asarray(times, dtype=np.float64)
+        if times.ndim != 2 or times.shape[1] != n:
+            raise ValueError("PDM power_rows: times must be (n_rows, n_points)")
+        periods = np.ascontiguousarray(grid.period, dtype=np.float64)
+        n_rows = int(times.shape[0])
+        if periods.size == 0:
+            return np.zeros((n_rows, 0), dtype=np.float64)
+        tau = times - times.min(axis=1, keepdims=True)
+        if not bool(np.all(tau.max(axis=1) > 0.0)):
+            raise InsufficientDataError("PDM: no usable time baseline")
+        if not all(bool(foldable_periods(float(m), periods).all()) for m in tau.max(1)):
+            return None
+        y = np.ascontiguousarray(lc.value, dtype=np.float64)
+        y_mean = float(y.mean())
+        sigma2 = float(((y - y_mean) ** 2).sum() / (n - 1)) if n > 1 else 0.0
+        if sigma2 <= 0.0:
+            theta = np.ones((n_rows, periods.size), dtype=np.float64)
+        else:
+            ensure_cuda_dll_path()
+            theta = _pdm_cuda_rows(
+                tau, y - y_mean, periods, n_bins=settings.n_bins,
+                n_covers=settings.n_covers, sigma2=sigma2,
+                precision=resolve_precision(settings.precision, "cuda"),
+            )
+        order = np.argsort(1.0 / periods, kind="stable")
+        return np.ascontiguousarray(theta[:, order])
 
     def multiband_power(  # type: ignore[override]
         self,

@@ -1,15 +1,32 @@
 """Multi-band Box Least Squares.
 
-Bands of the same star share one trial *period*: each band is box-searched on its own
-over the common period grid (its own best duration and mid-transit time at every
-period), and the per-period statistic is the quadrature sum of the bands' best
-depth-SNRs, ``sum_k max(SNR_k, 0)^2`` — a likelihood-ratio stack of independent
-per-band searches. Only the period is shared: a band's box is not forced onto another
-band's duration or phase, so the stack also rewards noise maxima at unrelated phases,
-and in sparse data it is weaker than a joint search with one shared box would be. The
-reported box geometry (depth, duration, mid-transit time) at each period comes from
-the band detecting it most strongly; ``extras["band_index"]`` names that band (an
-index into ``meta["bands"]``), and its depth is in that band's own flux units.
+Bands of the same star share one trial *period*. Two statistics are available
+(``BLSSettings.mb_ephemeris``, or the ``ephemeris=`` argument of
+:func:`bls_multiband_power`):
+
+``"independent"`` (default)
+    Each band is box-searched on its own over the common period grid (its own best
+    duration and mid-transit time at every period), and the per-period statistic is
+    the quadrature sum of the bands' best depth-SNRs, ``sum_k max(SNR_k, 0)^2`` -- a
+    likelihood-ratio stack of independent per-band searches. Only the period is
+    shared: a band's box is not forced onto another band's duration or phase, so the
+    stack also rewards noise maxima at unrelated phases, and in sparse data it is
+    weaker than the joint search. The reported box geometry (depth, duration,
+    mid-transit time) at each period comes from the band detecting it most strongly.
+
+``"shared"``
+    A transit is achromatic, so one box -- one duration and one mid-transit time on a
+    phase grid common to every band -- is placed for all bands at once, each band
+    fitting its own depth inside it, and the summed squared depth-SNRs of the bands
+    that dip there are maximised over the boxes (see
+    :mod:`cuperiod.multiband._bls_joint`). The reported duration and mid-transit time
+    are that shared box's. Supported on the in-house backends (``numba``, ``numpy``,
+    ``cupy``, ``torch``); astropy's ``BoxLeastSquares`` searches one band at a time
+    and is refused.
+
+Either way the power is ``sum_k max(SNR_k, 0)^2``, ``extras["band_index"]`` names the
+band with the largest SNR (an index into ``meta["bands"]``), and the reported depth is
+that band's, in its own flux units.
 
 The stack is only an SNR stack when every band's depth-SNR is dimensionless, so a
 band's errors are used only when *every* contributing band has them (the same rule
@@ -20,12 +37,14 @@ keeps the bands commensurate whatever their flux scale or zero point.
 
 from __future__ import annotations
 
+from typing import Any, Final
+
 import numpy as np
 
 from cuperiod.core._typing import FloatArray
 from cuperiod.core.columns import Domain
 from cuperiod.core.config import BLSSettings
-from cuperiod.core.errors import InsufficientDataError
+from cuperiod.core.errors import BackendUnavailableError, InsufficientDataError
 from cuperiod.core.grid import GridSpec
 from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
 from cuperiod.core.result import Periodogram
@@ -36,6 +55,9 @@ _MIN_BAND_POINTS = 3
 
 #: Scale factor turning a median absolute deviation into a Gaussian sigma.
 _MAD_TO_SIGMA = 1.4826
+
+#: The multi-band box statistics (see the module docstring).
+EPHEMERIS_MODES: Final = ("independent", "shared")
 
 
 def _robust_scatter(flux: FloatArray) -> float:
@@ -70,12 +92,39 @@ def _band_errors(bands: list[LightCurve]) -> list[FloatArray]:
     return [np.full(lc.n, _robust_scatter(lc.value)) for lc in bands]
 
 
+def resolve_ephemeris(settings: Any, ephemeris: str | None = None) -> str:
+    """The multi-band box statistic to run: the argument, else the settings' field.
+
+    ``BLSSettings.mb_ephemeris`` when the settings carry one, else ``"independent"``.
+
+    Raises
+    ------
+    ValueError
+        For a name outside :data:`EPHEMERIS_MODES`.
+    """
+    if ephemeris is not None:
+        mode = ephemeris
+    elif isinstance(settings, BLSSettings):
+        mode = settings.mb_ephemeris
+    else:  # a settings-like object from before the field existed
+        mode = "independent"
+    mode = str(mode).strip().lower()
+    if mode not in EPHEMERIS_MODES:
+        raise ValueError(
+            f"BLS multiband: unknown ephemeris {mode!r}; choose from "
+            f"{EPHEMERIS_MODES}"
+        )
+    return mode
+
+
 def bls_multiband_power(
     grid: GridSpec,
     mblc: MultiBandLightCurve,
     settings: BLSSettings,
     backend: str,
     method: PeriodogramMethod,
+    *,
+    ephemeris: str | None = None,
 ) -> Periodogram:
     """Compute the multi-band BLS statistic on a shared period grid.
 
@@ -96,22 +145,39 @@ def bls_multiband_power(
         ``"torch:<device>"``).
     method : PeriodogramMethod
         The owning :class:`~cuperiod.methods.bls.BLSMethod` (unused; reserved).
+    ephemeris : {"independent", "shared"}, optional
+        The box statistic (see the module docstring). ``None`` reads
+        ``settings.mb_ephemeris`` when the settings have that field, else
+        ``"independent"``.
 
     Returns
     -------
     Periodogram
         The per-period sum of the bands' squared depth-SNRs, with the box geometry
-        of the strongest band (``extras["band_index"]`` indexes ``meta["bands"]``,
-        the contributing bands).
+        of the strongest band (``"independent"``) or of the shared box
+        (``"shared"``; ``meta["mb_ephemeris"]`` records it).
+        ``extras["band_index"]`` indexes ``meta["bands"]``, the contributing bands.
 
     Raises
     ------
     InsufficientDataError
         If no band has 3 finite points, the contributing bands hold fewer than
         ``min_detections`` points, the grid is empty, or the baseline is empty.
+    BackendUnavailableError
+        For ``ephemeris="shared"`` on the ``astropy`` backend.
+    ValueError
+        For an unknown ``ephemeris``.
     """
-    from cuperiod.methods.bls import _SEGMENT_FIELDS, _grid_segments, _segment_power
+    from cuperiod.methods.bls import _grid_segments, _segments_power
 
+    mode = resolve_ephemeris(settings, ephemeris)
+    if mode == "shared" and backend == "astropy":
+        raise BackendUnavailableError(
+            "BLS multiband: ephemeris='shared' needs the in-house box search, and "
+            "the 'astropy' backend (what 'auto'/'cpu' pick when numba is not "
+            "installed) searches one band at a time; use backend='numba', 'numpy', "
+            "'cupy' or 'torch', or install the [fast] extra"
+        )
     finite = mblc.finite()
     used = [
         (name, lc.in_domain(Domain.FLUX))
@@ -135,57 +201,19 @@ def bls_multiband_power(
     if not segments:
         raise InsufficientDataError("BLS multiband: empty trial grid")
     errors = _band_errors(bands)
-
-    period_parts: list[FloatArray] = []
-    combined_parts: list[FloatArray] = []
-    depth_parts: list[FloatArray] = []
-    dsnr_parts: list[FloatArray] = []
-    dur_parts: list[FloatArray] = []
-    t0_parts: list[FloatArray] = []
-    band_parts: list[FloatArray] = []
-    band_caches: list[dict[str, object]] = [{} for _ in bands]
-    for periods, durations in segments:
-        per_band = []
-        for lc, err, device_cache in zip(bands, errors, band_caches, strict=True):
-            seg = _segment_power(
-                backend,  # type: ignore[arg-type]
-                lc.time,
-                lc.value,
-                err,
-                periods,
-                durations,
-                settings,
-                device_cache,  # type: ignore[arg-type]
-            )
-            per_band.append(seg)
-        dsnr = np.vstack([np.clip(s["depth_snr"], 0.0, None) for s in per_band])
-        depth = np.vstack([s["depth"] for s in per_band])
-        dur = np.vstack([s["duration"] for s in per_band])
-        t0 = np.vstack([s["transit_time"] for s in per_band])
-        combined = np.sum(dsnr**2, axis=0)
-        best = np.argmax(dsnr, axis=0)
-        cols = np.arange(dsnr.shape[1])
-        period_parts.append(periods)
-        combined_parts.append(combined)
-        dsnr_parts.append(np.sqrt(combined))
-        depth_parts.append(depth[best, cols])
-        dur_parts.append(dur[best, cols])
-        t0_parts.append(t0[best, cols])
-        band_parts.append(best.astype(np.float64))
-
-    _ = _SEGMENT_FIELDS  # documents the shared per-band field set
-    period = np.concatenate(period_parts)
-    power = np.nan_to_num(np.concatenate(combined_parts), nan=0.0, posinf=0.0)
+    meta: dict[str, Any] = {
+        **dict(finite.meta), "bands": tuple(name for name, _ in used),
+    }
+    if mode == "shared":
+        period, power, extras = _shared(bands, errors, segments, settings, backend)
+        meta["mb_ephemeris"] = "shared"
+    else:
+        period, power, extras = _independent(
+            bands, errors, segments, settings, backend, _segments_power
+        )
+    power = np.nan_to_num(power, nan=0.0, posinf=0.0)
     mean, std = float(power.mean()), float(power.std())
     sde = (power - mean) / std if std > 0.0 else np.zeros_like(power)
-    extras = {
-        "depth": np.concatenate(depth_parts),
-        "depth_snr": np.concatenate(dsnr_parts),
-        "duration": np.concatenate(dur_parts),
-        "t0": np.concatenate(t0_parts),
-        "sde": sde,
-        "band_index": np.concatenate(band_parts),
-    }
     return Periodogram.from_spectrum(
         method="BLS",
         backend=backend,
@@ -194,9 +222,91 @@ def bls_multiband_power(
         objective_sense="max",
         n_samples=n_total,
         baseline=baseline,
-        extras=extras,
-        meta={**dict(finite.meta), "bands": tuple(name for name, _ in used)},
+        extras={
+            "depth": extras["depth"],
+            "depth_snr": extras["depth_snr"],
+            "duration": extras["duration"],
+            "t0": extras["t0"],
+            "sde": sde,
+            "band_index": extras["band_index"],
+        },
+        meta=meta,
     )
 
 
-__all__ = ["bls_multiband_power"]
+def _independent(
+    bands: list[LightCurve],
+    errors: list[FloatArray],
+    segments: list[tuple[FloatArray, FloatArray]],
+    settings: BLSSettings,
+    backend: str,
+    segments_power: Any,
+) -> tuple[FloatArray, FloatArray, dict[str, FloatArray]]:
+    """The independent per-band stack: ``(period, power, extras)``."""
+    per_band = [
+        segments_power(backend, lc.time, lc.value, err, segments, settings)
+        for lc, err in zip(bands, errors, strict=True)
+    ]
+    parts: dict[str, list[FloatArray]] = {
+        name: [] for name in ("period", "power", "depth", "depth_snr", "duration",
+                              "t0", "band_index")
+    }
+    for s, (periods, _) in enumerate(segments):
+        seg = [band_segments[s] for band_segments in per_band]
+        dsnr = np.vstack([np.clip(b["depth_snr"], 0.0, None) for b in seg])
+        depth = np.vstack([b["depth"] for b in seg])
+        dur = np.vstack([b["duration"] for b in seg])
+        t0 = np.vstack([b["transit_time"] for b in seg])
+        combined = np.sum(dsnr**2, axis=0)
+        best = np.argmax(dsnr, axis=0)
+        cols = np.arange(dsnr.shape[1])
+        parts["period"].append(periods)
+        parts["power"].append(combined)
+        parts["depth_snr"].append(np.sqrt(combined))
+        parts["depth"].append(depth[best, cols])
+        parts["duration"].append(dur[best, cols])
+        parts["t0"].append(t0[best, cols])
+        parts["band_index"].append(best.astype(np.float64))
+    joined = {name: np.concatenate(values) for name, values in parts.items()}
+    period, power = joined.pop("period"), joined.pop("power")
+    return period, power, joined
+
+
+def _shared(
+    bands: list[LightCurve],
+    errors: list[FloatArray],
+    segments: list[tuple[FloatArray, FloatArray]],
+    settings: BLSSettings,
+    backend: str,
+) -> tuple[FloatArray, FloatArray, dict[str, FloatArray]]:
+    """The joint-ephemeris search: ``(period, power, extras)``."""
+    from cuperiod.multiband._bls_joint import joint_bands, joint_search
+
+    prepared = joint_bands(
+        [lc.time for lc in bands], [lc.value for lc in bands], errors
+    )
+    found = joint_search(
+        prepared,
+        segments,
+        settings.bins_per_duration,
+        objective=settings.objective,
+        backend=backend,
+        batch=settings.batch_periods,
+        precision=settings.precision,
+    )
+    period = np.concatenate([np.asarray(p, dtype=np.float64) for p, _ in segments])
+
+    def joined(name: str) -> FloatArray:
+        return np.concatenate([f[name] for f in found])
+
+    extras = {
+        "depth": joined("depth"),
+        "depth_snr": joined("depth_snr"),
+        "duration": joined("duration"),
+        "t0": joined("transit_time"),
+        "band_index": joined("band_index"),
+    }
+    return period, joined("power"), extras
+
+
+__all__ = ["EPHEMERIS_MODES", "bls_multiband_power", "resolve_ephemeris"]

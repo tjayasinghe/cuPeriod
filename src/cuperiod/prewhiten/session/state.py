@@ -19,7 +19,7 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, get_args
 
 import numpy as np
 import numpy.typing as npt
@@ -43,13 +43,46 @@ INTERACTIVE_STOP_REASON = "interactive session (not run to a stopping rule)"
 
 # --- errors ---------------------------------------------------------------------
 
+#: The remedy a refusal names, as a code (:attr:`StepReport.hint`). The refusal's
+#: message spells the remedy in the library's own keyword arguments ("pass
+#: allow_close=True ..."), which a front end cannot offer as such; the code lets it
+#: phrase its own advice without parsing the message.
+#:
+#: ``"allow_close"``
+#:     The frequency is within the collision radius of another component;
+#:     ``add(..., allow_close=True)`` or ``tie(..., allow_close=True)`` keeps it.
+#: ``"cascade"``
+#:     The component is a tie parent; ``remove(..., cascade=True)`` dissolves the
+#:     ties of its children.
+#: ``"exact"``
+#:     The frequency cannot be refined there; ``add(..., refine="none")`` adds it
+#:     exactly where it is.
+#: ``"fit_mean"``
+#:     Zero points per subset need a floating mean: ``configure(fit_mean=True)``.
+RefusalHint = Literal["allow_close", "cascade", "exact", "fit_mean"]
+
+#: Every :data:`RefusalHint` code.
+REFUSAL_HINTS: frozenset[str] = frozenset(get_args(RefusalHint))
+
 
 class SessionError(CuPeriodError):
     """An action a session cannot honour (bad argument, unknown id, wrong state).
 
     :meth:`~cuperiod.PreWhitenSession.do` turns it into a ``"refused"`` report; it
     propagates from the read-only helpers and from the thread guard.
+
+    Parameters
+    ----------
+    *args
+        The message, as for any exception.
+    hint : str, optional
+        The remedy as a :data:`RefusalHint` code; the refused report carries it as
+        :attr:`StepReport.hint`.
     """
+
+    def __init__(self, *args: object, hint: RefusalHint | None = None) -> None:
+        super().__init__(*args)
+        self.hint: str | None = hint
 
 
 class ProjectError(SessionError):
@@ -771,6 +804,10 @@ class StepReport:
         The arguments the reducer actually used, when it resolved some (the seed and
         grid index of a step, a snapped frequency): what the log stores instead of the
         arguments as given. Not part of the log entry's report.
+    hint : str or None
+        For a ``"refused"`` report whose message names a remedy, that remedy as a
+        :data:`RefusalHint` code (``"allow_close"``, ``"cascade"``, ``"exact"``,
+        ``"fit_mean"``); ``None`` otherwise. The message is unchanged.
     """
 
     kind: ReportKind
@@ -781,13 +818,18 @@ class StepReport:
     changed: frozenset[str] = frozenset()
     warning: str = ""
     resolved: Mapping[str, Any] | None = field(default=None, compare=False)
+    hint: str | None = None
 
     @property
     def committed(self) -> bool:
         return self.kind in COMMITTED_KINDS
 
     def to_dict(self) -> dict[str, Any]:
-        """The log-entry form (NaN statistics become ``None``)."""
+        """The log-entry form (NaN statistics become ``None``).
+
+        ``hint`` is written only when set: only refusals carry one, and they are
+        never logged, so a log entry's form is what it was before the field existed.
+        """
         out: dict[str, Any] = {"kind": self.kind, "message": self.message[:500]}
         out["component_id"] = self.component_id
         out["frequency"] = (
@@ -801,6 +843,8 @@ class StepReport:
         }
         if self.warning:
             out["warning"] = self.warning[:500]
+        if self.hint is not None:
+            out["hint"] = self.hint
         return out
 
     @classmethod
@@ -811,6 +855,7 @@ class StepReport:
         }
         frequency = data.get("frequency")
         component = data.get("component_id")
+        hint = data.get("hint")
         return cls(
             kind=data["kind"],
             message=str(data["message"]),
@@ -818,6 +863,7 @@ class StepReport:
             frequency=None if frequency is None else float(frequency),
             statistics=stats,
             warning=str(data.get("warning", "")),
+            hint=None if hint is None else str(hint),
         )
 
 
@@ -987,6 +1033,8 @@ __all__ = [
     "LogEntry",
     "PointMask",
     "ProjectError",
+    "REFUSAL_HINTS",
+    "RefusalHint",
     "ReportKind",
     "SessionData",
     "SessionError",

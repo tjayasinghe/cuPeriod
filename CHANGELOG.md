@@ -309,6 +309,26 @@ All notable changes to cuPeriod are documented here. The format is based on
   panel helpers to compose your own. Built on `Figure` + `FigureCanvasAgg` rather than
   pyplot, so it is safe to call from batch workers, and matplotlib is imported lazily so
   everything else works without it.
+- **Refusal hints.** A refused `StepReport` whose message names a remedy in keyword
+  arguments also carries it as a code in `StepReport.hint` (`"allow_close"`,
+  `"cascade"`, `"exact"` for `refine="none"`, `"fit_mean"`; `REFUSAL_HINTS`,
+  `SessionError(..., hint=...)`), so a front end can phrase its own advice without
+  parsing the message, which is unchanged.
+- **Multi-band BLS with a shared ephemeris.** `BLSSettings(mb_ephemeris="shared")` places
+  one box (duration and mid-transit time on a common phase grid) in every band, fits
+  each band's own depth, and maximises `Σ_k max(SNR_k, 0)²` over that one box, so noise
+  maxima at unrelated phases in different bands no longer add up. On 40 simulated
+  six-band light curves with a 1.5% transit in 0.5% noise it recovers 39 periods where
+  the independent stack recovers 24. numba, numpy and torch agree bit for bit, cupy to
+  1e-15; astropy is refused. The default (`"independent"`) is unchanged.
+- **GUI: refused edits offer their remedy.** When the session refuses an edit the window
+  can fix itself, it asks without blocking and does it on a yes, as one undoable action:
+  removing a component others are tied to (*Dissolve their ties and remove F1?*), a
+  frequency or tie inside another component's collision guard (*Add anyway* / *Tie
+  anyway*), a frequency outside the grid or one the refinement would move onto another
+  component (*Add it exactly, no refinement?*). The wording comes from the new
+  `StepReport.hint` (documented in the interactive pre-whitening guide); a yes that
+  arrives after the session changed does nothing and says so.
 
 ### Changed
 
@@ -506,12 +526,30 @@ Other changes:
   on the CPU); with the GPU stack but no device, GPU tests skip.
 - **Docs.** New guide page on interactive pre-whitening, with the GUI's shortcut tables
   generated from its command registry at build time; `BatchSettings` is documented as
-  reserved (nothing reads it yet; `CUPERIOD_BATCH_*` has no effect).
+  deprecated (nothing reads it; `CUPERIOD_BATCH_*` has no effect and now warns).
+- **Batch keys are always distinct.** A key given twice, two light curves with one
+  `meta["id"]`, or two keys a CSV sink would store identically (`"=x"` and `"'=x"`)
+  keep the first occurrence and rename the repeats `key#2`, `key#3`, … with a warning;
+  they used to share result rows and a resume entry, so a resumed sink skipped the second
+  light curve as done.
+- **Provenance in every batch sink.** `batch_prewhiten` rows and `batch_pdot` summary
+  rows carry a `source` column (the file's absolute path; `""` in memory; also
+  `prewhiten_to_rows(source=)` and `pdot_to_rows(source=)`), and resuming into a sink
+  that holds a key from a different file is reported, as `batch_periodograms` already
+  did. `batch_pdot` figures of keys that differ only in letter case get distinct names,
+  so one no longer overwrites the other on Windows and macOS.
+- **Pooled-band warning.** Reading a multi-filter table as one light curve now names
+  the exact remedy (`columns=ColumnMap(band='filtercode')`, or `band_column=` for the
+  batch functions) and is attributed to the caller's line, not a library one.
 
 ### Deprecated
 
 - `PreWhitenSettings.downsample_points` never had an effect; setting it now warns
   (`DeprecationWarning`), and it will be removed.
+- `BatchSettings` is read by no batch driver, so it and `CUPERIOD_BATCH_*` never had an
+  effect; building it now warns (`DeprecationWarning`), so does a batch run while a
+  `CUPERIOD_BATCH_*` variable is set, and it will be removed. Pass `device=`,
+  `workers=`, `n_best=`, `store_raw=` and `resume=` to the batch functions.
 
 ### Fixed
 
@@ -730,6 +768,48 @@ Other changes:
   and reads c/d, no empty period badge, "no components yet", automatic option values to
   six significant digits, checked boxes in disabled tables keep their tick, and the
   import dialog no longer claims a header row a file does not have.
+- **Constrained fits: an amplitude that collapses under a non-linear phase.** A
+  component with per-subset amplitudes and a common phase (or per-subset phases and a
+  common amplitude) on data without signal at its frequency solves its amplitude to
+  round-off; its phase, and a free frequency only it sets, were then reported with an
+  error made of two rounding errors (~0.3 rad, unflagged). They are now NaN with the
+  `degenerate` flag and drop out of `FitDetail.rank`, and the analytic and bootstrap
+  estimators report every parameter the fit found undetermined as NaN too (they gave
+  it a number). The threshold is the session's round-off rule (1e4 ε of the largest
+  |value|), so no other fit changes.
+- **`PreWhitenSession(grid=(f0, df, nf))`** goes through the grid-size guard
+  (`GridTooLargeError` before anything is allocated; `nf = 10**12` asked for 8 TB), and
+  a negative start, a non-positive or non-finite step or an empty grid is a
+  `ValueError` instead of a failure deep in the spectrum engine.
+- **GPU BLS chose a different box than the CPU on exact ties.** The CUDA kernel broke
+  ties between equally good boxes by thread id, so on sparse curves it reported another
+  (equally good) mid-transit time and duration than numpy/astropy at ~70% of periods.
+  Ties now go to the earliest (duration, start), as astropy does; power never differed.
+- **`suggest_gpu_workers` suggested 16 workers on almost any card.** It now counts each
+  worker's measured CUDA context (~200–235 MiB) and assumes a 100k-point grid, caps at 4
+  workers without NVIDIA MPS (16 with) and at the host CPUs, and rejects a bad
+  `headroom`. A GPU batch with `workers=None` is sized for the most demanding of its
+  methods and for `grid=` when given, not for the first method listed.
+- **Period-change arguments.** The tools raise a `ValueError` naming the argument for a
+  non-finite or non-integer `f0`, harmonic count, `n_tau`, `min_neff`,
+  `min_window_points`, `points_per_interval`, `n_intervals` or `min_points`, and for a
+  non-finite warp rate; `PdotSettings` refuses infinite values (its `> 0` bounds already
+  refused NaN but let `inf` through).
+- **GUI: the raw light curve no longer squeezes the plots.** With *Show Raw LC* on in a
+  1366 × 768 or 1440 × 900 window the fold and the raw curve were stacked with under
+  90 px of plot each. They now sit side by side where the centre is wide enough and
+  otherwise share the pane as *Phased light curve* / *Raw light curve* tabs (Left/Right
+  switch; a point tool or Ctrl+3 brings the raw curve forward), the raw view's tools fit
+  one compact row, and the spectrum and light curve get plots of equal height (212 px at
+  1366 × 768, 278 px at 1440 × 900) until the split is dragged.
+- **GUI: the window title names the application once** (`star.csv — star.cupw.json* —
+  cuPeriod`; it read "cuPeriod — star.csv - cuPeriod" on Windows), and macOS shows its own
+  unsaved-changes dot.
+- **GUI: a failed spectrum preview while another session's result was on show** reached
+  only the status bar; the stale result is taken down and the spectrum pane says why.
+- **GUI: replacing an existing image on export** (when `.png` had to be appended to the
+  chosen name) asked through a blocking message box; it now asks through the window's
+  non-blocking dialogs like every other question.
 
 ### Security
 
@@ -766,7 +846,10 @@ Other changes:
 - **Benchmark downloads.** `download_ogle_triples.py` and `download_v1309sco.py` fetch
   the OGLE archive over HTTPS instead of plaintext FTP, `download_s82_rrlyrae.py` reads
   astroML-data at a pinned commit with a 120 s timeout, and all three verify a pinned
-  SHA-256 for every file, on download and for cached copies.
+  SHA-256 for every file, on download and for cached copies. The shared fetcher refuses
+  any URL but HTTPS; the two downloaders built on third-party clients (lightkurve from
+  MAST over HTTPS, the ASAS-SN Sky Patrol API over plain HTTP) say in their docstrings
+  that no reference digest exists for what they fetch.
 
 ### Performance
 
@@ -811,6 +894,20 @@ Other changes:
   hidden raw panel builds only when shown (refolds of 1e5–5e5-point curves: 0.2–2 s →
   ~30 ms); the Load demo menu fills when first opened (~0.8 s off start-up); the lasso
   hit test stays well under a second on million-point curves.
+- **GPU paths measured and tightened** (RTX 5070 Ti, warm, min of N):
+  - One-off GPU GLS periodograms (API, GUI, multi-band) reuse a process-wide,
+    thread-safe, size-capped cufinufft engine instead of planning per call: 2.2 → 1.2 ms
+    at 300 points, 9.5 → 4.6 ms at 20k; `free_gpu_memory()` releases it.
+  - GPU `pdot_search` computes all warped rows on the device for GLS (cufinufft) and PDM
+    (cupy): the default GLS map 231 → 43 ms (1.2k points) and 352 → 93 ms (20k); PDM
+    254 → 124 ms.
+  - Pre-whitening on cufinufft solves the normal equations and forms the window terms,
+    spectral window and full spectrum on the device: a scan at 1.4M frequencies
+    23.6 → 6.7 ms; `cup.prewhiten` 310 → 128 ms (20k points), 2.15 → 1.25 s (100k).
+  - GPU BLS uploads all period segments of a curve once and downloads once (5–15%).
+- **`AmplitudeSpectrum.noise_curve(estimator="median")`** computes every box at once:
+  1e5 samples with 4000-sample boxes 4.0 s → 85 ms, identical values (the GUI calls it
+  on every edit).
 
 ### Validated
 
@@ -937,8 +1034,8 @@ Other changes:
   results.
 - The fold methods' default grids are not exactly invariant to the time origin: the last
   sample sits on a phase-bin edge, so JD and MJD inputs differ at the O(1/N) level.
-- `BatchSettings` is reserved: no batch driver reads it yet, so `CUPERIOD_BATCH_*` has no
-  effect.
+- `BatchSettings` is deprecated (see Deprecated): no batch driver reads it, so
+  `CUPERIOD_BATCH_*` has no effect beyond a warning.
 
 ## [1.2.0] - 2026-08-30
 

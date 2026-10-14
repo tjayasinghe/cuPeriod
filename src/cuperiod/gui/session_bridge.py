@@ -24,6 +24,10 @@ section 4.2, decision D15):
   component.
 * **Dirty sessions are never evicted.** Clean sessions live in an LRU of
   :data:`MAX_CLEAN_SESSIONS`.
+* **Refusals carry their remedy.** A refused action is reported as a
+  :class:`~cuperiod.gui.refusals.Refusal`: the message, the library's remedy code
+  (``StepReport.hint``) and, for an op, a way to queue it again with the remedy's
+  arguments. Such a retry runs only if nothing changed the session in between.
 
 Session jobs never read :attr:`ComputeManager.generation` (see
 :class:`~cuperiod.gui.compute.SessionJob`).
@@ -35,11 +39,13 @@ import time
 from collections import OrderedDict, deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from functools import partial
 from typing import TYPE_CHECKING, Any, Literal
 
 from cuperiod.core._typing import FloatArray
 from cuperiod.gui.compute import ComputeManager, SessionJob
 from cuperiod.gui.qt import QObject, QtCore, Signal
+from cuperiod.gui.refusals import Refusal, report_hint
 from cuperiod.gui.viewmodels import (
     SessionKey,
     SessionView,
@@ -74,6 +80,12 @@ STALE_IDS_MESSAGE = (
     "The component list changed before this action ran; nothing was changed."
 )
 
+#: A retry offered for a refusal arrived after the session changed.
+STALE_RETRY_MESSAGE = (
+    "The session changed before your answer arrived; nothing was changed. Try the "
+    "action again."
+)
+
 RequestKind = Literal["mutation", "view", "query", "open"]
 
 
@@ -100,6 +112,8 @@ class _Outcome:
     requested_backend: str | None = None
     # A project load: what ``describe(session)`` returned (``loaded`` signal).
     loaded: Any = None
+    # The submitted ops that were refused (their indices in the request), in order.
+    refused_ops: tuple[int, ...] = ()
 
 
 @dataclass
@@ -120,6 +134,10 @@ class _Request:
     manual: bool = False
     # A project load: its ``loaded`` payload is announced on completion.
     load: bool = False
+    # The ops of a submitted request, as given (a refusal's retry repeats them).
+    ops: tuple[tuple[str, dict[str, Any]], ...] = ()
+    # Run only if the session's change count is still this (a refusal's retry).
+    expect_changes: int | None = None
 
 
 @dataclass(eq=False)
@@ -144,6 +162,8 @@ class _Entry:
     query_gen: dict[str, int] = field(default_factory=dict)
     discarded: bool = False
     opened: bool = False  # an open/restore has been queued
+    # Jobs that changed (or replaced) the session so far, in completion order.
+    changes: int = 0
 
     @property
     def idle(self) -> bool:
@@ -202,7 +222,11 @@ class SessionBridge(QObject):
     progress(key, StepReport)
         An Auto or Step attempt committed (during Auto, after every step).
     message(severity, text)
-        Refused ops, warnings, notices (``"info"``, ``"warning"``, ``"error"``).
+        Warnings and notices (``"info"``, ``"warning"``, ``"error"``).
+    refused(key, Refusal)
+        An action of a finished job was refused: the first refusal of the job (the
+        rest follow from it, like the tie of a combination whose add was refused),
+        with its remedy code and, for submitted ops, a retry.
     failed(key, message)
         A job raised (not a refusal); the controller surfaces it as a failure.
     preview_failed(key, reason)
@@ -233,6 +257,7 @@ class SessionBridge(QObject):
     view_ready = Signal(object, object)
     progress = Signal(object, object)
     message = Signal(str, str)
+    refused = Signal(object, object)
     failed = Signal(object, str)
     preview_failed = Signal(object, str)
     busy = Signal(bool)
@@ -509,7 +534,12 @@ class SessionBridge(QObject):
         *,
         expect_id_epoch: int | None = None,
     ) -> None:
-        """Queue ``session.do(op, **args)``; ``"finalize"`` is polish + prune."""
+        """Queue ``session.do(op, **args)``; ``"finalize"`` is polish + prune.
+
+        ``("add", {"frequency": f, "snap": True, ...})`` — an add with ``snap`` among
+        its arguments — goes through :meth:`PreWhitenSession.add`, which snaps ``f``
+        to the residual peak on the worker (only the worker has the spectrum).
+        """
         self.submit_group(
             key, [(op, dict(args or {}))], expect_id_epoch=expect_id_epoch
         )
@@ -520,8 +550,13 @@ class SessionBridge(QObject):
         actions: Sequence[tuple[str, Mapping[str, Any]]],
         *,
         expect_id_epoch: int | None = None,
+        expect_changes: int | None = None,
     ) -> None:
-        """Queue several ops that undo as one group."""
+        """Queue several ops that undo as one group.
+
+        ``expect_changes``: run only if the session's change count is still that
+        (a refusal's retry); otherwise the request is dropped with a message.
+        """
         entry = self._live_entry(key)
         if entry is None:
             return
@@ -548,6 +583,8 @@ class SessionBridge(QObject):
                 long=long,
                 expect_id_epoch=expect_id_epoch,
                 manual=manual,
+                ops=tuple(ops),
+                expect_changes=expect_changes,
             ),
         )
 
@@ -620,20 +657,42 @@ class SessionBridge(QObject):
         self, session: PreWhitenSession, ops: Sequence[tuple[str, dict[str, Any]]]
     ) -> _Outcome:
         reports: list[StepReport] = []
+        refused: list[int] = []
         out = _Outcome()
         with session.group():
-            for op, args in ops:
+            for index, (op, args) in enumerate(ops):
                 if op == "finalize":
                     out.result = session.finalize()
                     out.committed = out.id_changed = True
                     continue
-                report = session.do(op, **args)
+                report = self._do(session, op, args)
                 reports.append(report)
+                if report.kind == "refused":
+                    refused.append(index)
                 if report.committed:
                     out.committed = True
                     out.id_changed = out.id_changed or op in _ID_REMAP_OPS
         out.reports = tuple(reports)
+        out.refused_ops = tuple(refused)
         return out
+
+    @staticmethod
+    def _do(
+        session: PreWhitenSession, op: str, args: Mapping[str, Any]
+    ) -> StepReport:
+        """``session.do(op, **args)``; an ``add`` with ``snap`` among its arguments
+        goes through :meth:`PreWhitenSession.add` (it snaps on the worker)."""
+        if op == "add" and "snap" in args:
+            from cuperiod.prewhiten.session.state import SessionError, StepReport
+
+            options = dict(args)
+            frequency = options.pop("frequency", None)
+            try:
+                return session.add(frequency, **options)
+            except (SessionError, ValueError) as exc:
+                # As do() would: a refusal, not a failed job (D21).
+                return StepReport(kind="refused", message=str(exc))
+        return session.do(op, **args)
 
     def undo(self, key: SessionKey) -> None:
         self._history_move(key, "undo")
@@ -1123,6 +1182,10 @@ class SessionBridge(QObject):
             if epoch is not None and epoch != entry.id_epoch:
                 self.message.emit("warning", STALE_IDS_MESSAGE)
                 continue
+            if req.expect_changes is not None and req.expect_changes != entry.changes:
+                # The user answered a question about a session that has moved on.
+                self.message.emit("warning", STALE_RETRY_MESSAGE)
+                continue
             job = SessionJob(
                 req.make(),
                 key=entry.key,
@@ -1205,12 +1268,16 @@ class SessionBridge(QObject):
         entry, req = found
         assert isinstance(outcome, _Outcome)
         key = entry.key
+        if outcome.committed or outcome.replaced:
+            entry.changes += 1
         for severity, text in outcome.messages:
             self.message.emit(severity, text)
+        refused = [r for r in outcome.reports if r.kind == "refused"]
+        refusal = (
+            self._refusal(entry, req, outcome, refused[0]) if refused else None
+        )
         for report in outcome.reports:
-            if report.kind == "refused":
-                self.message.emit("warning", report.message)
-            elif report.warning:
+            if report.kind != "refused" and report.warning:
                 entry.warnings.append(report.warning)
         # An action that changed nothing ("nothing to improve", "ids are already
         # compact") said so nowhere, so its button looked dead.
@@ -1281,12 +1348,70 @@ class SessionBridge(QObject):
         elif req.kind == "mutation" and outcome.result is not None:
             self.finalized.emit(key, outcome.result)
         self._continue(entry)
+        if refusal is not None:
+            # Last, once this job is fully accounted for: a retry the user accepts
+            # (at once, for a scripted answer) queues behind what is queued already.
+            self.refused.emit(key, refusal)
+
+    def _refusal(
+        self, entry: _Entry, req: _Request, outcome: _Outcome, report: StepReport
+    ) -> Refusal:
+        """The :class:`Refusal` of a job's first refused ``report``.
+
+        For submitted ops the refused ones (the first and those that followed it,
+        such as the tie of a combination whose add was refused) can be queued again,
+        with the arguments of a remedy the user accepts.
+        """
+        op = ""
+        args: Mapping[str, Any] = {}
+        retry: Callable[[Mapping[str, Any]], None] | None = None
+        if req.ops and outcome.refused_ops:
+            op, args = req.ops[outcome.refused_ops[0]]
+            again = tuple(req.ops[i] for i in outcome.refused_ops)
+            retry = partial(self._retry, entry.key, again, entry.changes)
+        return Refusal(
+            key=entry.key,
+            text=report.message,
+            hint=report_hint(report),
+            op=op,
+            args=dict(args),
+            retry=retry,
+        )
+
+    def _retry(
+        self,
+        key: SessionKey,
+        ops: Sequence[tuple[str, Mapping[str, Any]]],
+        changes: int,
+        extra: Mapping[str, Any],
+    ) -> None:
+        """Queue refused ``ops`` again, each with those of the ``extra`` arguments its
+        operation takes, unless the session changed since they were refused."""
+        from cuperiod.prewhiten.session.actions import ARGS
+
+        patched = [
+            (
+                op,
+                {
+                    **args,
+                    **{
+                        name: value
+                        for name, value in extra.items()
+                        if op in ARGS and name in ARGS[op].model_fields
+                    },
+                },
+            )
+            for op, args in ops
+        ]
+        self.submit_group(key, patched, expect_changes=changes)
 
     def _on_failed(self, job: SessionJob, text: str) -> None:
         found = self._finish_job(job)
         if found is None:
             return
         entry, req = found
+        if req.kind == "mutation":
+            entry.changes += 1  # it may have committed some of its actions
         if req.preview:
             entry.opened = False
             self.preview_failed.emit(entry.key, text)
@@ -1376,6 +1501,8 @@ __all__ = [
     "MAX_CLEAN_SESSIONS",
     "QUICK_BUSY_MS",
     "STALE_IDS_MESSAGE",
+    "STALE_RETRY_MESSAGE",
+    "Refusal",
     "SessionBridge",
     "SessionKey",
 ]

@@ -445,3 +445,16 @@ QTabBar QToolButton::right-arrow {
 
 /* The toolbar's stretch is not a control: no box of its own. */
 QWidget#toolbarSpacer { background: transparent; }
+
+/* The plot toolbars (spectrum, fold, light curve) are compact: every row they take
+   over a plot is a row of plot less in a small window. Their widths, and so where
+   their rows wrap, are as everywhere else. */
+QWidget#plotToolbar QPushButton, QWidget#plotToolbar QToolButton {
+    padding-top: 4px;
+    padding-bottom: 4px;
+}
+QWidget#plotToolbar QComboBox, QWidget#plotToolbar QLineEdit,
+QWidget#plotToolbar QDoubleSpinBox {
+    padding-top: 2px;
+    padding-bottom: 2px;
+}

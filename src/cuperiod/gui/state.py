@@ -33,7 +33,7 @@ from __future__ import annotations
 import math
 import time as _time
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Literal, Protocol
 
@@ -67,6 +67,7 @@ from cuperiod.gui.models import (
     settings_hash,
 )
 from cuperiod.gui.qt import QObject, QtCore, QtGui, Signal
+from cuperiod.gui.refusals import HINT_ARGUMENTS, Refusal
 from cuperiod.gui.session_bridge import SessionBridge
 from cuperiod.gui.viewmodels import (
     ComponentView,
@@ -262,7 +263,8 @@ class AppController(QObject):
     # -- interactive pre-whitening (design 4.2) ----------------------------------------
     session_changed = Signal(object)  # SessionView of the displayed session
     session_progress = Signal(object)  # StepReport, during Auto / Step
-    session_message = Signal(str, str)  # (severity, text): refusals, warnings, notices
+    session_message = Signal(str, str)  # (severity, text): warnings, notices
+    session_refused = Signal(object)  # Refusal: a refused edit, its remedy, a retry
     session_busy = Signal(bool)  # a quick job ran > 300 ms (non-blocking indicator)
     variations_ready = Signal(object)  # VariationResult
     components_selected = Signal(object)  # tuple[int, ...], current first
@@ -333,6 +335,7 @@ class AppController(QObject):
         bridge.view_ready.connect(self._on_view)
         bridge.progress.connect(self._on_progress)
         bridge.message.connect(self.session_message)
+        bridge.refused.connect(self._on_refused)
         bridge.failed.connect(self._on_session_failed)
         bridge.preview_failed.connect(self._on_preview_failed)
         bridge.busy.connect(self.busy_changed)
@@ -1329,19 +1332,27 @@ class AppController(QObject):
         """Add a component at ``frequency`` (``SpectrumView.add_requested``).
 
         Plain: at the residual peak nearest ``frequency``, refined as the settings
-        say. ``exact``: at ``frequency`` itself, not refined.
+        say. ``exact``: at ``frequency`` itself, not refined. Submitted as an op
+        (the bridge snaps on the worker), so a refusal can be retried with the
+        remedy its hint names.
         """
         key = self._active_key()
         if key is None:
             return
-        f = float(frequency)
+        args: dict[str, Any] = {"frequency": float(frequency), "snap": not exact}
+        if exact:
+            args["refine"] = "none"
+        self._bridge.submit(key, "add", args)
 
-        def call(session: PreWhitenSession) -> StepReport:
-            if exact:
-                return session.add(f, snap=False, refine="none")
-            return session.add(f)
-
-        self._bridge.submit_call(key, "add", call)
+    def retry_refused(self, refusal: Refusal) -> bool:
+        """Ask again for what ``refusal`` refused, with the remedy its hint names
+        (the user agreed to it): ties dissolved, a frequency kept although close to
+        another, added without refinement. False when there is nothing to retry."""
+        extra = HINT_ARGUMENTS.get(refusal.hint or "")
+        if refusal.retry is None or extra is None:
+            return False
+        refusal.retry(extra)
+        return True
 
     def delete_points(self, indices: Sequence[int] | Any) -> None:
         """Leave points out (indices into ``SessionView.time``); one undo step."""
@@ -1604,6 +1615,15 @@ class AppController(QObject):
         self._intents.setdefault(key, _Intent()).attempt = True
         if key == self._shown:
             self.session_progress.emit(report)
+
+    def _on_refused(self, key: object, refusal: object) -> None:
+        if not isinstance(refusal, Refusal):
+            return
+        if key != self._shown:
+            # Redoing an edit of a session no longer on show would surprise the
+            # user: it is only reported.
+            refusal = replace(refusal, retry=None)
+        self.session_refused.emit(refusal)
 
     def _on_reported(self, key: object, reports: object) -> None:
         if not isinstance(key, SessionKey) or not isinstance(reports, tuple):

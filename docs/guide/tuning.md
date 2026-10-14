@@ -191,7 +191,7 @@ export CUPERIOD_BLS_MAX_PERIOD_DAYS=30
 explicitly takes precedence over the environment. `CUPERIOD_<METHOD>_BACKEND` sets the
 method's default backend, which `backend="auto"` defers to; the GUI seeds its Options
 form from these variables too. (`CUPERIOD_BATCH_*` has no effect: `BatchSettings` is
-reserved.)
+deprecated, and the batch functions warn when one of those variables is set.)
 
 ## Custom grids
 

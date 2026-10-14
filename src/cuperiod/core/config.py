@@ -269,6 +269,14 @@ class BLSSettings(_DeviceSettings):
     objective: Literal["snr", "likelihood"] = Field(
         default="snr", description="Box objective."
     )
+    mb_ephemeris: Literal["independent", "shared"] = Field(
+        default="independent",
+        description=(
+            "Multi-band box: 'independent' stacks each band's own best box; "
+            "'shared' fits one duration and mid-transit time to every band "
+            "(per-band depths)."
+        ),
+    )
     n_peaks: int = Field(default=10, ge=1, description="Default stored peak count.")
     peak_separation_rayleigh: float = Field(
         default=3.0, gt=0.0, description="Min peak separation in Rayleigh widths."
@@ -1023,7 +1031,11 @@ class PdotSettings(BaseSettings):
     is large enough to matter over the observed span.
     """
 
-    model_config = SettingsConfigDict(env_prefix="CUPERIOD_PDOT_", extra="forbid")
+    # No field here means anything at infinity (an infinite window, drift or range
+    # is a typo, not a request), and the "> 0" bounds alone let +inf through.
+    model_config = SettingsConfigDict(
+        env_prefix="CUPERIOD_PDOT_", extra="forbid", allow_inf_nan=False
+    )
 
     @model_validator(mode="after")
     def _check_bounds(self) -> Self:
@@ -1191,17 +1203,32 @@ class PdotSettings(BaseSettings):
 
 
 class BatchSettings(BaseSettings):
-    """Reserved: batch-processing defaults that nothing reads yet.
+    """Deprecated: batch-processing defaults that no batch driver reads.
 
     No batch driver consults this class, so building it, or setting any
     ``CUPERIOD_BATCH_*`` variable, has no effect on a run. Pass ``device``,
-    ``workers``, ``n_best``, ``resume`` ... to :func:`cuperiod.batch_periodograms`
-    (and the other batch drivers) directly; their ``settings`` argument means the
-    per-method settings. The class is kept, and exported, so code that builds it
-    keeps importing until a later release wires it in or removes it.
+    ``workers``, ``n_best``, ``store_raw`` and ``resume`` to
+    :func:`cuperiod.batch_periodograms` (and the other batch drivers) directly; their
+    ``settings`` argument means the per-method settings. Building it emits a
+    ``DeprecationWarning`` (so does a batch run while a ``CUPERIOD_BATCH_*`` variable
+    is set); it is still exported so existing code keeps importing, and it will be
+    removed in a future release.
     """
 
     model_config = SettingsConfigDict(env_prefix="CUPERIOD_BATCH_", extra="forbid")
+
+    @model_validator(mode="after")
+    def _deprecated(self) -> Self:
+        # Every field is dead, so any construction is the deprecated use.
+        warnings.warn(
+            "BatchSettings is deprecated and has no effect: no batch driver reads it "
+            "(nor the CUPERIOD_BATCH_* variables). Pass device=, workers=, n_best=, "
+            "store_raw= and resume= to batch_periodograms() directly. It will be "
+            "removed in a future release.",
+            DeprecationWarning,
+            stacklevel=_caller_stacklevel(),
+        )
+        return self
 
     device: Literal["cpu", "gpu", "hybrid"] = Field(
         default="cpu", description="Where to run the workers."

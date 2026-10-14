@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -29,9 +30,27 @@ TIMEOUT = 120.0
 MAX_BYTES = 64 * 1024 * 1024
 _CHUNK = 1 << 16
 
+#: Hosts a plain-HTTP URL may name: a local test server, never the network.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
 
 class DownloadError(RuntimeError):
     """A transfer or a cached file did not match its pinned SHA-256."""
+
+
+def _require_https(url: str) -> None:
+    """Refuse any transport but HTTPS (plain HTTP to the loopback host aside).
+
+    The digest catches a substituted file either way; TLS also stops an on-path
+    attacker from feeding a stalled or endless body, and keeps a script that
+    regresses to an FTP or plain-HTTP mirror from passing unnoticed.
+    """
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme == "https":
+        return
+    if parts.scheme == "http" and parts.hostname in _LOOPBACK_HOSTS:
+        return
+    raise ValueError(f"refusing a non-HTTPS download: {url!r}")
 
 
 def sha256_of(path: Path) -> str:
@@ -57,7 +76,8 @@ def fetch(
     Parameters
     ----------
     url
-        Where to get the file (HTTPS).
+        Where to get the file. Only HTTPS is accepted (plain HTTP only to the
+        loopback host, for tests).
     target
         Final path; its folder must exist.
     sha256
@@ -83,10 +103,13 @@ def fetch(
         download; a mismatching cached copy is left for inspection.
     OSError
         The transfer itself failed (``urllib.error.URLError``, ``TimeoutError``).
+    ValueError
+        For a digest that is not 64 hex characters, or a URL that is not HTTPS.
     """
     want = sha256.strip().lower()
     if len(want) != 64 or any(c not in "0123456789abcdef" for c in want):
         raise ValueError(f"not a hex SHA-256 digest: {sha256!r}")
+    _require_https(url)
     target = Path(target)
     if target.exists() and not force:
         got = sha256_of(target)

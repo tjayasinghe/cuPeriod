@@ -74,6 +74,12 @@ class DialogProvider(Protocol):
     def inform(self, title: str, text: str, severity: Severity = "info") -> None:
         """A message the user acknowledges; nothing waits for it."""
 
+    def confirm(
+        self, title: str, text: str, accept: str, done: Callable[[bool], None]
+    ) -> None:
+        """A yes-or-no question: ``done(True)`` when the user chose the ``accept``
+        button, ``done(False)`` for Cancel, Esc or closing it."""
+
     def show_html(self, title: str, html: str) -> None:
         """A read-only rich-text sheet (the keyboard shortcuts)."""
 
@@ -297,6 +303,37 @@ class QtDialogProvider(QObject):
         self._track(box)
         box.open()
 
+    def confirm(
+        self, title: str, text: str, accept: str, done: Callable[[bool], None]
+    ) -> None:
+        box = QtWidgets.QMessageBox(self._parent)
+        box.setObjectName("dialog_confirm")
+        box.setIcon(QtWidgets.QMessageBox.Icon.Question)
+        box.setWindowTitle(title)
+        # The question quotes component labels and numbers, never markup.
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        box.setText(text)
+        yes = box.addButton(accept, QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        no = box.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(yes)
+        box.setEscapeButton(no)
+        answered: list[bool] = []
+
+        def _clicked(button: QtWidgets.QAbstractButton) -> None:
+            if not answered:
+                answered.append(True)
+                done(button is yes)
+
+        def _finished(_: int) -> None:
+            if not answered:  # closed by the title bar
+                answered.append(True)
+                done(False)
+
+        box.buttonClicked.connect(_clicked)
+        box.finished.connect(_finished)
+        self._track(box)
+        box.open()
+
     def show_html(self, title: str, html: str) -> None:
         dialog = QtWidgets.QDialog(self._parent)
         dialog.setObjectName("dialog_sheet")
@@ -363,8 +400,9 @@ class FakeDialogProvider:
     ----------
     answers : iterable, optional
         Replies consumed in order by the prompts (``confirm_discard``, ``open_file``,
-        ``save_file``, ``ask_text``, ``ask_float``). When exhausted, each prompt gives
-        its "cancel" answer (``"cancel"`` / ``None``).
+        ``save_file``, ``ask_text``, ``ask_float``, ``confirm`` — where only
+        ``True`` accepts). When exhausted, each prompt gives its "cancel" answer
+        (``"cancel"`` / ``None`` / ``False``).
 
     Attributes
     ----------
@@ -430,6 +468,12 @@ class FakeDialogProvider:
 
     def inform(self, title: str, text: str, severity: Severity = "info") -> None:
         self.calls.append(("inform", (title, text, severity)))
+
+    def confirm(
+        self, title: str, text: str, accept: str, done: Callable[[bool], None]
+    ) -> None:
+        self.calls.append(("confirm", (title, text, accept)))
+        done(self._next(False) is True)
 
     def show_html(self, title: str, html: str) -> None:
         self.calls.append(("show_html", (title, html)))

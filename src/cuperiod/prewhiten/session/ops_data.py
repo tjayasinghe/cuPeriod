@@ -316,7 +316,8 @@ def use_offsets(
         state.partition(args.name)
         if not state.settings.fit_mean:
             raise SessionError(
-                "zero points per subset need fit_mean=True (configure it first)"
+                "zero points per subset need fit_mean=True (configure it first)",
+                hint="fit_mean",
             )
     new = replace(state, offsets_by=args.name, subset_offsets=None)
     validate_model(kernel, new)

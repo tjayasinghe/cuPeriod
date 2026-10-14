@@ -817,10 +817,11 @@ def wwz(
     if not (math.isfinite(c) and c > 0.0):
         raise ValueError(f"c must be positive and finite, got {c}")
     min_neff = float(min_neff)
-    if not min_neff >= 3.0:  # written so that NaN fails too
+    # Written so that NaN fails too; an infinite floor would mask every cell.
+    if not (min_neff >= 3.0 and math.isfinite(min_neff)):
         raise ValueError(
-            f"min_neff must be >= 3 (the algebraic floor: the fit has three "
-            f"free parameters), got {min_neff}"
+            f"min_neff must be finite and >= 3 (the algebraic floor: the fit has "
+            f"three free parameters), got {min_neff}"
         )
     resolved = _resolve_backend(backend)
 
@@ -858,8 +859,9 @@ def wwz(
         ):
             raise ValueError("wwz: frequency values must be finite and positive")
     if tau is None:
-        if n_tau < 1:
-            raise ValueError(f"n_tau must be >= 1, got {n_tau}")
+        # `not (... >= 1)` so a NaN fails here rather than in int() below.
+        if not (math.isfinite(n_tau) and float(n_tau).is_integer() and n_tau >= 1):
+            raise ValueError(f"n_tau must be an integer >= 1, got {n_tau}")
         tau_values = np.asarray(
             np.linspace(t_min, t_max, int(n_tau)), dtype=np.float64
         )

@@ -48,7 +48,7 @@ import numbers
 import warnings
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, get_args
 
@@ -59,6 +59,7 @@ from cuperiod.batch.io import (
     csv_safe,
     load_source,
     resolve_inputs,
+    source_label,
     write_rows,
 )
 from cuperiod.batch.runner import (
@@ -69,6 +70,9 @@ from cuperiod.batch.runner import (
     _part_path,
     _read_existing_rows,
     _run_pool,
+    _source_clash,
+    _warn_dead_batch_env,
+    _warn_source_clashes,
 )
 from cuperiod.batch.sizing import (
     cpu_worker_count,
@@ -153,6 +157,9 @@ class _ChunkConfig:
     store_profile: bool
     plots_dir: str | None
     plot_keys: frozenset[str] | None
+    #: Figure stems overriding ``_safe_name`` (letter-case clashes; see
+    #: ``_figure_stems``). Usually empty, so chunk tasks stay small.
+    figure_stems: Mapping[str, str] = field(default_factory=dict)
 
 
 # --- row assembly -------------------------------------------------------------
@@ -215,6 +222,7 @@ def pdot_to_rows(
     n_samples: int = 0,
     baseline: float = float("nan"),
     figure: str = "",
+    source: str = "",
 ) -> dict[str, tuple[dict[str, Any], ...]]:
     """Flatten one light curve's results into the three catalogue tables.
 
@@ -242,6 +250,11 @@ def pdot_to_rows(
         Light-curve size and span, recorded even when every stage failed.
     figure : str, default ""
         Path of the diagnostic figure written for this star, if any.
+    source : str, default ""
+        Provenance of the light curve: its file's absolute path, or ``""`` for an
+        in-memory one (:func:`cuperiod.batch.io.source_label`). A resumed sink uses
+        it to tell a same-named light curve from another folder apart from the one
+        it holds.
 
     Returns
     -------
@@ -251,6 +264,7 @@ def pdot_to_rows(
     """
     row: dict[str, Any] = {
         "key": key,
+        "source": source,
         "status": status,
         "n_samples": int(n_samples),
         "baseline": float(baseline),
@@ -597,7 +611,8 @@ def _write_figure(
     try:
         from cuperiod.pdot.plots import pdot_figure
 
-        path = Path(cfg.plots_dir or ".") / f"{_safe_name(key)}.png"
+        stem = cfg.figure_stems.get(key) or _safe_name(key)
+        path = Path(cfg.plots_dir or ".") / f"{stem}.png"
         path.parent.mkdir(parents=True, exist_ok=True)
         pdot_figure(
             # The LightCurve itself, not a bare (t, y, dy) tuple: the figure reads
@@ -628,6 +643,16 @@ _RESERVED_STEMS = frozenset(
 )
 
 
+def _sanitized(key: str) -> str:
+    return "".join(c if (c.isalnum() or c in "-_.") else "_" for c in key)
+
+
+def _digested_name(key: str) -> str:
+    """The sanitized key, cut to fit, with an 8-hex digest of the key appended."""
+    digest = hashlib.sha1(key.encode("utf-8"), usedforsecurity=False).hexdigest()[:8]
+    return f"{(_sanitized(key) or 'lightcurve')[: _STEM_MAX - 9]}-{digest}"
+
+
 def _safe_name(key: str) -> str:
     """A filesystem-safe stem for a catalogue key, distinct for distinct keys.
 
@@ -636,17 +661,35 @@ def _safe_name(key: str) -> str:
     key appended: a path-qualified key such as ``"fieldA/lc_0000"`` would
     otherwise alias a real key ``"fieldA_lc_0000"`` (as ``"a b"`` / ``"a:b"`` /
     ``"a_b"`` did), and one star's figure silently overwrote another's. A key cut
-    to fit, or naming a Windows device, is digested for the same reason.
+    to fit, or naming a Windows device, is digested for the same reason. Keys that
+    differ only in letter case are told apart per run (:func:`_figure_stems`).
     """
-    stem = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in key)
+    stem = _sanitized(key)
     if (
         stem == key
         and 0 < len(stem) <= _STEM_MAX
         and stem.split(".", 1)[0].lower() not in _RESERVED_STEMS
     ):
         return stem
-    digest = hashlib.sha1(key.encode("utf-8"), usedforsecurity=False).hexdigest()[:8]
-    return f"{(stem or 'lightcurve')[: _STEM_MAX - 9]}-{digest}"
+    return _digested_name(key)
+
+
+def _figure_stems(keys: Iterable[str]) -> dict[str, str]:
+    """Figure stems, for the ``keys`` whose :func:`_safe_name` clash in letter case.
+
+    ``"V1"`` and ``"v1"`` are distinct keys and safe names, but one file on a
+    case-insensitive file system (Windows, macOS): the second star's figure
+    overwrote the first's. Those keys get the digested stem; every other key keeps
+    :func:`_safe_name` (and is absent from the returned mapping, which is usually
+    empty).
+    """
+    plain = {key: _safe_name(key) for key in dict.fromkeys(keys)}
+    folded = Counter(stem.casefold() for stem in plain.values())
+    return {
+        key: _digested_name(key)
+        for key, stem in plain.items()
+        if folded[stem.casefold()] > 1
+    }
 
 
 def _process_chunk(
@@ -674,7 +717,13 @@ def _process_chunk(
             produced = pdot_to_rows(
                 key, status=message, n_samples=n_samples, baseline=baseline
             )
-        for name in TABLES:
+        # Every summary row names its file, so a resumed sink can tell a same-named
+        # light curve from another folder apart from the one it holds.
+        label = source_label(source)
+        tables["summary"].extend(
+            {**row, "source": label} for row in produced["summary"]
+        )
+        for name in TABLES[1:]:
             tables[name].extend(produced[name])
     if not cfg.store_oc:
         tables["oc"] = []
@@ -832,23 +881,27 @@ def _as_count(value: Any) -> int:
 
 
 def _done_keys(
-    keys: Iterable[str],
+    items: Sequence[InputItem],
     tables: Mapping[str, _Sink],
     existing: Mapping[str, list[dict[str, Any]]],
     method: str,
-) -> set[str]:
-    """The ``keys`` whose every requested table already holds a finished result.
+) -> tuple[set[str], list[tuple[str, str, str]]]:
+    """The keys whose every requested table already holds a finished result.
 
     A summary row says the star finished (``status == "ok"``) with this method and
     how many O-C and ``P(t)`` rows it produced. The star is done only if each
     requested long table holds exactly that many rows for it — so a part lost to an
     interrupt, a long table added after the summary was written, or a file sink
     that never got finalised all make it be computed again.
+
+    Also returns ``(key, stored source, input source)`` for the done keys whose
+    summary row was written from a different file than this input (a same-named
+    light curve from another folder): they stay done, and the caller reports them.
     """
     summary_sink = tables["summary"]
     if summary_sink[0] == "memory":
-        return set()  # in-memory rows must be returned, so everything is computed
-    wanted = ["key", "status", "method", *_ROW_COUNT_FIELD.values()]
+        return set(), []  # in-memory rows must be returned: everything is computed
+    wanted = ["key", "source", "status", "method", *_ROW_COUNT_FIELD.values()]
     summary = (
         existing["summary"]
         if summary_sink[0] == "file"
@@ -860,15 +913,18 @@ def _done_keys(
         if str(row.get("status")) == "ok" and str(row.get("method")) == method
     }
     if not promised:
-        return set()
+        return set(), []
     stored: dict[str, Counter[str]] = {}
     for name in _ROW_COUNT_FIELD:
         if name in tables:
             kind, sink_dir, _ = tables[name]
             rows = existing[name] if kind == "file" else _part_rows(sink_dir, ["key"])
             stored[name] = Counter(str(row.get("key")) for row in rows)
+    kind, _, summary_file = summary_sink
+    csv_summary = kind == "file" and summary_file.suffix.lower() == ".csv"
     done: set[str] = set()
-    for key in keys:
+    clashes: list[tuple[str, str, str]] = []
+    for key, src in items:
         row = promised.get(_stored_key(key, summary_sink))
         if row is not None and all(
             counts.get(_stored_key(key, tables[name]), 0)
@@ -876,7 +932,10 @@ def _done_keys(
             for name, counts in stored.items()
         ):
             done.add(key)
-    return done
+            label = source_label(src)
+            if _source_clash(row.get("source"), label, csv_sink=csv_summary):
+                clashes.append((key, str(row.get("source")), label))
+    return done, clashes
 
 
 def _merge_part(
@@ -1006,9 +1065,11 @@ def batch_pdot(
         ``sink``.
     plots : str or Path, optional
         Directory for per-star diagnostic figures (one PNG per light curve,
-        named after the key). Needs matplotlib; a plotting failure is recorded
-        as an empty ``figure`` cell and never fails the analysis. Generating
-        thousands of figures is slow — pair it with ``plot_keys``.
+        named after the key; a key that is not a plain file name, or that differs
+        from another only in letter case, gets a short digest appended so no
+        figure overwrites another). Needs matplotlib; a plotting failure is
+        recorded as an empty ``figure`` cell and never fails the analysis.
+        Generating thousands of figures is slow — pair it with ``plot_keys``.
     plot_keys : str or sequence, optional
         Restrict figures to these keys (matched as strings; a bare string is
         one key).
@@ -1018,8 +1079,10 @@ def batch_pdot(
         method and every requested O-C / ``P(t)`` table holds all of its rows.
         A failed star is retried, and a recomputed star replaces its rows in
         every table (one summary row per key). Changed settings are not
-        detected — re-run with ``resume=False`` after changing them. With an
-        in-memory summary (``sink=None``) every star is computed.
+        detected — re-run with ``resume=False`` after changing them. Summary
+        rows record their file (``source``), so a key the sink holds from a
+        different file is reported (and still skipped). With an in-memory
+        summary (``sink=None``) every star is computed.
     chunk_size : int, default 32
         Light curves per chunk/task. Much smaller than the periodogram batch's,
         because one light curve here costs a whole grid search. A directory
@@ -1046,6 +1109,15 @@ def batch_pdot(
     TypeError
         If ``period`` is neither a number nor a mapping.
 
+    Warns
+    -----
+    UserWarning
+        When the period catalogue matches no key, when input keys repeat (the
+        repeats are renamed ``key#2``, ...), or when a resumed sink holds a key
+        from a different source file.
+    DeprecationWarning
+        When a ``CUPERIOD_BATCH_*`` variable is set: nothing reads them.
+
     Examples
     --------
     >>> cup.batch_pdot("lightcurves/*.csv", sink="pdot.parquet",
@@ -1055,6 +1127,7 @@ def batch_pdot(
     """
     if device not in {"cpu", "gpu"}:
         raise ValueError("device must be 'cpu' or 'gpu'")
+    _warn_dead_batch_env()
     if detrend_width is not None and not (
         np.isfinite(detrend_width) and detrend_width > 0.0
     ):
@@ -1144,6 +1217,9 @@ def batch_pdot(
             UserWarning,
             stacklevel=2,
         )
+    if cfg.plots_dir is not None:
+        plotted = (k for k in keys if cfg.plot_keys is None or k in cfg.plot_keys)
+        cfg = replace(cfg, figure_stems=_figure_stems(plotted))
 
     size = max(1, chunk_size)
     has_dir = any(kind == "dir" for kind, _, _ in tables.values())
@@ -1158,7 +1234,10 @@ def batch_pdot(
         for name, (kind, _, sink_file) in tables.items():
             if kind == "file" and sink_file.exists():
                 existing[name] = _read_existing_rows(sink_file)
-    done = _done_keys(keys, tables, existing, wrapped.name) if resume else set()
+    done: set[str] = set()
+    if resume:
+        done, clashes = _done_keys(items, tables, existing, wrapped.name)
+        _warn_source_clashes(clashes)
 
     if device == "gpu":
         n_workers = workers if workers is not None else suggest_gpu_workers(method)

@@ -75,7 +75,7 @@ suggested method (BLS for the transit).
 | **Controls** (left) | **Analysis** (Periodogram or Pre-whitening), the method, the **Backend** and **Band** pickers, and the **Options** form for the method's settings. **Compute** — **Run pre-whitening** with **Step** beside it in pre-whitening — runs; **Stop** (<kbd>Esc</kbd>) stops. A disabled Compute button says why in its tooltip. |
 | **Spectrum** (centre) | The full-resolution periodogram or amplitude spectrum. Click a peak to fold on it; drag the shaded band; toggle frequency ↔ period and **log** scales; **peaks** hides the markers and the band. The x-axis and log choice are remembered per kind of result; **Reset** or a double click restores the default view. |
 | **Phased** | The light curve folded on the selected period. **2 cycles** repeats the fold; **×2** / **÷2** and a typed **P (d)** refold at another period. Multi-band data are overlaid, one colour and one marker shape per band. |
-| **Raw light curve** | The unfolded time series (View ▸ *Show raw light curve*, <kbd>Ctrl+R</kbd>); it stacks under the fold when there is no room beside it. Curves above 20 000 points are drawn as a fixed random subset (*N of M points shown*) — computations always use every point. In a pre-whitening session it also shows residuals and the model, edits points, and a click puts a time cursor where Subsets ▸ *Split at* cuts. |
+| **Raw light curve** | The unfolded time series (View ▸ *Show raw light curve*, <kbd>Ctrl+R</kbd>). It sits beside the fold when the centre is wide enough for both, and otherwise shares the pane with it as a second tab (*Phased light curve* / *Raw light curve*). While it is shown the spectrum and the light curve get plots of the same height, until you drag the split yourself. Curves above 20 000 points are drawn as a fixed random subset (*N of M points shown*) — computations always use every point. In a pre-whitening session it also shows residuals and the model, edits points, and a click puts a time cursor where Subsets ▸ *Split at* cuts. |
 | **Peaks** (pane) | The ranked N-best periods ({doc}`results`), with frequency and the method's own statistic (power, θ, entropy, string length…). Click a row to fold on that peak. |
 | **Frequencies** (pane) | In pre-whitening, the extracted components with 1σ uncertainties, S/N, false-alarm probability, blend ratio (**A/Asp**) and combination identifications, plus the stop reason and fit statistics. In a session the **session bar** sits above it and the table is editable. |
 | **Subsets**, **Variations**, **History** (panes) | Pre-whitening sessions: partitions with zero points, weights and per-subset amplitudes; amplitude/phase variation tests; the action log with undo to any state. |
@@ -87,7 +87,9 @@ The result panes share one tab group on the right; each has 24 px **Float** / **
 buttons, View ▸ *Panes* brings back any closed pane, and View ▸ *Reset layout* puts
 everything back. In a narrow dock the Subsets, Variations and Period spacing panes and
 the session bar wrap their controls onto more rows instead of pushing them out of sight,
-and a pane still wider than its dock scrolls rather than squeezing the plots. The window
+and a pane still wider than its dock scrolls rather than squeezing the plots. The plot
+toolbars are compact and wrap too, so even a 1366 × 768 window with the raw light curve
+on gives every plot on show some 200 px of height at the default zoom. The window
 sizes itself to the screen — its minimum size follows what the panes need, also after a
 zoom — and keeps its layout, the analysis, every form's options, the raw-view choice,
 the theme and the zoom across launches. Switching between Periodogram and Pre-whitening
@@ -192,7 +194,11 @@ the result on screen untouched. Every command answers in the status bar, also wh
 changes nothing — Step at the stopping rule, *Renumber* with nothing to renumber,
 *Restore all points* with nothing deleted, an Improve with nothing to refine — and an
 edit that is refused says why in the window's terms (*Add exactly here*, untie it
-first), never as a keyword argument of the library.
+first), never as a keyword argument of the library. When the remedy is one the window
+can carry out, it asks first — *Dissolve ties and remove* for a component others are
+tied to, *Add anyway* / *Tie anyway* for a frequency inside another one's collision
+guard, *Add exactly* (no refinement) for one the refinement cannot keep — and does it
+on a yes, as one more undoable action.
 
 ## Exports and tables
 
@@ -216,14 +222,17 @@ nightly zero points, weights and variation tests in the Subsets and Variations p
 undo to any state from the History pane; and `*.cupw.json` projects. The session for the
 displayed curve opens on its own — on the CPU — so the data spectrum appears without a
 click; when it cannot be computed the spectrum pane says why (*Spectrum unavailable:
-…*) and the session commands stay off. **Calculate** (<kbd>F8</kbd>) and **Improve**
+…*) above the light curve and the session commands stay off — also when another
+session's result was on show (a band picked before, say), which is taken down rather
+than left under the message. **Calculate** (<kbd>F8</kbd>) and **Improve**
 (<kbd>F9</kbd>, <kbd>Shift+F9</kbd>) fill in the table's uncertainties (the quick
 re-calculation after each edit shows "–"), and Pre-whitening ▸ *Compute uncertainties*
 runs the configured estimator, a bootstrap say. Unsaved work survives switching source,
 band or analysis (File ▸ *Unsaved sessions*, by the name each source was loaded under);
 closing, *New session* or opening other data asks **Save / Discard / Cancel** first. The
-title bar shows the data and the project, with `*` for unsaved work:
-`cuPeriod — star.csv — star.cupw.json*`. All of it is described in
+title bar shows the data and the project, with `*` for unsaved work, and the
+application's name once, last: `star.csv — star.cupw.json* — cuPeriod` (macOS shows
+its own unsaved-changes dot instead of the `*`). All of it is described in
 {doc}`interactive-prewhitening`.
 
 ## Keyboard and accessibility
@@ -235,8 +244,11 @@ ring on every control, and nothing is conveyed by colour alone.
   the Options fields (the form scrolls to the field Tab reaches), the Compute / Run
   buttons, then on to the plots and the panes, and round again; <kbd>Shift+Tab</kbd>
   goes back the same way. Panes hidden behind another tab and the tab bars' scroll arrows are
-  skipped. <kbd>Ctrl+1</kbd> … <kbd>Ctrl+5</kbd> jump to the spectrum, the frequency
-  table, the light curve, the subsets and the history.
+  skipped. When the fold and the raw light curve share their pane, its tabs come right
+  after the spectrum, and <kbd>Left</kbd> / <kbd>Right</kbd> switch them; a point tool
+  from the Data menu or <kbd>Ctrl+3</kbd> brings the light curve to the front.
+  <kbd>Ctrl+1</kbd> … <kbd>Ctrl+5</kbd> jump to the spectrum, the frequency table, the
+  light curve, the subsets and the history.
 - **The spectrum** is keyboard-operable: <kbd>Left</kbd> / <kbd>Right</kbd> move a cursor
   between local maxima (<kbd>Ctrl</kbd>: marked peaks; <kbd>Shift</kbd>: one grid
   sample), <kbd>Home</kbd> goes to the tallest, <kbd>Enter</kbd> folds there,

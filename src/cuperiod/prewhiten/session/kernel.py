@@ -21,9 +21,14 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from cuperiod.core._typing import FloatArray
-from cuperiod.core.grid import GridSpec
-from cuperiod.prewhiten.engine import _ROUNDOFF_EPS, _zero_model_fit
-from cuperiod.prewhiten.fit import MultiSineFit, Refinement, fit_multisine
+from cuperiod.core.grid import GridSpec, check_grid_size
+from cuperiod.prewhiten.engine import _zero_model_fit
+from cuperiod.prewhiten.fit import (
+    _ROUNDOFF_EPS,
+    MultiSineFit,
+    Refinement,
+    fit_multisine,
+)
 from cuperiod.prewhiten.session.state import (
     CreationArgs,
     Derived,
@@ -63,7 +68,31 @@ class ExactUniformGrid(GridSpec):
 
     @classmethod
     def of(cls, params: tuple[float, float, int]) -> ExactUniformGrid:
+        """The grid ``f0 + df * arange(nf)``, checked before anything is allocated.
+
+        Raises
+        ------
+        ValueError
+            Unless ``f0 >= 0`` and ``df > 0`` are finite and ``nf >= 1``.
+        GridTooLargeError
+            When ``nf`` exceeds :data:`~cuperiod.core.grid.MAX_GRID_SIZE`: a
+            ``(f0, df, nf)`` handed to the session constructor used to allocate
+            whatever it asked for (``nf = 10**12`` is 8 TB), skipping the size guard
+            every other grid builder applies.
+        """
         f0, df, nf = float(params[0]), float(params[1]), int(params[2])
+        if not (np.isfinite(f0) and f0 >= 0.0 and np.isfinite(df) and df > 0.0):
+            raise ValueError(
+                f"a uniform grid needs finite f0 >= 0 and df > 0, got f0={f0!r}, "
+                f"df={df!r}"
+            )
+        if nf < 1:
+            raise ValueError(f"a uniform grid needs nf >= 1 samples, got {nf}")
+        check_grid_size(
+            nf,
+            maximum_frequency=f0 + df * (nf - 1),
+            context="pre-whitening session grid",
+        )
         values = f0 + df * np.arange(nf, dtype=np.float64)
         return cls(kind="frequency", values=values, uniform=True, params=(f0, df, nf))
 

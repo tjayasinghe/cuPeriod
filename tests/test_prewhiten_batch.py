@@ -352,7 +352,9 @@ def _fake_prewhiten(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         PW_BATCH,
         "prewhiten_to_rows",
-        lambda key, result, max_components=None: [{"key": key, "id": result}],
+        lambda key, result, max_components=None, source=None: [
+            {"key": key, "id": result}
+        ],
     )
 
 

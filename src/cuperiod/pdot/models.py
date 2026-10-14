@@ -92,7 +92,15 @@ class PeriodModel:
         -------
         numpy.ndarray
             ``tau`` in days; equal to ``dt`` when ``a == 0``.
+
+        Raises
+        ------
+        ValueError
+            If ``a`` is not finite (a NaN rate warped every time to NaN, and an
+            infinite one was reported as a period passing through zero).
         """
+        if not np.isfinite(a):
+            raise ValueError(f"the rate a = (dP/dt)/P must be finite, got {a}")
         if a == 0.0:
             return np.asarray(dt, dtype=np.float64)
         return self._warp(np.asarray(dt, dtype=np.float64), a)

@@ -24,7 +24,8 @@ Backends
 --------
 cufinufft
     NVIDIA fast path; the plan and its ``setpts`` are built once and reused across every
-    pre-whitening iteration (only the strengths change).
+    pre-whitening iteration (only the strengths change), and the normal-equation solve
+    runs on the device too, so an iteration brings back only the amplitude and the sums.
 finufft
     CPU fast path, same plan reuse. The default when no CUDA device is present.
 torch
@@ -36,6 +37,7 @@ numpy
 
 from __future__ import annotations
 
+import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Final, Literal
@@ -532,21 +534,96 @@ class AmplitudeSpectrum(_SpectrumReadout):
             lo[short] = low
             hi[short] = np.minimum(n, low + need)
         amplitude = self.amplitude
+        if estimator != "mean":
+            return _range_medians(amplitude, lo, hi)
         finite = np.isfinite(amplitude)
         out = np.empty(n, dtype=np.float64)
-        if estimator == "mean":
-            sums = np.concatenate([[0.0], np.cumsum(np.where(finite, amplitude, 0.0))])
-            counts = np.concatenate([[0], np.cumsum(finite)])
-            count = counts[hi] - counts[lo]
-            with np.errstate(invalid="ignore", divide="ignore"):
-                out[:] = (sums[hi] - sums[lo]) / count
-            out[count == 0] = np.nan
-            return out
-        for i in range(n):
-            box = amplitude[lo[i] : hi[i]]
-            box = box[finite[lo[i] : hi[i]]]
-            out[i] = float(np.median(box)) if box.size else float("nan")
+        sums = np.concatenate([[0.0], np.cumsum(np.where(finite, amplitude, 0.0))])
+        counts = np.concatenate([[0], np.cumsum(finite)])
+        count = counts[hi] - counts[lo]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            out[:] = (sums[hi] - sums[lo]) / count
+        out[count == 0] = np.nan
         return out
+
+
+def _range_medians(values: FloatArray, lo: IntArray, hi: IntArray) -> FloatArray:
+    """``np.median`` of the finite entries of ``values[lo[i]:hi[i]]`` for every ``i``.
+
+    NaN where a range holds no finite entry. The value is exactly what
+    ``np.median`` returns for that box (the middle order statistic, or the mean of
+    the two middle ones), but all boxes are answered together in
+    ``O((n + q) log n)`` vectorised work instead of one ``O(width)`` selection per
+    box: a per-sample loop took seconds on a 1e5-sample spectrum with boxes
+    thousands of samples wide, and the S/N line is redrawn on every edit.
+
+    The order statistics come from a wavelet matrix over the ranks of the finite
+    values, descended one bit level at a time for every query at once; nothing is
+    assumed about the boxes (they need not be monotone or of equal width).
+    """
+    lo = np.asarray(lo, dtype=np.int64)
+    hi = np.asarray(hi, dtype=np.int64)
+    out = np.full(lo.shape, np.nan, dtype=np.float64)
+    finite = np.isfinite(values)
+    kept = np.asarray(values, dtype=np.float64)[finite]
+    m = int(kept.size)
+    if m == 0 or lo.size == 0:
+        return out
+    # Boxes in the coordinates of the finite-only sequence.
+    position = np.concatenate([[0], np.cumsum(finite, dtype=np.int64)])
+    first, last = position[lo], position[hi]
+    count = last - first
+    rows = np.flatnonzero(count > 0)
+    if rows.size == 0:
+        return out
+    order = np.argsort(kept, kind="stable")
+    ascending = kept[order]
+    rank = np.empty(m, dtype=np.int64)
+    rank[order] = np.arange(m, dtype=np.int64)
+    c = count[rows]
+    # Both middle order statistics in one descent (equal when the count is odd).
+    k = np.concatenate([(c - 1) // 2, c // 2])
+    start = np.concatenate([first[rows], first[rows]])
+    stop = np.concatenate([last[rows], last[rows]])
+    picked = _wavelet_kth(rank, start, stop, k)
+    low = ascending[picked[: rows.size]]
+    high = ascending[picked[rows.size :]]
+    odd = (c % 2) == 1
+    # np.median averages the two middle values as mean([low, high]).
+    with np.errstate(over="ignore"):
+        out[rows] = np.where(odd, low, (low + high) / 2.0)
+    return out
+
+
+def _wavelet_kth(
+    rank: IntArray, start: IntArray, stop: IntArray, k: IntArray
+) -> IntArray:
+    """The ``k``-th smallest (0-based) of ``rank[start:stop]``, for every query.
+
+    ``rank`` is a permutation of ``0..m-1``. Each pass looks at one bit, from the
+    most significant down: a query whose ``k`` falls among the range's zero bits
+    moves to the zeros' block of the stably partitioned sequence, otherwise to the
+    ones' block with ``k`` reduced by the zeros it skipped, and the bits of the
+    answer are read off on the way.
+    """
+    m = int(rank.size)
+    seq = rank
+    lo, hi, kk = start.copy(), stop.copy(), k.copy()
+    answer = np.zeros(k.shape, dtype=np.int64)
+    for level in range(max(1, (m - 1).bit_length()) - 1, -1, -1):
+        bit = (seq >> level) & 1
+        ones = np.concatenate([[0], np.cumsum(bit, dtype=np.int64)])
+        n_zero = m - int(ones[-1])
+        ones_lo, ones_hi = ones[lo], ones[hi]
+        zeros_in = (hi - lo) - (ones_hi - ones_lo)
+        right = kk >= zeros_in
+        kk = np.where(right, kk - zeros_in, kk)
+        answer |= right.astype(np.int64) << level
+        lo = np.where(right, n_zero + ones_lo, lo - ones_lo)
+        hi = np.where(right, n_zero + ones_hi, hi - ones_hi)
+        is_one = bit.astype(bool)
+        seq = np.concatenate([seq[~is_one], seq[is_one]])
+    return answer
 
 
 @dataclass(frozen=True, eq=False)
@@ -582,18 +659,28 @@ class _SpectrumScan(_SpectrumReadout):
         self,
         engine: SpectrumEngine,
         amplitude: FloatArray,
-        a: FloatArray,
-        b: FloatArray,
+        a: FloatArray | None,
+        b: FloatArray | None,
         yc: FloatArray,
         ys: FloatArray,
         yy: float,
         bad: IntArray,
+        *,
+        terms: _NormalTerms | None = None,
     ) -> None:
         self.frequency = engine.frequency
         self.amplitude = amplitude
         self._a, self._b, self._yc, self._ys = a, b, yc, ys
         self._yy = yy
         self._bad = bad
+        # A device scan (see SpectrumEngine._scan_device) brings back only the
+        # amplitude and the data sums. Its coefficients are re-formed when a power or
+        # the full spectrum is asked for -- on the device while the engine is live,
+        # else on the host -- with the device's arithmetic either way: the Gram
+        # terms pre-scaled by 1/det, then one product pair and a difference, every
+        # step an IEEE operation, so the two places give the same bits.
+        self._terms = terms
+        self._engine = weakref.ref(engine) if a is None else None
         self._meta = (
             engine.t_ref,
             engine.backend,
@@ -602,12 +689,33 @@ class _SpectrumScan(_SpectrumReadout):
             engine.baseline,
         )
 
+    def _coefficients(
+        self, sl: slice | None = None
+    ) -> tuple[FloatArray, FloatArray]:
+        """The solved ``(a, b)`` over ``sl`` (whole grid when ``None``)."""
+        if self._a is not None and self._b is not None:
+            if sl is None:
+                return self._a, self._b
+            return self._a[sl], self._b[sl]
+        whole = slice(None) if sl is None else sl
+        yc, ys = self._yc[whole], self._ys[whole]
+        terms = self._terms
+        if terms is None:  # "dft" normalization
+            a, b = 2.0 * yc, 2.0 * ys
+        else:
+            inv = terms.inv[whole]
+            ssi, csi, cci = terms.ss[whole] * inv, terms.cs[whole] * inv, (
+                terms.cc[whole] * inv
+            )
+            a = ssi * yc - csi * ys
+            b = cci * ys - csi * yc
+        if sl is None:
+            self._a, self._b = a, b
+        return a, b
+
     def _power(self, sl: slice | None = None) -> FloatArray:
-        a, b, yc, ys = (
-            (self._a, self._b, self._yc, self._ys)
-            if sl is None
-            else (self._a[sl], self._b[sl], self._yc[sl], self._ys[sl])
-        )
+        a, b = self._coefficients(sl)
+        yc, ys = (self._yc, self._ys) if sl is None else (self._yc[sl], self._ys[sl])
         if self._yy > 0.0:
             return np.clip((a * yc + b * ys) / self._yy, 0.0, 1.0)
         return np.zeros(a.shape, dtype=np.float64)
@@ -621,8 +729,15 @@ class _SpectrumScan(_SpectrumReadout):
 
     def to_spectrum(self) -> AmplitudeSpectrum:
         """The full :class:`AmplitudeSpectrum` (phase and power on the whole grid)."""
-        phase = np.mod(np.arctan2(self._a, self._b), 2.0 * np.pi)
-        power = self._power()
+        engine = self._engine() if self._engine is not None else None
+        if engine is not None and engine._device_live():
+            phase, power = engine._device_phase_power(
+                self._yc, self._ys, self._yy, dft=self._terms is None
+            )
+        else:
+            a, b = self._coefficients()
+            phase = np.mod(np.arctan2(a, b), 2.0 * np.pi)
+            power = self._power()
         if self._bad.size:
             phase[self._bad] = 0.0
             power[self._bad] = 0.0
@@ -875,6 +990,9 @@ class SpectrumEngine:
         self._precision = "float64"
         self._window_sums: tuple[FloatArray, FloatArray] | None = None
         self._terms: _NormalTerms | None = None
+        # cufinufft only: the Gram terms pre-scaled by 1/det, and the ill-conditioned
+        # indices, as device arrays (see _device_terms).
+        self._dev_terms: tuple[Any, Any, Any, Any] | None = None
         self._released = False
         self._setup(device, precision)
         # The weights sum to 1, so a well-conditioned frequency has det ~ 0.25 and
@@ -949,15 +1067,6 @@ class SpectrumEngine:
         mod = xp.exp(2j * np.pi * (f0 + (nf // 2) * df) * self._tau_dev)
         return plan, mod
 
-    def _plan_sums(
-        self, plan: Any, mod: Any, strengths: FloatArray
-    ) -> tuple[FloatArray, FloatArray]:
-        """Execute ``plan`` for ``strengths`` and split the result into cos/sin sums."""
-        # Real strengths times the complex128 modulation are already complex128.
-        out = plan.execute(self._xp.asarray(strengths) * mod)
-        out = out[0] if out.ndim == 2 else out
-        return _complex_to_host(out)
-
     def _direct_sums(
         self, strengths: FloatArray, f0: float, df: float
     ) -> tuple[FloatArray, FloatArray]:
@@ -996,6 +1105,7 @@ class SpectrumEngine:
         self._plan = None
         self._plan_mod = None
         self._tau_dev = None
+        self._dev_terms = None
         self._released = True
 
     def _ensure_ready(self) -> None:
@@ -1013,11 +1123,34 @@ class SpectrumEngine:
             )
             self._xp = array_namespace(self._tau_dev)
 
+    def _plan_transform(self, strengths: FloatArray, *, doubled: bool = False) -> Any:
+        """Complex sums of ``strengths`` on the base (or doubled) grid, plan backends.
+
+        The result stays in the plan's namespace (a cupy array on cufinufft).
+        """
+        self._ensure_ready()
+        xp, plan = self._xp, self._plan
+        if not doubled:
+            out = plan.execute(xp.asarray(strengths) * self._plan_mod)
+            return out[0] if out.ndim == 2 else out
+        # Re-point the base plan at the doubled angles rather than building a second
+        # one (on a GPU that is a second device workspace per light curve), then put
+        # its points back: the base sums afterwards are bit-identical.
+        nf = self._nf
+        f0, df = 2.0 * self._f0, 2.0 * self._df
+        plan.setpts(_wrapped_angles(xp, self._tau_dev, df))
+        try:
+            mod = xp.exp(2j * np.pi * (f0 + (nf // 2) * df) * self._tau_dev)
+            out = plan.execute(xp.asarray(strengths) * mod)
+            return out[0] if out.ndim == 2 else out
+        finally:
+            plan.setpts(_wrapped_angles(xp, self._tau_dev, self._df))
+
     def _base_sums(self, strengths: FloatArray) -> tuple[FloatArray, FloatArray]:
         """Cos/sin sums of ``strengths`` on the base grid, returned on the host."""
         self._ensure_ready()
         if self._plan is not None:
-            return self._plan_sums(self._plan, self._plan_mod, strengths)
+            return _complex_to_host(self._plan_transform(strengths))
         return self._direct_sums(strengths, self._f0, self._df)
 
     def _doubled_sums(self, strengths: FloatArray) -> tuple[FloatArray, FloatArray]:
@@ -1025,17 +1158,12 @@ class SpectrumEngine:
         self._ensure_ready()
         if self._plan is None:
             return self._direct_sums(strengths, 2.0 * self._f0, 2.0 * self._df)
-        # Re-point the base plan at the doubled angles rather than building a second
-        # one (on a GPU that is a second device workspace per light curve), then put
-        # its points back: the base sums afterwards are bit-identical.
-        xp, plan, nf = self._xp, self._plan, self._nf
-        f0, df = 2.0 * self._f0, 2.0 * self._df
-        plan.setpts(_wrapped_angles(xp, self._tau_dev, df))
-        try:
-            mod = xp.exp(2j * np.pi * (f0 + (nf // 2) * df) * self._tau_dev)
-            return self._plan_sums(plan, mod, strengths)
-        finally:
-            plan.setpts(_wrapped_angles(xp, self._tau_dev, self._df))
+        return _complex_to_host(self._plan_transform(strengths, doubled=True))
+
+    def _device_live(self) -> bool:
+        """Whether the cufinufft device state is up (not :meth:`release`-d)."""
+        live = not self._released and self._plan is not None
+        return self.backend == "cufinufft" and live
 
     def _to_dev(self, host: FloatArray) -> Any:
         """Move a host float64 array onto the compute device at the working dtype."""
@@ -1057,23 +1185,59 @@ class SpectrumEngine:
         falls below :data:`_ILL_CONDITIONED` of the ideal the frequency is flagged
         ``ill`` and :meth:`spectrum` reports the bounded power-equivalent amplitude.
         """
+        if self.backend == "cufinufft":
+            return self._window_terms_device()
         if self._window_sums is None:
             self._window_sums = self._base_sums(self._weight)
         c, s = self._window_sums  # exactly the spectral window; see :meth:`window`
         c2, s2 = self._doubled_sums(self._weight)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            cc, ss, cs, inv, ill = self._gram_terms(np, c, s, c2, s2)
+        return _NormalTerms(
+            cc=cc, ss=ss, cs=cs, inv=inv, ill=ill, ill_index=np.flatnonzero(ill)
+        )
+
+    def _gram_terms(
+        self, xp: Any, c: Any, s: Any, c2: Any, s2: Any
+    ) -> tuple[Any, Any, Any, Any, Any]:
+        """``(cc, ss, cs, inv, ill)`` from the window sums, in namespace ``xp``.
+
+        One expression for the host and the device: every step is an IEEE operation
+        (products, sums, a square root, a division), so both give the same bits.
+        """
         cc = 0.5 * (1.0 + c2) - c * c
         ss = 0.5 * (1.0 - c2) - s * s
         cs = 0.5 * s2 - c * s
         det = cc * ss - cs * cs
         # det / lam_max rather than half - root: no cancellation if lam_min << lam_max.
-        lam_max = 0.5 * (cc + ss) + np.sqrt(0.25 * (cc - ss) ** 2 + cs * cs)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            lam_min = np.where(lam_max > 0.0, det / lam_max, 0.0)
+        diff = cc - ss
+        lam_max = 0.5 * (cc + ss) + xp.sqrt(0.25 * (diff * diff) + cs * cs)
+        lam_min = xp.where(lam_max > 0.0, det / lam_max, 0.0)
         safe = (det > self._det_floor) & (lam_min > self._dead_floor)
-        inv = np.where(safe, 1.0 / np.where(safe, det, 1.0), 0.0)
+        inv = xp.where(safe, 1.0 / xp.where(safe, det, 1.0), 0.0)
         ill = safe & (lam_min < 0.5 * _ILL_CONDITIONED)
+        return cc, ss, cs, inv, ill
+
+    def _window_terms_device(self) -> _NormalTerms:
+        """:meth:`_window_terms` formed on the cufinufft device.
+
+        Both window transforms stay on the device; the conditioning arithmetic runs
+        there, the pre-scaled terms the scans use are kept there (as
+        :meth:`_device_terms` would upload them), and one transfer brings the host
+        copies back. On the host this cost ~0.1 s per engine at a 2.5M-sample grid.
+        """
+        xp = self._xp
+        base = self._plan_transform(self._weight)
+        doubled = self._plan_transform(self._weight, doubled=True)
+        cc, ss, cs, inv, ill = self._gram_terms(
+            xp, base.real, base.imag, doubled.real, doubled.imag
+        )
+        self._dev_terms = (ss * inv, cs * inv, cc * inv, xp.flatnonzero(ill))
+        host = xp.stack([cc, ss, cs, inv]).get()
+        ill_host = np.asarray(ill.get(), dtype=bool)
         return _NormalTerms(
-            cc=cc, ss=ss, cs=cs, inv=inv, ill=ill, ill_index=np.flatnonzero(ill)
+            cc=host[0], ss=host[1], cs=host[2], inv=host[3], ill=ill_host,
+            ill_index=np.flatnonzero(ill_host),
         )
 
     def _normal_terms(self) -> _NormalTerms:
@@ -1081,6 +1245,55 @@ class SpectrumEngine:
         if self._terms is None:
             self._terms = self._window_terms()
         return self._terms
+
+    def _device_terms(self) -> tuple[Any, Any, Any, Any]:
+        """``(ss/det, cs/det, cc/det, ill_index)`` on the cufinufft device.
+
+        Formed on the device with the terms themselves (:meth:`_window_terms_device`)
+        and, after a :meth:`release`, uploaded again from the host copies -- the
+        same products either way, so every scan shares the host's conditioning
+        decisions exactly. Pre-scaling by ``1/det`` leaves two products and a
+        difference per coefficient; the result differs from the host path's
+        ``(ss*yc - cs*ys)*inv`` by an ulp at most.
+        """
+        if self._dev_terms is None:
+            terms = self._normal_terms()  # a first build sets _dev_terms itself
+            if self._dev_terms is None:
+                xp = self._xp
+                self._dev_terms = (
+                    xp.asarray(terms.ss * terms.inv),
+                    xp.asarray(terms.cs * terms.inv),
+                    xp.asarray(terms.cc * terms.inv),
+                    xp.asarray(terms.ill_index),
+                )
+        return self._dev_terms
+
+    def _device_phase_power(
+        self, yc: FloatArray, ys: FloatArray, yy: float, *, dft: bool
+    ) -> tuple[FloatArray, FloatArray]:
+        """Phase and power of a device scan's sums, formed on the device.
+
+        The arithmetic of :meth:`_SpectrumScan._coefficients` and
+        :meth:`_SpectrumScan._power` (IEEE steps only, so the power is bit-identical
+        to the host's); the phase's ``arctan2`` may differ from the host's by an ulp.
+        """
+        xp = self._xp
+        yc_d, ys_d = xp.asarray(yc), xp.asarray(ys)
+        if dft:
+            a, b = 2.0 * yc_d, 2.0 * ys_d
+        else:
+            ssi, csi, cci, _ = self._device_terms()
+            a = ssi * yc_d - csi * ys_d
+            b = cci * ys_d - csi * yc_d
+        phase = xp.mod(xp.arctan2(a, b), 2.0 * np.pi)
+        if yy > 0.0:
+            power = xp.clip((a * yc_d + b * ys_d) / yy, 0.0, 1.0)
+        else:
+            power = xp.zeros(a.shape, dtype=xp.float64)
+        return (
+            np.asarray(phase.get(), dtype=np.float64),
+            np.asarray(power.get(), dtype=np.float64),
+        )
 
     def _conditioning_at(self, frequency: float) -> float:
         """Conditioning of the floating-mean design at one frequency, ``O(N)``.
@@ -1121,6 +1334,8 @@ class SpectrumEngine:
                 "SpectrumEngine: values contain non-finite entries; drop those points "
                 "first (LightCurve.finite() does)"
             )
+        if self.backend == "cufinufft":
+            return self._scan_device(w * centred, yy)
         yc, ys = self._base_sums(w * centred)
 
         if self.normalization == "dft":
@@ -1145,6 +1360,49 @@ class SpectrumEngine:
         if bad.size:
             amplitude[bad] = 0.0
         return _SpectrumScan(self, amplitude, a, b, yc, ys, yy, bad)
+
+    def _scan_device(self, strengths: FloatArray, yy: float) -> _SpectrumScan:
+        """:meth:`_scan` on the cufinufft device: the amplitude is formed there.
+
+        The transform's sums never cross to the host as an intermediate. The
+        coefficient solve, the ill-conditioned fallback and the non-finite guard run
+        on the device, and two transfers bring back what the loop reads -- the
+        amplitude -- and the data sums the scan keeps for :meth:`_SpectrumScan.
+        power_at` / :meth:`_SpectrumScan.to_spectrum`. On the host that arithmetic
+        cost about three quarters of a scan at a million-sample grid. Everything the
+        scan holds is host memory: a cached scan pins no GPU memory, and
+        :meth:`release` still leaves an idle engine holding none.
+        """
+        xp = self._xp
+        terms: _NormalTerms | None = None
+        if self.normalization != "dft":
+            # Built (once) before the transform: the first build runs transforms of
+            # its own through the same plan.
+            terms = self._normal_terms()
+        out = self._plan_transform(strengths)
+        yc_d, ys_d = out.real, out.imag
+        if terms is None:
+            amp_d = xp.hypot(2.0 * yc_d, 2.0 * ys_d)
+        else:
+            ssi, csi, cci, ill = self._device_terms()
+            a_d = ssi * yc_d - csi * ys_d
+            b_d = cci * ys_d - csi * yc_d
+            amp_d = xp.hypot(a_d, b_d)
+            if int(ill.size):
+                # The bounded power-equivalent amplitude, as in the host path.
+                explained = a_d[ill] * yc_d[ill] + b_d[ill] * ys_d[ill]
+                amp_d[ill] = xp.sqrt(2.0 * xp.clip(explained, 0.0, max(yy, 0.0)))
+        finite = xp.isfinite(amp_d)
+        bad = np.zeros(0, dtype=np.int64)
+        # One reduction answers the usual all-finite case; the index scan (a few ms
+        # at a million samples) runs only when there is something to zero.
+        if not bool(finite.all()):
+            bad_d = xp.flatnonzero(~finite)
+            amp_d[bad_d] = 0.0
+            bad = np.asarray(bad_d.get(), dtype=np.int64)
+        amplitude = np.asarray(amp_d.get(), dtype=np.float64)
+        yc, ys = _complex_to_host(out)
+        return _SpectrumScan(self, amplitude, None, None, yc, ys, yy, bad, terms=terms)
 
     def spectrum(self, values: FloatArray) -> AmplitudeSpectrum:
         """Amplitude spectrum of ``values`` on this engine's sampling and grid.
@@ -1183,20 +1441,33 @@ class SpectrumEngine:
         on first call, then nothing: the sums are shared with the cached normal
         equations, so after a :meth:`spectrum` call (or before one) neither pays for
         them twice — and an engine that only ever serves the window never computes
-        the doubled-grid normal-equation terms at all.
+        the doubled-grid normal-equation terms at all. On ``cufinufft`` the window is
+        instead formed on the device from one transform per call (its host
+        ``hypot``/``arctan2`` cost ten times the transform on a large grid); the
+        session caches the result.
 
         Returns
         -------
         AmplitudeSpectrum
         """
-        if self._window_sums is None:
-            self._window_sums = self._base_sums(self._weight)
-        c, s = self._window_sums
-        amplitude = np.hypot(c, s)
+        if self.backend == "cufinufft":
+            xp = self._xp
+            out = self._plan_transform(self._weight)
+            amplitude = np.asarray(xp.hypot(out.real, out.imag).get(), dtype=np.float64)
+            phase = np.asarray(
+                xp.mod(xp.arctan2(out.imag, out.real), 2.0 * np.pi).get(),
+                dtype=np.float64,
+            )
+        else:
+            if self._window_sums is None:
+                self._window_sums = self._base_sums(self._weight)
+            c, s = self._window_sums
+            amplitude = np.hypot(c, s)
+            phase = np.mod(np.arctan2(s, c), 2.0 * np.pi)
         return AmplitudeSpectrum(
             frequency=self.frequency,
             amplitude=amplitude,
-            phase=np.mod(np.arctan2(s, c), 2.0 * np.pi),
+            phase=phase,
             power=amplitude * amplitude,
             t_ref=self.t_ref,
             backend=self.backend,

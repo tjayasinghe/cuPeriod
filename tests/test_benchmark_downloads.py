@@ -184,6 +184,25 @@ def test_fetch_validates_the_pinned_digest(
         dl.fetch("https://example.invalid/a.dat", tmp_path / "a.dat", "abc123")
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "ftp://ftp.astrouw.edu.pl/ogle/a.dat",
+        "http://ftp.astrouw.edu.pl/ogle/a.dat",
+        "file:///etc/passwd",
+        "ftp.astrouw.edu.pl/ogle/a.dat",
+    ],
+)
+def test_fetch_refuses_anything_but_https(
+    dl: types.ModuleType, tmp_path: Path, url: str
+) -> None:
+    # The digest would catch a substituted file, but a script that regressed to a
+    # plaintext mirror must fail loudly, before any connection is made.
+    with pytest.raises(ValueError, match="non-HTTPS"):
+        dl.fetch(url, tmp_path / "a.dat", _sha256(GOOD))
+    assert _leftovers(tmp_path) == []
+
+
 # --- the scripts -------------------------------------------------------------------
 
 

@@ -243,12 +243,16 @@ def add(
         if not low <= frequency <= high:
             raise SessionError(
                 f"{frequency:.9g} c/d is outside the frequency grid "
-                f"[{low:.9g}, {high:.9g}]; add it with refine='none'"
+                f"[{low:.9g}, {high:.9g}]; add it with refine='none'",
+                hint="exact",
             )
     if not args.allow_close:
         other = too_close(kernel, state, frequency)
         if other is not None:
-            raise SessionError(_collision_message(kernel, state, frequency, other))
+            raise SessionError(
+                _collision_message(kernel, state, frequency, other),
+                hint="allow_close",
+            )
     new_id = state.next_id
     component = Component(
         id=new_id, frequency=frequency, amplitude=0.0, phase=0.0, origin="manual"
@@ -268,10 +272,13 @@ def add(
             kernel, state, landed, ignore=(new_id,), radius=kernel.separation(state)
         )
         if other is not None:
+            # Both keywords would add it, but only an exact add keeps the frequency
+            # the user chose rather than the one the refinement slid onto.
             raise SessionError(
                 f"the refinement moved {frequency:.9g} c/d onto {other.label} "
                 f"({other.frequency:.9g} c/d); add it with refine='none' or "
-                "allow_close=True"
+                "allow_close=True",
+                hint="exact",
             )
     delta_bic = float(fit.bic - state.stats.bic)
     staged = with_components(staged, {new_id: replace(component, delta_bic=delta_bic)})
@@ -313,7 +320,8 @@ def remove(
         parent = next(p for p in child.tie.parents if p in doomed)
         raise SessionError(
             f"F{parent} is a tie parent of {child.label} ({child.label} = "
-            f"{child.tie.text()}); remove with cascade=True to dissolve the tie"
+            f"{child.tie.text()}); remove with cascade=True to dissolve the tie",
+            hint="cascade",
         )
     untied = {c.id: replace(c, tie=None) for c in children}
     new = replace(
@@ -474,7 +482,8 @@ def tie(
             raise SessionError(
                 f"tie puts {c.label} at {predicted:.9g} c/d, within "
                 f"{kernel.session_settings.collision_rayleigh:g} Rayleigh widths of "
-                f"{other.label}; pass allow_close=True to tie it anyway"
+                f"{other.label}; pass allow_close=True to tie it anyway",
+                hint="allow_close",
             )
     new = with_components(
         state,

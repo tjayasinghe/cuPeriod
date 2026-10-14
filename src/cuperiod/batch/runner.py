@@ -63,6 +63,7 @@ from cuperiod.core.backend import (
 )
 from cuperiod.core.columns import ColumnMap, Domain, coerce_domain
 from cuperiod.core.device import free_gpu_memory, suggest_gpu_workers
+from cuperiod.core.errors import _user_stacklevel
 from cuperiod.core.grid import GridSpec
 from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve, raise_if_unusable
 from cuperiod.core.result import Periodogram
@@ -106,6 +107,28 @@ _POOL_HINT = (
     _GUARD_HINT + " If the script is guarded, a worker process died, for example by "
     "running out of memory."
 )
+
+#: Environment prefix of the deprecated :class:`~cuperiod.BatchSettings`.
+_BATCH_ENV_PREFIX = "CUPERIOD_BATCH_"
+
+
+def _warn_dead_batch_env() -> None:
+    """Warn that ``CUPERIOD_BATCH_*`` variables change nothing.
+
+    They look like every other ``CUPERIOD_<MODEL>_<FIELD>`` override, but their model
+    (``BatchSettings``, deprecated) was never read by any driver, so a job configured
+    through them ran with the defaults without a word. Matched case-insensitively,
+    as pydantic-settings matches the variables it does read.
+    """
+    names = sorted(k for k in os.environ if k.upper().startswith(_BATCH_ENV_PREFIX))
+    if names:
+        warnings.warn(
+            f"{', '.join(names)} has no effect: BatchSettings is deprecated and no "
+            "batch driver reads CUPERIOD_BATCH_* variables; pass device=, workers=, "
+            "n_best=, store_raw= and resume= to the batch function instead.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
 
 
 @dataclass(frozen=True)
@@ -283,6 +306,23 @@ def _chunked(items: Sequence[Any], size: int) -> list[list[Any]]:
     return [list(items[i : i + size]) for i in range(0, len(items), size)]
 
 
+def _gpu_worker_count(
+    methods: Sequence[str], grid: GridSpec | None, workers: int | None
+) -> int:
+    """Workers for a GPU pool: the caller's count, else what every method fits.
+
+    Every worker runs every method, so the most demanding method sets the count (not
+    the first one listed); an explicit ``grid`` is the real per-worker footprint,
+    otherwise :func:`~cuperiod.suggest_gpu_workers` assumes a survey-sized grid.
+    """
+    if workers is not None:
+        return max(1, int(workers))
+    grid_size = int(grid.values.size) if grid is not None else None
+    return max(
+        1, min(suggest_gpu_workers(name, grid_size=grid_size) for name in methods)
+    )
+
+
 def _auto_chunk_size(n_items: int, n_workers: int) -> int:
     """Chunk size for a pool: about four tasks per worker, at most the default."""
     if n_workers <= 1:
@@ -324,6 +364,36 @@ def _sink_key(value: Any, *, csv_sink: bool) -> str | None:
         return None
     text = str(value)
     return str(csv_safe(text)) if csv_sink else text
+
+
+def _source_clash(stored: Any, label: str, *, csv_sink: bool) -> bool:
+    """Whether a sink row stored for a key came from another file than ``label``.
+
+    In-memory inputs (``label == ""``) and rows written without a ``source`` cell
+    carry no provenance and never clash.
+    """
+    if not stored or not label:
+        return False
+    return str(stored) != str(csv_safe(label) if csv_sink else label)
+
+
+def _warn_source_clashes(clashes: Sequence[tuple[str, str, str]]) -> None:
+    """Report ``(key, stored source, input source)`` triples skipped as done.
+
+    Resuming after the data moved must not recompute (nor duplicate) a catalogue, so
+    such inputs are still skipped, but two different light curves sharing one row
+    must not pass without a word.
+    """
+    if not clashes:
+        return
+    shown = "; ".join(f"{k!r}: sink has {a}, input is {b}" for k, a, b in clashes[:3])
+    warnings.warn(
+        f"{len(clashes)} input rows share a key with rows already in the sink that "
+        f"came from a different file, and were skipped as done ({shown}). If they "
+        "are different light curves, give them distinct keys or use another sink.",
+        UserWarning,
+        stacklevel=_user_stacklevel(),
+    )
 
 
 def _read_key_table(
@@ -637,7 +707,9 @@ def _pending_chunks(
     caller that indexes ``chunks[idx]`` for each returned ``idx`` and writes
     ``part-idx`` keeps working unchanged. A fresh directory keeps its layout.
 
-    Light curves that failed left no row, so a resume tries them again.
+    Light curves that failed left no row, so a resume tries them again. A key whose
+    part rows came from a different file than this input is still taken as done,
+    with a warning (as :func:`batch_periodograms` does).
     """
     if sink_kind != "dir" or not resume:
         return list(range(len(chunks)))
@@ -645,7 +717,16 @@ def _pending_chunks(
     if next_index == 0:
         return list(range(len(chunks)))
     size = max(1, max((len(c) for c in chunks), default=1))
-    todo = [item for chunk in chunks for item in chunk if (item[0],) not in done]
+    todo: list[InputItem] = []
+    clashes: list[tuple[str, str, str]] = []
+    for chunk in chunks:
+        for key, src in chunk:
+            stored = done.get((key,))
+            if stored is None:
+                todo.append((key, src))
+            elif _source_clash(stored, label := source_label(src), csv_sink=False):
+                clashes.append((key, stored, label))
+    _warn_source_clashes(clashes)
     replanned = _chunked(todo, size)
     chunks[:] = [[] for _ in range(next_index)] + replanned
     return list(range(next_index, next_index + len(replanned)))
@@ -771,7 +852,10 @@ def batch_periodograms(
     -----
     UserWarning
         When there is nothing to process (the sink is left untouched), when input
-        keys collide, or when a resumed sink holds a key from a different source file.
+        keys repeat (the repeats are renamed), or when a resumed sink holds a key
+        from a different source file.
+    DeprecationWarning
+        When a ``CUPERIOD_BATCH_*`` variable is set: nothing reads them.
     """
     if device not in {"cpu", "gpu", "hybrid"}:
         raise ValueError("device must be 'cpu', 'gpu', or 'hybrid'")
@@ -779,6 +863,7 @@ def batch_periodograms(
         raise NotImplementedError(
             "hybrid device is planned; use device='cpu' or device='gpu'"
         )
+    _warn_dead_batch_env()
     if grid is not None and not isinstance(grid, GridSpec):
         raise TypeError(f"grid must be a GridSpec or None, got {type(grid).__name__}")
     if chunk_size is not None and int(chunk_size) < 1:
@@ -864,8 +949,7 @@ def batch_periodograms(
 
     # -- workers and chunks ----------------------------------------------------------
     if device == "gpu":
-        n_workers = suggest_gpu_workers(methods[0]) if workers is None else workers
-        n_workers = max(1, n_workers)
+        n_workers = _gpu_worker_count(methods, grid, workers)
     else:
         n_workers = cpu_worker_count(workers)
     size = (
@@ -973,23 +1057,13 @@ def _plan_items(
             prev = done.get((lookup, name))
             if prev is None:
                 missing.append(name)
-            elif prev and label and prev != str(csv_safe(label) if csv_sink else label):
+            elif _source_clash(prev, label, csv_sink=csv_sink):
                 clashes.append((key, prev, label))
         if missing:
             plan.append(((key, src), tuple(missing)))
         else:
             n_skipped += 1
-    if clashes:
-        shown = "; ".join(
-            f"{k!r}: sink has {a}, input is {b}" for k, a, b in clashes[:3]
-        )
-        warnings.warn(
-            f"{len(clashes)} input rows share a key with rows already in the sink that "
-            f"came from a different file, and were skipped as done ({shown}). If they "
-            "are different light curves, give them distinct keys or use another sink.",
-            UserWarning,
-            stacklevel=3,
-        )
+    _warn_source_clashes(clashes)
     return plan, n_skipped
 
 

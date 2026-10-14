@@ -143,7 +143,7 @@ def test_interactive_prewhitening_end_to_end(qtbot: QtBot, tmp_path: Path) -> No
     assert window._solution_panel.editable
     assert len([r for r in view.rows if r.active]) == 2
     assert window._session_bar.isVisible()
-    assert not window.windowTitle().endswith("*")  # an untouched Auto is clean
+    assert not window.isWindowModified()  # an untouched Auto is clean
     first = view.rows[0].frequency
     assert first == pytest.approx(7.3, abs=0.01)
 
@@ -154,7 +154,7 @@ def test_interactive_prewhitening_end_to_end(qtbot: QtBot, tmp_path: Path) -> No
     _key(plot, Qt.Key.Key_A)
     view = _settle(qtbot, window)
     assert len(view.rows) == 3
-    assert window.windowTitle().endswith("*")  # edited: unsaved work
+    assert window.isWindowModified()  # edited: unsaved work
     assert window.commands.action("edit.undo").isEnabled()
 
     # A combination typed in the session bar: "=F1+F2" adds F1 + F2 and ties it.
@@ -233,7 +233,7 @@ def test_interactive_prewhitening_end_to_end(qtbot: QtBot, tmp_path: Path) -> No
         window.commands.action("file.save_project").trigger()
     qtbot.waitUntil(lambda: project.is_file() and not ctl.is_session_dirty())
     qtbot.waitUntil(lambda: "nightly.cupw.json" in window.windowTitle())
-    assert not window.windowTitle().endswith("*")
+    assert not window.isWindowModified()
     saved_rows = [(r.id, r.frequency, r.amplitude) for r in view.rows]
 
     script = tmp_path / "nightly_session.py"

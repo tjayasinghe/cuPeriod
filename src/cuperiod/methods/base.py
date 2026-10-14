@@ -19,6 +19,7 @@ from typing import ClassVar, TypeVar, cast
 from pydantic_settings import BaseSettings
 
 from cuperiod.core._arrayapi import TORCH_DEVICES
+from cuperiod.core._typing import FloatArray
 from cuperiod.core.backend import (
     BACKEND_SELECTORS,
     available_backends,
@@ -339,6 +340,35 @@ class PeriodogramMethod(ABC):
         single-band path; methods without a reusable plan simply ignore it.
         """
         raise NotImplementedError(f"{self.name} does not support multi-band input")
+
+    def supports_power_rows(self, grid: GridSpec, backend: str) -> bool:
+        """Whether :meth:`power_rows` has a batched path for ``grid`` on ``backend``.
+
+        Lets a caller skip building the rows' times when the answer is no.
+        """
+        return False
+
+    def power_rows(
+        self,
+        grid: GridSpec,
+        lc: LightCurve,
+        times: FloatArray,
+        settings: BaseSettings,
+        backend: str,
+        engine: object | None = None,
+    ) -> FloatArray | None:
+        """The statistic of many re-timed copies of one light curve, or ``None``.
+
+        Row ``r`` of the ``(n_rows, grid.size)`` result equals
+        ``self.power(grid, replace(lc, time=times[r]), settings, backend,
+        engine).power`` -- the values a period-derivative scan reads, in ascending
+        frequency. ``lc`` must already be finite (``lc.finite()``) and ``times`` hold
+        one finite time array per row, aligned with it. Methods with a batched
+        device path override this (GLS on cufinufft, PDM on cupy) so the rows share
+        uploads and one download; ``None`` -- the default -- tells the caller to loop
+        over :meth:`power` instead.
+        """
+        return None
 
     def make_engine(self, backend: str, settings: BaseSettings) -> object | None:
         """Build a reusable plan/kernel engine for repeated calls on ``backend``.

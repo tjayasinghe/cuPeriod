@@ -238,3 +238,25 @@ def test_pdot_segments_from_the_environment_are_bounded(
     monkeypatch.setenv("CUPERIOD_PDOT_N_SEGMENTS", "4")
     assert cup.PdotSettings().n_segments == 4
     assert cup.PdotSettings(n_segments=None).n_segments is None
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("window_rayleigh", float("inf")),
+        ("max_cycle_drift", float("inf")),
+        ("min_segment_cycles", float("inf")),
+        ("ltte_min_cycles", float("inf")),
+        ("pdot_over_p_range", (-float("inf"), 1e-6)),
+        ("pdot_over_p_range", (float("nan"), 1e-6)),
+    ],
+)
+def test_pdot_settings_refuse_non_finite_floats(field: str, value: object) -> None:
+    # The "> 0" bounds reject NaN but let +inf through; an infinite window, drift or
+    # range is never a meaningful request.
+    from pydantic import ValidationError
+
+    from cuperiod.core.config import PdotSettings
+
+    with pytest.raises(ValidationError):
+        PdotSettings(**{field: value})

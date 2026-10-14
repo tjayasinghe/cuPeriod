@@ -54,7 +54,19 @@ Every command answers in the status bar, also when it changes nothing: Step at t
 stopping rule, *Renumber* with the numbering already in order, *Restore all points* with
 nothing deleted or an Improve with nothing free to refine says so, and an edit the
 session refuses says why in the window's terms (*Add exactly here*, untie the row
-first) — a refused table edit puts the cell back.
+first) — a refused table edit puts the cell back. Where the remedy is one the window
+can carry out, it asks whether to (from the report's `hint`, see
+[below](#one-entry-point-that-never-raises-for-bad-input)):
+
+| Refused | The window offers | Done as |
+| --- | --- | --- |
+| Deleting a component others are tied to | *F1 has tied children (F5, F7). Dissolve their ties and remove F1?* | `remove(..., cascade=True)` |
+| A frequency or a tie within the collision guard of another component | *Add anyway* / *Tie anyway* | `add` / `tie` with `allow_close=True` |
+| A frequency outside the grid, or one the refinement would move onto another component | *Add it exactly at 12.34 c/d (no refinement)?* | `add(..., refine="none")` |
+
+A yes is one more undoable action; if the session changed while the question was open,
+nothing is done and the status bar says so. Zero points per subset without a floating
+mean are only explained: tick *floating mean* in the Options first.
 
 In pre-whitening the spectrum shows the data spectrum, the residual spectrum of the
 current model, the optional spectral window and **S/N limit** (the acceptance threshold
@@ -106,11 +118,13 @@ after the usual columns.
 ### Editing the light curve
 
 With a session open, the raw light-curve panel (View ▸ *Show raw light curve*,
-<kbd>Ctrl+R</kbd>) plots **Data**, **Residuals** or **Data + model**, colours and shapes
-points by subset, and has three tools: **Pan** (<kbd>V</kbd>; a <kbd>Shift</kbd>-drag
-still selects), **Rectangle** (<kbd>X</kbd>) and **Lasso** (<kbd>G</kbd>);
-<kbd>Ctrl</kbd> adds to the selection. The selection bar reads *37 points selected* with
-**Delete** (<kbd>Del</kbd>), **Restore** (<kbd>U</kbd>) and **Clear** (<kbd>Esc</kbd>).
+<kbd>Ctrl+R</kbd>; beside the fold, or its second tab in a narrow window) plots
+**Data**, **Residuals** or **Data + model**, colours and shapes points by subset, and has
+three tools: **Pan** (<kbd>V</kbd>; a <kbd>Shift</kbd>-drag still selects),
+**Rectangle** (<kbd>X</kbd>) and **Lasso** (<kbd>G</kbd>); <kbd>Ctrl</kbd> adds to the
+selection. The panel's title line counts the selection (*37 points selected*), and
+**Delete** (<kbd>Del</kbd>), **Restore** (<kbd>U</kbd>) and **Clear** (<kbd>Esc</kbd>)
+sit with the tools, in one row that wraps when the panel is narrow.
 **Select beyond N σ** selects the residual outliers with a robust σ per zero-point
 subset — the keyboard route to outliers. Deleted points stay visible as hollow grey
 crosses and can be selected and restored; one delete is one undoable action, and Data ▸
@@ -170,7 +184,7 @@ session as a script.
 **Projects.** File ▸ *Save project* (<kbd>Ctrl+S</kbd>), *Save project as…*
 (<kbd>Ctrl+Shift+S</kbd>) and *Open project…* (<kbd>Ctrl+Shift+O</kbd>) read and write
 `*.cupw.json` files (see [the project file](#the-project-file)). The title bar reads
-`cuPeriod — star.csv — star.cupw.json*`; the `*` means unsaved work. Opening a project
+`star.csv — star.cupw.json* — cuPeriod`; the `*` means unsaved work. Opening a project
 whose data file has moved asks for the file. *Verify project…* replays a project's log
 and compares it with the stored result.
 
@@ -286,8 +300,8 @@ for c in session.components:
 
 Every action returns a {class}`~cuperiod.StepReport`: a `kind`, one human-readable
 `message`, the component and frequency it concerned, `statistics` (`snr`, `fap`,
-`delta_bic`, `amplitude`, `rms` where they apply), what it `changed` and an optional
-`warning`.
+`delta_bic`, `amplitude`, `rms` where they apply), what it `changed`, an optional
+`warning` and, for some refusals, a `hint` (see below).
 
 | `kind` | Committed? | Meaning |
 | --- | --- | --- |
@@ -322,6 +336,27 @@ print(report.kind, report.message)
 report = session.do("tie", id=3, expression="0.5 F2")
 print(report.kind, report.message)
 # refused non-integer coefficient '0.5' in tie '0.5 F2'
+```
+
+When the remedy for a refusal is a keyword argument of the same call, the message
+names it and the report carries it as a code too, `report.hint`, so a front end can
+offer the remedy without parsing the message (the desktop app does):
+
+| `hint` | Refused because | Remedy |
+| --- | --- | --- |
+| `"allow_close"` | the frequency is within `collision_rayleigh` of another component | `add(..., allow_close=True)`, `tie(..., allow_close=True)` |
+| `"cascade"` | other components are tied to the one being removed | `remove(..., cascade=True)` dissolves their ties |
+| `"exact"` | the frequency is outside the grid, or the refinement would move it onto another component | `add(..., refine="none")` adds it where it is |
+| `"fit_mean"` | zero points per subset need a floating mean | `configure(fit_mean=True)` first |
+
+Every other report has `hint=None`.
+
+```python
+report = session.add(12.3457, snap=False)
+print(report.kind, report.hint)
+# refused allow_close
+print(report.message)
+# 12.3457 c/d is within 0.25 Rayleigh widths of F1 (12.3456848 c/d); pass allow_close=True to add it anyway
 ```
 
 The 25 operations, all available through `do(op, **args)` and as methods of the same

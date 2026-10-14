@@ -26,7 +26,7 @@ from cuperiod.core.errors import InsufficientDataError
 from cuperiod.core.grid import GridSpec, check_grid_size
 from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
 from cuperiod.core.result import Periodogram
-from cuperiod.methods._bls_core import bls_power
+from cuperiod.methods._bls_core import bls_power, bls_power_segments
 from cuperiod.methods.base import PeriodogramMethod, register
 
 #: Per-period fields shared by every backend (astropy + the in-house search).
@@ -234,6 +234,43 @@ def _segment_power(
     return {name: getattr(power, name) for name in _SEGMENT_FIELDS}
 
 
+def _segments_power(
+    backend: str,
+    jd: FloatArray,
+    flux: FloatArray,
+    err: FloatArray,
+    segments: list[Segment],
+    settings: BLSSettings,
+) -> list[dict[str, FloatArray]]:
+    """Every segment's per-period box maxima for one light curve.
+
+    The same values as :func:`_segment_power` segment by segment; on ``cupy`` the
+    segments go through :func:`~cuperiod.methods._bls_core.bls_power_segments`, one
+    upload and one download for the whole grid.
+    """
+    if backend != "cupy":
+        device_cache: dict[str, Any] = {}
+        return [
+            _segment_power(
+                backend, jd, flux, err, periods, durations, settings, device_cache
+            )
+            for periods, durations in segments
+        ]
+    powers = bls_power_segments(
+        jd,
+        flux,
+        err,
+        segments,
+        settings.bins_per_duration,
+        objective=settings.objective,
+        backend=backend,
+        batch=settings.batch_periods,
+        precision=settings.precision,
+        device_cache={},
+    )
+    return [{name: getattr(p, name) for name in _SEGMENT_FIELDS} for p in powers]
+
+
 def _assemble(
     chunks: dict[str, list[FloatArray]], n: int, baseline: float, backend: str,
     meta: Any,
@@ -352,11 +389,7 @@ class BLSMethod(PeriodogramMethod):
             raise InsufficientDataError("BLS: empty trial grid")
 
         chunks: dict[str, list[FloatArray]] = {name: [] for name in _SEGMENT_FIELDS}
-        device_cache: dict[str, Any] = {}
-        for periods, durations in segments:
-            seg = _segment_power(
-                backend, jd, flux, err, periods, durations, settings, device_cache
-            )
+        for seg in _segments_power(backend, jd, flux, err, segments, settings):
             for name in _SEGMENT_FIELDS:
                 chunks[name].append(seg[name])
         return _assemble(chunks, n, finite.baseline, backend, finite.meta)

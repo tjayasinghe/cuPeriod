@@ -237,8 +237,10 @@ class RunInfoBar(QtWidgets.QWidget):
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
-        layout = FlowLayout()
-        layout.setContentsMargins(8, 4, 8, 4)
+        # Rows close together: the strip wraps in a narrow window, and every pixel
+        # it takes is one less for the plots under it.
+        layout = FlowLayout(vspacing=4)
+        layout.setContentsMargins(8, 2, 8, 2)
         self.setLayout(layout)
 
         self._method = _badge("badgeAccent")

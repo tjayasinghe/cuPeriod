@@ -8,6 +8,27 @@ keys on the standard types keeps working.
 
 from __future__ import annotations
 
+import sys
+
+
+def _user_stacklevel() -> int:
+    """``stacklevel`` that attributes a warning to the nearest caller outside cuPeriod.
+
+    For a ``warnings.warn`` issued in the function that calls this. One warning can
+    be reached through call chains of different depths (a table read from
+    ``LightCurve.from_dataframe``, ``to_input`` or ``periodogram``; batch keys from a
+    list or a glob); a fixed level pointed some of them at a library line, where
+    Python's default filter shows the warning once for every caller there is.
+    """
+    level = 1
+    frame = sys._getframe(1)  # the function that will call warnings.warn
+    while frame.f_back is not None and (
+        str(frame.f_globals.get("__name__", "")).partition(".")[0] == "cuperiod"
+    ):
+        frame = frame.f_back
+        level += 1
+    return level
+
 
 class CuPeriodError(Exception):
     """Base class for every error raised by cuPeriod."""

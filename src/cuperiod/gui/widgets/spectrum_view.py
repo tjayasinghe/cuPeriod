@@ -79,6 +79,7 @@ from cuperiod.gui.theme import (
     plot_label_style,
 )
 from cuperiod.gui.widgets._view_helpers import (
+    ElidedLabel,
     ask_save_path,
     confirm_overwrite,
     device_scale,
@@ -435,48 +436,13 @@ class _LogTickAxis(pg.AxisItem):
         return [text if kept else "" for text, kept in zip(texts, keep, strict=True)]
 
 
-class _ReadoutLabel(QtWidgets.QLabel):
+class _ReadoutLabel(ElidedLabel):
     """The readout line: elided at its right end to the width it is given.
 
     Right-aligned text wider than the label lost its *start* ("cursor  f = 15.4")
     in a narrow centre column; eliding the end keeps the frequency, which matters
     most. :meth:`text` and the accessible description hold the full line.
     """
-
-    def __init__(self, text: str) -> None:
-        super().__init__()
-        self._full = ""
-        self.setText(text)
-
-    def setText(self, text: str) -> None:  # noqa: N802 - Qt override
-        self._full = text
-        self.setAccessibleDescription(text)
-        self._elide()
-
-    def text(self) -> str:
-        """The full (unelided) readout."""
-        return self._full
-
-    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: N802
-        super().resizeEvent(event)
-        self._elide()
-
-    def changeEvent(self, event: QtCore.QEvent) -> None:  # noqa: N802
-        super().changeEvent(event)
-        if event.type() in (
-            QtCore.QEvent.Type.FontChange,
-            QtCore.QEvent.Type.StyleChange,
-        ):
-            self._elide()
-
-    def _elide(self) -> None:
-        margins = self.contentsMargins()
-        room = max(16, self.width() - margins.left() - margins.right())
-        shown = self.fontMetrics().elidedText(
-            self._full, Qt.TextElideMode.ElideRight, room
-        )
-        if shown != super().text():
-            super().setText(shown)
 
 
 class SpectrumView(QtWidgets.QWidget):
@@ -526,7 +492,8 @@ class SpectrumView(QtWidgets.QWidget):
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
+        # Tight: in a 768 px window the plot gets what the rows around it leave.
+        layout.setSpacing(2)
         layout.addWidget(self._build_toolbar())
 
         self._plot = pg.PlotWidget(
@@ -694,10 +661,11 @@ class SpectrumView(QtWidgets.QWidget):
         from cuperiod.gui.widgets.info_bar import FlowLayout
 
         bar = QtWidgets.QWidget()
+        bar.setObjectName("plotToolbar")  # compact controls (theme sheets)
         # A wrapping row: with the pre-whitening toggles shown the toolbar is the
         # widest thing in the pane, and in a narrow window an unwrapped row squeezed
         # the check boxes and buttons into unreadable stubs (UX-04).
-        row = FlowLayout(hspacing=6, vspacing=4)
+        row = FlowLayout(hspacing=6, vspacing=2)
         bar.setLayout(row)
         row.setContentsMargins(6, 2, 6, 2)
 
@@ -2522,8 +2490,11 @@ class SpectrumView(QtWidgets.QWidget):
         )
 
     def _write_png(self, path: str) -> None:
-        if not confirm_overwrite(self, path, image_target(path)):
-            return
+        confirm_overwrite(
+            self, self._dialogs, path, image_target(path), lambda: self._save_png(path)
+        )
+
+    def _save_png(self, path: str) -> None:
         try:
             self.export_png(path)
         except OSError as exc:

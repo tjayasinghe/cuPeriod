@@ -282,11 +282,25 @@ period on its own (with one band fifteen times noisier: 3 of 40 periods recovere
 before, 40 of 40 now). Every MHAOV power with two or more bands differs from cuPeriod
 1.2; a single band is unchanged.
 
-**BLS** shares only the **period** across bands, not a (period, duration, t0)
-ephemeris: each band is searched on its own and the statistic is the sum of each band's
-best squared depth-SNR. The reported box (depth, duration, t0) is that of the strongest
-band, named by `extras["band_index"]` (an index into `meta["bands"]`). A user `grid=` is
-searched exactly, segmented like single-band BLS.
+**BLS** shares only the **period** across bands by default, not a (period, duration,
+t0) ephemeris: each band is searched on its own and the statistic is the sum of each
+band's best squared depth-SNR. The reported box (depth, duration, t0) is that of the
+strongest band, named by `extras["band_index"]` (an index into `meta["bands"]`). A user
+`grid=` is searched exactly, segmented like single-band BLS.
+
+A transit is achromatic, so its duration and mid-transit time are the same in every
+band. `BLSSettings(mb_ephemeris="shared")` searches that model: one box (duration and
+mid-transit time on a common phase grid) is placed in every band, each band fits its
+own depth, and the statistic is `Σ_k max(SNR_k, 0)²` over that one box, so noise maxima
+at unrelated phases in different bands no longer add up. On 40 simulated six-band
+light curves with a 1.5% transit in 0.5% noise it recovers 39 periods where the
+independent stack recovers 24, at about three times the numba cost. It runs on the
+numba, numpy, torch and cupy backends (they agree bit for bit, cupy to 1e-15); astropy
+is refused. `meta["mb_ephemeris"]` records the mode, and the default is unchanged:
+
+```python
+pg = cup.periodogram(mb, "BLS", settings=cup.BLSSettings(mb_ephemeris="shared"))
+```
 
 :::{note}
 SuperSmoother pools **scores, not phases** — being non-parametric there is no shared-phase

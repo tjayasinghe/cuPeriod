@@ -574,7 +574,7 @@ class PreWhitenSession:
         try:
             parsed = actions.parse(op, raw)
         except SessionError as exc:
-            return StepReport(kind="refused", message=str(exc))
+            return StepReport(kind="refused", message=str(exc), hint=exc.hint)
         reduce = actions.reducer(op)
         if reduce is None:
             return StepReport(kind="refused", message=f"op {op!r} is not available")
@@ -586,8 +586,12 @@ class PreWhitenSession:
             if report.committed and actions.OP_CLASS[op] == "manual":
                 new, new_derived = self._manual_effects(new, new_derived)
         except _REFUSABLE as exc:
+            # A refusal that names a remedy carries it as a code too (SessionError's
+            # hint), so a front end need not parse the keyword advice in the message.
             return StepReport(
-                kind="refused", message=str(exc) or type(exc).__name__
+                kind="refused",
+                message=str(exc) or type(exc).__name__,
+                hint=getattr(exc, "hint", None),
             )
         if not report.committed:
             return report

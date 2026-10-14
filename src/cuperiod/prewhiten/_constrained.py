@@ -905,6 +905,39 @@ def _natural(setup: _Setup, problem: _Problem) -> _Natural:
     return _Natural(amps, phases, offsets)
 
 
+def _resolved_amplitudes(
+    setup: _Setup,
+    natural: _Natural,
+    headline: list[tuple[float, float, complex]],
+) -> tuple[_Natural, list[tuple[float, float, complex]]]:
+    """``natural`` and ``headline`` with round-off amplitudes set to exactly zero.
+
+    A component (or one subset of it) that carries no signal is solved to an
+    amplitude of a few float64 epsilons of the data's scale, not to 0. The Jacobian
+    column of its phase, ``A cos(...)``, is then round-off as well, and the column
+    scaling of the pseudo-inverse makes it look healthy: the covariance divided two
+    rounding errors and reported the phase — and a frequency only that component
+    sets — known to a fraction of a radian (spec 1.8: "fitted amplitude -> 0 with a
+    non-linear phase"). Evaluated at ``A = 0`` those columns vanish, so the
+    parameters are reported NaN with the ``degenerate`` flag, exactly as for an
+    amplitude that is zero to the bit. The threshold is the session's round-off rule
+    (``_ROUNDOFF_EPS`` epsilons of the largest ``|y|``), far below any photometric
+    amplitude, so the covariance of every other fit is unchanged to the bit (the
+    inputs are returned as they are). A headline keeps its phase, the direction its
+    amplitude error is taken along; only its amplitude is zeroed.
+    """
+    scale = float(np.max(np.abs(setup.y))) if setup.y.size else 0.0
+    floor = _fit._ROUNDOFF_EPS * float(np.finfo(np.float64).eps) * scale
+    if not any(bool(np.any(np.abs(amp) <= floor)) for amp in natural.amp):
+        return natural, headline
+    amps = [np.where(np.abs(amp) <= floor, 0.0, amp) for amp in natural.amp]
+    heads = [
+        (0.0, phase, 0j) if abs(amp) <= floor else (amp, phase, z)
+        for amp, phase, z in headline
+    ]
+    return _Natural(amps, natural.phase, natural.offsets), heads
+
+
 def _broadcast(values: FloatArray, n_v: int) -> FloatArray:
     return np.full(n_v, float(values[0])) if values.size == 1 else values
 
@@ -1322,13 +1355,20 @@ validate>`).
     if covariance:
         total = float(w.sum())
         shift = float(np.dot(w, dt) / total) if total > 0.0 and n else 0.0
-        gram, r_factor = _natural_gram(setup, layout, natural, theta, shift, True)
+        # Round-off amplitudes count as zero here, so an undetermined phase is NaN
+        # and flagged rather than a ratio of two rounding errors (spec 1.8).
+        cov_natural, cov_headline = _resolved_amplitudes(setup, natural, headline)
+        gram, r_factor = _natural_gram(
+            setup, layout, cov_natural, theta, shift, True
+        )
         inverse, degenerate = _pseudo_inverse(gram)
         dof = n - n_p
         cov_p = inverse * (rss / dof if dof > 0 else float("nan"))
         cov_p = _shift_phases(cov_p, layout, setup, -_TWO_PI * shift)
         rank, condition = _rank(r_factor, gram)
-        transform = _headline_transform(setup, layout, natural, headline, fit_mean)
+        transform = _headline_transform(
+            setup, layout, cov_natural, cov_headline, fit_mean
+        )
         cov_q = _masked_product(transform, cov_p)
 
     detail = _detail(

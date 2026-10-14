@@ -5,6 +5,13 @@ lightkurve (the same tool the Mendeley dataset used), flatten/normalize, save th
 raw (time, flux) series, and recover the period with the `transitleastsquares`
 package. cuPeriod's TLS is run separately in the main GPU venv (tls_cuperiod.py)
 on the identical saved series.
+
+Integrity: lightkurve fetches the light curves from MAST over HTTPS (through
+astroquery). MAST publishes no checksum this script could pin, and re-processes
+its products, so there is no reference digest to verify against (unlike the OGLE
+and S82 downloads, which go through ``_download.fetch``); the raw series are kept
+in the gitignored ``data/mendeley`` folder, and only the derived results table is
+committed.
 """
 
 from __future__ import annotations

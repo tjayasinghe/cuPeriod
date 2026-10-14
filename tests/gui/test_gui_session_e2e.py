@@ -34,6 +34,7 @@ from cuperiod.gui.models import SourceItem
 from cuperiod.gui.qt import QtCore, QtGui, QtWidgets
 from cuperiod.gui.viewmodels import SessionView
 from cuperiod.gui.widgets.frequency_table import COLUMNS, ID_ROLE, FrequencyTable
+from cuperiod.prewhiten.session.state import StepReport
 
 Qt = QtCore.Qt
 SETTINGS = PreWhitenSettings(
@@ -199,7 +200,7 @@ def test_the_full_period04_loop(qtbot: QtBot, tmp_path: Path) -> None:
     assert table.rowCount() == 3 and window._solution_panel.editable
     assert _cell(table, 1, "label").text().endswith("F1")
     assert set(_marker_symbols(window).values()) == {"o"}  # every component free
-    assert not window.windowTitle().endswith("*")
+    assert not window.isWindowModified()
 
     # -- Step at the stopping rule says why nothing happened ---------------------------
     window.commands.action("session.step").trigger()
@@ -216,7 +217,7 @@ def test_the_full_period04_loop(qtbot: QtBot, tmp_path: Path) -> None:
     assert added.frequency == pytest.approx(15.40, abs=0.02)
     assert added.origin == "manual"
     assert table.rowCount() == 4
-    assert window.windowTitle().endswith("*")  # unsaved work
+    assert window.isWindowModified()  # unsaved work
     assert window._spectrum.cursor_frequency() is not None
 
     # -- a combination typed in the session bar, tied ----------------------------------
@@ -374,7 +375,7 @@ def test_the_full_period04_loop(qtbot: QtBot, tmp_path: Path) -> None:
     with qtbot.waitSignal(ctl.project_changed, timeout=60_000):
         window.commands.action("file.save_project").trigger()
     qtbot.waitUntil(lambda: project.is_file() and not ctl.is_session_dirty())
-    qtbot.waitUntil(lambda: not window.windowTitle().endswith("*"))
+    qtbot.waitUntil(lambda: not window.isWindowModified())
     script = tmp_path / "campaign_session.py"
     provider.answers.append(str(script))
     window.commands.action("file.export_script").trigger()
@@ -442,6 +443,60 @@ def test_every_action_answers_even_when_it_changes_nothing(qtbot: QtBot) -> None
     assert view.row(1) is not None  # refused: F1 is still there
     assert any("untie it first" in s for s in status), status
     assert not any("cascade=True" in s for s in status)
+    ctl.shutdown()
+
+
+@pytest.mark.skipif(
+    "hint" not in getattr(StepReport, "__dataclass_fields__", {}),
+    reason="the library's refusals carry no remedy code (StepReport.hint)",
+)
+def test_a_refused_edit_offers_its_remedy_and_does_it_on_a_yes(qtbot: QtBot) -> None:
+    # A refusal used to end in the status bar ("untie it first"); the window now
+    # asks whether to do what the library suggests, and does it on a yes.
+    provider = FakeDialogProvider()
+    window = _window(qtbot, provider)
+    ctl = window.controller
+    status: list[str] = []
+    bar = window.statusBar()
+    assert bar is not None
+    bar.messageChanged.connect(status.append)
+    window._load_demo(SourceItem("campaign", "Two-site campaign", campaign))
+    window._analysis_actions["prewhiten"].trigger()
+    window._controls._backend_combo.setCurrentText("numpy")
+    window._controls.set_prewhiten_settings(SETTINGS)
+    with qtbot.waitSignal(ctl.solution_ready, timeout=90_000):
+        window._controls.request_compute()
+    _settle(qtbot, window)
+    field = window._session_bar.field
+    field.setText("=F1+F2")
+    _key(field, Qt.Key.Key_Return)
+    tied = _settle(qtbot, window).rows[-1]
+    assert tied.tie == "F1 + F2"
+    # Delete a tie parent from the table: refused, and offered with its ties gone.
+    table = window._solution_panel.table
+    table.select_ids([1])
+    table.setFocus(Qt.FocusReason.OtherFocusReason)
+    provider.answers.append(True)
+    _key(table, Qt.Key.Key_Delete)
+    view = _settle(qtbot, window)
+    asked = [args for name, args in provider.calls if name == "confirm"]
+    assert asked[-1] == (
+        "Remove and untie?",
+        f"F1 has a tied child ({tied.label}). Dissolve its tie and remove F1?",
+        "Dissolve ties and remove",
+    )
+    assert any("untie it first" in s for s in status)
+    child = view.row(tied.id)
+    assert view.row(1) is None and child is not None and child.tie is None
+    # Add exactly next to F2: within its collision guard, added anyway on a yes.
+    near = view.row(2)
+    assert near is not None
+    target = near.frequency + 1e-4
+    provider.answers.append(True)
+    ctl.add_frequency(target, exact=True)  # the spectrum's Ctrl+Shift+click
+    view = _settle(qtbot, window)
+    assert provider.calls[-1][1][2] == "Add anyway"
+    assert any(r.frequency == pytest.approx(target, abs=1e-9) for r in view.rows)
     ctl.shutdown()
 
 

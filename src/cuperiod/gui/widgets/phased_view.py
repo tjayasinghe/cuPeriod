@@ -157,13 +157,14 @@ class PhasedView(QtWidgets.QWidget):
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
+        layout.setSpacing(2)  # tight, like the other plot panes
 
         from cuperiod.gui.widgets.info_bar import FlowLayout
 
         bar = QtWidgets.QWidget()
+        bar.setObjectName("plotToolbar")  # compact controls (theme sheets)
         # Wraps instead of squeezing its labels when the pane is narrow (UX-05).
-        row = FlowLayout(hspacing=6, vspacing=4)
+        row = FlowLayout(hspacing=6, vspacing=2)
         bar.setLayout(row)
         row.setContentsMargins(6, 2, 6, 2)
         title = QtWidgets.QLabel("Phased light curve")
@@ -383,8 +384,11 @@ class PhasedView(QtWidgets.QWidget):
         )
 
     def _write_png(self, path: str) -> None:
-        if not confirm_overwrite(self, path, image_target(path)):
-            return
+        confirm_overwrite(
+            self, self._dialogs, path, image_target(path), lambda: self._save_png(path)
+        )
+
+    def _save_png(self, path: str) -> None:
         try:
             self.export_png(path)
         except OSError as exc:

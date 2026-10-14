@@ -34,6 +34,20 @@ def _finish(code: int, *, hard_exit: bool) -> int:
     return code
 
 
+def name_application(app: QtWidgets.QApplication) -> None:
+    """Name the application (its settings, its dialogs) and give it its icon.
+
+    No *display* name is set: Qt appends an explicitly set one to every window
+    title (" - cuPeriod" on Windows, " — cuPeriod" on Linux), and the main window's
+    title already ends with the application's name, so it read
+    "cuPeriod — star.csv - cuPeriod". Unset, the display name (which dialogs show)
+    is the application name all the same.
+    """
+    app.setApplicationName("cuPeriod")
+    app.setOrganizationName("cuPeriod")
+    app.setWindowIcon(app_icon())
+
+
 def run_app(argv: list[str] | None = None, *, exit_when_closed: bool = False) -> int:
     """Create the application, show the main window, and run the Qt event loop.
 
@@ -60,14 +74,11 @@ def run_app(argv: list[str] | None = None, *, exit_when_closed: bool = False) ->
     else:
         assert isinstance(existing, QtWidgets.QApplication)
         app = existing
-    app.setApplicationName("cuPeriod")
-    app.setApplicationDisplayName("cuPeriod")
-    app.setOrganizationName("cuPeriod")
-    app.setWindowIcon(app_icon())
+    name_application(app)
 
     window = MainWindow(app, theme=DEFAULT_THEME)
     window.show()
     return _finish(app.exec(), hard_exit=exit_when_closed)
 
 
-__all__ = ["DEFAULT_THEME", "run_app"]
+__all__ = ["DEFAULT_THEME", "name_application", "run_app"]

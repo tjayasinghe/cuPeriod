@@ -269,6 +269,53 @@ def _row_power(
     return m.power(grid, work, settings, backend, engine=engine)
 
 
+#: Warped-time values per batched block of rows (~64 MB of float64).
+_ROW_BLOCK_VALUES = 1 << 23
+
+
+def _batched_rows(
+    m: PeriodogramMethod,
+    grid: GridSpec,
+    work: LightCurve | MultiBandLightCurve,
+    t_ref: float,
+    axis: FloatArray,
+    model: PeriodModel,
+    settings: BaseSettings,
+    backend: str,
+    engine: object | None,
+    power: FloatArray,
+) -> int:
+    """Fill leading rows of ``power`` through the method's batched-rows path.
+
+    A method with a device path (GLS on cufinufft, PDM on cupy; see
+    :meth:`~cuperiod.methods.base.PeriodogramMethod.power_rows`) takes the warped
+    times of a block of rows at once and returns their rows in one transfer, where
+    the per-row loop uploaded the curve and waited on the device once per row. The
+    rows are the ones the loop would produce. Returns how many leading rows were
+    filled: 0 when the method has no batched path, fewer than all when it declined
+    a later block (the caller loops over the rest).
+    """
+    if isinstance(work, MultiBandLightCurve) or not m.supports_power_rows(
+        grid, backend
+    ):
+        return 0
+    dt = work.time - t_ref
+    rows_per_block = max(1, _ROW_BLOCK_VALUES // max(1, dt.size))
+    for start in range(0, int(axis.size), rows_per_block):
+        stop = min(start + rows_per_block, int(axis.size))
+        times = np.stack([model.warp(dt, float(a)) for a in axis[start:stop]])
+        block = m.power_rows(grid, work, times, settings, backend, engine)
+        if block is None:
+            return start
+        if block.shape != (stop - start, power.shape[1]):
+            raise RuntimeError(
+                f"pdot_search: {m.name} returned a {block.shape} block for "
+                f"{stop - start} rows of a {power.shape[1]}-point grid"
+            )
+        power[start:stop] = block
+    return int(axis.size)
+
+
 def _warp(
     work: LightCurve | MultiBandLightCurve,
     t_ref: float,
@@ -491,11 +538,14 @@ def pdot_search(
     engine = m.make_engine(resolved, row_settings)
     power = np.empty((axis.size, frequency.size), dtype=np.float64)
     backend_actual = resolved
-    for j, a in enumerate(axis):
+    done = _batched_rows(
+        m, fgrid, work, t_ref, axis, pmodel, row_settings, resolved, engine, power
+    )
+    for j in range(done, int(axis.size)):
         pg = _row_power(
             m,
             fgrid,
-            _warp(work, t_ref, float(a), pmodel),
+            _warp(work, t_ref, float(axis[j]), pmodel),
             row_settings,
             resolved,
             engine,

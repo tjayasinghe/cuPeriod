@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from cuperiod.core.columns import ColumnMap, Domain
+from cuperiod.core.errors import _user_stacklevel
 from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
 from cuperiod.core.result import Periodogram
 
@@ -155,10 +156,13 @@ def resolve_inputs(
     Returns
     -------
     list of (str, Source)
-        Stable keys paired with a light curve or a path to load lazily. A path's key
-        is its file stem; files that share a stem (``fieldA/lc.csv`` and
-        ``fieldB/lc.csv``) get the shortest trailing path that tells them apart
-        (``fieldA/lc``, ``fieldB/lc``), with a warning.
+        Stable keys paired with a light curve or a path to load lazily, each key
+        distinct. A path's key is its file stem; files that share a stem
+        (``fieldA/lc.csv`` and ``fieldB/lc.csv``) get the shortest trailing path
+        that tells them apart (``fieldA/lc``, ``fieldB/lc``). A key that still
+        repeats -- given twice, or two light curves with one ``meta["id"]`` -- keeps
+        its first occurrence and gets ``#2``, ``#3``, ... on the later ones, so no two
+        inputs share a result row or a resume entry in any sink.
 
     Raises
     ------
@@ -171,8 +175,8 @@ def resolve_inputs(
     Warns
     -----
     UserWarning
-        When file stems collide (keys were path-qualified), or when explicit keys
-        repeat (their rows cannot be told apart).
+        When file stems collide (keys were path-qualified), or when keys repeat (the
+        repeats were renamed).
     """
     # (DataFrame, group_column)
     if isinstance(inputs, tuple) and len(inputs) == 2 and _is_dataframe(inputs[0]):
@@ -191,12 +195,13 @@ def resolve_inputs(
             else:
                 lc = LightCurve.from_dataframe(sub, columns=columns, domain=domain)
             items.append((str(key), lc))
-        return items
+        # Distinct group values can share a text form (1 and "1" in one column).
+        return _unique_keys(items)
 
     # Glob / directory / single file given as a string or Path.
     if isinstance(inputs, (str, os.PathLike)):
         paths = _resolve_path_like(inputs)
-        return list(zip(_path_keys(paths), paths, strict=True))
+        return _unique_keys(list(zip(_path_keys(paths), paths, strict=True)))
 
     # An iterable of light curves / (key, lc) pairs / paths.
     if isinstance(inputs, Iterable):
@@ -279,7 +284,7 @@ def _path_keys(paths: Sequence[Path]) -> list[str]:
         f"{len(renamed)} input files share a file stem with another input, so their "
         f"keys were path-qualified to stay distinct (e.g. {', '.join(renamed[:3])})",
         UserWarning,
-        stacklevel=3,
+        stacklevel=_user_stacklevel(),
     )
     return keys
 
@@ -356,22 +361,52 @@ def _resolve_iterable(inputs: Iterable[Any]) -> list[InputItem]:
         keys = _path_keys([p for p in paths if isinstance(p, Path)])
         for row, key in zip(path_rows, keys, strict=True):
             items[row] = (key, items[row][1])
-    _warn_duplicate_keys(items)
-    return items
+    return _unique_keys(items)
 
 
-def _warn_duplicate_keys(items: Sequence[InputItem]) -> None:
-    counts = Counter(key for key, _ in items)
-    repeated = [key for key, n in counts.items() if n > 1]
-    if repeated:
-        warnings.warn(
-            f"{len(repeated)} batch keys occur more than once (e.g. "
-            f"{', '.join(repr(k) for k in repeated[:3])}); their result rows cannot be "
-            "told apart, and a resumed sink treats them as one light curve. Give each "
-            "light curve its own key.",
-            UserWarning,
-            stacklevel=4,
-        )
+def _unique_keys(items: list[InputItem]) -> list[InputItem]:
+    """``items`` with every repeated key made distinct (``key#2``, ``key#3``, ...).
+
+    A key is a light curve's identity in every sink: its result rows, the resume
+    check (``key`` and ``(key, method)`` sets), the period catalogue of
+    ``batch_pdot``. Two inputs under one key used to share all of that -- rows that
+    could not be told apart, and a resumed sink that counted the second as done when
+    only the first had run. The first occurrence keeps its key, so the common case
+    (keys that are already unique) is untouched. Keys are compared in the form a CSV
+    sink stores them (:func:`csv_safe`): ``"=x"`` and ``"'=x"`` are distinct keys
+    that a CSV sink would write identically.
+    """
+    stored = [str(csv_safe(key)) for key, _ in items]
+    counts = Counter(stored)
+    if all(n == 1 for n in counts.values()):
+        return items
+    taken = set(stored)
+    seen: Counter[str] = Counter()
+    out: list[InputItem] = []
+    renamed: list[str] = []
+    for (key, source), form in zip(items, stored, strict=True):
+        seen[form] += 1
+        if seen[form] == 1:
+            out.append((key, source))
+            continue
+        n = seen[form]
+        while str(csv_safe(f"{key}#{n}")) in taken:  # never onto another real key
+            n += 1
+        new = f"{key}#{n}"
+        taken.add(str(csv_safe(new)))
+        out.append((new, source))
+        renamed.append(new)
+    warnings.warn(
+        f"{len(renamed)} batch keys occur more than once; the repeats were renamed "
+        f"({', '.join(repr(k) for k in renamed[:3])}) so each light curve keeps its "
+        "own result rows and resume entry. Give every light curve its own key to "
+        "choose the names (a key-based catalogue, such as batch_pdot's period=, "
+        "matches only the first occurrence).",
+        UserWarning,
+        # Reached from a list, a glob or a table, at different depths.
+        stacklevel=_user_stacklevel(),
+    )
+    return out
 
 
 def load_source(

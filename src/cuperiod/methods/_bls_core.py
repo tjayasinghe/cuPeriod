@@ -578,7 +578,7 @@ extern "C" __global__ void bls_block(
     __syncthreads();
 
     REAL loc_obj = NEG_INF;
-    int loc_n = 0, loc_d = 0;
+    int loc_n = 0, loc_d = 0, loc_di = 0;
     for (int di = 0; di < n_dur; ++di) {
         const int d = dur_bins[di];
         if (d < 1 || d >= n_bins) continue;
@@ -596,20 +596,30 @@ extern "C" __global__ void bls_block(
             REAL obj = (obj_flag == 0)
                 ? depth / sqrt((REAL)1.0 / iv_in + (REAL)1.0 / iv_out)
                 : (REAL)0.5 * iv_in * depth * depth;
-            if (obj > loc_obj) { loc_obj = obj; loc_n = n; loc_d = d; }
+            if (obj > loc_obj) { loc_obj = obj; loc_n = n; loc_d = d; loc_di = di; }
         }
     }
 
+    // An exact tie (boxes that differ only by empty bins hold the same points, so
+    // sparse curves have many) goes to the earliest (duration, start) of the sweep
+    // order: astropy's first-wins rule, which the host searches follow too.
     __shared__ REAL r_obj[CUDA_BLOCK];
     __shared__ int r_n[CUDA_BLOCK];
     __shared__ int r_d[CUDA_BLOCK];
-    r_obj[tid] = loc_obj; r_n[tid] = loc_n; r_d[tid] = loc_d;
+    __shared__ int r_di[CUDA_BLOCK];
+    r_obj[tid] = loc_obj; r_n[tid] = loc_n; r_d[tid] = loc_d; r_di[tid] = loc_di;
     __syncthreads();
     for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-        if (tid < s && r_obj[tid + s] > r_obj[tid]) {
-            r_obj[tid] = r_obj[tid + s];
-            r_n[tid] = r_n[tid + s];
-            r_d[tid] = r_d[tid + s];
+        if (tid < s) {
+            const REAL other = r_obj[tid + s], mine = r_obj[tid];
+            const bool earlier = r_di[tid + s] < r_di[tid]
+                || (r_di[tid + s] == r_di[tid] && r_n[tid + s] < r_n[tid]);
+            if (other > mine || (other == mine && earlier)) {
+                r_obj[tid] = other;
+                r_n[tid] = r_n[tid + s];
+                r_d[tid] = r_d[tid + s];
+                r_di[tid] = r_di[tid + s];
+            }
         }
         __syncthreads();
     }
@@ -662,6 +672,181 @@ def _cuda_kernel(block: int, real: str) -> Any:
     return kernel
 
 
+#: The per-period output arrays of every box search, in kernel-argument order.
+_OUTPUT_NAMES: Final = (
+    "power",
+    "depth",
+    "depth_err",
+    "depth_snr",
+    "duration",
+    "transit_time",
+    "log_likelihood",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _SearchSpec:
+    """One duration-homogeneous box search: a period block and its binning."""
+
+    periods: FloatArray
+    bin_duration: float
+    dur_bins: list[int]
+    width: int
+
+
+def _search_spec(
+    periods: FloatArray, durations: FloatArray, oversample: int
+) -> _SearchSpec:
+    """Binning of one segment: bin width, box widths in bins and bins per period."""
+    periods_host = np.ascontiguousarray(periods, dtype=np.float64)
+    durations_host = np.ascontiguousarray(durations, dtype=np.float64)
+    bin_duration = float(durations_host.min()) / oversample
+    dur_bins = _duration_bins(durations_host, bin_duration)
+    max_n_bins = int(np.ceil(float(periods_host.max()) / bin_duration)) + oversample
+    return _SearchSpec(periods_host, bin_duration, dur_bins, max_n_bins + 1)
+
+
+def _cuda_curve(
+    cp: Any,
+    t: FloatArray,
+    y: FloatArray,
+    ivar: FloatArray,
+    rdtype: Any,
+    device_cache: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """The light curve's device arrays and float64 sums, cached per light curve."""
+    data: dict[str, Any] | None = None
+    if device_cache is not None:
+        data = device_cache.get("cuda")
+        if data is not None and (data["n"] != t.shape[0] or data["dtype"] != rdtype):
+            data = None
+    if data is None:
+        t_min = float(t.min())
+        yw_h = y * ivar
+        data = {
+            "n": int(t.shape[0]),
+            "dtype": rdtype,
+            "t_min": t_min,
+            "tau": cp.asarray(np.ascontiguousarray(t - t_min, dtype=rdtype)),
+            "yw": cp.asarray(np.ascontiguousarray(yw_h, dtype=rdtype)),
+            "ivar": cp.asarray(np.ascontiguousarray(ivar, dtype=rdtype)),
+            "sum_y": float(yw_h.sum()),
+            "sum_ivar": float(ivar.sum()),
+        }
+        if device_cache is not None:
+            device_cache["cuda"] = data
+    return data
+
+
+def _bls_search_cuda_specs(
+    t: FloatArray,
+    y: FloatArray,
+    ivar: FloatArray,
+    specs: list[_SearchSpec],
+    *,
+    oversample: int,
+    obj_flag: int,
+    precision: str = "float64",
+    device_cache: dict[str, Any] | None = None,
+    block: int = CUDA_BLOCK,
+) -> list[dict[str, Any]]:
+    """The CUDA box search of several segments with one upload and one download.
+
+    Every segment's periods and box widths go up in one transfer and every kernel
+    writes into its slice of one ``(7, n_periods)`` output that comes back in one
+    transfer, so the launches queue back to back. Issued per segment, the transfers
+    each waited for the previous kernel (a copy from pageable host memory
+    synchronises its stream) and left the device idle while the host prepared the
+    next launch. Each segment's results are exactly those of a separate search.
+    """
+    import cupy as cp
+
+    from cuperiod.core.backend import ensure_shared_memory
+
+    rdtype = np.float32 if precision == "float32" else np.float64
+    data = _cuda_curve(cp, t, y, ivar, rdtype, device_cache)
+    sizes = [int(spec.periods.shape[0]) for spec in specs]
+    total = sum(sizes)
+    if total == 0:
+        return [_empty_output(0) for _ in specs]
+    periods_d = cp.asarray(
+        np.concatenate([spec.periods for spec in specs]).astype(rdtype, copy=False)
+    )
+    dur_all = [np.asarray(spec.dur_bins, dtype=np.int32) for spec in specs]
+    dur_d = cp.asarray(np.concatenate(dur_all))
+    out = cp.empty((len(_OUTPUT_NAMES), total), dtype=cp.float64)
+    real_size = 4 if precision == "float32" else 8
+    kernel = _cuda_kernel(block, precision)
+    # The relative floor of _ivar_floor: an empty side of a box (or the outside of a
+    # box holding every point) is cumulative-sum *noise* of order N*eps*sum_ivar
+    # (sum_ivar*eps_f32 in float32), never exactly 0.
+    floor = rdtype(
+        max(
+            _ivar_floor(data["n"], data["sum_ivar"], float32=precision == "float32"),
+            float(np.finfo(rdtype).tiny),
+        )
+    )
+    empty: list[int] = []
+    p_off = d_off = 0
+    for k, (spec, n_periods) in enumerate(zip(specs, sizes, strict=True)):
+        n_dur = int(dur_all[k].shape[0])
+        if n_periods == 0 or n_dur == 0:
+            empty.append(k)
+        else:
+            smem = 2 * spec.width * real_size
+            ensure_shared_memory(
+                kernel, smem, method="BLS", hint="the period range (max_period_days)"
+            )
+            sl = slice(p_off, p_off + n_periods)
+            kernel(
+                (n_periods,),
+                (block,),
+                (
+                    data["tau"],
+                    data["yw"],
+                    data["ivar"],
+                    periods_d[sl],
+                    dur_d[d_off : d_off + n_dur],
+                    np.int32(data["n"]),
+                    np.int32(n_periods),
+                    np.int32(n_dur),
+                    rdtype(spec.bin_duration),
+                    np.int32(oversample),
+                    np.int32(spec.width),
+                    rdtype(data["sum_y"]),
+                    rdtype(data["sum_ivar"]),
+                    np.float64(data["t_min"]),
+                    np.int32(obj_flag),
+                    rdtype(-np.inf),
+                    floor,
+                    *(out[i, sl] for i in range(len(_OUTPUT_NAMES))),
+                ),
+                shared_mem=smem,
+            )
+        p_off += n_periods
+        d_off += n_dur
+    host = out.get()
+    results: list[dict[str, Any]] = []
+    p_off = 0
+    for k, n_periods in enumerate(sizes):
+        if k in empty:
+            results.append(_empty_output(n_periods))
+        else:
+            sl = slice(p_off, p_off + n_periods)
+            results.append(
+                {name: host[i, sl] for i, name in enumerate(_OUTPUT_NAMES)}
+            )
+        p_off += n_periods
+    return results
+
+
+def _empty_output(n_periods: int) -> dict[str, Any]:
+    """The output of a search with no admissible box: power -inf, zeros elsewhere."""
+    out = {name: np.zeros(n_periods, dtype=np.float64) for name in _OUTPUT_NAMES}
+    out["power"][...] = -np.inf
+    return out
+
+
 def _bls_search_cuda(
     t: FloatArray,
     y: FloatArray,
@@ -685,101 +870,13 @@ def _bls_search_cuda(
     time origin is subtracted on the host in float64 before any (possibly float32)
     device cast; the kernel adds ``t_min`` back into ``transit_time`` in double.
     """
-    import cupy as cp
-
-    rdtype = np.float32 if precision == "float32" else np.float64
-    data: dict[str, Any] | None = None
-    if device_cache is not None:
-        data = device_cache.get("cuda")
-        if data is not None and (data["n"] != t.shape[0] or data["dtype"] != rdtype):
-            data = None
-    if data is None:
-        t_min = float(t.min())
-        yw_h = y * ivar
-        data = {
-            "n": int(t.shape[0]),
-            "dtype": rdtype,
-            "t_min": t_min,
-            "tau": cp.asarray(np.ascontiguousarray(t - t_min, dtype=rdtype)),
-            "yw": cp.asarray(np.ascontiguousarray(yw_h, dtype=rdtype)),
-            "ivar": cp.asarray(np.ascontiguousarray(ivar, dtype=rdtype)),
-            "sum_y": float(yw_h.sum()),
-            "sum_ivar": float(ivar.sum()),
-        }
-        if device_cache is not None:
-            device_cache["cuda"] = data
-
-    periods_d = cp.asarray(np.ascontiguousarray(periods, dtype=rdtype))
-    n_periods = int(periods_d.shape[0])
-    dur_d = cp.asarray(np.asarray(dur_bins, dtype=np.int32))
-
-    names = (
-        "power",
-        "depth",
-        "depth_err",
-        "depth_snr",
-        "duration",
-        "transit_time",
-        "log_likelihood",
+    spec = _SearchSpec(
+        np.ascontiguousarray(periods, dtype=np.float64), bin_duration, dur_bins, width
     )
-    if n_periods == 0 or len(dur_bins) == 0:
-        out_empty = {name: np.zeros(n_periods, dtype=np.float64) for name in names}
-        out_empty["power"][...] = -np.inf
-        return out_empty
-    out = {name: cp.empty(n_periods, dtype=cp.float64) for name in names}
-
-    from cuperiod.core.backend import ensure_shared_memory
-
-    real_size = 4 if precision == "float32" else 8
-    smem = 2 * width * real_size
-    kernel = _cuda_kernel(block, precision)
-    ensure_shared_memory(
-        kernel, smem, method="BLS", hint="the period range (max_period_days)"
-    )
-    kernel(
-        (n_periods,),
-        (block,),
-        (
-            data["tau"],
-            data["yw"],
-            data["ivar"],
-            periods_d,
-            dur_d,
-            np.int32(data["n"]),
-            np.int32(n_periods),
-            np.int32(dur_d.shape[0]),
-            rdtype(bin_duration),
-            np.int32(oversample),
-            np.int32(width),
-            rdtype(data["sum_y"]),
-            rdtype(data["sum_ivar"]),
-            np.float64(data["t_min"]),
-            np.int32(obj_flag),
-            rdtype(-np.inf),
-            # The relative floor of _ivar_floor: an empty side of a box (or the
-            # outside of a box holding every point) is cumulative-sum *noise* of
-            # order N*eps*sum_ivar (sum_ivar*eps_f32 in float32), never exactly 0.
-            rdtype(
-                max(
-                    _ivar_floor(
-                        data["n"], data["sum_ivar"], float32=precision == "float32"
-                    ),
-                    float(np.finfo(rdtype).tiny),
-                )
-            ),
-            out["power"],
-            out["depth"],
-            out["depth_err"],
-            out["depth_snr"],
-            out["duration"],
-            out["transit_time"],
-            out["log_likelihood"],
-        ),
-        shared_mem=smem,
-    )
-    # One stacked D2H copy instead of seven independent transfers.
-    host = cp.asnumpy(cp.stack([out[name] for name in names]))
-    return {name: host[i] for i, name in enumerate(names)}
+    return _bls_search_cuda_specs(
+        t, y, ivar, [spec], oversample=oversample, obj_flag=obj_flag,
+        precision=precision, device_cache=device_cache, block=block,
+    )[0]
 
 
 def bls_power(
@@ -839,32 +936,17 @@ def bls_power(
     BLSPower
         Per-period maxima aligned with ``periods``.
     """
-    if objective not in ("snr", "likelihood"):
-        raise ValueError("objective must be 'snr' or 'likelihood'")
-    obj_flag = 0 if objective == "snr" else 1
+    obj_flag = _objective_flag(objective)
     is_torch = backend == "torch" or backend.startswith("torch:")
     if not is_torch and backend not in ("numpy", "cupy", "numba"):
         raise ValueError(f"unknown backend {backend!r}")
 
     periods_host = np.ascontiguousarray(periods, dtype=np.float64)
-    durations_host = np.ascontiguousarray(durations, dtype=np.float64)
     if periods_host.size == 0:
-        empty = tuple(np.empty(0, dtype=np.float64) for _ in range(8))
-        return BLSPower(*empty)
-    bin_duration = float(durations_host.min()) / oversample
-    dur_bins = _duration_bins(durations_host, bin_duration)
-    max_n_bins = int(np.ceil(float(periods_host.max()) / bin_duration)) + oversample
-    width = max_n_bins + 1
-
-    t_host = np.ascontiguousarray(t, dtype=np.float64)
-    # Centred on the median in float64, before any device cast, as astropy does: every
-    # box statistic is offset-invariant, but uncentred cumulative sums of y*ivar carry
-    # the whole flux level -- in float32 (forced on Apple MPS) its 6e-8 rounding swamps
-    # ppm-level transits, and even in float64 it costs parity digits.
-    y_host = np.ascontiguousarray(y, dtype=np.float64)
-    if y_host.size:
-        y_host = y_host - float(np.median(y_host))
-    ivar_host = 1.0 / (np.ascontiguousarray(dy, dtype=np.float64) ** 2)
+        return _empty_power()
+    spec = _search_spec(periods_host, durations, oversample)
+    bin_duration, dur_bins, width = spec.bin_duration, spec.dur_bins, spec.width
+    t_host, y_host, ivar_host = _host_inputs(t, y, dy)
 
     # Time origin subtracted before any (possibly float32) device cast; restored
     # into the absolute ``transit_time`` on the host below. Stays 0.0 for the float64
@@ -943,8 +1025,43 @@ def bls_power(
             batch=_resolve_batch(batch, int(t_host.shape[0]), width, on_device=False),
         )
 
+    return _to_power(periods_host, out, t_ref)
+
+
+def _objective_flag(objective: str) -> int:
+    """Kernel flag of a box objective: 0 = depth SNR, 1 = log-likelihood."""
+    if objective not in ("snr", "likelihood"):
+        raise ValueError("objective must be 'snr' or 'likelihood'")
+    return 0 if objective == "snr" else 1
+
+
+def _empty_power() -> BLSPower:
+    """The :class:`BLSPower` of an empty period grid."""
+    return BLSPower(*(np.empty(0, dtype=np.float64) for _ in range(8)))
+
+
+def _host_inputs(
+    t: FloatArray, y: FloatArray, dy: FloatArray
+) -> tuple[FloatArray, FloatArray, FloatArray]:
+    """``(t, y - median(y), 1/dy**2)`` as contiguous float64 host arrays.
+
+    Centred on the median in float64, before any device cast, as astropy does: every
+    box statistic is offset-invariant, but uncentred cumulative sums of y*ivar carry
+    the whole flux level -- in float32 (forced on Apple MPS) its 6e-8 rounding swamps
+    ppm-level transits, and even in float64 it costs parity digits.
+    """
+    t_host = np.ascontiguousarray(t, dtype=np.float64)
+    y_host = np.ascontiguousarray(y, dtype=np.float64)
+    if y_host.size:
+        y_host = y_host - float(np.median(y_host))
+    ivar_host = 1.0 / (np.ascontiguousarray(dy, dtype=np.float64) ** 2)
+    return t_host, y_host, ivar_host
+
+
+def _to_power(periods: FloatArray, out: dict[str, Any], t_ref: float) -> BLSPower:
+    """A search's output dict as host float64 :class:`BLSPower` arrays."""
     return BLSPower(
-        period=periods_host,
+        period=periods,
         power=to_host(out["power"]),
         depth=to_host(out["depth"]),
         depth_err=to_host(out["depth_err"]),
@@ -955,9 +1072,68 @@ def bls_power(
     )
 
 
+def bls_power_segments(
+    t: FloatArray,
+    y: FloatArray,
+    dy: FloatArray,
+    segments: list[tuple[FloatArray, FloatArray]],
+    oversample: int,
+    *,
+    objective: str = "snr",
+    backend: str = "numpy",
+    batch: int = DEFAULT_BATCH,
+    precision: str = "auto",
+    device_cache: dict[str, Any] | None = None,
+) -> list[BLSPower]:
+    """:func:`bls_power` over the ``(periods, durations)`` segments of one curve.
+
+    Equal to calling :func:`bls_power` once per segment (the same arguments, the
+    same results). On ``cupy`` the segments share one upload of their period grids
+    and one download of every result, so the kernels run back to back instead of
+    each waiting on a transfer; the other backends loop over :func:`bls_power`.
+    """
+    if backend != "cupy":
+        return [
+            bls_power(
+                t, y, dy, periods, durations, oversample, objective=objective,
+                backend=backend, batch=batch, precision=precision,
+                device_cache=device_cache,
+            )
+            for periods, durations in segments
+        ]
+    from cuperiod.core.backend import ensure_cuda_dll_path
+
+    obj_flag = _objective_flag(objective)
+    ensure_cuda_dll_path()
+    t_host, y_host, ivar_host = _host_inputs(t, y, dy)
+    specs = [
+        _search_spec(periods, durations, oversample)
+        for periods, durations in segments
+        if np.asarray(periods).size
+    ]
+    outs = iter(
+        _bls_search_cuda_specs(
+            t_host, y_host, ivar_host, specs, oversample=oversample,
+            obj_flag=obj_flag, precision=resolve_precision(precision, "cuda"),
+            device_cache=device_cache,
+        )
+        if specs
+        else []
+    )
+    spec_iter = iter(specs)
+    results: list[BLSPower] = []
+    for periods, _ in segments:
+        if np.asarray(periods).size == 0:
+            results.append(_empty_power())
+        else:
+            results.append(_to_power(next(spec_iter).periods, next(outs), 0.0))
+    return results
+
+
 __all__ = [
     "BLSBackend",
     "BLSPower",
     "DEFAULT_BATCH",
     "bls_power",
+    "bls_power_segments",
 ]

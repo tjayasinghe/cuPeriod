@@ -56,6 +56,7 @@ from cuperiod.prewhiten.session.state import (
     LogEntry,
     PointMask,
     ProjectError,
+    RefusalHint,
     SessionData,
     SessionError,
     SessionSnapshot,
@@ -262,6 +263,9 @@ class ReportModel(_Strict):
     frequency: float | None = None
     statistics: dict[Text64, float | None] = Field(default_factory=dict)
     warning: str = Field(default="", max_length=500)
+    # Only refusals carry a hint and they are never logged, so files hold none; the
+    # field keeps StepReport.to_dict()/from_dict() round-tripping through a project.
+    hint: RefusalHint | None = None
 
 
 class LogEntryModel(_Strict):

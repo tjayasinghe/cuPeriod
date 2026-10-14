@@ -570,12 +570,17 @@ def period_profile(
     # comparison and must be refused here, not deep inside the scan.
     if not 0.0 < window < 1.0:
         raise ValueError(f"period_window must be in (0, 1), got {window}")
-    if harmonics is not None and harmonics < 1:
-        raise ValueError(f"harmonics must be >= 1, got {harmonics}")
-    if per_interval < 1:
-        raise ValueError(f"points_per_interval must be >= 1, got {per_interval}")
-    if n_intervals is not None and n_intervals < 1:
-        raise ValueError(f"n_intervals must be >= 1, got {n_intervals}")
+    # Counts: `not (... >= 1)` so a NaN fails here, and an infinity too, rather than
+    # as an int() conversion error or an empty profile further down.
+    for name, count in (
+        ("harmonics", harmonics),
+        ("points_per_interval", per_interval),
+        ("n_intervals", n_intervals),
+    ):
+        if count is not None and not (
+            math.isfinite(count) and float(count).is_integer() and count >= 1
+        ):
+            raise ValueError(f"{name} must be an integer >= 1, got {count}")
     if period is not None and not (math.isfinite(period) and period > 0.0):
         raise ValueError(f"period must be finite and positive, got {period}")
 

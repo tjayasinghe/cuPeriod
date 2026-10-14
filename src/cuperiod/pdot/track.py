@@ -230,10 +230,19 @@ def fit_template(
         ``N*ln(RSS/N) + k*ln(N)`` up to a constant, as before.
     """
     del weighted  # the scale-free criterion needs no branch (see above)
+    # A non-finite frequency or order otherwise surfaces as an SVD that did not
+    # converge, or an integer conversion error, far from the cause.
+    if not (np.isfinite(f0) and f0 > 0.0):
+        raise ValueError(f"f0 must be positive and finite, got {f0}")
+    for name, order in (("n_harmonics", n_harmonics), ("max_harmonics", max_harmonics)):
+        if order is not None and not (
+            np.isfinite(order) and float(order).is_integer() and order >= 1
+        ):
+            raise ValueError(f"{name} must be an integer >= 1, got {order}")
     n = dt.size
     if n_harmonics is not None:
-        return _fit_template_order(dt, y, w, f0, n_harmonics)[0]
-    top = max(1, min(max_harmonics, (n - 2) // 2))
+        return _fit_template_order(dt, y, w, f0, int(n_harmonics))[0]
+    top = max(1, min(int(max_harmonics), (n - 2) // 2))
     ladder = _ladder_chi2(dt, y, w, f0, top)
     if ladder is None:
         ladder = np.array(

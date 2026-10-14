@@ -146,13 +146,54 @@ def test_title_bar_marks_unsaved_work_and_names_the_project(
     provider = FakeDialogProvider()
     window = _window(qtbot, provider)
     _dirty_session(qtbot, window)
-    assert window.windowTitle().startswith("cuPeriod — Star")
-    qtbot.waitUntil(lambda: window.windowTitle().endswith("*"))
+    qtbot.waitUntil(lambda: _shown_title(window) == "Star* — cuPeriod")
+    assert window.isWindowModified()
     project = tmp_path / "star.cupw.json"
     provider.answers.append(str(project))
     window.commands.action("file.save_project").trigger()
     qtbot.waitUntil(lambda: project.is_file())
-    qtbot.waitUntil(lambda: window.windowTitle() == "cuPeriod — Star — star.cupw.json")
+    qtbot.waitUntil(
+        lambda: _shown_title(window) == "Star — star.cupw.json — cuPeriod"
+    )
+    assert not window.isWindowModified()
+    window.controller.shutdown()
+
+
+def _shown_title(window: MainWindow) -> str:
+    """The title the platform is given (Qt's ``[*]`` marker resolved)."""
+    handle = window.windowHandle()
+    assert handle is not None
+    return handle.title()
+
+
+def test_the_title_names_the_application_once(qtbot: QtBot) -> None:
+    # Qt appends an explicitly set application display name to every title; the
+    # app set one, so on Windows the bar read "cuPeriod — Star - cuPeriod".
+    from cuperiod.gui.app import name_application
+    from cuperiod.gui.main_window import window_title
+
+    named: list[tuple[str, object]] = []
+
+    class Recorder:
+        def __getattr__(self, attribute: str) -> object:
+            return lambda *args: named.append((attribute, args))
+
+    name_application(Recorder())  # type: ignore[arg-type]
+    assert [n for n, _ in named] == [
+        "setApplicationName", "setOrganizationName", "setWindowIcon"
+    ]
+    window = _window(qtbot)
+    assert _shown_title(window).count("cuPeriod") == 1
+    window._load_demo(SourceItem("star", "Star", _curve))
+    assert _shown_title(window) == "Star — cuPeriod"
+    assert not window.isWindowModified()
+    # The document first, the application once and last; a name holding Qt's
+    # marker cannot move the "*".
+    assert window_title("star.csv", "star.cupw.json") == (
+        "star.csv — star.cupw.json[*] — cuPeriod"
+    )
+    assert window_title("a[*].csv") == "a[*][*].csv[*] — cuPeriod"
+    assert window_title("", "").count("cuPeriod") == 1
     window.controller.shutdown()
 
 
@@ -256,6 +297,33 @@ def test_a_failed_preview_says_so_where_the_spectrum_would_be(qtbot: QtBot) -> N
     assert spectrum.placeholder() == "Spectrum unavailable: no memory"
     assert spectrum._placeholder.isVisible()
     assert spectrum._plot.accessibleDescription() == "Spectrum unavailable: no memory"
+
+
+def test_a_failed_preview_takes_down_a_result_of_another_session(
+    qtbot: QtBot,
+) -> None:
+    # With a result on show (another band's session, say), the failure of the
+    # displayed session's preview reached only the status bar, under that result.
+    window = _window(qtbot)
+    window._load_demo(SourceItem("star", "Star", _curve))
+    window._controls.set_analysis("prewhiten")
+    _auto(qtbot, window)
+    assert window._showing_result and window._solution_panel.table.rowCount() > 0
+    text = "Spectrum unavailable: not enough points in band r"
+    window.controller.preview_failed.emit(text)
+    status = window.statusBar()
+    assert status is not None and status.currentMessage() == text
+    spectrum = window._spectrum
+    assert spectrum.isVisible() and spectrum.placeholder() == text
+    assert spectrum._placeholder.isVisible()
+    assert window._placeholder.isVisible() and text in window._placeholder.text()
+    # As with no result: the curve full size, and nothing of the other session.
+    assert window.lc_layout == "preview" and window._raw.isVisible()
+    assert not window._phased.isVisible()
+    assert window._solution_panel.table.rowCount() == 0
+    assert not window._session_bar.isVisible()
+    assert window._info.is_idle()
+    window.controller.shutdown()
 
 
 def test_a_failed_preview_disables_the_session_commands(qtbot: QtBot) -> None:

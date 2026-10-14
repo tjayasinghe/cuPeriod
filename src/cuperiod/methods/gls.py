@@ -30,6 +30,7 @@ astropy
 from __future__ import annotations
 
 import dataclasses
+import threading
 from collections import OrderedDict
 from typing import Any, ClassVar, Final, Literal
 
@@ -372,6 +373,42 @@ def lombscargle_power_torch(
     return to_host(power)
 
 
+_ROW_PREP: Any = None
+
+
+def _row_prep_kernel() -> Any:
+    """The fused per-row prologue of :meth:`CufinufftGLS.power_rows` (compiled once).
+
+    From one row of times it writes the wrapped NUFFT points
+    ``x = (scale*tau + pi) mod 2pi - pi`` and the three modulated strengths
+    ``w*e^{i c1 tau}``, ``wy*e^{i c1 tau}`` and ``w*e^{i c2 tau}``. The times are
+    row-relative (non-negative), where ``fmod`` is exactly the ``numpy.mod`` of the
+    unfused path.
+    """
+    global _ROW_PREP
+    if _ROW_PREP is None:
+        import cupy
+
+        _ROW_PREP = cupy.ElementwiseKernel(
+            "float64 tau, float64 w, float64 wy, float64 scale, float64 c1, "
+            "float64 c2",
+            "float64 x, complex128 s0, complex128 s1, complex128 s2",
+            r"""
+            const double pi = 3.141592653589793;
+            const double two_pi = 6.283185307179586;
+            x = fmod(scale * tau + pi, two_pi) - pi;
+            double sn, cs;
+            sincos(c1 * tau, &sn, &cs);
+            s0 = complex<double>(w * cs, w * sn);
+            s1 = complex<double>(wy * cs, wy * sn);
+            sincos(c2 * tau, &sn, &cs);
+            s2 = complex<double>(w * cs, w * sn);
+            """,
+            "cuperiod_gls_row_prep",
+        )
+    return _ROW_PREP
+
+
 class CufinufftGLS:
     """Plan-reusing GPU Lomb-Scargle for batch processing.
 
@@ -392,15 +429,33 @@ class CufinufftGLS:
     on grids of the same mode count, so one bucketed plan pair serves every band,
     every harmonic, and every star of a batch.
 
+    The bucket is deliberately coarse even for small grids: on an RTX 5070 Ti a plan
+    sized to a 601-mode window spread a 1200-point curve ~35% *slower* than a
+    65536-mode one (cufinufft's shared-memory spreader parallelises over bins of the
+    fine grid, and a tiny grid has only a couple of them).
+
     Parameters
     ----------
     eps : float, default 1e-9
         NUFFT relative tolerance.
     nf_bucket : int, default 65536
         Plan mode-count rounding granularity.
+    max_cached_modes : int, optional
+        Least-recently-used plans are dropped once the cached plans hold more modes
+        than this (summed over ``n_trans``); unbounded when omitted.
+    thread_safe : bool, default False
+        Serialise every transform with a lock, so one instance can serve several
+        threads (the process-wide engine of :func:`shared_cufinufft_engine`).
     """
 
-    def __init__(self, eps: float = DEFAULT_EPS, nf_bucket: int = 1 << 16) -> None:
+    def __init__(
+        self,
+        eps: float = DEFAULT_EPS,
+        nf_bucket: int = 1 << 16,
+        *,
+        max_cached_modes: int | None = None,
+        thread_safe: bool = False,
+    ) -> None:
         ensure_cuda_dll_path()
         import cufinufft
         import cupy
@@ -409,16 +464,40 @@ class CufinufftGLS:
         self._cp = cupy
         self._eps = eps
         self._bucket = max(1, int(nf_bucket))
-        self._plans: dict[tuple[int, int], Any] = {}
+        self._max_modes = (
+            None if max_cached_modes is None else max(1, int(max_cached_modes))
+        )
+        self._plans: OrderedDict[tuple[int, int, str], Any] = OrderedDict()
+        self._lock: threading.RLock | None = threading.RLock() if thread_safe else None
 
-    def _plan(self, nf: int, n_trans: int) -> Any:
-        plan = self._plans.get((nf, n_trans))
-        if plan is None:
-            plan = self._cufinufft.Plan(
-                1, (nf,), n_trans=n_trans, eps=self._eps, isign=1, dtype="complex128"
-            )
-            self._plans[(nf, n_trans)] = plan
+    def _plan(self, nf: int, n_trans: int, *, rows: bool = False) -> Any:
+        # Row plans (power_rows) spread without sorting the points: one setpts per
+        # light-curve copy, where the sort cost more than the unsorted spread saves.
+        key = (nf, n_trans, "rows" if rows else "sorted")
+        plan = self._plans.get(key)
+        if plan is not None:
+            self._plans.move_to_end(key)
+            return plan
+        options: dict[str, int] = {"gpu_method": 1, "gpu_sort": 0} if rows else {}
+        plan = self._cufinufft.Plan(
+            1, (nf,), n_trans=n_trans, eps=self._eps, isign=1, dtype="complex128",
+            **options,
+        )
+        self._plans[key] = plan
+        if self._max_modes is not None:
+            while len(self._plans) > 1 and (
+                sum(m * k for m, k, _ in self._plans) > self._max_modes
+            ):
+                self._plans.popitem(last=False)
         return plan
+
+    def release(self) -> None:
+        """Destroy every cached plan (their device workspaces go with them)."""
+        if self._lock is None:
+            self._plans.clear()
+            return
+        with self._lock:
+            self._plans.clear()
 
     def trig_sums(
         self, tau: Any, strengths: Any, f0: float, df: float, nf: int
@@ -432,6 +511,14 @@ class CufinufftGLS:
         transforms of the same shape — across bands, harmonics, and light curves —
         share one plan.
         """
+        if self._lock is None:
+            return self._trig_sums(tau, strengths, f0, df, nf)
+        with self._lock:
+            return self._trig_sums(tau, strengths, f0, df, nf)
+
+    def _trig_sums(
+        self, tau: Any, strengths: Any, f0: float, df: float, nf: int
+    ) -> Any:
         cp = self._cp
         nf_plan = ((nf + self._bucket - 1) // self._bucket) * self._bucket
         two_pi = 2.0 * np.pi
@@ -463,14 +550,183 @@ class CufinufftGLS:
         """
         if nf <= 0:
             return np.zeros(0, dtype=np.float64)
+        if self._lock is None:
+            return self._power(t, y, dy, f0, df, nf, fit_mean)
+        with self._lock:
+            return self._power(t, y, dy, f0, df, nf, fit_mean)
+
+    def _power(
+        self,
+        t: FloatArray,
+        y: FloatArray,
+        dy: FloatArray | None,
+        f0: float,
+        df: float,
+        nf: int,
+        fit_mean: bool,
+    ) -> FloatArray:
         cp = self._cp
         tau, w, y_c, yy = _prep(t, y, dy)
         tau_g = cp.asarray(tau)
         base = cp.asarray(np.stack([w, w * y_c]))
-        pair = self.trig_sums(tau_g, base, f0, df, nf)
-        sw2 = self.trig_sums(tau_g, base[:1], 2.0 * f0, 2.0 * df, nf)
+        pair = self._trig_sums(tau_g, base, f0, df, nf)
+        sw2 = self._trig_sums(tau_g, base[:1], 2.0 * f0, 2.0 * df, nf)
         power = _assemble_power(pair[0], pair[1], sw2[0], yy, fit_mean)
         return np.asarray(cp.asnumpy(power), dtype=np.float64)
+
+    def power_rows(
+        self,
+        times: FloatArray,
+        y: FloatArray,
+        dy: FloatArray | None,
+        f0: float,
+        df: float,
+        nf: int,
+        *,
+        fit_mean: bool = True,
+    ) -> FloatArray:
+        """GLS power of one light curve re-timed per row: an ``(n_rows, nf)`` map.
+
+        Row ``r`` equals :meth:`power` of ``(times[r], y, dy)`` to the NUFFT
+        tolerance -- the map a period-derivative scan builds, where only the
+        (warped) times change from row to row. The weights and centred data go up
+        once, the rows' times in one transfer, the whole map comes back in one, and
+        each row costs a single ``setpts`` and one ``n_trans=3`` transform: the
+        doubled-frequency sums are the even modes ``2k`` of a plan covering
+        ``2*nf - 1`` modes on the base-grid points, so they need neither their own
+        points nor their own plan. Its plan spreads without sorting the points
+        (``gpu_method=1, gpu_sort=0``): per light-curve copy the sort cost more than
+        the unsorted spread saves. On an RTX 5070 Ti a 201-row map of a 601-sample
+        window of a 1200-point curve takes ~45 ms, against ~230 ms through
+        :meth:`power` row by row.
+
+        Parameters
+        ----------
+        times : numpy.ndarray
+            ``(n_rows, N)`` finite times, one light-curve copy per row.
+        y, dy : numpy.ndarray
+            Values and 1-sigma errors (``dy`` may be None), shared by every row.
+        f0, df, nf : float, float, int
+            The frequency grid ``f0 + df*arange(nf)``.
+        fit_mean : bool, default True
+            Floating-mean (generalized) variant.
+
+        Returns
+        -------
+        numpy.ndarray
+            ``(n_rows, nf)`` power, clipped to ``[0, 1]``.
+        """
+        times = np.asarray(times, dtype=np.float64)
+        if times.ndim != 2:
+            raise ValueError("power_rows: times must be (n_rows, n_points)")
+        n_rows = int(times.shape[0])
+        if nf <= 0 or n_rows == 0:
+            return np.zeros((n_rows, max(nf, 0)), dtype=np.float64)
+        if self._lock is None:
+            return self._power_rows(times, y, dy, f0, df, nf, fit_mean)
+        with self._lock:
+            return self._power_rows(times, y, dy, f0, df, nf, fit_mean)
+
+    def _power_rows(
+        self,
+        times: FloatArray,
+        y: FloatArray,
+        dy: FloatArray | None,
+        f0: float,
+        df: float,
+        nf: int,
+        fit_mean: bool,
+    ) -> FloatArray:
+        cp = self._cp
+        n_rows, n_points = (int(v) for v in times.shape)
+        # The weights and the centred data do not depend on the times.
+        w = _weights(n_points, dy)
+        y_c, yy = _centred(w, y)
+        w_d = cp.asarray(w)
+        wy_d = cp.asarray(w * y_c)
+        nf_plan = ((2 * nf - 1 + self._bucket - 1) // self._bucket) * self._bucket
+        plan = self._plan(nf_plan, 3, rows=True)
+        two_pi = 2.0 * np.pi
+        half = (nf_plan // 2) * df
+        prep = _row_prep_kernel()
+        x = cp.empty(n_points, dtype=cp.float64)
+        strengths = cp.empty((3, n_points), dtype=cp.complex128)
+        out = np.empty((n_rows, nf), dtype=np.float64)
+        # Rows per transfer: the times and the (rows, 3, nf) sums of a chunk stay
+        # within ~64 MB of device memory each.
+        chunk = max(
+            1, min(n_rows, (1 << 23) // max(1, n_points), (1 << 22) // (3 * nf))
+        )
+        for start in range(0, n_rows, chunk):
+            stop = min(start + chunk, n_rows)
+            block = times[start:stop]
+            # Each row's own origin, as power() takes t - t.min(): it keeps the
+            # modulation phases small whatever the time system.
+            tau_rows = cp.asarray(block - block.min(axis=1, keepdims=True))
+            sums = cp.empty((stop - start, 3, nf), dtype=cp.complex128)
+            for r in range(stop - start):
+                # One fused launch for the points and the three modulated
+                # strengths (it was eight elementwise launches per row).
+                prep(
+                    tau_rows[r], w_d, wy_d, two_pi * df,
+                    two_pi * (f0 + half), two_pi * (2.0 * f0 + half),
+                    x, strengths[0], strengths[1], strengths[2],
+                )
+                plan.setpts(x)
+                result = plan.execute(strengths)
+                sums[r, :2] = result[:2, :nf]
+                sums[r, 2] = result[2, : 2 * nf - 1 : 2]
+            power = _assemble_power(sums[:, 0], sums[:, 1], sums[:, 2], yy, fit_mean)
+            out[start:stop] = cp.asnumpy(power)
+        return out
+
+
+#: Plan modes the process-wide engine keeps alive (summed over ``n_trans``): with the
+#: 2x upsampled fine grid that bounds its plans to ~64 MB of device memory, and it
+#: still holds the plans of grids up to ~5e5 frequencies.
+_SHARED_ENGINE_MODES: Final = 1 << 21
+
+_SHARED_ENGINES: dict[float, CufinufftGLS] = {}
+_SHARED_GUARD = threading.Lock()
+
+
+def shared_cufinufft_engine(eps: float = DEFAULT_EPS) -> CufinufftGLS:
+    """The process-wide, thread-safe :class:`CufinufftGLS` for one-off GPU runs.
+
+    A batch hands each worker its own engine; a single periodogram (the API, the
+    GUI's worker threads) used to build and destroy two cufinufft plans per call,
+    ~1-5 ms that was 40-70% of a GPU GLS periodogram on an RTX 5070 Ti. This engine
+    keeps them, bounded by :data:`_SHARED_ENGINE_MODES`, and serialises its
+    transforms with a lock. :func:`release_shared_engines` (and
+    :func:`cuperiod.free_gpu_memory`) gives the memory back.
+
+    Parameters
+    ----------
+    eps : float, default 1e-9
+        NUFFT relative tolerance (one engine per tolerance).
+
+    Returns
+    -------
+    CufinufftGLS
+    """
+    key = float(eps)
+    with _SHARED_GUARD:
+        engine = _SHARED_ENGINES.get(key)
+        if engine is None:
+            engine = CufinufftGLS(
+                key, max_cached_modes=_SHARED_ENGINE_MODES, thread_safe=True
+            )
+            _SHARED_ENGINES[key] = engine
+        return engine
+
+
+def release_shared_engines() -> None:
+    """Destroy the plans of the process-wide engines (a no-op when there are none)."""
+    with _SHARED_GUARD:
+        engines = list(_SHARED_ENGINES.values())
+        _SHARED_ENGINES.clear()
+    for engine in engines:
+        engine.release()
 
 
 #: Plan modes kept alive by one :class:`FinufftGLS` (summed over ``n_trans``); about
@@ -769,9 +1025,20 @@ class GLSMethod(PeriodogramMethod):
                     precision=settings.precision,
                     freq_batch=settings.direct_freq_batch,
                 )
-            elif (backend == "cufinufft" and isinstance(engine, CufinufftGLS)) or (
-                backend == "finufft" and isinstance(engine, FinufftGLS)
-            ):
+            elif backend == "cufinufft":
+                # A batch hands its own engine; a one-off call (the API, the GUI)
+                # reuses the process-wide one instead of planning per call.
+                actual_backend = backend
+                gpu_engine = (
+                    engine
+                    if isinstance(engine, CufinufftGLS)
+                    else shared_cufinufft_engine(settings.nufft_eps)
+                )
+                power = gpu_engine.power(
+                    finite.time, finite.value, finite.error, f0, df, nf,
+                    fit_mean=settings.fit_mean,
+                )
+            elif backend == "finufft" and isinstance(engine, FinufftGLS):
                 # Each plan-reusing engine only serves its own backend.
                 actual_backend = backend
                 power = engine.power(
@@ -819,6 +1086,51 @@ class GLSMethod(PeriodogramMethod):
 
         return gls_multiband_power(grid, mblc, settings, backend, engine=engine)
 
+    def supports_power_rows(self, grid: GridSpec, backend: str) -> bool:
+        """cufinufft on a uniform frequency grid has the batched rows path."""
+        return backend == "cufinufft" and grid.uniform and grid.kind == "frequency"
+
+    def power_rows(  # type: ignore[override]
+        self,
+        grid: GridSpec,
+        lc: LightCurve,
+        times: FloatArray,
+        settings: GLSSettings,
+        backend: str,
+        engine: object | None = None,
+    ) -> FloatArray | None:
+        """Batched rows on cufinufft (:meth:`CufinufftGLS.power_rows`), else None.
+
+        Applies :meth:`power`'s checks and its final clean-up (non-finite to 0,
+        clip to ``[0, 1]``), so a row equals that call's ``power`` to the NUFFT
+        tolerance. Only a uniform frequency grid has the batched path.
+        """
+        if not self.supports_power_rows(grid, backend):
+            return None
+        n = lc.n
+        if n < settings.min_detections:
+            raise InsufficientDataError(
+                f"GLS: {n} finite points < min_detections {settings.min_detections}"
+            )
+        if grid.size == 0:
+            raise InsufficientDataError("GLS: empty trial grid")
+        times = np.asarray(times, dtype=np.float64)
+        spans = times.max(axis=1) - times.min(axis=1) if times.size else times
+        if times.ndim != 2 or times.shape[1] != n or not bool(np.all(spans > 0.0)):
+            raise InsufficientDataError("GLS: no usable time baseline")
+        f0, df, nf = grid.uniform_frequency_params()
+        gpu_engine = (
+            engine
+            if isinstance(engine, CufinufftGLS)
+            else shared_cufinufft_engine(settings.nufft_eps)
+        )
+        power = gpu_engine.power_rows(
+            times, lc.value, lc.error, f0, df, nf, fit_mean=settings.fit_mean
+        )
+        power = np.nan_to_num(power, nan=0.0, posinf=0.0, neginf=0.0)
+        np.clip(power, 0.0, 1.0, out=power)
+        return power
+
     def make_engine(self, backend: str, settings: GLSSettings) -> object | None:  # type: ignore[override]
         """A plan-reusing engine for repeated transforms on ``backend``.
 
@@ -848,4 +1160,6 @@ __all__ = [
     "NufftBackend",
     "lombscargle_power",
     "lombscargle_power_torch",
+    "release_shared_engines",
+    "shared_cufinufft_engine",
 ]

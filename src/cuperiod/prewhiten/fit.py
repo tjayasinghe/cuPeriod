@@ -76,6 +76,13 @@ _GTOL: Final = 1e-11
 #: Elements per transient block when accumulating the covariance normal matrix (8 MB).
 _COV_BLOCK_ELEMS: Final = 1 << 20
 
+#: Amplitudes at or below this many float64 epsilons of the largest ``|value|`` are
+#: rounding noise left by a subtraction, not signal. Measured junk on noise-free and
+#: constant curves reaches ~250 eps, so 1e4 leaves a 40x margin while sitting ~2e-12
+#: of the data's own scale — far below any photometric amplitude. The session's
+#: prune and the constrained fit's identifiability test share this one rule.
+_ROUNDOFF_EPS: Final = 1e4
+
 _TWO_PI: Final = 2.0 * np.pi
 
 

@@ -52,8 +52,12 @@ single-curve API; `ColumnMap(band=...)` makes each group a
   matches nothing raises `FileNotFoundError` instead of succeeding with no work.
 - Keys are file stems; stems that collide (`a.csv` beside `a.parquet`, or the same name
   in two folders) get the shortest unique trailing path (`fieldB/lc_0000`) with a
-  warning, and every row records its `source` file. `(key, lightcurve)` keys may be
-  strings or integers (NumPy integers included); a float key raises `TypeError`.
+  warning, and every row records its `source` file. A key that still repeats — given
+  twice, or two light curves with one `meta["id"]` — keeps its first occurrence and the
+  later ones become `key#2`, `key#3`, … (with a warning), so no two inputs ever share a
+  result row or a resume entry; keys a CSV sink would store identically count as
+  repeats. `(key, lightcurve)` keys may be strings or integers (NumPy integers
+  included); a float key raises `TypeError`.
 - `grid=` applies one trial grid to every light curve and method, as in
   {func}`~cuperiod.periodogram`, and per-method `settings` mappings match their keys like
   method names (a typo, or a settings object of the wrong class, raises). Rows honour
@@ -87,8 +91,13 @@ CPU-pool worker on the GPU on CUDA machines. Such batches now run float64 CPU ke
 values can move at the 1e-6 level and the rows' `backend` column changes.
 :::
 
-Size the GPU pool from probed device memory with
-{func}`~cuperiod.suggest_gpu_workers`:
+With `workers=None` a GPU pool is sized by {func}`~cuperiod.suggest_gpu_workers` for
+the most demanding of the requested methods (every worker runs all of them) and for
+`grid=` when one is given. It counts each worker's own CUDA context (~200–235 MiB
+measured on an RTX 5070 Ti) plus the method's working set against the free memory, and
+caps the count at 4 without NVIDIA MPS — the processes take turns on the device, so
+GLS throughput measured 550 / 860 / 1150 / 1150 curves/s for 1 / 2 / 4 / 8 workers —
+at 16 with MPS, and at the CPUs this process may use. To choose it yourself:
 
 ```python
 summary = cup.batch_periodograms(
@@ -173,7 +182,9 @@ rules: with `device="cpu"`, `"auto"` means a CPU backend (the method's settings 
 is the fallback) and a GPU-only backend raises. `batch_prewhiten(backend=None)` — the
 default — takes `settings.backend`, so `CUPERIOD_PREWHITEN_BACKEND` applies, as for
 {func}`~cuperiod.prewhiten`. Both resume by key and retry failures; `batch_pdot` does so
-across its three tables (see {doc}`period-change`). For CPU pools without a directory
+across its three tables (see {doc}`period-change`). Their rows carry the `source` file
+too, and all three drivers warn when a resumed sink already holds a key that came from
+a different file. For CPU pools without a directory
 sink `chunk_size` is an upper bound, and rows and errors come back in input order: 16
 light curves on 4 workers went from 13.9 s to 2.2 s for `batch_pdot`.
 
