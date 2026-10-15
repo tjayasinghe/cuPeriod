@@ -44,13 +44,13 @@ Every implementation is validated against the standard reference (astropy
   literature periods — the pooled fold statistics recover up to 93% of periods strictly
   (97% harmonic-aware) on real five-band data.
 - **A fast CPU tier, no GPU required.** The `[fast]` extra's multicore `numba` kernels
-  make `backend="cpu"` 20x faster than astropy's `BoxLeastSquares` and 2177x faster than
+  make `backend="cpu"` 89x faster than astropy's `BoxLeastSquares` and 1988x faster than
   PyAstronomy's PDM on a representative light curve, while recovering the same periods.
 - **GPU acceleration beyond NVIDIA.** The portable PyTorch backend runs every method on
   AMD (ROCm), Intel (XPU), and Apple (MPS) GPUs, in addition to the NVIDIA CUDA fast
   paths — so the accelerated code isn't locked to one vendor.
-- **Built for catalogue scale.** `batch_periodograms` sustains up to 574 light curves/s
-  (>2 million/hour) on a single GPU, with a resumable batch sink for runs spanning
+- **Built for catalogue scale.** `batch_periodograms` sustains up to 728 light curves/s
+  (>2.6 million/hour) on a single GPU, with a resumable batch sink for runs spanning
   millions of curves.
 - **Eight methods, one API.** GLS, BLS, PDM, CE, String-Length, MHAOV, TLS, and
   SuperSmoother share one entry point, one CLI, and an optional desktop GUI, with
@@ -206,7 +206,7 @@ six bands:
 | any single band | 0.0% | 49.3% | 99.0% |
 | multi-band `offsets` (1,0) | **81.7%** | **99.7%** | 100.0% |
 
-`perband` and `flex` land in between (17.7% / 20.0% at 30 epochs, 97.0% at 60): sharing
+`perband` and `flex` land in between (19.7% / 20.0% at 30 epochs, 97.0% at 60): sharing
 the phase is what buys sparse-cadence recovery, which is why `"offsets"` is the default.
 These are simulations on a deliberately simplified cadence (random nights, no rolling
 cadence) — read the ordering, not the absolute numbers. See the

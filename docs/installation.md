@@ -42,7 +42,7 @@ Installing `numba` flips `backend="cpu"` (and the CPU fallback of `"auto"`) from
 fallback implementations — astropy's `BoxLeastSquares` for BLS, the vectorized numpy
 kernels for PDM, CE, String-Length, MHAOV, TLS, and SuperSmoother — to in-house multicore
 JIT kernels. Nothing else about your code changes: the results match the fallbacks to
-round-off (BLS still matches astropy), they just arrive much sooner (~20× for BLS over
+round-off (BLS still matches astropy), they just arrive much sooner (~89× for BLS over
 astropy; ~25–300× for the others over their numpy paths). (Note that `numba` currently caps
 `numpy < 2.5`, so installing it may downgrade numpy slightly.) The kernels are compiled
 once per install and cached on disk; files named `supersmoother._numba_ss_kernel…` left in

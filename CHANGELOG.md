@@ -917,7 +917,7 @@ Other changes:
   the planted (P, dP/dt) in **60/60** stars, the tracker's F-test detected **60/60**
   at p < 1e-3 with **0/60** false detections on the nulls, and the pull distributions
   are calibrated (null rms 1.07, injected 0.8–1.3). Median cost per star on one CPU
-  core: 4.1 s for the 201×601 search, 0.06 s for the tracking measurement.
+  core: 0.05 s for the 201×601 search, 0.008 s for the tracking measurement.
 - **Reproducing a published period-decay law on real data**
   (`benchmarks/pdot_v1309sco.py`, `download_v1309sco.py`): V1309 Sco, the contact binary
   OGLE watched spiral in until it merged as a red nova in 2008 — the one merger with
@@ -932,13 +932,13 @@ Other changes:
 
   Running the same two-step recipe on the authors' own photometry (detrend,
   `period_profile` at 50 points per interval, `compare_period_laws`): BIC picks
-  `singular` over a constant rate by **ΔBIC = 198**, the measured P(t) points scatter
-  about the published Eq. (1) by **0.21% of P** with a +0.055% mean offset, and the two
+  `singular` over a constant rate by **ΔBIC = 188**, the measured P(t) points scatter
+  about the published Eq. (1) by **0.19% of P** with a +0.064% mean offset, and the two
   fitted P(t) curves differ by at most **0.33% of P** anywhere in the observed span. The
-  total change is **−1.47%** from the law and −1.06% from the endpoint intervals against
+  total change is **−1.47%** from the law and −1.11% from the endpoint intervals against
   the published −1.2% (and −1.14% from integrating Eq. (1) over this exact window); the
-  decay timescale runs **869 → 185 yr** against Eq. (1)'s 1730 → 156 and the quoted
-  ~1000 → ~170. Repeating at 35/40/50/60 points per interval spans −1.06% to −1.47%,
+  decay timescale runs **875 → 185 yr** against Eq. (1)'s 1730 → 156 and the quoted
+  ~1000 → ~170. Repeating at 35/40/50/60 points per interval spans −1.07% to −1.47%,
   which is the method's own systematic and is reported rather than hidden. Forcing a
   single constant rate instead returns −1.91%, and the tools say why: the F-test is
   decisive (p = 3e-8) while the O−C residuals fall 194 → 89 → 16 minutes from a
@@ -989,7 +989,7 @@ Other changes:
   a contact binary with equal minima has a template that is almost perfectly
   symmetric under a half-period shift, so a segment's best shift lands on either
   branch by noise and the O−C jumped by P/2 between segments (on four of the six
-  OGLE stars below, for up to two thirds of the segments, which the template
+  OGLE stars below, for up to three quarters of the segments, which the template
   re-derivation then turned into hour-scale garbage). The
   tracker now measures the template's fold symmetry (harmonics outside the multiples
   of `m` below 5% of the power) and unwraps consecutive delays by `period / m`;
@@ -1001,7 +1001,7 @@ Other changes:
   `phase_track` (40 segments) → `ltte_search` with no per-season binary modelling.
   **6/6** recovered outer periods agree with the published ones within 2σ (median
   offset 4%; e.g. 6.43 ± 0.09 yr vs 6.2 ± 0.2 for OGLE-BLG-ECL-289126, amplitude
-  660 ± 17 s, ΔBIC +2085), while the parabola alone claimed a ≥ 3σ dP/dt on **3/6**
+  660 ± 17 s, ΔBIC +2081), while the parabola alone claimed a ≥ 3σ dP/dt on **3/6**
   and the joint fit's secular rate on 1/6.
 - **Injection-recovery of the cyclic O−C** (`benchmarks/pdot_ltte_recovery.py`): 80
   planted 120–600 s orbits at outer periods of 0.25–1.5 baselines plus 40 nulls. With
@@ -1011,6 +1011,27 @@ Other changes:
   baselines long) against 20% for the joint fit, and there are no false cycles and
   no false rates on the nulls. Beyond one baseline the cycle is detected in 12%: the
   degenerate regime, stated as such.
+- **The whole benchmark suite re-measured for this release** (`benchmarks/REPORT.md`;
+  RTX 5070 Ti and a 16-core/32-thread CPU, best of N on a quiet machine). Single-curve
+  CPU: GLS 12.6 → 5.8 ms, BLS 171 → 39 ms (89× astropy's `BoxLeastSquares`, was 20×;
+  bit-identical power and the same best period on 126/126 stars), String-Length 43 →
+  8.9 ms, SuperSmoother 99 → 64 ms, TLS 132 → 126 ms on its 2.5× denser default grid
+  (2.6× less per trial period) — while `torch:cuda` TLS takes about 30% longer per trial
+  period, the price of fitting the out-of-transit level jointly with the depth. GPU GLS
+  5.4 → 1.7 ms; batch GLS peaks at 728 light curves/s on one GPU (was 574; >2.6
+  million/hour), with CPU pools now running CPU kernels only. CPU↔GPU parity tightened
+  for MHAOV (1.1e-5 → 1.2e-10), PDM (2.0e-10 → 2.6e-15) and BLS (1.2e-11 → 2.3e-12), TLS
+  moved to 9.0e-9 and GLS to 3.1e-6 (relative, at near-zero powers; its CPU and GPU
+  NUFFTs agree to their 1e-9 tolerance in absolute power), and every backend picks the
+  identical best period on every star. Recovery is unchanged except TLS exact, 85.7% →
+  82.1% (one W UMa binary now found at P/2; harmonic-aware unchanged). On the real
+  Stripe 82 RR Lyrae MHAOV rises from 83% to 92% strict (84% → 94% harmonic-aware) and
+  BLS falls from 22% to 20%; GPU top periods agree on 99.7% of runs with no strict
+  recovery changing. Simulated multi-band recovery moved only for GLS `perband` at 30
+  epochs (17.7% → 19.7%) and injection–recovery in 2 of 77 cells (TLS transits at SNR ≤
+  1); Kepler TLS (10/12) and the dP/dt, light-time and OGLE-triple conclusions are
+  unchanged, and the dP/dt recovery search now costs 0.05 s per star (4.1 s when first
+  measured).
 
 ### Known limitations
 
@@ -1028,10 +1049,6 @@ Other changes:
   history is re-created by replaying it, as *Verify project* does); and a session's
   spectrum backend is fixed when it is created (`load` / `restore` / `replay` take
   `backend=`).
-- Several published benchmark figures predate this release's fixes and are being
-  re-measured: the batch throughput (it ignored `grid=`, and its "CPU pool" arm ran on
-  the GPU on CUDA hosts), the TLS and SuperSmoother timings, and the multi-band MHAOV
-  results.
 - The fold methods' default grids are not exactly invariant to the time origin: the last
   sample sits on a phase-bin edge, so JD and MJD inputs differ at the O(1/N) level.
 - `BatchSettings` is deprecated (see Deprecated): no batch driver reads it, so

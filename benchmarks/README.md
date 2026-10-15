@@ -80,7 +80,7 @@ Recovery fraction, 300 stars per cell:
 |---|---|---|---|
 | best single band (r) | 0.0% | 37.3% | 97.3% |
 | any single band | 0.0% | 49.3% | 99.0% |
-| multiband perband (0,1) | 17.7% | 97.0% | 100.0% |
+| multiband perband (0,1) | 19.7% | 97.0% | 100.0% |
 | multiband flex (1,1) | 20.0% | 97.0% | 100.0% |
 | multiband offsets (1,0) | 81.7% | 99.7% | 100.0% |
 
@@ -113,27 +113,29 @@ python multiband_real.py                   # -> results/multiband_real.parquet
 
 | model | strict | harmonic-aware | median CPU s/star |
 |---|---|---|---|
-| GLS `offsets` (1,0) | 76% | 80% | 0.070 |
-| GLS `perband` (0,1) | 78% | 81% | 0.112 |
-| GLS `flex` (1,1) | 78% | 81% | 0.367 |
-| PDM | **93%** | 94% | 0.011 |
-| CE | 85% | 90% | 0.023 |
-| String-Length | **93%** | **97%** | 0.036 |
-| MHAOV | 83% | 84% | 0.538 |
+| GLS `offsets` (1,0) | 76% | 80% | 0.019 |
+| GLS `perband` (0,1) | 78% | 81% | 0.065 |
+| GLS `flex` (1,1) | 78% | 81% | 0.263 |
+| PDM | **93%** | 94% | 0.010 |
+| CE | 85% | 90% | 0.021 |
+| String-Length | **93%** | **97%** | 0.015 |
+| MHAOV | 92% | 94% | 0.514 |
 | SuperSmoother | 85% | 96% | 0.296 |
-| BLS | 22% | 34% | 3.024 |
+| BLS | 20% | 32% | 0.713 |
 
 Single-band GLS on one filter at a time is the baseline the joint methods have to beat: 72–78%
 strict per band (*z* worst, *r* best), and 92% if you count a star as recovered when **any** of
 the five bands lands on the right period — the same optimistic upper bound as above, since in
 practice you don't know which band was right. The median fractional period error over strict
-hits is ~1e-05 for every model, so a hit is a hit at the grid's resolution.
+hits is ~1e-05 for every model but BLS (1.7e-03), so apart from BLS a hit is a hit at the
+grid's resolution.
 
 The read: on curves this well sampled (~280 points across five bands) the pooled fold
 statistics lead. PDM and String-Length reach 93% strict, String-Length 97% harmonic-aware —
 a dense fold exploits the full non-sinusoidal RRab shape, while the single-harmonic GLS models
-stay alias-limited. Those three GLS models are indistinguishable here (76–78%) and no better
-than the best single band (78%), which is the *opposite* regime from the simulated sparse
+stay alias-limited; MHAOV's multi-harmonic fit, which pools each band in its own variance
+units, is close behind at 92%. Those three GLS models are indistinguishable here (76–78%) and
+no better than the best single band (78%), which is the *opposite* regime from the simulated sparse
 cadence above, where `offsets` recovers 82% at 30 total epochs and the flexible models ≤20%:
 dense per-band data reward shape, sparse data reward parsimony. (The fold methods were not run
 at sparse cadence, so this says nothing about how they would do there.) SuperSmoother's
@@ -141,13 +143,16 @@ strict-vs-harmonic gap, 85% → 96%, is exactly the documented integer-multiples
 fold-family harmonic-but-not-strict picks, 11 sit at exactly 2P and 5 at 3P — and it shows up
 by subtype: 55% strict on the near-sinusoidal RRc against 92.5% on RRab, since a fold at 2P
 stays coherent. The documented recipe applies: take the shortest member of a near-tied family,
-or let `cuperiod.alias_diagnostics` arbitrate. Of the 163 non-harmonic misses across all
-models, 54% sit on the ±1 or ±2 cycle/day loci — the ground-based window function, not noise.
-BLS's 22% is expected: it is transit-shaped by design, included for completeness rather than
+or let `cuperiod.alias_diagnostics` arbitrate. Of the 155 non-harmonic misses across all
+models, 55% sit on the ±1 or ±2 cycle/day loci — the ground-based window function, not noise.
+BLS's 20% is expected: it is transit-shaped by design, included for completeness rather than
 recommended for RR Lyrae.
 
-A GPU pass runs alongside the scored CPU pass to record agreement and timing. The step needs
-no network access — the light curves are committed.
+A GPU pass runs alongside the scored CPU pass to record agreement and timing: it picks the
+same top period (to 1e-4) in 99.7% of model×star runs, and strict and harmonic-aware
+recovery are identical on both backends. The 3 disagreements are BLS noise peaks on stars
+where neither backend recovers the period; 14 more BLS runs land on the same peak at most
+1.4e-05 apart. The step needs no network access — the light curves are committed.
 
 ## Period-change benchmarks
 

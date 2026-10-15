@@ -144,52 +144,52 @@ vs. the `[fast]`-extra CPU backends, on a 32-thread machine):
   - GPU speed-up
 * - GLS
   - finufft
-  - 0.013 s
-  - 0.005 s
-  - 0.009 s
-  - ~2×
+  - 0.006 s
+  - 0.002 s
+  - 0.008 s
+  - ~3×
 * - BLS
   - numba
-  - 0.171 s
-  - 0.093 s
-  - 0.396 s
-  - ~2×
+  - 0.039 s
+  - 0.090 s
+  - 0.382 s
+  - ~0.4× (GPU slower)
 * - PDM
   - numba
   - 0.003 s
   - 0.005 s
-  - 0.009 s
+  - 0.011 s
   - ~0.6× (GPU slower)
 * - CE
   - numba
-  - 0.003 s
+  - 0.005 s
   - 0.004 s
-  - 0.021 s
-  - ~0.7× (GPU slower)
+  - 0.044 s
+  - ~1.3×
 * - String-Length
   - numba
-  - 0.043 s
+  - 0.009 s
   - 0.012 s
   - 0.009 s
-  - ~4×
+  - ~0.8× (GPU slower)
 * - MHAOV
   - numba
   - 0.026 s
-  - 0.038 s
-  - 0.032 s
+  - 0.037 s
+  - 0.031 s
   - ~0.7× (GPU slower)
 * - TLS
   - numba
-  - 0.132 s
-  - 0.072 s
-  - 2.205 s
-  - ~2×
+  - 0.126 s
+  - 0.133 s
+  - 7.047 s
+  - ~0.9× (a wash)
 * - SuperSmoother
   - numba
-  - 0.099 s
-  - 0.284 s
-  - 0.222 s
-  - ~0.3× (GPU slower)
+  - 0.064 s
+  - 0.271 s
+  - 0.214 s
+  - ~0.2× (GPU slower)
 ```
 
 How to read this:
@@ -197,17 +197,27 @@ How to read this:
 - **The CPU backend for every method but GLS is now the multicore `numba` kernel** (with the
   `[fast]` extra installed — one to two orders of magnitude faster than the vectorized
   numpy fallback, see {doc}`../installation`). On this 32-thread machine, that CPU tier is
-  now fast enough that a single-curve GPU run is only a modest win for GLS/String-Length
-  (~2-4×), a near-wash for BLS/TLS (~1.8×), and the GPU is actually a touch *slower* than
-  the CPU for PDM/CE/MHAOV (~0.6-0.7×) and SuperSmoother (~0.3×) at this curve size —
-  fixed dispatch and host↔device transfer overhead no longer amortizes when the CPU
-  kernel itself takes low single-digit milliseconds. GLS keeps its edge because its CPU
-  path is finufft, not a numba kernel.
-- The scaling sweep (up to 30k points and a 100k-frequency grid) tells the same story
-  with two nuances: GLS holds a ~4-5× GPU edge at every grid size, and v1.2's auto-sized
-  batching lifted MHAOV's GPU from ~5× slower to a near-wash (~0.5-0.7×) across the whole
-  range, while SuperSmoother's GPU only approaches CPU parity once curves reach several
-  thousand points. Expect a wider GPU margin on a narrower CPU. The GPU's clear,
+  now fast enough that a single-curve GPU run is only a modest win for GLS (~3×), a
+  near-wash for CE and TLS (~0.9-1.3×), and the GPU is actually *slower* than the CPU for
+  String-Length, MHAOV, PDM and BLS (~0.4-0.8×) and SuperSmoother (~0.2×) at this curve
+  size — fixed dispatch and host↔device transfer overhead no longer amortizes when the CPU
+  kernel itself takes milliseconds. GLS keeps its edge because its CPU path is finufft,
+  not a numba kernel.
+- **TLS** searches a default grid 2.5× denser than in 1.2 (380,614 trial periods here,
+  enough to resolve the shortest searched transit) in the same CPU time — 2.6× less per
+  trial period. Its corrected statistic fits the out-of-transit level jointly with the depth;
+  the numba and cupy kernels absorbed that cost through their own speed-ups, but the
+  portable `torch:cuda` path takes about 30% longer per trial period than in 1.2, which
+  with the denser grid is why its column reads 7 s.
+- The scaling sweep (up to 30k points and a 100k-frequency grid) adds nuances. GLS's GPU
+  edge grows with the grid: with small finufft transforms running single-threaded, the CPU
+  is faster up to 3k frequencies (0.6× at 1k, 0.9× at 3k), while the GPU is 3.1× faster at
+  30k and 6.6× at 100k, and 2.9–4.5× across curve lengths. MHAOV is a near-wash across
+  grid sizes (0.3–1.1×), but across curve lengths the numba path stays near 0.03–0.04 s
+  from 100 to 30,000 points (on uniform grids it sums the harmonics by NUFFT) while the
+  GPU's time grows with the point count — 2.2× faster than the CPU at 100 points, 25×
+  slower at 30,000. SuperSmoother's GPU only approaches CPU parity once curves reach
+  several thousand points. Expect a wider GPU margin on a narrower CPU. The GPU's clear,
   reproducible win is **catalog throughput** — many curves in flight at once — and reaching
   non-NVIDIA hardware via the portable torch backend, not single-curve latency on the
   CPU-tier methods ({doc}`batch`).
@@ -219,22 +229,13 @@ How to read this:
   the opt-in `precision="float32"` runs the BLS/TLS CUDA kernels ~8-9× faster at
   detection-grade accuracy; float64 stays the default.
 - cuPeriod's **CPU** path already beats the established reference tools it was checked
-  against — GLS ~3× astropy, BLS ~20× astropy's `BoxLeastSquares`, and PDM's numba kernel
-  over 2,000× PyAstronomy's pure-Python `pyPDM` (the numpy PDM path alone is already ~4×).
+  against — GLS ~6× astropy, BLS ~89× astropy's `BoxLeastSquares`, and PDM's numba kernel
+  ~2,000× PyAstronomy's pure-Python `pyPDM` (the numpy PDM path alone is already ~4×).
 - Small finufft transforms — `n_trans × N + n_modes ≤ 150 000`, single GLS curves,
   `pdot_search` rows, pre-whitening spectra — run on one thread, where thread start-up
   would otherwise dominate (GLS 4–11× faster, pre-whitening spectra up to ~7× on many-core
   CPUs); larger ones use every core (`OMP_NUM_THREADS`). The crossover was measured on a
   32-thread Windows desktop and is machine-dependent.
-
-:::{note}
-The table above predates this release's CPU work, which mostly changes the CPU column:
-the numba TLS kernel is 2.2–4.5× faster but its default period grid is 2.5× denser (it
-now resolves the shortest transit searched); the numba SuperSmoother kernel is
-1.5–2.1× faster and no longer recompiles in every process; numpy PDM, CE and MHAOV and
-numba String-Length are faster too, and MHAOV on uniform grids uses NUFFT sums. The
-benchmark figures are being re-measured.
-:::
 
 :::{tip}
 Write `backend="auto"` and let cuPeriod choose. Reach for `"cpu"`/`"gpu"` or a concrete

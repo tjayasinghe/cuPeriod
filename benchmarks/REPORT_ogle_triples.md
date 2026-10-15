@@ -3,10 +3,10 @@
 **Summary.** cuPeriod 1.3's period-change chain — `detrend` → `phase_track` → `ltte_search`, with the published inner period as its only input — was run on the raw OGLE-III + OGLE-IV *I*-band photometry of six bulge contact binaries that Hong et al. (2022) classify as having a *sinusoidal* eclipse-timing variation: a third body seen through the light-travel-time effect, with outer periods of 5.6–10.2 yr on a 14-yr baseline. That is the regime the feedback on the dP/dt feature pointed at — a period variation that is not monotonic, through which a parabola returns a rate of arbitrary sign. Findings:
 
 * **All six outer periods are recovered within 2σ of the published values** (four within 1σ; median offset 4%) from survey photometry alone, with no per-season binary modelling (§3.4, Figure 4).
-* **A parabola alone reports a 4.0–5.8σ "dP/dt" on three of the six stars**, rates of 3.4–7.8 × 10⁻⁷ d/yr — the size of the typical secular rate in Hong et al.'s catalogue — although Hong et al. find no parabola in any of the six. With the cycle fitted jointly, the secular rates fall to 1.0–3.1σ (§3.5, Table 3).
+* **A parabola alone reports a 4.0–5.8σ "dP/dt" on three of the six stars**, rates of 3.39–7.75 × 10⁻⁷ d/yr — the size of the typical secular rate in Hong et al.'s catalogue — although Hong et al. find no parabola in any of the six. With the cycle fitted jointly, the secular rates fall to 1.2–3.2σ (§3.5, Table 3).
 * The light-time amplitudes of 280–800 s give mass functions of 0.002–0.13 M☉ and minimum third-body masses of 0.17–0.92 M☉ for a 1.5 M☉ binary (§3.6). Two of the six prefer an eccentric outer orbit (§3.7).
-* The benchmark exposed a failure mode the tracker now handles: an equal-minima contact binary has a template that is symmetric under a half-period shift, and on four of the six stars up to two thirds of the segments landed on the wrong branch, producing hour-scale "orbits" and 7–14σ parabolas. `phase_track` now unwraps by the template's symmetry period (§4).
-* The whole chain runs in about a second per star on the CPU.
+* The benchmark exposed a failure mode the tracker now handles: an equal-minima contact binary has a template that is symmetric under a half-period shift, and on four of the six stars up to three quarters of the segments landed on the wrong branch, producing hour-scale "orbits" and parabolas of up to 12σ. `phase_track` now unwraps by the template's symmetry period (§4).
+* The whole chain runs in well under a second per star on the CPU: all six stars take about 2 s, start-up included.
 
 ## 1 — Background: what Hong et al. did, and why these six
 
@@ -38,12 +38,12 @@ Quoted errors are the formal covariance errors inflated by √χ²ᵣ wherever �
 
 | Star | I | P (d) | points | baseline (yr) | segments | template harmonics | fold symmetry |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| ECL-061372 | 15.8 | 0.505810 | 662 | 14.2 | 33 | 8 | 2 |
-| ECL-246583 | 13.9 | 0.403251 | 2448 | 14.3 | 40 | 8 | 2 |
+| ECL-061372 | 15.8 | 0.505810 | 662 | 14.2 | 33 | 6 | 2 |
+| ECL-246583 | 13.9 | 0.403251 | 2448 | 14.3 | 40 | 2 | 2 |
 | ECL-252457 | 14.5 | 0.633032 | 10525 | 14.3 | 40 | 8 | 2 |
-| ECL-289126 | 15.4 | 0.445851 | 5663 | 14.3 | 40 | 8 | 2 |
-| ECL-299343 | 15.4 | 0.303691 | 5438 | 14.3 | 40 | 7 | 2 |
-| ECL-299686 | 13.3 | 0.444770 | 2146 | 14.3 | 40 | 8 | 2 |
+| ECL-289126 | 15.4 | 0.445851 | 5663 | 14.3 | 40 | 6 | 2 |
+| ECL-299343 | 15.4 | 0.303691 | 5438 | 14.3 | 40 | 6 | 2 |
+| ECL-299686 | 13.3 | 0.444770 | 2146 | 14.3 | 40 | 6 | 2 |
 
 Star names are OGLE-BLG-ECL-NNNNNN throughout; I and P are Hong et al.'s.
 
@@ -67,16 +67,16 @@ Every star shows the signature the feedback described: an O−C that turns over 
 
 | Star | P2 (yr), this work | P2 (yr), Hong et al. | other | agreement | A (s) | cycles covered | ΔBIC | χ²ᵣ (joint) |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| ECL-061372 | 5.52 ± 0.26 | 5.7 ± 0.1 | — | 0.6σ | 663 ± 82 | 2.48 | +57 | 0.5 |
-| ECL-246583 | 10.21 ± 1.86 | 9.8 ± 0.7 | — | 0.2σ | 281 ± 69 | 1.31 | +25 | 0.9 |
+| ECL-061372 | 5.52 ± 0.26 | 5.7 ± 0.1 | — | 0.6σ | 660 ± 83 | 2.48 | +56 | 0.4 |
+| ECL-246583 | 10.19 ± 1.88 | 9.8 ± 0.7 | — | 0.2σ | 279 ± 68 | 1.32 | +24 | 0.9 |
 | ECL-252457 | 5.93 ± 0.09 | 6.7 ± 0.6 | — | 1.3σ | 299 ± 17 | 1.85 | +300 | 1.0 |
-| ECL-289126 | 6.43 ± 0.09 | 6.2 ± 0.2 | 5.7 ± 0.2 (Hajdu+ 2019) | 1.1σ | 660 ± 17 | 1.94 | +2085 | 1.3 |
-| ECL-299343 | 5.49 ± 0.12 | 5.6 ± 0.1 | — | 0.7σ | 795 ± 61 | 2.29 | +830 | 4.1 |
-| ECL-299686 | 13.26 ± 3.82 (scan edge) | 10.2 ± 0.5 | — | 0.8σ | 475 ± 275 | 1.00 | +75 | 0.7 |
+| ECL-289126 | 6.43 ± 0.09 | 6.2 ± 0.2 | 5.7 ± 0.2 (Hajdu+ 2019) | 1.0σ | 660 ± 17 | 1.94 | +2081 | 1.3 |
+| ECL-299343 | 5.49 ± 0.12 | 5.6 ± 0.1 | — | 0.7σ | 795 ± 61 | 2.29 | +827 | 4.1 |
+| ECL-299686 | 13.26 ± 3.83 (scan edge) | 10.2 ± 0.5 | — | 0.8σ | 475 ± 275 | 1.00 | +75 | 0.7 |
 
 "Agreement" is |P2 − P2,pub| over the quadrature sum of the two errors. ΔBIC is BIC(parabola) − BIC(parabola + orbit); positive favours the orbit. "Cycles covered" is the O−C baseline over the recovered outer period.
 
-The cycle is decisive on every star (ΔBIC from +25 to +2085; the F-test p-values are all below 10⁻⁵). The joint fit describes the O−C to within its errors on four stars (χ²ᵣ 0.5–1.3); ECL-299343 is left with χ²ᵣ = 4.1, which §3.7 traces to an eccentric orbit.
+The cycle is decisive on every star (ΔBIC from +24 to +2081; the F-test p-values are all below 2 × 10⁻⁵). The joint fit describes the O−C to within its errors on five stars (χ²ᵣ 0.4–1.3); ECL-299343 is left with χ²ᵣ = 4.1, which §3.7 traces to an eccentric orbit.
 
 ### 3.3 The outer-period scan
 
@@ -95,7 +95,7 @@ The published periods sit on the main peak of every scan. The width of that peak
 All six periods agree within 1.3σ. On five of them the recovered period carries an error of 1.4–18% and the agreement is a real test; the sixth is discussed below. Two cases deserve comment:
 
 * **ECL-289126** has two published values, 6.2 ± 0.2 yr (Hong et al.) and 5.7 ± 0.2 yr (Hajdu et al. 2019, from an eclipse-timing analysis of the OGLE-IV data). The circular fit here, 6.43 ± 0.09 yr, agrees with the former; the eccentric fit (§3.7) gives 6.21 ± 0.06 yr.
-* **ECL-299686** is the one star whose recovered period is not well constrained: 13.3 ± 3.8 yr against 10.2 ± 0.5 yr. Its O−C baseline of 13.3 yr holds exactly one cycle at the recovered period, the scan peaks at its long end, and the result carries the `at_grid_edge` flag. Opening the scan to half a cycle does not help (14.7 ± 5.7 yr, still at the edge), nor does Hong et al.'s own model of a sinusoid on a linear ephemeris (13.3 ± 2.9 yr, Table 5). The "0.8σ agreement" is the large error at work, not a measurement of 10 yr; the honest statement is that on this star the polynomial and a cycle as long as the baseline are partly degenerate, which is what the flag says.
+* **ECL-299686** is the one star whose recovered period is not well constrained: 13.3 ± 3.8 yr against 10.2 ± 0.5 yr. Its O−C baseline of 13.3 yr holds exactly one cycle at the recovered period, the scan peaks at its long end, and the result carries the `at_grid_edge` flag. Opening the scan to half a cycle does not help (14.9 ± 5.9 yr), nor does Hong et al.'s own model of a sinusoid on a linear ephemeris (13.26 ± 2.95 yr, at the scan edge, Table 5). The "0.8σ agreement" is the large error at work, not a measurement of 10 yr; the honest statement is that on this star the polynomial and a cycle as long as the baseline are partly degenerate, which is what the flag says.
 
 ### 3.5 What a parabola alone would have reported
 
@@ -103,20 +103,20 @@ All six periods agree within 1.3σ. On five of them the recovered period carries
 
 | Star | parabola alone, dP/dt (10⁻⁷ d/yr) | S/N | χ²ᵣ (parabola) | F-test p (quadratic vs linear) | secular dP/dt (10⁻⁷ d/yr) | S/N | floor from the timing errors (10⁻⁷ d/yr) |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| ECL-061372 | -0.05 ± 2.23 | 0.0 | 2.7 | 9.8e-01 | +2.06 ± 1.96 | 1.0 | 1.37 |
-| ECL-246583 | -0.04 ± 0.81 | 0.0 | 1.8 | 9.7e-01 | -2.14 ± 1.12 | 1.9 | 0.56 |
+| ECL-061372 | -0.08 ± 2.21 | 0.0 | 2.6 | 9.7e-01 | +2.32 ± 1.98 | 1.2 | 1.41 |
+| ECL-246583 | +0.01 ± 0.82 | 0.0 | 1.8 | 9.9e-01 | -2.04 ± 1.09 | 1.9 | 0.57 |
 | ECL-252457 | +6.81 ± 1.18 | 5.8 | 9.3 | 1.4e-06 | +1.14 ± 0.61 | 1.8 | 0.36 |
-| ECL-289126 | -1.25 ± 1.97 | 0.6 | 57.9 | 5.3e-01 | +1.52 ± 0.49 | 3.1 | 0.26 |
-| ECL-299343 | +7.76 ± 1.36 | 5.7 | 26.5 | 1.6e-06 | +1.86 ± 0.86 | 2.2 | 0.47 |
-| ECL-299686 | +3.41 ± 0.85 | 4.0 | 2.9 | 3.0e-04 | +4.64 ± 2.75 | 1.7 | 0.46 |
+| ECL-289126 | -1.25 ± 1.97 | 0.6 | 57.8 | 5.3e-01 | +1.54 ± 0.49 | 3.2 | 0.26 |
+| ECL-299343 | +7.75 ± 1.36 | 5.7 | 26.4 | 1.6e-06 | +1.85 ± 0.86 | 2.2 | 0.47 |
+| ECL-299686 | +3.39 ± 0.85 | 4.0 | 2.9 | 3.1e-04 | +4.65 ± 2.76 | 1.7 | 0.46 |
 
 The "floor" is `detectable_pdot` evaluated at the actual segment epochs and the (inflated) median timing error: the formal 1σ on dP/dt that a quadratic ephemeris could reach with no cycle to fit.
 
-This table is the point of the benchmark. On three stars the parabola alone reports a period change at 4.0–5.8σ, and by the tests an O−C analysis would normally apply it looks real: the F-test of the quadratic against a linear ephemeris gives p ≈ 10⁻⁶ on the two worst cases, and the quoted errors already include the √χ²ᵣ inflation. The rates, +3.4 to +7.8 × 10⁻⁷ d/yr, are indistinguishable in size from the median secular rate in Hong et al.'s catalogue (7.7 × 10⁻⁷ d/yr), so nothing about their magnitude gives them away. They are also all positive, which is a coincidence of where the cycle falls in the baseline (the simulations of §5 produce both signs). Hong et al., with a sinusoid in the model, list no parabola for any of the six.
+This table is the point of the benchmark. On three stars the parabola alone reports a period change at 4.0–5.8σ, and by the tests an O−C analysis would normally apply it looks real: the F-test of the quadratic against a linear ephemeris gives p ≈ 10⁻⁶ on the two worst cases, and the quoted errors already include the √χ²ᵣ inflation. The rates, +3.39 to +7.75 × 10⁻⁷ d/yr, are indistinguishable in size from the median secular rate in Hong et al.'s catalogue (7.7 × 10⁻⁷ d/yr), so nothing about their magnitude gives them away. They are also all positive, which is a coincidence of where the cycle falls in the baseline (the simulations of §5 produce both signs). Hong et al., with a sinusoid in the model, list no parabola for any of the six.
 
-Two internal signs would have raised suspicion. The parabola's χ²ᵣ is 9.3, 26.5 and 57.9 on three stars, against 1.0, 4.1 and 1.3 once the cycle is included — but a χ²ᵣ of 58 comes with a 0.6σ rate on ECL-289126, and a χ²ᵣ of 2.9 with a 4.0σ rate on ECL-299686, so it is a warning and not a test. And the O−C plot turns over visibly on every star, which is the reliable check and the reason `cuperiod pdot` always draws it.
+Two internal signs would have raised suspicion. The parabola's χ²ᵣ is 9.3, 26.4 and 57.8 on three stars, against 1.0, 4.1 and 1.3 once the cycle is included — but a χ²ᵣ of 58 comes with a 0.6σ rate on ECL-289126, and a χ²ᵣ of 2.9 with a 4.0σ rate on ECL-299686, so it is a warning and not a test. And the O−C plot turns over visibly on every star, which is the reliable check and the reason `cuperiod pdot` always draws it.
 
-With the cycle fitted jointly, the secular rates are 1.0–3.1σ. The largest, +1.5 ± 0.5 × 10⁻⁷ d/yr on ECL-289126, is model-dependent at that level (the eccentric orbit preferred in §3.7 changes the polynomial too) and should be read as "not excluded", consistent with Hong et al. reporting none. The formal floors in the last column, 0.3–1.4 × 10⁻⁷ d/yr, are what the timing precision would allow; the joint fits sit two to four times above them because the orbit shares the baseline with the parabola.
+With the cycle fitted jointly, the secular rates are 1.2–3.2σ. The largest, +1.5 ± 0.5 × 10⁻⁷ d/yr on ECL-289126, is model-dependent at that level (the eccentric orbit preferred in §3.7 changes the polynomial too) and should be read as "not excluded", consistent with Hong et al. reporting none. The formal floors in the last column, 0.3–1.4 × 10⁻⁷ d/yr, are what the timing precision would allow; the joint fits sit 1.4–1.9 times above them on five stars, because the orbit shares the baseline with the parabola, and 6 times above on ECL-299686, whose orbit spans just one cycle of the baseline.
 
 ### 3.6 What the orbits imply
 
@@ -124,14 +124,14 @@ With the cycle fitted jointly, the secular rates are 1.0–3.1σ. The largest, +
 
 | Star | a₁₂ sin i (au) | f(m) (M☉) | m₃ sin i ≥ (M☉, for M₁₂ = 1.5 M☉) |
 | --- | --- | --- | --- |
-| ECL-061372 | 1.329 | 0.0770 | 0.73 |
-| ECL-246583 | 0.563 | 0.0017 | 0.17 |
+| ECL-061372 | 1.322 | 0.0758 | 0.72 |
+| ECL-246583 | 0.559 | 0.0017 | 0.17 |
 | ECL-252457 | 0.599 | 0.0061 | 0.27 |
-| ECL-289126 | 1.322 | 0.0558 | 0.63 |
-| ECL-299343 | 1.593 | 0.1340 | 0.92 |
-| ECL-299686 | 0.952 | 0.0049 | 0.25 |
+| ECL-289126 | 1.322 | 0.0559 | 0.63 |
+| ECL-299343 | 1.594 | 0.1341 | 0.92 |
+| ECL-299686 | 0.951 | 0.0049 | 0.25 |
 
-`LTTEFit.a_sini_au` is the light-time amplitude in light-seconds over 499.005 s au⁻¹; `mass_function` is (a₁₂ sin i)³ / P2², and `minimum_third_mass(1.5)` solves the mass-function cubic for sin i = 1 with an assumed 1.5 M☉ contact binary (a typical W UMa total mass; the true companions are heavier for any lower inclination). The minimum companions range from an M dwarf (ECL-246583) to stars comparable to the binary's own components (ECL-061372, ECL-289126, ECL-299343). Because f(m) scales as A³, the amplitude error dominates: ±12% on A for ECL-061372 is ±37% on f(m), and for ECL-299686 the amplitude is barely measured.
+`LTTEFit.a_sini_au` is the light-time amplitude in light-seconds over 499.005 s au⁻¹; `mass_function` is (a₁₂ sin i)³ / P2², and `minimum_third_mass(1.5)` solves the mass-function cubic for sin i = 1 with an assumed 1.5 M☉ contact binary (a typical W UMa total mass; the true companions are heavier for any lower inclination). The minimum companions range from an M dwarf (ECL-246583) to stars comparable to the binary's own components (ECL-061372, ECL-289126, ECL-299343). Because f(m) scales as A³, the amplitude error dominates: ±13% on A for ECL-061372 is ±38% on f(m), and for ECL-299686 the amplitude is barely measured.
 
 ### 3.7 Other models: a linear ephemeris, an eccentric orbit, a longer scan
 
@@ -139,36 +139,36 @@ With the cycle fitted jointly, the secular rates are 1.0–3.1σ. The largest, +
 
 | Star | P2 (yr), sinusoid on a linear ephemeris | e | P2 (yr), eccentric fit | A (s), eccentric fit | ΔBIC eccentric − circular | P2 (yr), scan to half a cycle |
 | --- | --- | --- | --- | --- | --- | --- |
-| ECL-061372 | 5.55 ± 0.25 | 0.20 ± 0.29 | 5.61 ± 0.27 | 681 ± 91 | +6.4 | 5.52 ± 0.26 |
-| ECL-246583 | 13.41 ± 5.57 (scan edge) | 0.18 ± 0.35 | 9.77 ± 1.25 | 270 ± 53 | +7.1 | 10.21 ± 1.86 |
+| ECL-061372 | 5.57 ± 0.26 | 0.43 ± 0.41 | 5.59 ± 0.17 | 744 ± 184 | +5.7 | 5.52 ± 0.26 |
+| ECL-246583 | 13.41 ± 5.55 (scan edge) | 0.10 ± 0.43 | 9.90 ± 1.71 | 272 ± 61 | +7.3 | 10.19 ± 1.88 |
 | ECL-252457 | 5.95 ± 0.09 | 0.33 ± 0.11 | 5.80 ± 0.10 | 348 ± 39 | -4.7 | 5.93 ± 0.09 |
-| ECL-289126 | 6.62 ± 0.09 | 0.28 ± 0.05 | 6.21 ± 0.06 | 697 ± 20 | -16.9 | 6.43 ± 0.09 |
-| ECL-299343 | 5.61 ± 0.11 | 0.51 ± 0.05 | 5.44 ± 0.06 | 1043 ± 60 | -104.0 | 5.49 ± 0.12 |
-| ECL-299686 | 13.26 ± 2.94 (scan edge) | 0.51 ± 0.17 | 13.26 ± 4.48 | 1285 ± 3188 | +1.3 | 14.74 ± 5.69 |
+| ECL-289126 | 6.61 ± 0.09 | 0.27 ± 0.05 | 6.21 ± 0.06 | 696 ± 20 | -16.6 | 6.43 ± 0.09 |
+| ECL-299343 | 5.61 ± 0.11 | 0.50 ± 0.05 | 5.43 ± 0.06 | 1036 ± 59 | -103.4 | 5.49 ± 0.12 |
+| ECL-299686 | 13.26 ± 2.95 (scan edge) | 0.51 ± 0.17 | 13.26 ± 4.64 | 1315 ± 3503 | +1.0 | 14.86 ± 5.87 |
 
 Negative ΔBIC favours the eccentric orbit.
 
-* **The ephemeris polynomial matters at the few-per-cent level.** Hong et al.'s model is a sinusoid on a linear ephemeris (`degree=1`). On the four stars with two or more cycles it moves the outer period by 0.02–0.2 yr (up to 3%), comparable to the quoted errors; on ECL-246583, with 1.3 cycles, removing the parabola pushes the peak to the scan edge (13.4 ± 5.6 yr) where the joint fit had given 10.2 ± 1.9 yr against a published 9.8 ± 0.7. At around one cycle the polynomial and the orbit share the baseline, and which model is "right" is a prior, not a measurement.
-* **Two orbits are eccentric.** ECL-299343 (e = 0.51 ± 0.05, ΔBIC = −104) and ECL-289126 (e = 0.28 ± 0.05, ΔBIC = −17) prefer Irwin's full model; ECL-252457 marginally so. Eccentricity is what the circular fit's χ²ᵣ = 4.1 on ECL-299343 was pointing at, and it changes the amplitude — from 795 to 1043 s on that star, a factor 2.3 in f(m) — so the masses of Table 4 are model-dependent to that extent. On ECL-299686 the eccentric fit is unconstrained (A = 1285 ± 3188 s) and the circular one is the one to keep. Hong et al. fitted sinusoids only, so there is no published eccentricity to compare against.
+* **The ephemeris polynomial matters at the few-per-cent level.** Hong et al.'s model is a sinusoid on a linear ephemeris (`degree=1`). On the four stars whose orbits cover 1.8–2.5 cycles it moves the outer period by 0.02–0.2 yr (up to 3%), comparable to the quoted errors; on ECL-246583, with 1.3 cycles, removing the parabola pushes the peak to the scan edge (13.41 ± 5.55 yr) where the joint fit had given 10.2 ± 1.9 yr against a published 9.8 ± 0.7. At around one cycle the polynomial and the orbit share the baseline, and which model is "right" is a prior, not a measurement.
+* **Two orbits are eccentric.** ECL-299343 (e = 0.50 ± 0.05, ΔBIC = −103) and ECL-289126 (e = 0.27 ± 0.05, ΔBIC = −17) prefer Irwin's full model; ECL-252457 marginally so. Eccentricity is what the circular fit's χ²ᵣ = 4.1 on ECL-299343 was pointing at, and it changes the amplitude — from 795 to 1036 s on that star, a factor 2.3 in f(m) — so the masses of Table 4 are model-dependent to that extent. On ECL-299686 the eccentric fit is unconstrained (A = 1315 ± 3503 s) and the circular one is the one to keep. Hong et al. fitted sinusoids only, so there is no published eccentricity to compare against.
 
 ## 4 — The half-period trap
 
 ![symmetry](figures/ogle_triples/fig5_symmetry.png)
 
-*Figure 5. ECL-061372, the worst case. Left: the O−C when consecutive segment delays are unwrapped by the full period, as the tracker did before this benchmark; 21 of 33 segments land on the branch half a period (6.07 h, dotted line) away, and the parabola through them reports dP/dt = −6.4 × 10⁻⁵ d/yr at 7σ. Right: the same segments unwrapped by the template's symmetry period P/2.*
+*Figure 5. ECL-246583, the worst case. Left: the O−C when consecutive segment delays are unwrapped by the full period, as the tracker did before this benchmark; 30 of 40 segments land on the branch half a period (4.84 h, dotted line) away, and the parabola through them reports dP/dt = −5.0 × 10⁻⁵ d/yr at 9σ. Right: the same segments unwrapped by the template's symmetry period P/2.*
 
 ### Table 6 — the half-period slips of the first attempt
 
 | Star | segments on the other branch | parabola dP/dt then (10⁻⁷ d/yr) | χ²ᵣ then | wrap risk flagged then |
 | --- | --- | --- | --- | --- |
-| ECL-061372 | 21 / 33 | -636.4 ± 86.5 | 186 | yes |
-| ECL-246583 | 11 / 40 | -507.5 ± 40.9 | 1303 | yes |
+| ECL-061372 | 20 / 33 | 146.9 ± 95.2 | 2506 | yes |
+| ECL-246583 | 30 / 40 | -497.1 ± 55.4 | 1142 | yes |
 | ECL-252457 | 0 / 40 | 6.8 ± 1.2 | 9 | no |
 | ECL-289126 | 0 / 40 | -1.3 ± 2.0 | 58 | no |
-| ECL-299343 | 19 / 40 | -347.0 ± 25.5 | 863 | yes |
-| ECL-299686 | 10 / 40 | -798.9 ± 74.7 | 734 | yes |
+| ECL-299343 | 16 / 40 | -159.0 ± 42.2 | 1636 | yes |
+| ECL-299686 | 12 / 40 | -1459.5 ± 121.4 | 1405 | yes |
 
-A contact binary with equal minima has a light curve that is very nearly periodic in P/2: the template's odd harmonics carry almost no power. A segment's best template shift then lands on either of two branches half a period apart, decided by noise, and the tracker's unwrapping — which assumed that consecutive delays differ by less than half a period — stitched the branches into a sawtooth. On four of the six stars a quarter to two thirds of the segments slipped; the parabola through the result reported period changes of 3.5–8.0 × 10⁻⁵ d/yr at 7–14σ (a hundred times the median rate in Hong et al.'s catalogue), and the template re-derivation that follows the first pass then folded that curvature into the warp. The `wrap_risk` flag fired on all four, which is the safeguard a batch user would have had; a user reading only the rate columns would not have been saved.
+A contact binary with equal minima has a light curve that is very nearly periodic in P/2: the template's odd harmonics carry almost no power. A segment's best template shift then lands on either of two branches half a period apart, decided by noise, and the tracker's unwrapping — which assumed that consecutive delays differ by less than half a period — stitched the branches into a sawtooth. On four of the six stars 30–75% of the segments slipped; the parabola through the result reported period changes of 1.5 × 10⁻⁵ to 1.5 × 10⁻⁴ d/yr in size (20 to 190 times the median rate in Hong et al.'s catalogue), three of them at 3.8–12σ, and the template re-derivation that follows the first pass then folded that curvature into the warp. The `wrap_risk` flag fired on all four, which is the safeguard a batch user would have had; a user reading only the rate columns would not have been saved.
 
 `phase_track` now measures the template's fold symmetry — the largest *m* (4, 3, 2) for which the harmonics that are not multiples of *m* hold under 5% of the template's power — and unwraps consecutive delays by P/*m*, scaling `wrap_risk` the same way. `PhaseTrackResult.symmetry_order` records the value (2 on all six stars, Table 1). The right-hand panel of Figure 5, and every number in §3, is the result. The cost of the symmetry is a genuine ambiguity: a delay of P/2 is indistinguishable from none on such a star, so the O−C is measured modulo P/2 and a real jump of half a period (a swap of primary and secondary minimum) could not be seen; nothing in this sample suggests one.
 
@@ -187,7 +187,7 @@ A contact binary with equal minima has a light curve that is very nearly periodi
 | 0.75–1.00 | 11 | 64% | 82% | 45% | 9% |
 | 1.00–1.50 | 33 | 73% | 12% | 6% | 45% |
 
-Nulls (no orbit, n = 40): cycle falsely detected on 0%, parabola ≥ 3σ on 0%; median 0.07 s per star for tracking + search.
+Nulls (no orbit, n = 40): cycle falsely detected on 0%, parabola ≥ 3σ on 0%; median 0.01 s per star for tracking + search.
 
 The simulation places the six real stars on a curve. With the cycle covered at least once, the outer period is recovered within 10% on 81% of the planted stars and the cycle is detected on 85%; the parabola's false rate climbs from zero at a quarter of the baseline to 64% at three quarters to one. Beyond one cycle the joint fit can no longer separate the orbit from the parabola either (12% detected, 45% false secular rates), which is the regime ECL-299686 sits in and the reason the default scan stops at one baseline. Hong et al.'s 307 sinusoidal systems, with outer periods of 0.3–0.9 baselines, fall almost entirely in the bins where the joint fit works and the parabola does not.
 
@@ -199,7 +199,7 @@ The simulation places the six real stars on a curve. With the cycle covered at l
 * **The circular orbit is the default.** Two stars prefer an eccentric one, and their amplitudes and mass functions move by up to a factor 2.3 (§3.7). A classification should quote the circular numbers and flag the eccentric preference, as the tables here do.
 * **One cycle is not enough.** ECL-299686 (and ECL-246583 without a parabola) sit at the scan edge; `at_grid_edge` and `n_cycles` say so, and only a longer baseline or archival timings (the AAVSO and var.astro.cz databases documented in the guide) can settle them.
 * **The published table carries no amplitudes**, so only outer periods are compared; the eccentricities have no published counterpart either.
-* **Timing errors are formal.** The χ²ᵣ of the joint fits (0.5–4.1) show that the segment errors are honest to within a factor two on five stars; the quoted errors carry the √χ²ᵣ inflation.
+* **Timing errors are formal.** The χ²ᵣ of the joint fits (0.4–4.1) show that the segment errors are honest to within a factor two on five stars; the quoted errors carry the √χ²ᵣ inflation.
 
 ## 7 — Reproducing this report
 

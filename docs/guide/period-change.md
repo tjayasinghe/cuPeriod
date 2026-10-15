@@ -248,7 +248,7 @@ print(best.mass_function, best.minimum_third_mass(1.5))
 ```text
 OGLE-BLG-ECL-289126: 14.3 yr of OGLE-III+IV photometry, 40 segments
   parabola alone  : dP/dt = -1.3e-7 +- 2.0e-7 d/yr         chi2_r = 58
-  light-time orbit: P2 = 6.43 +- 0.09 yr   A = 660 +- 17 s   dBIC = +2085
+  light-time orbit: P2 = 6.43 +- 0.09 yr   A = 660 +- 17 s   dBIC = +2081
                     (published: 6.2 +- 0.2 yr, Hong et al. 2022)
   secular dP/dt   : +1.5e-7 +- 0.5e-7 d/yr                  chi2_r = 1.3
   f(m) = 0.056 Msun  ->  m3 >= 0.63 Msun for a 1.5 Msun binary

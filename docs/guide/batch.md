@@ -190,18 +190,12 @@ light curves on 4 workers went from 13.9 s to 2.2 s for `batch_pdot`.
 
 ## Throughput
 
-On one GPU, batch GLS peaks at **~574 light curves/second** for short survey curves
-(>2 million/hour) — GLS is the method with the most consistent GPU edge, at both single-
-curve and batch scale. With the `[fast]` extra's multicore `numba` CPU tier, the CPU
-process pool now keeps pace with the GPU for PDM at the batch sizes and curve lengths
-benchmarked so far — see {doc}`../benchmarks` for the current breakdown before assuming
-the GPU wins by default.
-
-:::{caution}
-The published batch throughput figures predate two fixes in this release: `grid=` was
-ignored (every light curve got its default grid), and on CUDA hosts the "CPU pool" arm
-with the default backend actually ran on the GPU. They are being re-measured.
-:::
+On one GPU, batch GLS peaks at **~728 light curves/second** for short survey curves
+(>2.6 million/hour), and PDM at ~534/second. With the `[fast]` extra's multicore `numba`
+CPU tier, a CPU process pool on a 32-thread machine stays within 1.0–1.8× of the GPU at
+the batch sizes where both were measured (256 and 1024 curves): GLS 1.2× and 1.0×, PDM
+1.8× and 1.3× — see {doc}`../benchmarks` for the current breakdown before assuming the
+GPU wins by default.
 
 ---
 

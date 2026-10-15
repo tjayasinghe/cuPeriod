@@ -199,7 +199,7 @@ of the truth, with no harmonic credit; 300 stars per cell.
 | --- | --- | --- | --- |
 | best single band (*r*) | 0.0% | 37.3% | 97.3% |
 | any single band | 0.0% | 49.3% | 99.0% |
-| multi-band `perband` (0,1) | 17.7% | 97.0% | 100.0% |
+| multi-band `perband` (0,1) | 19.7% | 97.0% | 100.0% |
 | multi-band `flex` (1,1) | 20.0% | 97.0% | 100.0% |
 | multi-band `offsets` (1,0) | **81.7%** | **99.7%** | 100.0% |
 

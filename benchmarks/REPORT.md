@@ -1,6 +1,6 @@
 # cuPeriod — Validation & Benchmark Report
 
-**Summary.** cuPeriod 1.2.0's 7 single-band-benchmarked period-search methods were validated on 126 real ASAS-SN light curves with literature periods, plus 12 confirmed Kepler KOIs for the transit methods. CPU and GPU backends agree to round-off (worst-case relative difference 1e-05, dominated by the two single-precision GPU paths) and select the identical best period on 100% of targets; every method with an established external reference implementation reproduces it on an identical grid. Harmonic-aware period recovery is ≥88% for all of them. Peak measured throughput is 574 light curves/s (GLS) on one GPU. Every multi-band method was additionally validated on 100 real SDSS Stripe 82 RR Lyrae with literature periods (best joint model: 93% strict top-period recovery; §4). Practical guidance on backend selection is given in §8; limitations in §9.
+**Summary.** cuPeriod 1.3.0.dev0's 7 single-band-benchmarked period-search methods were validated on 126 real ASAS-SN light curves with literature periods, plus 12 confirmed Kepler KOIs for the transit methods. CPU and GPU backends agree to round-off (worst-case relative difference 3e-06, in GLS where the power is near zero; its absolute difference stays ≤ 5e-09) and select the identical best period on 100% of targets; every method with an established external reference implementation reproduces it on an identical grid. Harmonic-aware period recovery is ≥88% for all of them. Peak measured throughput is 728 light curves/s (GLS) on one GPU. Every multi-band method was additionally validated on 100 real SDSS Stripe 82 RR Lyrae with literature periods (best joint model: 93% strict top-period recovery; §4). Practical guidance on backend selection is given in §8; limitations in §9.
 
 ## 1 — Test environment and methodology
 
@@ -11,7 +11,7 @@
 | GPU | NVIDIA GeForce RTX 5070 Ti, 16 GB (compute capability 12.0, sm_120) |
 | CPU | AMD Ryzen 9 9950X3D, 16 cores / 32 threads |
 | Memory | 32 GB |
-| Software | cuPeriod 1.2.0, Python 3.12, CuPy (CUDA 12), PyTorch cu128 (torch:cuda), numba, finufft |
+| Software | cuPeriod 1.3.0.dev0, Python 3.12, CuPy (CUDA 12), PyTorch cu128 (torch:cuda), numba, finufft |
 | torch device (validated) | torch:cuda |
 | Reference tools | astropy (`LombScargle`, `BoxLeastSquares`), PyAstronomy (`pyPDM`), `transitleastsquares`; CE/String-Length/MHAOV vs direct NumPy implementations of the published algorithms |
 | Validation data | 126 ASAS-SN g-band light curves (6 variability classes: Eclipsing 28, Rr Lyrae 22, Cepheid 16, Delta Scuti 16, Long Period 22, Rotational 22) with VSX literature periods, bundled in `dataset/light_curves.parquet` (core sample plus an extension selected/downloaded via `dataset/download_extension.py` from ASAS-SN Sky Patrol — clean single VSX types, n_det≥300, baseline≥1000 d); 12 confirmed Kepler KOIs (Mendeley *Dataset_Machine_Learning_Exoplanets_2024*; flux via MAST/lightkurve); 100 SDSS Stripe 82 RR Lyrae with ugriz photometry and literature periods (Sesar et al. 2010, `dataset/s82_rrlyrae.parquet`) for the multi-band methods |
@@ -33,15 +33,15 @@ Every method runs on an identical grid through cuPeriod's CPU and GPU backends a
 
 | Method | N stars | CPU↔GPU parity (max rel.) | identical peak | reference | ref. agreement (max abs.) |
 | --- | --- | --- | --- | --- | --- |
-| GLS | 126 | 2.1e-06 | 100% | astropy LS | 8.0e-10 |
-| BLS | 126 | 1.2e-11 | 100% | astropy BLS | 1.1e-09 |
-| PDM | 126 | 2.0e-10 | 100% | PyAstronomy | r≥0.9288 |
+| GLS | 126 | 3.1e-06 | 100% | astropy LS | 7.6e-10 |
+| BLS | 126 | 2.3e-12 | 100% | astropy BLS | 2.0e-12 |
+| PDM | 126 | 2.6e-15 | 100% | PyAstronomy | r≥0.9288 |
 | CE | 126 | 1.7e-15 | 100% | Graham 2013 | 3.1e-15 |
 | String-Len | 126 | 6.2e-15 | 100% | Dworetsky 1983 | 4.3e+00 |
-| MHAOV | 126 | 1.1e-05 | 100% | Sch.-Czerny | 1.4e-04 |
-| TLS | 28 | 9.3e-10 | 100% | — | — |
+| MHAOV | 126 | 1.2e-10 | 100% | Sch.-Czerny | 1.1e-07 |
+| TLS | 28 | 9.0e-09 | 100% | — | — |
 
-**Table 1.** Numerical validation per method (metrics defined in §1.3). The GLS and MHAOV GPU kernels are single precision, bounding their parity at ≈1e-6 (GLS) / ≈1e-5 (MHAOV); all other GPU paths — String-Length included, via a stable phase sort on every backend — are double precision. String-Length's worst-case reference difference is an isolated outlier on 1–2 heavily phase-tied stars, where the textbook reference breaks ties with an unstable sort (correlation ≈1, median \|Δ\| ≈ 6e-12, recovered period unaffected).
+**Table 1.** Numerical validation per method (metrics defined in §1.3). Every GPU path computes in double precision (String-Length included, via a stable phase sort on every backend). GLS's CPU and GPU sums are NUFFTs with a relative tolerance of 1e-9 (`nufft_eps`), so their absolute power differences stay at that level and the relative figure above is largest where the power is near zero. String-Length's worst-case reference difference is an isolated outlier on 1–2 heavily phase-tied stars, where the textbook reference breaks ties with an unstable sort (correlation ≈1, median \|Δ\| ≈ 6e-12, recovered period unaffected).
 
 ![parity](figures/fig1_parity_reference.png)
 
@@ -50,12 +50,12 @@ Every method runs on an identical grid through cuPeriod's CPU and GPU backends a
 | Method | torch device | N stars (torch avail.) | max rel. diff vs CPU | identical peak vs CPU |
 | --- | --- | --- | --- | --- |
 | GLS | torch:cuda | 126 | 1.4e-06 | 100% |
-| BLS | torch:cuda | 126 | 1.3e-11 | 100% |
-| PDM | torch:cuda | 126 | 2.5e-10 | 100% |
+| BLS | torch:cuda | 126 | 1.4e-12 | 100% |
+| PDM | torch:cuda | 126 | 4.9e-15 | 100% |
 | CE | torch:cuda | 126 | 1.8e-15 | 100% |
 | String-Len | torch:cuda | 126 | 6.0e-15 | 100% |
-| MHAOV | torch:cuda | 126 | 2.2e-06 | 100% |
-| TLS | torch:cuda | 28 | 1.1e-09 | 100% |
+| MHAOV | torch:cuda | 126 | 1.2e-10 | 100% |
+| TLS | torch:cuda | 28 | 1.4e-08 | 100% |
 
 **Table 1b.** CPU↔torch parity per method — the portable `backend="torch"` path against cuPeriod's CPU backend on the shared validation grid. Rows with `N stars (torch avail.) = 0` mean torch (or a compatible device) was unavailable in the environment that produced this parquet; the wider rerun fills these in. Torch validated on **torch:cuda** here — the same code path also runs on Apple (mps) and Intel (xpu) devices but those were not exercised (§8).
 
@@ -73,7 +73,7 @@ Every method runs on an identical grid through cuPeriod's CPU and GPU backends a
 | CE | 126 | 89.7% [83.1–93.9%] | 72.2% [63.8–79.3%] |
 | String-Len | 126 | 88.9% [82.2–93.3%] | 50.8% [42.2–59.4%] |
 | MHAOV | 126 | 88.1% [81.3–92.7%] | 66.7% [58.1–74.3%] |
-| TLS | 28 | 96.4% [82.3–99.4%] | 85.7% [68.5–94.3%] |
+| TLS | 28 | 96.4% [82.3–99.4%] | 82.1% [64.4–92.1%] |
 
 **Table 2.** Period recovery rates, with Wilson 95% confidence intervals. *harmonic* accepts the method-appropriate fold ambiguity (e.g. Fourier methods recover P/2 for contact binaries); *exact* requires the VSX literature period itself within 2%. The exact-recovery spread across methods reflects the methods' differing harmonic responses to eclipsing systems, not implementation quality — §2 establishes all implementations match their references.
 
@@ -122,23 +122,23 @@ Every method runs on an identical grid through cuPeriod's CPU and GPU backends a
 | single-band GLS, i | 100 | 75.0% [65.7–82.5%] | 79.0% [70.0–85.8%] | — | — | — |
 | single-band GLS, z | 100 | 72.0% [62.5–79.9%] | 77.0% [67.8–84.2%] | — | — | — |
 | single-band GLS, any band | 100 | 92.0% [85.0–95.9%] | — | — | — | — |
-| **GLS offsets (1,0)** | 100 | 76.0% [66.8–83.3%] | 80.0% [71.1–86.7%] | 1.0e-05 | 0.07 | 0.13 |
-| **GLS perband (0,1)** | 100 | 78.0% [68.9–85.0%] | 81.0% [72.2–87.5%] | 9.6e-06 | 0.11 | 0.21 |
-| **GLS flex (1,1)** | 100 | 78.0% [68.9–85.0%] | 81.0% [72.2–87.5%] | 9.6e-06 | 0.37 | 0.27 |
-| **PDM** | 100 | 93.0% [86.3–96.6%] | 94.0% [87.5–97.2%] | 9.0e-06 | 0.01 | 0.07 |
-| **CE** | 100 | 85.0% [76.7–90.7%] | 90.0% [82.6–94.5%] | 9.8e-06 | 0.02 | 0.05 |
-| **String-Len** | 100 | 93.0% [86.3–96.6%] | 97.0% [91.5–99.0%] | 8.1e-06 | 0.04 | 0.03 |
-| **MHAOV** | 100 | 83.0% [74.5–89.1%] | 84.0% [75.6–89.9%] | 8.4e-06 | 0.54 | 0.48 |
-| **SuperSmoother** | 100 | 85.0% [76.7–90.7%] | 96.0% [90.2–98.4%] | 8.0e-06 | 0.30 | 0.87 |
-| **BLS** | 100 | 22.0% [15.0–31.1%] | 34.0% [25.5–43.7%] | 1.4e-03 | 3.02 | 3.66 |
+| **GLS offsets (1,0)** | 100 | 76.0% [66.8–83.3%] | 80.0% [71.1–86.7%] | 1.0e-05 | 0.019 | 0.0039 |
+| **GLS perband (0,1)** | 100 | 78.0% [68.9–85.0%] | 81.0% [72.2–87.5%] | 9.6e-06 | 0.065 | 0.007 |
+| **GLS flex (1,1)** | 100 | 78.0% [68.9–85.0%] | 81.0% [72.2–87.5%] | 9.6e-06 | 0.26 | 0.021 |
+| **PDM** | 100 | 93.0% [86.3–96.6%] | 94.0% [87.5–97.2%] | 9.0e-06 | 0.0096 | 0.035 |
+| **CE** | 100 | 85.0% [76.7–90.7%] | 90.0% [82.6–94.5%] | 9.8e-06 | 0.021 | 0.024 |
+| **String-Len** | 100 | 93.0% [86.3–96.6%] | 97.0% [91.5–99.0%] | 8.1e-06 | 0.015 | 0.012 |
+| **MHAOV** | 100 | 92.0% [85.0–95.9%] | 94.0% [87.5–97.2%] | 8.4e-06 | 0.51 | 0.19 |
+| **SuperSmoother** | 100 | 85.0% [76.7–90.7%] | 96.0% [90.2–98.4%] | 8.0e-06 | 0.3 | 0.34 |
+| **BLS** | 100 | 20.0% [13.3–28.9%] | 32.0% [23.7–41.7%] | 1.7e-03 | 0.71 | 1.8 |
 
 **Table 3.** Multi-band period recovery on real Stripe 82 RR Lyrae, Wilson 95% CIs. *median \|ΔP\|/P* is over strict hits (grid resolution is ~3e-5 of the period at these frequencies). Timings are median wall time per star on the shared ~97k-frequency grid, warm JIT, single shot — the batch runner amortises further via engine reuse. BLS is transit-shaped by design and is included for completeness, not as a recommended RR Lyrae tool.
 
-**Reading the result.** The pooled fold statistics lead on these well-sampled curves: PDM reaches 93% strict vs 78% for the best GLS model. With ~280 points a fold uses the full non-sinusoidal light-curve shape, while the single-harmonic GLS models stay alias-limited — dense data reward shape, sparse data reward parsimony (see the model-choice note below). Of the 163 non-harmonic misses across all models, 54% sit on the ±1 or ±2 cycle/day window aliases (Figure 7b) — the failure mode is the ground-based window function, not noise. For the fold-family statistics (PDM/CE/String-Length/SuperSmoother), 21 harmonic-aware hits are not strict hits; 52% of those sit at exactly 2P — the documented integer-multiple degeneracy of phase-folding statistics (a fold at 2P, 3P… of a true period stays coherent). The practical recipe stands: treat the *shortest* member of a near-tied family as the period, or arbitrate with `cuperiod.alias_diagnostics`.
+**Reading the result.** The pooled fold statistics lead on these well-sampled curves: PDM reaches 93% strict vs 78% for the best GLS model. With ~280 points a fold uses the full non-sinusoidal light-curve shape, while the single-harmonic GLS models stay alias-limited — dense data reward shape, sparse data reward parsimony (see the model-choice note below). Of the 155 non-harmonic misses across all models, 55% sit on the ±1 or ±2 cycle/day window aliases (Figure 7b) — the failure mode is the ground-based window function, not noise. For the fold-family statistics (PDM/CE/String-Length/SuperSmoother), 21 harmonic-aware hits are not strict hits; 52% of those sit at exactly 2P — the documented integer-multiple degeneracy of phase-folding statistics (a fold at 2P, 3P… of a true period stays coherent). The practical recipe stands: treat the *shortest* member of a near-tied family as the period, or arbitrate with `cuperiod.alias_diagnostics`.
 
 **Model choice depends on sampling density.** On these well-sampled curves (~280 points) the three GLS models perform comparably (offsets 76%, perband 78%, flex 78% strict). The **simulated sparse-cadence benchmark** (`multiband_recovery.py`) probes the opposite regime: at 30 total epochs the shared-phase `offsets` model recovers 82% vs ≤20% for the flexible models — fewer parameters win when epochs are few. Both regimes are real; `offsets` stays the default because the sparse regime (early Rubin) is the one that needs a joint method most, and the flexible models are one `mb_model=` switch away.
 
-**Backends.** The GPU pass picks the same top period as the scored cpu pass in 100.0% of model×star runs. Per-star GPU timings in Table 3 are single-shot periodogram calls; no model gains ≥1.5× from the GPU at this single-shot size. PDM (7× slower) is dominated by fixed per-call dispatch and transfer overhead that a single-shot call cannot amortise — for one-off searches of this method use the CPU tier, and at catalogue scale use the batch runner, which amortises launches and reuses engines across stars.
+**Backends.** The GPU pass picks the same top period as the scored cpu pass in 99.7% of model×star runs. Per-star GPU timings in Table 3 are single-shot periodogram calls; GPU speedups ≥1.5× at this grid size: GLS flex (1,1) 12.5×, GLS perband (0,1) 9.3×, GLS offsets (1,0) 4.7×, MHAOV 2.7×.
 
 ![multiband real](figures/fig7_multiband_real.png)
 
@@ -160,7 +160,7 @@ Every method runs on an identical grid through cuPeriod's CPU and GPU backends a
 | Eclipse | CE | 10% | 42% | 75% | 90% | 100% | 100% | 95% |
 | Eclipse | String-Len | 8% | 10% | 38% | 70% | 80% | 75% | 78% |
 | Transit | BLS | 18% | 92% | 100% | 100% | 100% | 100% | 100% |
-| Transit | TLS | 20% | 90% | 100% | 100% | 100% | 100% | 100% |
+| Transit | TLS | 25% | 88% | 100% | 100% | 100% | 100% | 100% |
 
 **Table 4.** Recovery fraction (%) per method × signal × SNR, n=40 trials/cell. Wilson intervals per cell are wide at this trial count (omitted here for readability; §3's Table 2 shows the CI convention on the larger real-star sample).
 
@@ -172,21 +172,21 @@ Every method runs on an identical grid through cuPeriod's CPU and GPU backends a
 
 ## 6 — TLS on Kepler transits
 
-12 confirmed KOIs, blind search 0.5–12 d. cuPeriod (GPU) recovers the known period (or a 1/2 or 2× harmonic) within 2% for **83%** of them, and agrees with `transitleastsquares` on **83%**. On the 5-KOI CPU-timed subset, CPU↔GPU max\|Δpower\| ≤ 2.1e-14 and the GPU is a median **2×** faster.
+12 confirmed KOIs, blind search 0.5–12 d. cuPeriod (GPU) recovers the known period (or a 1/2 or 2× harmonic) within 2% for **83%** of them, and agrees with `transitleastsquares` on **83%**. On the 5-KOI CPU-timed subset, CPU↔GPU max\|Δpower\| ≤ 2.8e-14 and the GPU is a median **1.5×** faster.
 
 | KIC ID | P_KOI [d] | P_cuPeriod GPU [d] | P_TLS ref [d] | rel. error | P_cuPeriod CPU [d] | GPU speedup |
 | --- | --- | --- | --- | --- | --- | --- |
-| 11673802 | 5.2879 | 5.2882 | 5.2883 | 4.7e-05 | 5.2882 | 2× |
-| 12020329 | 7.2750 | 7.2741 | 7.2754 | 1.2e-04 | 7.2741 | 2× |
-| 3458028 | 1.4426 | 2.2700 | 4.5411 | 2.1e-01 | 2.2700 | 2× |
-| 5371777 | 0.9917 | 0.9916 | 0.9916 | 1.0e-04 | 0.9916 | 2× |
-| 6291033 | 3.7060 | 3.7063 | 3.7058 | 8.8e-05 | 3.7063 | 2× |
-| 6310636 | 0.9210 | 0.9210 | 0.9211 | 1.5e-05 | — | — |
-| 6387542 | 2.5348 | 2.5346 | 2.5349 | 8.0e-05 | — | — |
+| 11673802 | 5.2879 | 5.2882 | 5.2883 | 4.7e-05 | 5.2882 | 1.6× |
+| 12020329 | 7.2750 | 7.2752 | 7.2754 | 2.3e-05 | 7.2752 | 1.6× |
+| 3458028 | 1.4426 | 2.2699 | 4.5411 | 2.1e-01 | 2.2699 | 1.5× |
+| 5371777 | 0.9917 | 0.9916 | 0.9916 | 6.6e-05 | 0.9916 | 1.4× |
+| 6291033 | 3.7060 | 3.7059 | 3.7058 | 2.4e-05 | 3.7059 | 1.5× |
+| 6310636 | 0.9210 | 0.9211 | 0.9211 | 2.5e-05 | — | — |
+| 6387542 | 2.5348 | 2.5347 | 2.5349 | 3.4e-05 | — | — |
 | 7529266 | 8.6002 | 8.6000 | 8.5994 | 2.0e-05 | — | — |
-| 7532973 | 2.1446 | 2.1446 | 2.1445 | 4.0e-07 | — | — |
-| 7685981 | 4.4084 | 4.4082 | 4.4082 | 4.5e-05 | — | — |
-| 8051946 | 1.4952 | 11.4480 | 1.4952 | 2.8e+00 | — | — |
+| 7532973 | 2.1446 | 2.1446 | 2.1445 | 2.1e-05 | — | — |
+| 7685981 | 4.4084 | 4.4086 | 4.4082 | 5.1e-05 | — | — |
+| 8051946 | 1.4952 | 11.4454 | 1.4952 | 2.8e+00 | — | — |
 | 9907129 | 9.7057 | 9.7068 | 9.7054 | 1.1e-04 | — | — |
 
 **Table 5.** Blind TLS period recovery on confirmed Kepler KOIs. cuPeriod recovers 10/12; the `transitleastsquares` reference recovers 11/12. Both miss only the shallowest transits, where a blind 0.5–12 d search aliases — a failure mode shared with the reference implementation, not a backend defect.
@@ -198,22 +198,22 @@ Every method runs on an identical grid through cuPeriod's CPU and GPU backends a
 
 ## 7 — Performance
 
-**cuPeriod's CPU box search beats astropy.** The default CPU BLS backend is a multicore `numba` port of the CUDA kernel — **20× faster than astropy's compiled `BoxLeastSquares`** (171 ms vs 3.5 s on this light curve), matching it to floating-point — verified on all 126 validation light curves: max\|Δpower\| ≤ 0.0e+00, identical best period on 126/126. The GPU then adds another 2× (37× over astropy).
+**cuPeriod's CPU box search beats astropy.** The default CPU BLS backend is a multicore `numba` port of the CUDA kernel — **89× faster than astropy's compiled `BoxLeastSquares`** (39 ms vs 3.5 s on this light curve), matching it to floating-point — verified on all 126 validation light curves: max\|Δpower\| ≤ 0.0e+00, identical best period on 126/126. On a single curve this kernel also outpaces the GPU path (90 ms, 39× over astropy).
 
 | method | CPU backend | t_CPU [s] | t_GPU [s] | t_torch [s] | torch device | reference tool | t_ref [s] | CPU vs ref | GPU vs CPU |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| GLS | finufft | 0.013 | 0.0054 | 0.009 | torch:cuda | astropy | 0.04 | 3× | 2.3× |
-| BLS | numba | 0.171 | 0.0932 | 0.396 | torch:cuda | astropy | 3.47 | 20× | 1.8× |
-| PDM | numba | 0.003 | 0.0051 | 0.009 | torch:cuda | PyAstronomy | 6.17 | 2177× | 0.6× |
-| CE | numba | 0.003 | 0.0044 | 0.021 | torch:cuda | — | — | — | 0.7× |
-| String-Len | numba | 0.043 | 0.0119 | 0.009 | torch:cuda | — | — | — | 3.7× |
-| MHAOV | numba | 0.026 | 0.0381 | 0.032 | torch:cuda | — | — | — | 0.7× |
-| SuperSmoother | numba | 0.099 | 0.2843 | 0.222 | torch:cuda | — | — | — | 0.3× |
-| TLS | numba | 0.132 | 0.0723 | 2.205 | torch:cuda | — | — | — | 1.8× |
+| GLS | finufft | 0.006 | 0.0017 | 0.008 | torch:cuda | astropy | 0.03 | 6× | 3.4× |
+| BLS | numba | 0.039 | 0.0898 | 0.382 | torch:cuda | astropy | 3.50 | 89× | 0.4× |
+| PDM | numba | 0.003 | 0.0051 | 0.011 | torch:cuda | PyAstronomy | 6.12 | 1988× | 0.6× |
+| CE | numba | 0.005 | 0.0039 | 0.044 | torch:cuda | — | — | — | 1.3× |
+| String-Len | numba | 0.009 | 0.0116 | 0.009 | torch:cuda | — | — | — | 0.8× |
+| MHAOV | numba | 0.026 | 0.0372 | 0.031 | torch:cuda | — | — | — | 0.7× |
+| SuperSmoother | numba | 0.064 | 0.2714 | 0.214 | torch:cuda | — | — | — | 0.2× |
+| TLS | numba | 0.126 | 0.1330 | 7.047 | torch:cuda | — | — | — | 0.9× |
 
 **Table 6.** Single-curve wall time per method (methodology in §1.2). *CPU backend* = what `backend="cpu"` resolves to — the fast default a user gets: finufft (GLS), the multicore numba box search (BLS), numba for the rest (with the `[fast]` extra) or numpy otherwise. *CPU vs ref* = cuPeriod-CPU speedup over the established external tool; *GPU vs CPU* = CUDA backend over cuPeriod's own CPU backend. *t_torch* = the portable PyTorch backend (device in *torch device*: cpu/cuda/mps/xpu) — the cross-vendor path that also runs on AMD/Intel/Mac GPUs.
 
-cuPeriod's CPU path already outperforms every external reference tool it has (GLS, PDM, BLS). **With the multicore numba tier, the GPU's single-curve margin over the CPU is modest almost everywhere** on this 16-core machine: a ≥2× win for GLS (2.3×), String-Len (3.7×); a wash (0.8–2×) for BLS (1.8×), TLS (1.8×); slower than the warm CPU kernel for PDM (0.6×), CE (0.7×), MHAOV (0.7×), SuperSmoother (0.3×) at this size — fixed per-call dispatch and transfer overhead does not amortise once the CPU kernel itself runs in milliseconds. GLS's edge reflects its CPU path being finufft rather than a numba kernel. The scaling sweep (up to 30 000 points / a 100 000-frequency grid; Figure 5b) shows where that balance shifts with problem size. The GPU's case is catalogue throughput and non-NVIDIA hardware (the portable torch backend), not single-curve latency on the CPU-tier methods; see §8.
+cuPeriod's CPU path already outperforms every external reference tool it has (GLS, PDM, BLS). **With the multicore numba tier, the GPU's single-curve margin over the CPU is modest almost everywhere** on this 16-core machine: a ≥2× win for GLS (3.4×); a wash (0.8–2×) for CE (1.3×), String-Len (0.8×), TLS (0.9×); slower than the warm CPU kernel for BLS (0.4×), PDM (0.6×), MHAOV (0.7×), SuperSmoother (0.2×) at this size — fixed per-call dispatch and transfer overhead does not amortise once the CPU kernel itself runs in milliseconds. GLS's edge reflects its CPU path being finufft rather than a numba kernel. The scaling sweep (up to 30 000 points / a 100 000-frequency grid; Figure 5b) shows where that balance shifts with problem size. The GPU's case is catalogue throughput and non-NVIDIA hardware (the portable torch backend), not single-curve latency on the CPU-tier methods; see §8.
 
 
 > The pure-`numpy` BLS backend shares one array-module-generic source with the CUDA kernel (so they validate to floating-point), but it is a *parity reference*, not the product path — 18.0 s here, slower than numba and astropy because its GPU-shaped layout trades memory traffic for the parallelism that makes the GPU fast.
@@ -222,37 +222,37 @@ cuPeriod's CPU path already outperforms every external reference tool it has (GL
 
 **Figure 5.** (a) Single-curve GPU speedup over cuPeriod's CPU backend (green boxes: cuPeriod-CPU speedup over the external reference tool); (b) wall time vs search-grid size (solid = GPU, dashed = CPU); (c) batch throughput, GPU vs CPU process pool.
 
-Batch throughput on one GPU peaks at **574 light curves/s** (GLS, n=4096) — **>2.1 million light curves/hour**. This is a *single-batch* rate that includes the one-off worker-pool spin-up (process spawn + per-worker CUDA context); a warmed pool sustains a higher rate over many chunks. On this 32-thread machine the CPU process pool keeps pace with the GPU for the numba-tier methods — GLS n=256 1.3×; GLS n=1024 1.4×; PDM n=256 1.0×; PDM n=1024 1.0× — with GLS the one method that shows a consistent GPU edge at batch scale too. Expect a wider GPU margin on a narrower CPU, or at batch sizes beyond what's swept here.
+Batch throughput on one GPU peaks at **728 light curves/s** (GLS, n=4096) — **>2.6 million light curves/hour**. This is a *single-batch* rate that includes the one-off worker-pool spin-up (process spawn + per-worker CUDA context); a warmed pool sustains a higher rate over many chunks. On this 32-thread machine the CPU process pool keeps pace with the GPU — GLS n=256 1.2×; GLS n=1024 1.0×; PDM n=256 1.8×; PDM n=1024 1.3× — and PDM keeps the clearest GPU edge (1.3–1.8×). Expect a wider GPU margin on a narrower CPU, or at batch sizes beyond what's swept here.
 
 ## 8 — Backend recommendations
 
 | method | fastest measured | best time | GPU vs CPU | single-curve recommendation |
 | --- | --- | --- | --- | --- |
-| GLS | gpu (CUDA) | 5.4 ms | 2.3× | `gpu` if available, else `cpu` |
-| BLS | gpu (CUDA) | 93.2 ms | 1.8× | `cpu` (GPU comparable) |
-| PDM | cpu (numba) | 2.8 ms | 0.6× | `cpu` (GPU slower here) |
-| CE | cpu (numba) | 3.0 ms | 0.7× | `cpu` (GPU slower here) |
-| String-Len | torch (torch:cuda) | 9.1 ms | 3.7× | `gpu` if available, else `cpu` |
-| MHAOV | cpu (numba) | 25.8 ms | 0.7× | `cpu` (GPU slower here) |
-| SuperSmoother | cpu (numba) | 98.9 ms | 0.3× | `cpu` (GPU slower here) |
-| TLS | gpu (CUDA) | 72.3 ms | 1.8× | `cpu` (GPU comparable) |
+| GLS | gpu (CUDA) | 1.7 ms | 3.4× | `gpu` if available, else `cpu` |
+| BLS | cpu (numba) | 39.5 ms | 0.4× | `cpu` (GPU slower here) |
+| PDM | cpu (numba) | 3.1 ms | 0.6× | `cpu` (GPU slower here) |
+| CE | gpu (CUDA) | 3.9 ms | 1.3× | `cpu` (GPU comparable) |
+| String-Len | cpu (numba) | 8.9 ms | 0.8× | `cpu` (GPU comparable) |
+| MHAOV | cpu (numba) | 26.1 ms | 0.7× | `cpu` (GPU slower here) |
+| SuperSmoother | cpu (numba) | 63.6 ms | 0.2× | `cpu` (GPU slower here) |
+| TLS | cpu (numba) | 126.3 ms | 0.9× | `cpu` (GPU comparable) |
 
 **Table 7.** Fastest measured backend per method on this machine (single curve, ~900 points; grids as in Table 6).
 
 Guidance by use case, from the measurements above:
 
-1. **Interactive, single-curve analysis (default).** Use `backend="cpu"` with the `[fast]` extra installed. On a modern multi-core CPU it is within a small factor of the GPU on every method, faster than the GPU for PDM/CE/MHAOV/SuperSmoother at typical light-curve sizes, and already 2–2000× faster than the established external tools. No GPU is required for competitive single-curve performance.
-2. **GLS-dominated pipelines on NVIDIA hardware.** Use `backend="gpu"`: GLS/String-Len show a consistent single-curve GPU advantage (Table 6 — GLS holds 3.9–4.7× across the grid-size sweep; GLS keeps ~1.4× at batch scale too, because its CPU path is finufft rather than a numba kernel).
-3. **Catalogue-scale processing (10³–10⁶ curves).** Use `batch_periodograms(..., device="gpu")` on NVIDIA hardware — peak measured throughput 574 curves/s (>2 million curves/hour) on one GPU. On this 32-thread CPU the process pool keeps pace for the numba-tier methods, so on wide CPU nodes `device="cpu"` is a legitimate alternative; expect the GPU margin to widen on narrower CPUs and larger batches.
+1. **Interactive, single-curve analysis (default).** Use `backend="cpu"` with the `[fast]` extra installed. On a modern multi-core CPU it is within a small factor of the GPU on every method, faster than the GPU for BLS/PDM/MHAOV/SuperSmoother at typical light-curve sizes, and already 6–1,988× faster than the established external tools. No GPU is required for competitive single-curve performance.
+2. **GLS-dominated pipelines on NVIDIA hardware.** Use `backend="gpu"`: GLS shows a single-curve GPU advantage at this size (Table 6; GLS ranges 0.6–6.6× across the grid-size sweep, the edge growing with the grid, and 1.0–1.2× over the CPU process pool at batch scale).
+3. **Catalogue-scale processing (10³–10⁶ curves).** Use `batch_periodograms(..., device="gpu")` on NVIDIA hardware — peak measured throughput 728 curves/s (>2.6 million curves/hour) on one GPU. On this 32-thread CPU the process pool keeps pace for the numba-tier methods, so on wide CPU nodes `device="cpu"` is a legitimate alternative; expect the GPU margin to widen on narrower CPUs and larger batches.
 4. **AMD, Intel or Apple GPUs.** Use `backend="torch"` — the portable path validated to the same parity standard. On NVIDIA hardware the native CUDA backend is usually at least as fast (Table 6), so treat torch as the portability path, not the speed path.
-5. **Strict double-precision requirements.** The GLS and MHAOV CUDA kernels are single precision (parity ≈1e-6 / ≈1e-5; Table 1). The selected best period was unaffected on all 126 validation stars, but if statistic values matter beyond ~6 significant digits (e.g. FAP tail comparisons), use the CPU backend, which is double precision throughout.
-6. **Minimal installations (no numba).** `backend="cpu"` falls back to numpy — numerically identical but much slower for the box methods (the pure-numpy BLS parity reference takes ~18 s vs 0.17 s with numba). Install the `[fast]` extra, or use `backend="astropy"` for BLS.
+5. **Bit-level reproducibility.** Every CUDA and CPU path computes in double precision; the one float32 path is torch on Apple MPS, which cannot do float64. GLS's CPU and GPU NUFFTs agree to their 1e-9 tolerance rather than to round-off (Table 1). The selected best period was unaffected on all 126 validation stars; if statistic values must match beyond ~8 significant digits across machines (e.g. FAP tail comparisons), pin one backend, and for GLS its `nufft_eps`.
+6. **Minimal installations (no numba).** `backend="cpu"` falls back to numpy — numerically identical but much slower for the box methods (the pure-numpy BLS parity reference takes ~18 s vs 0.04 s with numba). Install the `[fast]` extra, or use `backend="astropy"` for BLS.
 
 ## 9 — Limitations
 
 - All timings are from a single machine (Table in §1.1); CPU↔GPU ratios depend strongly on core count. The 16-core/32-thread CPU used here is near the top of the desktop range, so the reported GPU margins are conservative for typical hardware.
 - Batch throughput was swept only to 4096 curves per batch and is a single-shot rate including worker-pool start-up; sustained throughput and larger batches favour the GPU further.
-- The GLS and MHAOV GPU statistics are single precision (§8, item 5).
+- GLS backends agree to the NUFFT tolerance (1e-9 by default) rather than to round-off, and torch on Apple MPS runs in float32 (§8, item 5).
 - The torch backend was timed on a CUDA device only; Apple (mps) and Intel (xpu) devices are supported but not benchmarked here.
 - The TLS blind search uses a fixed 0.5–12 d window; the unrecovered KOIs are the shallowest transits, which alias within that window (the reference implementation misses one of the same targets; §6). The recovery rate therefore reflects the search configuration as much as the implementation.
 - The real multi-band validation (§4) covers one variable class (RR Lyrae) on well-sampled ~280-point curves; the sparse-cadence regime is covered by the simulated `multiband_recovery.py` benchmark, not by real data. BLS is included there for completeness but is transit-shaped by design.
