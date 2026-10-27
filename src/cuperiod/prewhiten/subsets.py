@@ -320,15 +320,27 @@ class Partition:
         name: str,
         labels: Sequence[str],
         weights: Sequence[float] | None = None,
-        origin: PartitionOrigin | None = None,
+        origin: PartitionOrigin | Mapping[str, Any] | None = None,
     ) -> Partition:
         """Rebuild a partition from :meth:`runs` (the faithful record of any edit).
+
+        ``origin`` may be given as an origin model or as its plain mapping (what
+        ``origin.model_dump(mode="json")`` and a project file hold).
 
         Raises
         ------
         ValueError
-            Unless the runs are contiguous, in order and cover ``[0, n)`` exactly.
+            Unless the runs are contiguous, in order and cover ``[0, n)`` exactly,
+            with every code in ``[0, len(labels))``.
+        pydantic.ValidationError
+            For an ``origin`` mapping that is not a known origin.
         """
+        if origin is None:
+            recipe: PartitionOrigin = ManualOrigin()
+        elif isinstance(origin, Mapping):
+            recipe = parse_origin(origin)
+        else:
+            recipe = origin
         codes = np.empty(int(n), dtype=np.int32)
         position = 0
         for run in runs:
@@ -340,6 +352,12 @@ class Partition:
                     f"runs must tile [0, {n}) in order; got ({start}, {stop}) at "
                     f"{position}"
                 )
+            # Checked before the int32 store, which would overflow on a huge code.
+            if not 0 <= code < len(labels):
+                raise ValueError(
+                    f"partition codes must lie in [0, {len(labels)}) — one label per "
+                    f"subset; got {code}"
+                )
             codes[start:stop] = code
             position = stop
         if position != n:
@@ -349,7 +367,7 @@ class Partition:
             codes=codes,
             labels=tuple(labels),
             weights=tuple(weights) if weights is not None else (1.0,) * len(labels),
-            origin=origin if origin is not None else ManualOrigin(),
+            origin=recipe,
         )
 
     @classmethod

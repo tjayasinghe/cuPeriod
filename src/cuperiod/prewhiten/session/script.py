@@ -127,7 +127,7 @@ def _partition_call(
         f"cup.Partition.from_runs({n}, {literal(_runs(runs))}, name={literal(name)}, "
         f"labels={literal(list(labels))}, "
         f"weights={literal([float(w) for w in weights])}, "
-        f"origin=parse_origin({literal(dict(origin))}))"
+        f"origin={literal(dict(origin))})"
     )
 
 
@@ -307,11 +307,10 @@ def _partition_expr(partition: Partition, n: int) -> str:
     )
 
 
-def _roots(session: PreWhitenSession, source: _Source) -> tuple[list[str], bool]:
-    """The ``partitions=`` items and whether ``parse_origin`` is needed."""
+def _roots(session: PreWhitenSession, source: _Source) -> list[str]:
+    """The ``partitions=`` items."""
     data = session.kernel.data
     items: list[str] = []
-    explicit = False
     for partition in session.kernel.creation.partitions:
         column = data.labels.get(partition.name)
         if (
@@ -322,8 +321,7 @@ def _roots(session: PreWhitenSession, source: _Source) -> tuple[list[str], bool]
             items.append(literal(partition.name))
         else:
             items.append(_partition_expr(partition, data.n))
-            explicit = True
-    return items, explicit
+    return items
 
 
 def _render(session: PreWhitenSession, source: _Source, title: str | None) -> str:
@@ -334,8 +332,7 @@ def _render(session: PreWhitenSession, source: _Source, title: str | None) -> st
     creation = kernel.creation
     log = session.history
     head = session.state
-    roots, explicit = _roots(session, source)
-    needs_origin = explicit or any(e.op == "define_partition" for e in log)
+    roots = _roots(session, source)
     domain = str(Domain(data.domain).value)
     stamp = datetime.now(UTC).strftime("%Y-%m-%d")
     name = f" '{sanitize_comment(title)}'" if title else ""
@@ -357,8 +354,6 @@ def _render(session: PreWhitenSession, source: _Source, title: str | None) -> st
         "",
         "import cuperiod as cup",
     ]
-    if needs_origin:
-        lines.append("from cuperiod.prewhiten.subsets import parse_origin")
     lines.append("")
     if source.kind == "expr":
         lines.append(f"DATA = {source.text}  # supplied when the script was written")

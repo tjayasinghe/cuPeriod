@@ -4,10 +4,10 @@ The kernel owns the session's data, its spectrum engines (one per sampling, in a
 small LRU) and the cache of :class:`~cuperiod.prewhiten.session.state.Derived`
 companions, and it performs every fit with exactly the arguments
 :func:`cuperiod.prewhiten` uses. A state with neither constraints nor data edits
-("plain" — every state of an automatic run) takes the v1.3 code path call for call:
-the same arrays, the same ``GridSpec`` object, the same keywords, so its numbers do
-not move. Only a state that needs them reaches the sampling and model-map modules,
-imported lazily.
+("plain" — every state of an automatic run) takes the automatic loop's code path call
+for call: the same arrays, the same ``GridSpec`` object, the same keywords, so its
+numbers do not move. Only a state that needs them reaches the sampling and model-map
+modules, imported lazily.
 """
 
 from __future__ import annotations
@@ -168,7 +168,7 @@ class SessionKernel:
         engine: SpectrumEngine | None = None,
         backend_request: str | None = None,
     ) -> tuple[SessionKernel, SessionState, Derived]:
-        """The v1.3 prologue: engine, offset-only fit, root state and its Derived.
+        """The automatic loop's prologue: engine, offset-only fit, root state, Derived.
 
         Parameters
         ----------
@@ -179,7 +179,8 @@ class SessionKernel:
             exact grid of ``creation.grid``.
         engine : SpectrumEngine, optional
             An engine already built on the full data and ``grid`` (the constructor
-            builds it first, in v1.3 order, so its errors surface first).
+            builds it first, in the automatic loop's order, so its errors surface
+            first).
         backend_request : str, optional
             The backend name to build further engines with.
         """
@@ -387,13 +388,27 @@ class SessionKernel:
         Without this a refinement started on a modest peak can slide down the wing of
         a much stronger neighbour and land on top of it, producing near-identical
         frequencies with enormous, mutually cancelling amplitudes.
+
+        The box is also clipped to the grid's band (half its first frequency up to its
+        last), but only where that keeps the component's own frequency inside: a
+        component the grid was configured past, or one added exactly outside it, is
+        refined around where it is instead of being dragged to the band's edge.
         """
         engine = self.engine(state)
         f_min, f_max = float(engine.frequency[0]), float(engine.frequency[-1])
         grid_low, grid_high = max(0.5 * f_min, 1e-12), f_max
         max_shift = state.settings.refine_bound_rayleigh / self.baseline(state)
-        low = np.maximum(frequencies - max_shift, grid_low)
-        high = np.minimum(frequencies + max_shift, grid_high)
+        frequencies = np.asarray(frequencies, dtype=np.float64)
+        low = np.where(
+            frequencies >= grid_low,
+            np.maximum(frequencies - max_shift, grid_low),
+            np.maximum(frequencies - max_shift, 1e-12),
+        )
+        high = np.where(
+            frequencies <= grid_high,
+            np.minimum(frequencies + max_shift, grid_high),
+            frequencies + max_shift,
+        )
         return low, np.maximum(high, np.nextafter(low, np.inf))
 
     def zero_point(self, state: SessionState) -> float:
@@ -432,7 +447,7 @@ class SessionKernel:
         extra_free: int = 0,
         hold: Collection[int] = frozenset(),
     ) -> ModelMap | None:
-        """``None`` for a plain state (the v1.3 fit); otherwise the model map."""
+        """``None`` for a plain state (the automatic loop's fit); else the model map."""
         if state.is_plain() and not hold:
             return None
         from cuperiod.prewhiten.session.modelmap import build
@@ -457,10 +472,11 @@ class SessionKernel:
     ) -> MultiSineFit:
         """Fit ``frequencies`` to the points ``state`` uses.
 
-        ``fit_mean`` is ``settings.fit_mean`` for every call, as in v1.3; with no
-        frequency and no free offset the model is empty (``y = 0`` on the centred
-        values). Constraints are passed only when ``mm`` carries non-trivial ones, so
-        a plain state's fit is the v1.3 call, keyword for keyword.
+        ``fit_mean`` is ``settings.fit_mean`` for every call, as in the automatic
+        loop; with no frequency and no free offset the model is empty (``y = 0`` on
+        the centred values). Constraints are passed only when ``mm`` carries
+        non-trivial ones, so a plain state's fit is the automatic loop's call, keyword
+        for keyword.
         """
         cfg = state.settings
         used = self._bundle(state).used

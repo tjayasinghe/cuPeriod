@@ -41,6 +41,38 @@ def test_paths_with_brackets_are_taken_literally(tmp_path: Path) -> None:
     assert summary.n_done == 2
 
 
+def test_a_directory_scan_takes_every_format_the_reader_takes(tmp_path: Path) -> None:
+    """A folder scan skipped .tab / .fts / .fz files and compressed light curves,
+    which LightCurve.from_file reads (an Open folder of them found nothing)."""
+    import bz2
+    import gzip
+
+    from astropy.table import Table
+
+    t, mag, err = synthetic_sine(n=60, seed=3)
+    folder = tmp_path / "mixed"
+    csv = _write_csv(folder / "a.csv", seed=1)
+    (folder / "b.csv.gz").write_bytes(gzip.compress(csv.read_bytes()))
+    table = Table({"jd": t, "mag": mag, "mag_err": err})
+    table.write(folder / "c.tab", format="ascii.tab")
+    table.write(tmp_path / "d.fits", format="fits")
+    raw = (tmp_path / "d.fits").read_bytes()
+    (folder / "d.fts").write_bytes(raw)
+    (folder / "e.fits.gz").write_bytes(gzip.compress(raw))
+    (folder / "f.dat.bz2").write_bytes(
+        bz2.compress(b"jd mag mag_err\n1.0 12.0 0.1\n2.0 12.1 0.1\n")
+    )
+    (folder / "notes.md").write_text("not a light curve", encoding="utf-8")
+    (folder / "archive.gz").write_bytes(gzip.compress(b"x"))
+    # pyarrow cannot read a compressed Parquet file: left out, not a failed curve.
+    (folder / "g.parquet.gz").write_bytes(gzip.compress(b"PAR1"))
+    names = [p.name for _, p in resolve_inputs(folder)]
+    assert names == ["a.csv", "b.csv.gz", "c.tab", "d.fts", "e.fits.gz", "f.dat.bz2"]
+    for _, path in resolve_inputs(folder):
+        assert isinstance(path, Path)
+        assert cup.LightCurve.from_file(path).n >= 2
+
+
 def test_a_glob_matching_nothing_raises_and_leaves_the_sink_alone(
     tmp_path: Path,
 ) -> None:

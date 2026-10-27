@@ -44,3 +44,46 @@ def test_console_entry_point_asks_for_the_hard_exit(
         gui.main()
     assert info.value.code == 0
     assert seen == {"exit_when_closed": True}
+
+
+# -- PySide6 6.12 aborts Python 3.11 ("deallocating None") -----------------------------
+
+
+@pytest.mark.parametrize(
+    ("python", "pyside", "refused"),
+    [
+        ((3, 11), "6.12.0", True),
+        ((3, 11), "6.13.1", True),
+        ((3, 11), "6.11.3", False),
+        ((3, 12), "6.12.0", False),
+        ((3, 11), "dev", False),
+    ],
+)
+def test_known_broken_pyside_is_refused_with_the_fix(
+    monkeypatch: pytest.MonkeyPatch,
+    python: tuple[int, int],
+    pyside: str,
+    refused: bool,
+) -> None:
+    import sys
+
+    import PySide6
+
+    monkeypatch.setattr(sys, "version_info", (*python, 0, "final", 0))
+    monkeypatch.setattr(PySide6, "__version__", pyside)
+    message = gui._known_broken_qt()
+    assert bool(message) is refused
+    if refused:
+        assert "PySide6<6.12" in message and pyside in message
+
+
+def test_console_entry_point_stops_before_a_broken_pyside(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started: list[bool] = []
+    monkeypatch.setattr(app, "run_app", lambda *a, **k: started.append(True) or 0)
+    monkeypatch.setattr(gui, "_known_broken_qt", lambda: "PySide6 6.12.0 crashes")
+    with pytest.raises(SystemExit) as info:
+        gui.main()
+    assert info.value.code == "PySide6 6.12.0 crashes"
+    assert started == []

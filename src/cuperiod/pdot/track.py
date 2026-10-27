@@ -41,7 +41,7 @@ from cuperiod.core.config import PdotSettings
 from cuperiod.core.errors import InsufficientDataError
 from cuperiod.core.lightcurve import LightCurve, raise_if_unusable
 from cuperiod.pdot.models import PeriodModel, get_model
-from cuperiod.pdot.result import SECONDS_PER_YEAR
+from cuperiod.pdot.result import DAYS_PER_MYR, SECONDS_PER_YEAR
 
 if TYPE_CHECKING:  # ltte imports this module; the annotation needs no runtime import.
     from cuperiod.pdot.ltte import LTTESearchResult
@@ -535,14 +535,24 @@ class EphemerisFit:
         return self.pdot * SECONDS_PER_YEAR * 1e3
 
     @property
+    def pdot_d_per_myr(self) -> float:
+        """dP/dt in days per megayear (the classical-pulsator unit)."""
+        return self.pdot * DAYS_PER_MYR
+
+    @property
     def pdot_d_per_yr(self) -> float:
         """dP/dt in days per year (the eclipsing-binary survey unit)."""
         return self.pdot * 365.25
 
     @property
+    def pdot_over_p(self) -> float:
+        """Fractional rate (dP/dt)/P in 1/day, at :attr:`period_ref`."""
+        return self.pdot / self.period_ref
+
+    @property
     def dlnp_dt_per_yr(self) -> float:
         """Fractional rate d(ln P)/dt per year (the Mira / delta Sct unit)."""
-        return (self.pdot / self.period_ref) * 365.25
+        return self.pdot_over_p * 365.25
 
     def predict(self, time: FloatArray) -> FloatArray:
         """The fitted O-C (days) at ``time`` (same time system as the input)."""
@@ -561,7 +571,9 @@ class EphemerisFit:
             "pdot_err_scaled": self.pdot_err_scaled,
             "pdot_s_per_yr": self.pdot_s_per_yr,
             "pdot_ms_per_yr": self.pdot_ms_per_yr,
+            "pdot_d_per_myr": self.pdot_d_per_myr,
             "pdot_d_per_yr": self.pdot_d_per_yr,
+            "pdot_over_p": self.pdot_over_p,
             "dlnp_dt_per_yr": self.dlnp_dt_per_yr,
             "pddot": self.pddot,
             "pddot_err": self.pddot_err,
@@ -893,9 +905,29 @@ class PhaseTrackResult:
         return self.pdot * SECONDS_PER_YEAR
 
     @property
+    def pdot_ms_per_yr(self) -> float:
+        """Total dP/dt in milliseconds per year (the transit-timing unit)."""
+        return self.pdot * SECONDS_PER_YEAR * 1e3
+
+    @property
+    def pdot_d_per_myr(self) -> float:
+        """Total dP/dt in days per megayear (the classical-pulsator unit)."""
+        return self.pdot * DAYS_PER_MYR
+
+    @property
     def pdot_d_per_yr(self) -> float:
         """Total dP/dt in days per year."""
         return self.pdot * 365.25
+
+    @property
+    def pdot_over_p(self) -> float:
+        """Fractional rate (dP/dt)/P in 1/day, at :attr:`period`."""
+        return self.pdot / self.period
+
+    @property
+    def dlnp_dt_per_yr(self) -> float:
+        """Fractional rate d(ln P)/dt per year (the Mira / delta Sct unit)."""
+        return self.pdot_over_p * 365.25
 
     @property
     def f_test_p(self) -> float:
@@ -927,7 +959,11 @@ class PhaseTrackResult:
             "pdot_err": self.pdot_err,
             "pdot_err_scaled": self.pdot_err_scaled,
             "pdot_s_per_yr": self.pdot_s_per_yr,
+            "pdot_ms_per_yr": self.pdot_ms_per_yr,
+            "pdot_d_per_myr": self.pdot_d_per_myr,
             "pdot_d_per_yr": self.pdot_d_per_yr,
+            "pdot_over_p": self.pdot_over_p,
+            "dlnp_dt_per_yr": self.dlnp_dt_per_yr,
             "pdot_seed": self.pdot_seed,
             "model": self.model,
             "f_test_p": self.f_test_p,

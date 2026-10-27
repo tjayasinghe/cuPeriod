@@ -436,6 +436,43 @@ def test_from_file_reads_compressed_fits(tmp_path: Path) -> None:
     assert np.array_equal(LightCurve.from_file(tmp_path / "lc.csv.gz").time, t)
 
 
+# --- a UTF-8 byte-order mark (Excel's "CSV UTF-8") ----------------------------------
+
+
+@pytest.mark.parametrize(
+    ("name", "sep"),
+    [("lc.csv", ","), ("lc.tsv", "\t"), ("lc.dat", " "), ("lc.csv.gz", ",")],
+)
+def test_from_file_reads_a_file_with_a_byte_order_mark(
+    tmp_path: Path, name: str, sep: str
+) -> None:
+    import gzip
+
+    t, mag, err = synthetic_sine(n=40)
+    lines = [sep.join(("time", "mag", "mag_err"))]
+    lines += [
+        sep.join(f"{v:.10g}" for v in row) for row in zip(t, mag, err, strict=True)
+    ]
+    raw = ("\n".join(lines) + "\n").encode("utf-8-sig")
+    assert raw.startswith(b"\xef\xbb\xbf")
+    path = tmp_path / name
+    path.write_bytes(gzip.compress(raw) if name.endswith(".gz") else raw)
+    lc = LightCurve.from_file(path)
+    np.testing.assert_allclose(lc.time, t, rtol=1e-9)
+    assert lc.domain is Domain.MAGNITUDE and lc.error is not None
+    # A multiband file too (it loaded in 1.2 through pandas, which drops the mark).
+    banded = path.with_name("bands" + name[2:])
+    rows = [sep.join(("time", "mag", "mag_err", "band"))]
+    rows += [
+        sep.join((f"{a:.10g}", f"{b:.10g}", "0.01", "gr"[i % 2]))
+        for i, (a, b) in enumerate(zip(t, mag, strict=True))
+    ]
+    raw = ("\n".join(rows) + "\n").encode("utf-8-sig")
+    banded.write_bytes(gzip.compress(raw) if name.endswith(".gz") else raw)
+    multi = MultiBandLightCurve.from_file(banded)
+    assert sorted(multi.bands) == ["g", "r"]
+
+
 # --- non-string column labels -------------------------------------------------------
 
 

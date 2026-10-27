@@ -10,9 +10,12 @@ by feeding the logged, resolved arguments to the reducers again.
 Opening a file never executes anything from it. It is read as JSON only (no pickle,
 no ``eval``), its size is checked before reading, ``NaN``/``Infinity`` tokens are
 refused, every object is validated by a strict pydantic model with
-``extra="forbid"``, every cross reference by :func:`validate_state`, and a data
-reference must stay inside the project's directory. Whatever goes wrong while reading
-surfaces as :class:`~cuperiod.ProjectError` and nothing else.
+``extra="forbid"``, every cross reference by :func:`validate_state`, the frequency
+grid is limited relative to the data (:func:`grid_limit`), and a data reference must
+stay inside the project's directory. A source file the document names in its metadata
+is kept as a record only (:data:`RECORDED_SOURCE`), never re-read by a later save or
+script export. Whatever goes wrong while reading surfaces as
+:class:`~cuperiod.ProjectError` and nothing else.
 """
 
 from __future__ import annotations
@@ -70,6 +73,7 @@ from cuperiod.prewhiten.session.state import (
 from cuperiod.prewhiten.subsets import MAX_LABEL_LENGTH, Partition, parse_origin
 
 if TYPE_CHECKING:
+    from cuperiod.prewhiten.session.modelmap import ModelMap
     from cuperiod.prewhiten.session.session import PreWhitenSession
 
 #: The ``format`` member of every project file.
@@ -86,10 +90,27 @@ _MIGRATIONS: dict[int, Callable[[dict[str, Any]], dict[str, Any]]] = {}
 
 #: Largest frequency grid a project may name (8e8 bytes of float64 frequencies).
 MAX_GRID_POINTS: Final = 100_000_000
+#: Opening a project computes its head's residual spectrum, so a small file naming
+#: a huge grid could keep :func:`load` busy for hours. Below :data:`MAX_GRID_POINTS`
+#: a project's grid is limited to :data:`GRID_POINTS_PER_POINT` per data point, but
+#: never below :data:`GRID_POINTS_FLOOR` (see :func:`grid_limit`).
+GRID_POINTS_FLOOR: Final = 20_000_000
+GRID_POINTS_PER_POINT: Final = 64
+#: Points times grid frequencies above which a project recorded on the direct
+#: ``numpy`` backend opens on the NUFFT CPU backend instead (about two minutes of
+#: direct summation per spectrum), unless ``backend=`` asks for it.
+DIRECT_WORK_LIMIT: Final = 2_000_000_000
 #: Most points a project may hold.
 MAX_POINTS: Final = 50_000_000
 #: Relative tolerance between a stored component value and the rebuilt fit.
 RESTORE_RTOL: Final = 1e-9
+#: The same for a fit that solves some phase non-linearly (a fixed amplitude, or an
+#: amplitude or phase shared across subsets whose partner varies): the rebuild
+#: re-converges only to the solver's precision (~1e-6 relative on an ill-conditioned
+#: design), not bit for bit (phases count as ``dphi / 2 pi``).
+RESTORE_NONLINEAR_RTOL: Final = 1e-5
+#: Metadata key under which an embedded project's own ``source`` claim is kept.
+RECORDED_SOURCE: Final = "recorded_source"
 #: Tolerances of ``verify``: frequencies (relative), amplitudes (relative) and
 #: phases (radians).
 VERIFY_FREQUENCY_RTOL: Final = 1e-9
@@ -394,6 +415,27 @@ def _brief(exc: ValidationError) -> str:
     )
 
 
+def grid_limit(n: int) -> int:
+    """The most grid frequencies a project on ``n`` data points may name.
+
+    :data:`GRID_POINTS_PER_POINT` per point, at least :data:`GRID_POINTS_FLOOR` and at
+    most :data:`MAX_GRID_POINTS`: every default grid of real data fits (a century of
+    sparse photometry to 50 c/d, or years of 20-s space photometry, which bring
+    their own millions of points), while a small file cannot name an hours-long one.
+    """
+    return min(MAX_GRID_POINTS, max(GRID_POINTS_FLOOR, GRID_POINTS_PER_POINT * n))
+
+
+def _check_grid(grid: tuple[float, float, int], n: int, where: str) -> None:
+    limit = grid_limit(n)
+    if int(grid[2]) > limit:
+        raise ProjectError(
+            f"{where}.nf: {int(grid[2])} frequencies exceed the limit of {limit} for "
+            f"{n} data points (max({GRID_POINTS_FLOOR}, {GRID_POINTS_PER_POINT} per "
+            "point))"
+        )
+
+
 def created_with() -> dict[str, str]:
     """Versions of what wrote a project (informative only)."""
     from cuperiod import __version__
@@ -561,7 +603,9 @@ def source_file(session: PreWhitenSession) -> tuple[Path, str] | tuple[None, str
 
     The file is ``meta["source"]``; it qualifies when the session has no label columns
     and :meth:`LightCurve.from_file` of it (same columns and domain) reproduces the
-    session's ``content_sha256`` exactly.
+    session's ``content_sha256`` exactly. A URL, a network (UNC) path or a path
+    relative to a drive (``C:data.csv``, or one with a single leading backslash)
+    never qualifies, and is refused before any filesystem call.
     """
     data = session.kernel.data
     source = data.meta.get("source")
@@ -569,6 +613,9 @@ def source_file(session: PreWhitenSession) -> tuple[Path, str] | tuple[None, str
         return None, "the data have no source file"
     if data.labels:
         return None, "the session has label columns, which only an embedded copy keeps"
+    why = _unusable_source(source)
+    if why:
+        return None, why
     columns = _session_columns(session)
     try:
         path = Path(source).resolve()
@@ -605,6 +652,23 @@ def source_file(session: PreWhitenSession) -> tuple[Path, str] | tuple[None, str
 #: Content hash of recently checked source files, by (path, mtime, size, columns,
 #: domain).
 _SOURCE_DIGESTS: dict[tuple[Any, ...], str] = {}
+
+
+def _unusable_source(text: str) -> str:
+    """Why ``text`` may not name a re-readable data file (``""`` when it may).
+
+    Decided on the text alone: resolving a UNC path already opens a connection to
+    its host, and a drive-relative path depends on that drive's working directory.
+    """
+    if "\x00" in text:
+        return "the source file name is malformed"
+    if text.startswith(("\\\\", "//")):
+        return f"the source file {text!r} is a network (UNC) or device path"
+    if re.match(r"^[A-Za-z][A-Za-z0-9+.\-]+:", text):
+        return f"the source {text!r} is a URL, not a file"
+    if text.startswith("\\") or re.match(r"^[A-Za-z]:(?![\\/])", text):
+        return f"the source file {text!r} is relative to a drive, not a full path"
+    return ""
 
 
 def _reference(session: PreWhitenSession, directory: Path) -> tuple[str | None, str]:
@@ -726,14 +790,20 @@ def save(
     Raises
     ------
     ProjectError
-        When the data can be neither referenced nor embedded as asked, or the file
-        would exceed ``max_project_bytes``.
+        When the data can be neither referenced nor embedded as asked, the file
+        would exceed ``max_project_bytes``, or the grid exceeds :func:`grid_limit`
+        (a file :func:`load` would refuse is never written).
     """
     target = Path(path)
     if embed_data not in ("auto", "always", "never"):
         raise ProjectError("embed_data must be 'auto', 'always' or 'never'")
     data = session.kernel.data
     limits = session.session_settings
+    try:
+        _check_grid(session.kernel.creation.grid, data.n, "creation.grid")
+        _check_grid(session.state.grid, data.n, "state.grid")
+    except ProjectError as exc:
+        raise ProjectError(f"the session cannot be saved: {exc}") from None
     reference: str | None = None
     if embed_data != "always":
         reference, why = _reference(session, target.parent)
@@ -1245,8 +1315,23 @@ def _embedded(model: DataModel) -> LightCurve:
         np.asarray(model.value, dtype=np.float64),
         None if model.error is None else np.asarray(model.error, dtype=np.float64),
         domain=model.domain,
-        meta=_plain_meta(model.meta),
+        meta=_untrusted_meta(model.meta),
     )
+
+
+def _untrusted_meta(meta: Mapping[str, Any]) -> dict[str, Any]:
+    """The metadata of an embedded project, with its ``source`` kept as a record only.
+
+    ``meta["source"]`` names the file :func:`source_file` re-reads (on save and on a
+    script export); only a source set in this process (``LightCurve.from_file``) may
+    name one. A file's own claim is kept under :data:`RECORDED_SOURCE` instead, so
+    a project can never make a save touch a path (or a network share) it chose.
+    """
+    out = _plain_meta(meta)
+    recorded = out.pop("source", None)
+    if recorded is not None and RECORDED_SOURCE not in out:
+        out[RECORDED_SOURCE] = recorded
+    return out
 
 
 def _columns(model: ColumnsModel | None) -> ColumnMap | None:
@@ -1345,7 +1430,9 @@ def _open(
         label_names=tuple(labels),
         content_sha256=actual,
     )
+    _check_grid(creation.grid, n, "creation.grid")
     head = build_state(project.state, n=n)
+    _check_grid(head.grid, n, "state.grid")
     validate_state(head, _session_data(lc, labels))
     log = _log(project.log)
     if len(log) > creation.session_settings.max_actions:
@@ -1354,6 +1441,17 @@ def _open(
             f"({creation.session_settings.max_actions})"
         )
     chosen = choose_backend(creation.backend, backend)
+    work = n * max(int(creation.grid[2]), int(head.grid[2]))
+    if backend is None and _requested(chosen) == "numpy" and work > DIRECT_WORK_LIMIT:
+        # The direct sum costs points x frequencies per spectrum; opening computes one.
+        warnings.warn(
+            f"the project ran on the direct 'numpy' backend, where its spectrum costs "
+            f"{work:.3g} evaluations (more than {DIRECT_WORK_LIMIT:.3g}); using the "
+            "NUFFT CPU backend instead (pass backend='numpy' to keep it)",
+            SessionWarning,
+            stacklevel=4,
+        )
+        chosen = "cpu"
     snapshot = SessionSnapshot(creation=creation, head=head, log=log)
     session = PreWhitenSession.restore(
         snapshot, lc, backend=chosen, labels=labels or None, columns=columns
@@ -1382,13 +1480,31 @@ def _component_drift(stored: SessionState, rebuilt: SessionState) -> float:
     return worst
 
 
+def _nonlinear_phases(mm: ModelMap | None) -> bool:
+    """Whether a fit of ``mm`` solves some phase non-linearly (``psi`` is not empty).
+
+    The rule of :func:`cuperiod.prewhiten._constrained._classify`: a fixed amplitude
+    with a free phase, or an amplitude or phase per subset whose partner is shared.
+    """
+    if mm is None or mm.constraints is None:
+        return False
+    for c in mm.constraints.components:
+        amplitude, phase = c.varies_amplitude, c.varies_phase
+        if amplitude != phase and (phase or c.phase is None):
+            return True
+        if not amplitude and not phase and c.amplitude is not None and c.phase is None:
+            return True
+    return False
+
+
 def _recommit(session: PreWhitenSession) -> None:
     """Re-derive the restored head's fit statistics and zero points from its data.
 
     ``stats``, ``offset`` and ``subset_offsets`` are never trusted from a file; the
     component values are kept unless the rebuilt fit moves them by more than
-    :data:`RESTORE_RTOL`, in which case the rebuilt values replace them (with a
-    :class:`SessionWarning`).
+    :data:`RESTORE_RTOL` (:data:`RESTORE_NONLINEAR_RTOL` when some phase is solved
+    non-linearly, which a rebuild repeats only to the solver's precision), in which
+    case the rebuilt values replace them (with a :class:`SessionWarning`).
     """
     kernel = session.kernel
     head = session.state
@@ -1398,7 +1514,8 @@ def _recommit(session: PreWhitenSession) -> None:
         head, derived.fit, mm=mm, spectrum=derived.scan
     )
     drift = _component_drift(head, rebuilt)
-    if drift > RESTORE_RTOL:
+    tolerance = RESTORE_NONLINEAR_RTOL if _nonlinear_phases(mm) else RESTORE_RTOL
+    if drift > tolerance:
         warnings.warn(
             f"the stored component values differ from a re-fit of the data by up to "
             f"{drift:.3g} (relative); the re-fitted values replace them",
@@ -1434,7 +1551,10 @@ def load(
     allow_modified_data : bool, default False
         Accept data whose content hash differs; the stored solution is re-fitted.
     backend : str, optional
-        Overrides the recorded backend (see :func:`choose_backend`).
+        Overrides the recorded backend (see :func:`choose_backend`). Without it, a
+        project recorded on the direct ``numpy`` backend whose spectrum would cost
+        more than :data:`DIRECT_WORK_LIMIT` (points x grid frequencies) opens on
+        the NUFFT CPU backend, with a :class:`SessionWarning`.
 
     Returns
     -------

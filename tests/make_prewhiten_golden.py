@@ -9,7 +9,8 @@ The golden pins the results of :func:`cuperiod.prewhiten` on the corpus of
 be written from a tree whose pre-whitening sources are the reference behaviour. It
 records the commit, the digests of the pre-whitening sources and the numerical
 environment's fingerprint next to the summaries; the test compares at ``1e-12`` when
-the running fingerprint matches and ``1e-9`` otherwise.
+the running fingerprint matches and at the looser cross-environment tolerances of
+``tests/prewhiten_corpus.py`` otherwise.
 
 An existing golden is never overwritten without ``--force``: regenerating it from a
 tree whose behaviour has already moved would silently bless the drift it exists to

@@ -50,6 +50,23 @@ _DEFAULT_SETTINGS: dict[
 #: Concrete CPU backend names, resolvable without probing for a GPU.
 _CPU_BACKEND_NAMES = frozenset({"finufft", "numba", "astropy", "numpy"})
 
+#: The pip extra that installs each optional backend, named in "not installed" errors
+#: (finufft and astropy are core dependencies).
+_BACKEND_EXTRAS: Mapping[str, str] = {
+    "numba": "fast",
+    "cupy": "gpu",
+    "cufinufft": "gpu",
+}
+
+
+def _not_installed(method: str, backend: str) -> BackendUnavailableError:
+    """The error for a named backend whose package is missing, naming its extra."""
+    extra = _BACKEND_EXTRAS.get(backend)
+    hint = f" (pip install 'cuperiod[{extra}]')" if extra else ""
+    return BackendUnavailableError(
+        f"{method}: backend {backend!r} is not installed{hint}"
+    )
+
 
 def default_settings(cls: type[_S]) -> _S:
     """A default-constructed ``cls()``, without re-reading the environment every call.
@@ -178,9 +195,7 @@ class PeriodogramMethod(ABC):
             )
         if requested in _CPU_BACKEND_NAMES:
             if requested != "numpy" and requested not in cpu_backends():
-                raise BackendUnavailableError(
-                    f"{self.name}: backend {requested!r} is not installed"
-                )
+                raise _not_installed(self.name, requested)
             return requested
         available = available_backends()
         if requested == "auto":
@@ -206,13 +221,13 @@ class PeriodogramMethod(ABC):
                 "device)"
             )
         if requested == self.gpu_backend and not cuda_available():
+            # cuda_available() is False without cupy as well as without a device.
             raise BackendUnavailableError(
-                f"{self.name}: backend {requested!r} needs a CUDA device"
+                f"{self.name}: backend {requested!r} needs a CUDA device and the "
+                "[gpu] extra (pip install 'cuperiod[gpu]')"
             )
         if requested == "cufinufft" and requested not in available:
-            raise BackendUnavailableError(
-                f"{self.name}: backend {requested!r} is not installed"
-            )
+            raise _not_installed(self.name, requested)
         return requested
 
     def _selector_help(self) -> str:

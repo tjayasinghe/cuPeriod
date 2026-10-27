@@ -157,7 +157,7 @@ class Sinusoid:
         constraints : bool, default False
             Append the interactive-session keys (``fixed``, ``tied``, ``variation``,
             ``amplitude_rms``, ``flags`` as one comma-separated string). The default
-            keeps the v1.3 row layout.
+            keeps the row layout of 1.2.
         """
         row = self._base_dict()
         if constraints:
@@ -457,7 +457,7 @@ class PreWhitenResult:
         constraints : bool, optional
             Include the interactive-session keys (see :meth:`Sinusoid.to_dict`).
             ``None`` includes them only when some component was fixed, tied or
-            allowed to vary, so an automatic solution keeps the v1.3 layout.
+            allowed to vary, so an automatic solution keeps the layout of 1.2.
         """
         if constraints is None:
             constraints = any(c.has_constraint for c in self.components)

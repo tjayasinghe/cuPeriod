@@ -210,7 +210,7 @@ def test_close_asks_about_unsaved_work_and_cancel_keeps_the_window(
     # The source's label (what the Load demo menu called it), not its key "star".
     assert kind == "confirm_discard" and names == ("Star",)
     window._populate_sessions_menu()  # File ▸ Unsaved sessions says the same
-    assert [a.text() for a in window._sessions_menu.actions()] == ["Star"]
+    assert [a.text() for a in window._sessions_menu.actions()] == ["&1 Star"]
     provider.answers.append("discard")
     assert window.close()
     assert not window.isVisible()
@@ -439,6 +439,139 @@ def test_a_batch_file_that_will_not_load_offers_to_choose_its_columns(
     window.controller.shutdown()
 
 
+def test_a_late_result_does_not_hide_the_choose_columns_banner(
+    qtbot: QtBot, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The previous source's result arriving after a file failed to load hid the
+    banner, and with it the only way to that file's import dialog (its row is
+    disabled)."""
+    from cuperiod.core.result import Periodogram
+
+    good = tmp_path / "a_good.csv"
+    good.write_text(
+        "time,mag,mag_err\n"
+        + "\n".join(f"{i},{14 + 0.1 * (i % 3)},0.01" for i in range(40)),
+        encoding="utf-8",
+    )
+    _write_semicolon_csv(tmp_path / "b_bad.csv")
+    provider = FakeDialogProvider()
+    window = _window(qtbot, provider)
+    monkeypatch.setattr(window._controls, "request_compute", lambda: None)
+    window._load_folder(tmp_path)
+    window._select_source(1)  # fails; the window stays on source 0
+    assert window._banner_container.isVisible() and window._banner_action.isVisible()
+    assert window._source_browser.is_failed(1)
+    frequency = np.linspace(0.05, 2.0, 200)
+    late = Periodogram.from_spectrum(
+        method="GLS",
+        backend="numpy",
+        frequency=frequency,
+        power=np.exp(-0.5 * ((frequency - 0.7) / 0.01) ** 2),
+        objective_sense="max",
+        n_samples=40,
+        baseline=39.0,
+    )
+    window.controller.compute_started.emit()  # source 0's run, still going ...
+    window.controller.periodogram_ready.emit(late)  # ... and its late result
+    assert window._banner_container.isVisible() and window._banner_action.isVisible()
+    window._banner_action.click()
+    assert provider.calls[-1][0] == "import_file"
+    # A run error, by contrast, is superseded by the next result as before.
+    window._hide_banner()
+    window._show_banner("InsufficientDataError: 3 finite points")
+    window.controller.periodogram_ready.emit(late)
+    assert not window._banner_container.isVisible()
+    window.controller.shutdown()
+
+
+def _write_table(path: Path, header: str | None, sep: str = ",") -> Path:
+    """A 40-row ``time, brightness, error`` table (``header`` None: no header row)."""
+    rows = [
+        sep.join((f"{2458000 + 0.37 * i:.5f}", f"{14 + 0.1 * (i % 3):.3f}", "0.010"))
+        for i in range(40)
+    ]
+    lines = rows if header is None else [header, *rows]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def _import_through_the_dialog(window: MainWindow, path: Path) -> object:
+    """Open ``path`` with the real import dialog, press Load, return the dialog."""
+    from cuperiod.gui.widgets.preview_dialog import PreviewDialog
+
+    window._load_file(path)
+    live = getattr(window._dialogs, "live_dialogs", ())
+    dialogs = [d for d in live if isinstance(d, PreviewDialog)]
+    assert len(dialogs) == 1
+    dialog = dialogs[0]
+    assert dialog.can_load(), dialog._problem.text()
+    dialog.accept()
+    return dialog
+
+
+def test_a_flux_file_after_a_magnitude_file_loads_as_flux(
+    qtbot: QtBot, tmp_path: Path
+) -> None:
+    """The remembered domain must not override a file whose column names say what
+    it holds (a flux CSV opened after a magnitude one loaded as magnitudes)."""
+    window = _window(qtbot)
+    _import_through_the_dialog(
+        window, _write_table(tmp_path / "star.csv", "time,mag,mag_err")
+    )
+    first = window.controller.state.current_lc
+    assert isinstance(first, LightCurve) and first.domain is Domain.MAGNITUDE
+    _import_through_the_dialog(
+        window, _write_table(tmp_path / "kepler.csv", "time,flux,flux_err")
+    )
+    lc = window.controller.state.current_lc
+    assert isinstance(lc, LightCurve) and lc.domain is Domain.FLUX
+    # And back: a magnitude file after the flux one is magnitudes again.
+    _import_through_the_dialog(
+        window, _write_table(tmp_path / "again.csv", "time,mag,mag_err")
+    )
+    lc = window.controller.state.current_lc
+    assert isinstance(lc, LightCurve) and lc.domain is Domain.MAGNITUDE
+    window.controller.shutdown()
+
+
+def test_a_header_file_after_a_headerless_one_keeps_its_header(
+    qtbot: QtBot, tmp_path: Path
+) -> None:
+    """The remembered read options must not override what the next file shows of
+    itself: a header CSV after an OGLE-style ``JD mag err`` table, a semicolon file."""
+    window = _window(qtbot)
+    _import_through_the_dialog(window, _write_table(tmp_path / "ogle.dat", None, " "))
+    assert window.controller.state.current_lc is not None
+    remembered = window._last_import()
+    assert remembered is not None and remembered.read is not None
+    assert not remembered.read.header
+    dialog = _import_through_the_dialog(
+        window, _write_table(tmp_path / "kepler.csv", "time,flux,flux_err")
+    )
+    assert dialog._header.isChecked()  # type: ignore[attr-defined]
+    lc = window.controller.state.current_lc
+    assert isinstance(lc, LightCurve) and lc.n == 40 and lc.domain is Domain.FLUX
+    # A semicolon file is still split on opening, after a headerless one.
+    _import_through_the_dialog(window, _write_table(tmp_path / "ogle2.dat", None, " "))
+    dialog = _import_through_the_dialog(
+        window, _write_table(tmp_path / "eu.csv", "time;mag;mag_err", ";")
+    )
+    assert dialog._delimiter.currentData() == ";"  # type: ignore[attr-defined]
+    lc = window.controller.state.current_lc
+    assert isinstance(lc, LightCurve) and lc.n == 40
+    # The choice persists across launches; detection still wins there.
+    _import_through_the_dialog(window, _write_table(tmp_path / "ogle3.dat", None, " "))
+    window.controller.shutdown()
+    window.close()
+    second = _window(qtbot)
+    dialog = _import_through_the_dialog(
+        second, _write_table(tmp_path / "next.csv", "time,mag,mag_err")
+    )
+    assert dialog._header.isChecked()  # type: ignore[attr-defined]
+    assert isinstance(second.controller.state.current_lc, LightCurve)
+    second.controller.shutdown()
+
+
 # -- UX-17: each analysis keeps its result ---
 def test_switching_analysis_keeps_each_result(qtbot: QtBot) -> None:
     window = _window(qtbot)
@@ -516,3 +649,107 @@ def test_verify_project_asks_for_a_file_and_opens_it_verified(
     window.commands.action("file.verify_project").trigger()
     assert provider.calls[-1][0] == "open_file"
     assert opened == [("C:/data/star.cupw.json", True)]
+
+
+def _saved_project(qtbot: QtBot, path: Path) -> None:
+    """A pre-whitening project at ``path``, saved from a window that then closes."""
+    window = _window(qtbot)
+    window.controller.set_light_curve(_curve(), "star")
+    window._controls.set_analysis("prewhiten")
+    _auto(qtbot, window)
+    window.controller.save_project(str(path))
+    qtbot.waitUntil(
+        lambda: path.is_file() and not window.controller.is_session_dirty(),
+        timeout=30_000,
+    )
+    window.controller.shutdown()
+    window.close()
+
+
+def _status_log(window: MainWindow) -> list[str]:
+    seen: list[str] = []
+    bar = window.statusBar()
+    assert bar is not None
+    bar.messageChanged.connect(lambda text: seen.append(text) if text else None)
+    return seen
+
+
+def test_opening_a_project_shows_its_warnings_and_the_run_to_press(
+    qtbot: QtBot, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """What opening a project warned about (its GPU backend is not here, its stored
+    values were re-fitted) reached only stderr; and the status then said "press
+    Compute periodogram" while the window showed pre-whitening."""
+    import warnings
+
+    from cuperiod.prewhiten.session.session import PreWhitenSession
+    from cuperiod.prewhiten.session.state import SessionWarning
+
+    path = tmp_path / "p.cupw.json"
+    _saved_project(qtbot, path)
+    text = (
+        "the project ran on 'cufinufft', which is not available here; using the "
+        "best CPU backend instead"
+    )
+    real_load = PreWhitenSession.load
+
+    def load(cls: object, target: object, **kwargs: object) -> PreWhitenSession:
+        warnings.warn(text, SessionWarning, stacklevel=2)
+        return real_load(target, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(PreWhitenSession, "load", classmethod(load))
+    window = _window(qtbot)
+    status = _status_log(window)
+    window.controller.open_project(path)
+    qtbot.waitUntil(
+        lambda: window.controller.state.source_id.startswith("project:"),
+        timeout=30_000,
+    )
+    view = _settle(qtbot, window)
+    assert text in view.warnings  # beside the table, with the session's first view
+    assert status[-1] == "The project ran on 'cufinufft', which is not available " \
+        "here; using the best CPU backend instead."
+    assert any("press Run pre-whitening" in s for s in status), status
+    assert not any("press Compute periodogram" in s for s in status), status
+    window.controller.shutdown()
+
+
+def test_a_project_that_does_not_verify_is_not_a_failed_run(
+    qtbot: QtBot, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cuperiod.prewhiten.session.project import ProjectError
+    from cuperiod.prewhiten.session.session import PreWhitenSession
+
+    path = tmp_path / "p.cupw.json"
+    _saved_project(qtbot, path)
+    real_load = PreWhitenSession.load
+
+    def load(cls: object, target: object, **kwargs: object) -> PreWhitenSession:
+        if kwargs.get("verify"):
+            raise ProjectError(
+                "verify failed: replaying all 3 log entries gives F1: frequency "
+                "1.31 instead of 1.3"
+            )
+        return real_load(target, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(PreWhitenSession, "load", classmethod(load))
+    window = _window(qtbot)
+    status = _status_log(window)
+    badge = window._info._method.text()
+    window.controller.open_project(path, verify=True)
+    qtbot.waitUntil(window._banner_container.isVisible, timeout=30_000)
+    assert status[-1].startswith("Could not verify p.cupw.json: ProjectError: verify")
+    runs = ("Compute periodogram failed", "Run pre-whitening failed")
+    assert not any(s.startswith(runs) for s in status), status
+    assert window._info._method.text() == badge  # no run is marked failed
+    assert "Could not verify p.cupw.json" in window._banner.text()
+    # Opening it (no verify) still works, and says so in its own words.
+    window._hide_banner()
+    window.controller.open_project(path)
+    qtbot.waitUntil(
+        lambda: window.controller.state.source_id.startswith("project:"),
+        timeout=30_000,
+    )
+    _settle(qtbot, window)
+    assert not window._banner_container.isVisible()
+    window.controller.shutdown()

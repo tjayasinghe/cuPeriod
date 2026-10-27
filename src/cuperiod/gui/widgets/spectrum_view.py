@@ -152,6 +152,23 @@ _NAV_KEYS = frozenset(
     }
 )
 
+#: The keys the focused spectrum acts on itself, as ``(what, keys)`` for the F1 sheet
+#: (the registry's A / Insert and the rest are listed with their commands).
+SPECTRUM_KEYS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Cursor to the previous / next local maximum", ("Left", "Right")),
+    (
+        "Cursor to the previous / next marked peak (pre-whitening: component)",
+        ("Ctrl+Left", "Ctrl+Right"),
+    ),
+    ("Cursor one sample left / right", ("Shift+Left", "Shift+Right")),
+    ("Cursor to the tallest peak", ("Home",)),
+    ("Cursor to the next candidate (pre-whitening)", ("N",)),
+    ("Fold at the cursor", ("Enter",)),
+    ("Zoom in / out", ("+", "-")),
+    ("Reset the view", ("0",)),
+    ("The plot's menu", ("Menu",)),
+)
+
 #: The keyboard and mouse gestures, for the plot's status tip and What's This text.
 _GESTURES_PERIODOGRAM = (
     "Click: fold at the nearest peak (Alt: exactly there) · drag the shaded band · "
@@ -2597,6 +2614,7 @@ class SpectrumView(QtWidgets.QWidget):
 __all__ = [
     "PREWHITEN_METHOD",
     "SNAP_PX",
+    "SPECTRUM_KEYS",
     "SpectrumView",
     "envelope_indices",
     "local_maxima",

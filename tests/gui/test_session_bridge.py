@@ -367,6 +367,35 @@ def test_failures_and_preview_failures(
     assert not bridge.latest_view(SessionKey("late"))
 
 
+def test_session_warnings_of_an_open_reach_the_gui(
+    rig: tuple[ComputeManager, SessionBridge], qtbot: QtBot
+) -> None:
+    """A SessionWarning raised on the worker while a session is made reached only
+    stderr; any other warning is still issued as before."""
+    import warnings
+
+    from cuperiod.prewhiten.session.state import SessionWarning
+
+    compute, bridge = rig
+    messages: list[tuple[str, str]] = []
+    bridge.message.connect(lambda severity, text: messages.append((severity, text)))
+    views = _views(bridge)
+
+    def warned() -> cup.PreWhitenSession:
+        warnings.warn(
+            "stored values were replaced by a re-fit", SessionWarning, stacklevel=2
+        )
+        warnings.warn("about the code", FutureWarning, stacklevel=2)
+        return _factory()()
+
+    bridge.display(KEY)
+    with pytest.warns(FutureWarning, match="about the code"):
+        bridge.open(KEY, warned, backend="numpy")
+        _idle(qtbot, bridge, compute)
+    assert messages == [("warning", "Stored values were replaced by a re-fit.")]
+    assert views[-1].warnings == ("stored values were replaced by a re-fit",)
+
+
 # -- queries -----------------------------------------------------------------------
 def test_stale_variation_queries_are_skipped_and_dropped(
     rig: tuple[ComputeManager, SessionBridge], qtbot: QtBot

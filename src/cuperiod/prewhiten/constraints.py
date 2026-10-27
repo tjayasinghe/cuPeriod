@@ -572,7 +572,7 @@ class FitConstraints:
         return cls(components=tuple(ComponentConstraint() for _ in range(n_components)))
 
     def is_trivial(self) -> bool:
-        """True when the fit is the unconstrained v1.3 fit (``start`` is ignored)."""
+        """True when the fit is the automatic loop's fit (``start`` is ignored)."""
         return (
             all(c.is_free for c in self.components)
             and self.offset_groups is None

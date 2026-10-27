@@ -477,3 +477,114 @@ def test_period_law_table_prints_the_ranking_criterion(
                                             abs=1e-3)
         if not fit.at_bound:
             assert float(dbic) >= 0.0
+
+
+# --- release gate (1.3.0): usage errors, the environment, one error convention ---
+
+
+@pytest.mark.parametrize(
+    "extra", [["-m", "BLS"], ["-m", "TLS"], ["--pdot-range=-1e-2,1e-2"]]
+)
+def test_pdot_options_the_search_cannot_honour_are_usage_errors(
+    tmp_path: Path, extra: list[str]
+) -> None:
+    # pdot_search raises ValueError for a box-search method and for a rate range
+    # outside the period law's domain; `pdot` used to end in a traceback.
+    csv, truth = _write_drifting_csv(tmp_path / "drift.csv")
+    result = runner.invoke(
+        app,
+        ["pdot", str(csv), "--period", str(truth["period"]), "--backend", "cpu",
+         *extra],
+    )
+    assert result.exit_code == 2, result.output
+    assert not isinstance(result.exception, ValueError)
+    assert "Traceback" not in result.output
+
+
+def test_pdot_too_few_points_is_still_an_error_not_a_usage_error(
+    tmp_path: Path,
+) -> None:
+    # InsufficientDataError is a ValueError too; it must keep its "Error:" / 1.
+    csv = _write_unusable_csv(tmp_path / "tiny.csv")
+    result = runner.invoke(
+        app, ["pdot", str(csv), "--period", "1.0", "--backend", "cpu"]
+    )
+    assert result.exit_code == 1, result.output
+    assert "Error:" in result.output
+
+
+def test_pdot_honours_the_pdot_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An option left unset must not pass the CLI's default over the environment.
+    monkeypatch.setenv("CUPERIOD_PDOT_MAX_CYCLE_DRIFT", "2")
+    monkeypatch.setenv("CUPERIOD_PDOT_N_SEGMENTS", "12")
+    csv, truth = _write_drifting_csv(tmp_path / "drift.csv")
+    command = [
+        "pdot", str(csv), "--period", str(truth["period"]), "--backend", "cpu",
+        "--window-rayleigh", "10", "--samples-per-peak", "5", "--no-ltte",
+    ]
+    result = runner.invoke(app, command)
+    assert result.exit_code == 0, result.output
+    # 4 * samples_per_drift * max_cycle_drift + 1 rows: 41 for 2 cycles, not 201.
+    assert re.search(r"grid\s+41 x \d+", result.stdout), result.stdout
+    assert re.search(r"segments\s+12\b", result.stdout), result.stdout
+    # An option given on the command line still beats the environment.
+    result = runner.invoke(app, [*command, "--segments", "6"])
+    assert result.exit_code == 0, result.output
+    assert re.search(r"segments\s+6\b", result.stdout), result.stdout
+
+
+def test_pdot_batch_honours_the_pdot_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pyarrow.parquet as pq
+
+    monkeypatch.setenv("CUPERIOD_PDOT_N_SEGMENTS", "12")
+    inputs, truth = _write_batch_inputs(tmp_path, n_stars=1)
+    out = tmp_path / "summary.parquet"
+    result = runner.invoke(
+        app,
+        ["pdot-batch", inputs, "--sink", str(out), "--period", str(truth["period"]),
+         "--backend", "cpu", "--workers", "1", "--no-profile", "--no-ltte",
+         *FAST_GRID],
+    )
+    assert result.exit_code == 0, result.output
+    (row,) = pq.read_table(out).to_pylist()
+    assert row["status"] == "ok"
+    assert row["n_segments"] == 12
+
+
+def test_pdot_options_help_names_the_environment() -> None:
+    result = runner.invoke(app, ["pdot", "--help"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0, result.output
+    assert "CUPERIOD_PDOT_MAX_CYCLE_DRIFT, else 10" in result.stdout
+    assert "CUPERIOD_PDOT_N_SEGMENTS, else auto" in result.stdout
+
+
+def test_ltte_block_quotes_every_error_in_one_convention(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """P2, A and the secular dP/dt all carry the formal error x error_inflation."""
+    import cuperiod as cup
+    from cuperiod.cli.app import _SECONDS_PER_YEAR, _print_ltte
+
+    rng = np.random.default_rng(1)
+    t = np.sort(rng.uniform(0.0, 5000.0, 40)) + 2450000.0
+    dt = t - t.mean()
+    oc = (
+        0.5 * (3e-8 / 0.4) * dt**2
+        + 0.003 * np.sin(2.0 * np.pi * dt / 1300.0 + 0.4)
+        + rng.normal(0.0, 5e-4, t.size)
+    )
+    # Quoted errors three times too small: chi2_reduced ~ 9, inflation ~ 3.
+    res = cup.ltte_search(t, oc=oc, errors=np.full(t.size, 5e-4 / 3), period=0.4)
+    best = res.best
+    scale = best.error_inflation
+    assert scale > 2.0
+    _print_ltte(res)
+    out = capsys.readouterr().out
+    assert f"+- {best.outer_period_err_yr * scale:.3f} yr" in out
+    assert f"+- {best.amplitude_err_s * scale:.1f} s" in out
+    assert f"+- {best.pdot_err_scaled * _SECONDS_PER_YEAR:.2g} s/yr" in out
+    assert f"formal x {scale:.3g}" in out and "error_inflation" in out

@@ -41,6 +41,9 @@ class History:
         self._cursor = 0
         self._open: list[int] = []
         self._next_group = 1
+        # States before this position were never in memory (a project opened from a
+        # file keeps only its head); later gaps were evicted by ``depth``.
+        self._unloaded = 0
 
     # -- read-only -----------------------------------------------------------------
     @property
@@ -97,6 +100,24 @@ class History:
         """Whether the state after entry ``seq`` (``0`` = root) is in memory."""
         position = self._position(seq)
         return position is not None and self._states[position] is not None
+
+    def unreachable(self, seq: int) -> str | None:
+        """Why the state after entry ``seq`` is not in memory (``None`` when it is)."""
+        position = self._position(seq)
+        if position is None:
+            return f"no log entry {seq}"
+        if self._states[position] is not None:
+            return None
+        what = "the root state" if position == 0 else f"the state after entry {seq}"
+        if position < self._unloaded:
+            return (
+                f"{what} is not in memory: this project was opened from a file; use "
+                "Verify project to replay its log"
+            )
+        return (
+            f"{what} is no longer in memory: only the newest {self._depth} states are "
+            "kept (SessionSettings.undo_depth)"
+        )
 
     # -- groups --------------------------------------------------------------------
     def allocate_group(self) -> int:
@@ -199,8 +220,10 @@ class History:
         if s.states is not None and len(s.states) == len(s.log) + 1:
             states: list[SessionState | None] = list(s.states)
             states[-1] = s.head
+            history._unloaded = 0
         else:
             states = [None] * len(s.log) + [s.head]
+            history._unloaded = len(s.log)
         history._states = states
         history._cursor = len(s.log)
         history._open = []

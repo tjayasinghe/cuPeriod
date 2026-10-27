@@ -36,6 +36,7 @@ Session jobs never read :attr:`ComputeManager.generation` (see
 from __future__ import annotations
 
 import time
+import warnings
 from collections import OrderedDict, deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -114,6 +115,44 @@ class _Outcome:
     loaded: Any = None
     # The submitted ops that were refused (their indices in the request), in order.
     refused_ops: tuple[int, ...] = ()
+    # What opening the session warned about (a project's backend is not here, its
+    # stored values were replaced by a re-fit): shown in the status bar and the view.
+    warnings: tuple[str, ...] = ()
+
+
+def _making(
+    make: Callable[[], PreWhitenSession],
+) -> tuple[PreWhitenSession, tuple[str, ...]]:
+    """``make()`` (on the worker) and the texts of the session warnings it raised.
+
+    A :class:`~cuperiod.prewhiten.session.state.SessionWarning` (opening a project
+    saved on a GPU machine here, replaying a log whose stored values differ) is
+    meant for the user, and from the worker it reached only stderr. Any other
+    warning is issued again unchanged.
+    """
+    from cuperiod.prewhiten.session.state import SessionWarning
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", SessionWarning)
+        session = make()
+    texts: list[str] = []
+    for item in caught:
+        if issubclass(item.category, SessionWarning):
+            texts.append(str(item.message))
+        else:
+            warnings.warn_explicit(
+                item.message, item.category, item.filename, item.lineno
+            )
+    return session, tuple(dict.fromkeys(texts))
+
+
+def _sentence(text: str) -> str:
+    """A library warning ("the project ran on ...") as a status-bar sentence."""
+    text = text.strip()
+    if not text:
+        return text
+    text = text[0].upper() + text[1:]
+    return text if text.endswith((".", "!", "?")) else text + "."
 
 
 @dataclass
@@ -397,9 +436,10 @@ class SessionBridge(QObject):
 
         def make() -> Callable[[SessionJob], _Outcome]:
             def work(job: SessionJob) -> _Outcome:
-                session = factory()
+                session, warned = _making(factory)
                 entry.session = session
-                return self._after(session, _Outcome(replaced=True, id_changed=True))
+                out = _Outcome(replaced=True, id_changed=True, warnings=warned)
+                return self._after(session, out)
 
             return work
 
@@ -439,11 +479,18 @@ class SessionBridge(QObject):
             def work(job: SessionJob) -> _Outcome:
                 from cuperiod.prewhiten.session.session import PreWhitenSession
 
-                session = PreWhitenSession.restore(
-                    snapshot, data, backend=backend, labels=labels
+                session, warned = _making(
+                    partial(
+                        PreWhitenSession.restore,
+                        snapshot,
+                        data,
+                        backend=backend,
+                        labels=labels,
+                    )
                 )
                 entry.session = session
-                return self._after(session, _Outcome(replaced=True, id_changed=True))
+                out = _Outcome(replaced=True, id_changed=True, warnings=warned)
+                return self._after(session, out)
 
             return work
 
@@ -476,7 +523,7 @@ class SessionBridge(QObject):
 
         def make() -> Callable[[SessionJob], _Outcome]:
             def work(job: SessionJob) -> _Outcome:
-                session = loader()
+                session, warned = _making(loader)
                 entry.session = session
                 payload = describe(session) if describe is not None else None
                 out = _Outcome(
@@ -484,6 +531,7 @@ class SessionBridge(QObject):
                     id_changed=True,
                     loaded=payload,
                     requested_backend=backend or session.backend,
+                    warnings=warned,
                 )
                 return self._after(session, out)
 
@@ -1272,6 +1320,8 @@ class SessionBridge(QObject):
             entry.changes += 1
         for severity, text in outcome.messages:
             self.message.emit(severity, text)
+        # Shown with the next view, beside the table (and in the status bar below).
+        entry.warnings.extend(outcome.warnings)
         refused = [r for r in outcome.reports if r.kind == "refused"]
         refusal = (
             self._refusal(entry, req, outcome, refused[0]) if refused else None
@@ -1343,6 +1393,8 @@ class SessionBridge(QObject):
             self.saved.emit(key, outcome.saved_path)
         if req.load:
             self.loaded.emit(key, outcome.loaded)
+        for text in outcome.warnings:  # after `loaded`: its status must not hide them
+            self.message.emit("warning", _sentence(text))
         if outcome.bundle is not None:
             self.auto_finished.emit(key, outcome.bundle)
         elif req.kind == "mutation" and outcome.result is not None:

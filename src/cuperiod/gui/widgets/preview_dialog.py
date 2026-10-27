@@ -22,6 +22,7 @@ those characters, not be rendered (or fetched) as markup.
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from pathlib import Path
 
 from cuperiod.core.columns import ColumnMap, Domain, infer_domain
@@ -115,6 +116,37 @@ def _headerless_looking(preview: FilePreview) -> bool:
     return len(numeric_cells(names)) == len(names)
 
 
+def _text_over_numbers(preview: FilePreview, columns: Sequence[str]) -> list[str]:
+    """The first-row cells of ``columns`` that are text over numbers below them.
+
+    Read without a header row, a file that has one starts with its column names
+    (``time``, ``flux`` ...) above the data; those cells are returned. A column of
+    text throughout (a band) is not one of them.
+    """
+    rows = preview.rows
+    if len(rows) < 2:
+        return []
+    found: list[str] = []
+    for column in columns:
+        if column not in preview.columns:
+            continue
+        j = preview.columns.index(column)
+        cells = [row[j] for row in rows if j < len(row)]
+        if (
+            cells
+            and cells[0].strip()
+            and not numeric_cells(cells[:1])
+            and numeric_cells(cells[1:])
+        ):
+            found.append(cells[0])
+    return found
+
+
+def _splits(preview: FilePreview | None) -> bool:
+    """Whether a preview split the file into columns (two or more)."""
+    return preview is not None and len(preview.columns) >= 2
+
+
 class PreviewDialog(QtWidgets.QDialog):
     """Preview a file and choose its columns; Load emits :attr:`choice_made`.
 
@@ -132,7 +164,10 @@ class PreviewDialog(QtWidgets.QDialog):
         missed one.
     columns, domain, read : optional
         A previous choice to start from (e.g. the last mapping used); names the file
-        does not have are ignored.
+        does not have are ignored. What the file shows of itself comes first: the
+        ``domain`` applies only to a brightness column whose name says neither
+        magnitude nor flux (``col2``, ``V``), and ``read`` only to a text file that
+        its own detection leaves in a single column.
     """
 
     #: The user pressed Load: carries the :class:`~cuperiod.gui.loaders.ImportChoice`.
@@ -158,8 +193,12 @@ class PreviewDialog(QtWidgets.QDialog):
         self._text = self._path is not None and is_text_table(self._path)
         #: The user changed a choice (then a working choice makes Load the default).
         self._touched = False
-        #: The user set the domain (then the value column no longer infers it).
-        self._domain_touched = domain is not None
+        #: The user set the domain in this dialog (then the value column no longer
+        #: infers it). A remembered domain is not such a choice: see below.
+        self._domain_touched = False
+        #: The previous file's domain, for a brightness column whose name does not
+        #: say (a flux file opened after a magnitude one must still read as flux).
+        self._fallback_domain = domain
         self._filling = False
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -224,7 +263,7 @@ class PreviewDialog(QtWidgets.QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-        self._start(preview, columns, domain, read)
+        self._start(preview, columns, read)
 
     # -- construction ------------------------------------------------------------
     def _make_table(self, name: str) -> QtWidgets.QTableWidget:
@@ -349,7 +388,6 @@ class PreviewDialog(QtWidgets.QDialog):
         self,
         preview: FilePreview,
         columns: ColumnMap | None,
-        domain: Domain | None,
         read: ReadOptions | None,
     ) -> None:
         """Show ``preview``; with the file at hand, fix an obviously wrong first read.
@@ -357,37 +395,58 @@ class PreviewDialog(QtWidgets.QDialog):
         A text file read into a single column (a semicolon or tab file) is re-read
         with the delimiter it appears to use, and one whose "column names" are
         numbers (no header row) is re-read without a header, so the user starts from
-        a table that looks like theirs.
+        a table that looks like theirs. The previous file's options (``read``) are
+        tried only when that still leaves a single column, and kept only if they
+        split it: a file that shows how it reads is never read the last file's way
+        (a header CSV opened after a headerless OGLE table keeps its header).
         """
-        self._filling = True
-        try:
-            if read is not None and self._text:
-                index = self._delimiter.findData(read.delimiter)
+        if self._text and self._path is not None:
+            options, detected = self._detect_read(self._path, preview)
+            if read is not None and read != options and not _splits(detected):
+                remembered = preview_file(self._path, read=read)
+                # header=False on a file that has one reads its names as data.
+                names_as_data = (
+                    remembered is not None
+                    and not read.header
+                    and bool(_text_over_numbers(remembered, remembered.columns))
+                )
+                if _splits(remembered) and not names_as_data:
+                    options, detected = read, remembered
+            if detected is not None:
+                preview = detected
+            self._filling = True
+            try:
+                index = self._delimiter.findData(options.delimiter)
                 self._delimiter.setCurrentIndex(max(index, 0))
-                self._header.setChecked(read.header)
-            elif self._text and self._path is not None:
-                if len(preview.columns) == 1:
-                    sniffed = sniff_delimiter(self._path)
-                    if sniffed is not None:
-                        self._delimiter.setCurrentIndex(
-                            max(self._delimiter.findData(sniffed), 0)
-                        )
-                if _headerless_looking(preview):
-                    self._header.setChecked(False)
-        finally:
-            self._filling = False
-        options = self.read_options()
-        if options is not None and self._path is not None:
-            fresh = preview_file(self._path, read=options)
-            if fresh is not None:
-                preview = fresh
-        self._show_preview(preview, columns, domain)
+                self._header.setChecked(options.header)
+            finally:
+                self._filling = False
+        self._show_preview(preview, columns)
+
+    @staticmethod
+    def _detect_read(
+        path: Path, preview: FilePreview
+    ) -> tuple[ReadOptions, FilePreview | None]:
+        """How a text file splits by its own look, and its preview read that way.
+
+        A single column is re-split on the delimiter :func:`sniff_delimiter` finds;
+        "column names" that are numbers (or the reader's ``col1, col2, ...``) mean
+        there is no header row.
+        """
+        options = ReadOptions()
+        current: FilePreview | None = preview
+        if len(preview.columns) == 1:
+            sniffed = sniff_delimiter(path)
+            if sniffed is not None:
+                options = ReadOptions(delimiter=sniffed)
+                current = preview_file(path, read=options)
+        if current is not None and _headerless_looking(current):
+            options = ReadOptions(delimiter=options.delimiter, header=False)
+            current = preview_file(path, read=options)
+        return options, current
 
     def _show_preview(
-        self,
-        preview: FilePreview,
-        columns: ColumnMap | None = None,
-        domain: Domain | None = None,
+        self, preview: FilePreview, columns: ColumnMap | None = None
     ) -> None:
         """Fill everything from ``preview``, keeping the choices that still apply."""
         previous = self._chosen()
@@ -410,19 +469,14 @@ class PreviewDialog(QtWidgets.QDialog):
         try:
             for role in _ROLES:
                 self._fill_combo(role, wanted[role])
-            if domain is not None:
-                chosen_domain = domain
-            elif self._domain_touched:
+            if self._domain_touched:
                 chosen_domain = self.domain()
-            elif preview.mapping and preview.domain in ("magnitude", "flux"):
-                chosen_domain = Domain(preview.domain)
             else:
+                # The brightness column's name decides (flux, mag_g ...); the
+                # previous file's domain fills in only for a name that says neither.
                 value = wanted.get("value")
-                chosen_domain = (
-                    (infer_domain(value) or Domain.MAGNITUDE)
-                    if value
-                    else Domain.MAGNITUDE
-                )
+                inferred = infer_domain(value) if value else None
+                chosen_domain = inferred or self._fallback_domain or Domain.MAGNITUDE
             self._show_domain(chosen_domain)
         finally:
             self._filling = False
@@ -565,6 +619,15 @@ class PreviewDialog(QtWidgets.QDialog):
                 return (
                     f"Column {column!r} holds no numbers in the first rows, so it "
                     f"cannot be the {role}."
+                )
+        if self._text and not self._header.isChecked():
+            numeric = [c for c in (time, value, error) if c not in (None, NO_COLUMN)]
+            above = _text_over_numbers(preview, [str(c) for c in numeric])
+            if above:
+                listed = ", ".join(repr(cell) for cell in above)
+                return (
+                    f"The first row holds text ({listed}) above numbers: it looks "
+                    "like the column names. Tick “First row holds the column names”."
                 )
         return ""
 

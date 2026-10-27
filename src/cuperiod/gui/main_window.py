@@ -54,7 +54,7 @@ import json
 import logging
 import math
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from functools import partial
 from pathlib import Path
 from typing import Any, Literal
@@ -65,7 +65,7 @@ from pydantic_settings import BaseSettings
 from cuperiod.core._typing import FloatArray
 from cuperiod.core.columns import ColumnMap, Domain
 from cuperiod.core.config import PreWhitenSettings
-from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
+from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve, _scan_suffix
 from cuperiod.core.result import Peak, Periodogram
 from cuperiod.gui.appinfo import version_label
 from cuperiod.gui.commands import CommandRegistry
@@ -83,6 +83,7 @@ from cuperiod.gui.models import COMBINED_BAND, STACKED_BAND, LoadedCurve, Source
 from cuperiod.gui.qt import Qt, QtCore, QtGui, QtWidgets, pg
 from cuperiod.gui.refusals import Refusal, gui_wording, refusal_offer, refusal_text
 from cuperiod.gui.state import (
+    LIGHT_CURVE_FILTER,
     PROJECT_FILTER,
     PROJECT_PREFIX,
     PROJECT_SUFFIX,
@@ -98,7 +99,11 @@ from cuperiod.gui.theme import (
     step_font_scale,
 )
 from cuperiod.gui.viewmodels import SessionView, marker_states
-from cuperiod.gui.widgets.controls_panel import ControlsPanel, method_description
+from cuperiod.gui.widgets.controls_panel import (
+    PREWHITEN_RUN_LABEL,
+    ControlsPanel,
+    method_description,
+)
 from cuperiod.gui.widgets.frequency_table import (
     TABLE_COMMANDS,
     FrequencyTable,
@@ -110,31 +115,35 @@ from cuperiod.gui.widgets.info_bar import RunInfoBar
 from cuperiod.gui.widgets.peaks_panel import PeaksTable, statistic_name
 from cuperiod.gui.widgets.phased_view import PhasedView
 from cuperiod.gui.widgets.preview_dialog import UNDETECTED_ADVICE
-from cuperiod.gui.widgets.rawlc_view import RawLightCurveView
+from cuperiod.gui.widgets.rawlc_view import LIGHT_CURVE_KEYS, RawLightCurveView
 from cuperiod.gui.widgets.session_bar import SessionBar
 from cuperiod.gui.widgets.solution_panel import SolutionPanel
 from cuperiod.gui.widgets.source_panel import SourceBrowser, rich_tooltip
 from cuperiod.gui.widgets.spacing_panel import SpacingPanel
-from cuperiod.gui.widgets.spectrum_view import PREWHITEN_METHOD, SpectrumView
+from cuperiod.gui.widgets.spectrum_view import (
+    PREWHITEN_METHOD,
+    SPECTRUM_KEYS,
+    SpectrumView,
+)
 from cuperiod.gui.widgets.subsets_panel import SubsetsPanel
 from cuperiod.gui.widgets.variation_panel import VariationPanel
 from cuperiod.prewhiten.result import PreWhitenResult
 
 _logger = logging.getLogger(__name__)
 
-_FILE_FILTER = (
-    "Light curves (*.csv *.ecsv *.fits *.fit *.fz *.parquet *.pq "
-    "*.tsv *.tab *.dat *.txt);;All files (*)"
-)
+#: The Open dialog's filter: every format the loader reads, compressed ones too.
+_FILE_FILTER = LIGHT_CURVE_FILTER
 
 #: Extensions recognized as light-curve files, mirroring ``_FILE_FILTER`` above; used to
-#: validate drag-and-drop drops (which bypass the file dialog's own filtering).
+#: validate drag-and-drop drops (which bypass the file dialog's own filtering). A
+#: ``.gz``/``.bz2``/``.xz`` suffix is looked through, see :func:`_is_light_curve_file`.
 _FILE_EXTENSIONS = frozenset(
     {
         ".csv",
         ".ecsv",
         ".fits",
         ".fit",
+        ".fts",
         ".fz",
         ".parquet",
         ".pq",
@@ -144,6 +153,11 @@ _FILE_EXTENSIONS = frozenset(
         ".txt",
     }
 )
+
+
+def _is_light_curve_file(path: Path) -> bool:
+    """Whether ``path`` names a format the loader reads (``star.fits.gz`` is FITS)."""
+    return _scan_suffix(path) in _FILE_EXTENSIONS
 
 #: What the empty window says. Drag and drop works everywhere in the window but has
 #: no visible control of its own, so the welcome text is where it gets mentioned.
@@ -637,6 +651,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._controller_switch = False
         #: The banner's action ("Choose columns…" for a file that would not load).
         self._banner_action_slot: Callable[[], None] | None = None
+        #: The banner says a batch file would not load: a result arriving for the
+        #: source the window stayed on does not supersede it.
+        self._banner_load_failure = False
 
         self._controller = AppController(self)
         self._dialogs: DialogProvider = QtDialogProvider(self)
@@ -807,9 +824,10 @@ class MainWindow(QtWidgets.QMainWindow):
             unavailable = QtGui.QAction("Demo files could not be read", self._demo_menu)
             unavailable.setEnabled(False)
             self._demo_menu.insertAction(self._demo_separator, unavailable)
+            assign_mnemonics(self._demo_menu)
             return
         for item in items:
-            action = QtGui.QAction(item.label, self._demo_menu)
+            action = QtGui.QAction(item.label.replace("&", "&&"), self._demo_menu)
             action.setStatusTip(f"Load the demo light curve {item.label}")
             action.triggered.connect(
                 lambda _=False, it=item: self._controller.confirm_then(
@@ -817,6 +835,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
             )
             self._demo_menu.insertAction(self._demo_separator, action)
+        assign_mnemonics(self._demo_menu)  # Alt+letter, as on every other menu
 
     def _build_central(self) -> None:
         splitter = QtWidgets.QSplitter(Qt.Orientation.Horizontal)
@@ -1507,6 +1526,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ctl.source_failed.connect(self._on_source_failed)
         ctl.lc_cleared.connect(self._on_lc_cleared)
         ctl.compute_failed.connect(self._on_compute_failed)
+        ctl.project_failed.connect(self._on_project_failed)
         ctl.selection_cleared.connect(self._spectrum.clear_selection)
         ctl.selection_cleared.connect(self._phased.clear_fold)
         ctl.analysis_changed.connect(self._on_controller_analysis)
@@ -2070,7 +2090,48 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _show_shortcuts(self) -> None:
-        self._dialogs.show_html("Keyboard shortcuts", self._commands.sheet_html())
+        self._dialogs.show_html(
+            "Keyboard shortcuts", self._commands.sheet_html(self._own_shortcut_rows())
+        )
+
+    def _own_shortcut_rows(self) -> list[tuple[str, str, str]]:
+        """``(section, command, keys)`` for the F1 sheet beyond the registry's: the
+        window's own actions under their menu, then the keys a focused plot handles."""
+
+        def native(keys: Iterable[QtGui.QKeySequence | str]) -> str:
+            return ", ".join(
+                QtGui.QKeySequence(k).toString(
+                    QtGui.QKeySequence.SequenceFormat.NativeText
+                )
+                for k in keys
+            )
+
+        def row(menu: str, action: QtGui.QAction) -> tuple[str, str, str]:
+            text = re.sub(r"&(.)", r"\1", action.text())  # without its mnemonic
+            return (menu, text, native(action.shortcuts()))
+
+        rows = [
+            row("File", self._folder_action),
+            row("File", self._quit_action),
+            row("View", self._compute_action),
+            row("View", self._raw_action),
+            row("View", self._theme_action),
+            *(row("View", action) for action in self._zoom_actions),
+            row("Help", self._whats_this_action),
+        ]
+        rows += [("Spectrum (focused)", what, native(k)) for what, k in SPECTRUM_KEYS]
+        rows += [
+            ("Light curve (focused)", what, native(k)) for what, k in LIGHT_CURVE_KEYS
+        ]
+        copy = QtGui.QKeySequence(QtGui.QKeySequence.StandardKey.Copy)
+        rows.append(
+            (
+                "Tables (focused)",
+                "Copy the selected rows (peaks, frequencies, history)",
+                native([copy]),
+            )
+        )
+        return rows
 
     def _open_documentation(self) -> None:
         if not QtGui.QDesktopServices.openUrl(QtCore.QUrl(DOCS_URL)):
@@ -2170,8 +2231,10 @@ class MainWindow(QtWidgets.QMainWindow):
             assert empty is not None
             empty.setEnabled(False)
             return
-        for key, name in dirty:
-            action = menu.addAction(name.replace("&", "&&"))
+        for number, (key, name) in enumerate(dirty, start=1):
+            escaped = name.replace("&", "&&")
+            # Numbered like Open recent: Alt+1 ... Alt+9 picks one.
+            action = menu.addAction(f"&{number} {escaped}" if number < 10 else escaped)
             assert action is not None
             action.setStatusTip(f"Show the session of {name} again")
             action.triggered.connect(
@@ -2536,12 +2599,14 @@ class MainWindow(QtWidgets.QMainWindow):
             unit = "mag" if domain == Domain.MAGNITUDE else "flux"
         self._solution_panel.set_amplitude_unit(unit)
         source = self._controller.state.source_id
+        action = self._controls.action_label
         if source.startswith(PROJECT_PREFIX):
             self._data_name = self._project_data_name(lc, source)
+            # The controller switches to pre-whitening next, to show the session.
+            action = PREWHITEN_RUN_LABEL
         time = self._controller.current_time()
         time = time[np.isfinite(time)]
         baseline = float(time.max() - time.min()) if time.size else 0.0
-        action = self._controls.action_label
         if isinstance(lc, MultiBandLightCurve):
             points = sum(band.n for band in lc.bands.values())
             note = f"Multiband curve loaded ({lc.n_bands} bands) — press {action}."
@@ -2588,7 +2653,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._leave_session_views()
 
     def _on_compute_started(self) -> None:
-        self._hide_banner()
+        self._supersede_banner()
         method = self._controls_method()
         self._info.set_busy(True, method)
         self._show_status(f"Computing {method}…  (Esc stops)")
@@ -2609,7 +2674,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_periodogram_ready(self, pg: object) -> None:
         assert isinstance(pg, Periodogram)
-        self._hide_banner()
+        self._supersede_banner()
         self._peaks_table.set_statistic(statistic_name(pg))
         self._info.set_result(pg)
         timing = self._timing_text() or "<1 ms"
@@ -2630,7 +2695,7 @@ class MainWindow(QtWidgets.QMainWindow):
         read-only at once and the session's next view makes the table editable.
         """
         assert isinstance(result, PreWhitenResult)
-        self._hide_banner()
+        self._supersede_banner()
         self._last_solution = (self._curve_tag(), result)
         self._spacing_panel.set_solution(result)
         view = self._session_view()
@@ -2909,13 +2974,21 @@ class MainWindow(QtWidgets.QMainWindow):
                     "Choose columns…",
                     partial(self._choose_columns_for_source, failed_source),
                 )
-            self._show_banner(message, action=action)
+            self._show_banner(message, action=action, load_failure=True)
             return
         self._info.set_failed(self._controls_method())
         self._show_status(f"{self._controls.action_label} failed: {first_line}")
         self._show_banner(message)
         if not self._showing_result:
             self._refresh_guidance()
+
+    def _on_project_failed(self, message: str) -> None:
+        """A project that could not be opened or verified ("Could not open p.cupw.json:
+        ..."): said in those words, not as a failed run, and the run state in the info
+        bar is left as it was -- nothing was computed."""
+        summary, _ = explain_failure(message)
+        self._show_status(summary.splitlines()[0] if summary else message)
+        self._show_banner(message)
 
     # =================================================================================
     # helpers
@@ -2973,14 +3046,18 @@ class MainWindow(QtWidgets.QMainWindow):
         message: str,
         *,
         action: tuple[str, Callable[[], None]] | None = None,
+        load_failure: bool = False,
     ) -> None:
         """Show a dismissable error banner, with an optional next-step button.
 
         It stays until dismissed or superseded (a new attempt, a new result or a new
         curve): an error that vanishes on a timer is missed by anyone who looked away
         or reads slowly. The summary is plain language; the full text is in the
-        tooltip, and the label can be selected and copied.
+        tooltip, and the label can be selected and copied. A ``load_failure`` (a
+        batch file that would not load) is not superseded by a result, see
+        :meth:`_supersede_banner`.
         """
+        self._banner_load_failure = load_failure
         summary, details = explain_failure(message)
         self._banner.setText(f"⚠  {summary}")
         self._banner.setToolTip(rich_tooltip(details) if details else "")
@@ -3007,6 +3084,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _hide_banner(self) -> None:
         self._banner_container.setVisible(False)
+        self._banner_load_failure = False
+
+    def _supersede_banner(self) -> None:
+        """A run started or a result arrived: the last run's error is out of date.
+
+        A batch file's load failure is not: the window stayed on the previous source,
+        whose late result says nothing about that file, and the banner's "Choose
+        columns…" is the only way to it (its row is disabled). It goes when the user
+        dismisses it, presses Compute or another curve loads.
+        """
+        if not self._banner_load_failure:
+            self._hide_banner()
 
     def _toggle_theme(self) -> None:
         self._theme = "light" if self._theme == "dark" else "dark"
@@ -3124,7 +3213,7 @@ class MainWindow(QtWidgets.QMainWindow):
         paths = [Path(url.toLocalFile()) for url in urls]
         return any(
             p.is_dir()
-            or p.suffix.lower() in _FILE_EXTENSIONS
+            or _is_light_curve_file(p)
             or p.name.endswith(PROJECT_SUFFIX)
             for p in paths
         )
@@ -3147,7 +3236,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._controller.open_project(str(paths[0]))
             return
         folders = [p for p in paths if p.is_dir()]
-        files = [p for p in paths if p.suffix.lower() in _FILE_EXTENSIONS]
+        files = [p for p in paths if _is_light_curve_file(p)]
         files = [p for p in files if not p.is_dir()]
         skipped = [p.name for p in paths if p not in folders and p not in files]
         if not folders and not files:

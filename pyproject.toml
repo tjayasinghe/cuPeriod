@@ -50,7 +50,9 @@ dependencies = [
     "array-api-compat>=1.9",
     "pydantic>=2.5",
     "pydantic-settings>=2.1",
-    "typer>=0.12",
+    # 0.16: older typer releases leave click uncapped but break on click 8.2+ (every
+    # --help and usage error, or every command, raises).
+    "typer>=0.16",
     # 14.0.1, not 14: pyarrow 0.14.0-14.0.0 unpickle extension-type metadata while
     # reading Parquet/IPC (CVE-2023-47248), and cuPeriod opens user .parquet files.
     "pyarrow>=14.0.1",
@@ -81,7 +83,9 @@ lsdb = ["cuperiod[nested]", "lsdb>=0.10.0"]
 # MHAOV, TLS and SuperSmoother, auto-selected as the "cpu"/"auto" backend when present
 # (otherwise those methods fall back to numpy / astropy's BoxLeastSquares). GLS is
 # unaffected — its CPU path is finufft.
-fast = ["numba>=0.59"]
+# scipy 1.13: with numba's thread pool, the OpenBLAS bundled with older scipy can exceed
+# its compiled thread count on many-core machines and crash the process at exit.
+fast = ["numba>=0.59", "scipy>=1.13"]
 # Portable accelerator reaching AMD (ROCm), Intel (XPU), Apple (MPS), and a fast CPU
 # path. Install the wheel matching your accelerator from https://pytorch.org/ — the
 # plain wheel is CPU-only; CUDA/ROCm/XPU builds come from PyTorch's own index, so we do
@@ -91,7 +95,16 @@ torch = ["torch>=2.2"]
 # Qt6 toolkit (LGPL); pyqtgraph renders the full-resolution spectrum and light-curve
 # panels at interactive speed; pandas backs the demo-data adapters and grouped-batch
 # input. Purely a presentation layer over the existing API — no core dependency.
-gui = ["PySide6>=6.6", "pyqtgraph>=0.13", "pandas>=2.0"]
+# PySide6 6.7 for QTimer.singleShot(msec, context, callable); pyqtgraph 0.13.7 for
+# PySide6 6.7. PySide6 6.12.0 drops a reference to None whenever a Qt call returns
+# null, which aborts Python 3.11 (None is not immortal before 3.12) within seconds of
+# GUI use, so 3.11 stays below 6.12.
+gui = [
+    "PySide6>=6.7,<6.12; python_version < '3.12'",
+    "PySide6>=6.7; python_version >= '3.12'",
+    "pyqtgraph>=0.13.7",
+    "pandas>=2.0",
+]
 # Static diagnostic figures for the period-change tools (cuperiod.pdot.plots, and
 # the --plots option of `cuperiod pdot-batch`). Imported lazily, so everything
 # else works without it. 3.6 is the floor for Figure(layout="constrained").
@@ -125,10 +138,12 @@ dev = [
     "gatspy>=0.3",
     # Exercise the portable torch-CPU path in CI (GPU devices auto-skip).
     "torch>=2.2",
-    # Drive the Qt GUI headlessly (QT_QPA_PLATFORM=offscreen) in tests.
-    "PySide6>=6.6",
-    "pyqtgraph>=0.13",
-    "pytest-qt>=4",
+    # Drive the Qt GUI headlessly (QT_QPA_PLATFORM=offscreen) in tests; the same
+    # bounds as the [gui] extra. pytest-qt 4.2 is the first that loads under pytest 8.
+    "PySide6>=6.7,<6.12; python_version < '3.12'",
+    "PySide6>=6.7; python_version >= '3.12'",
+    "pyqtgraph>=0.13.7",
+    "pytest-qt>=4.2",
     # Render the period-change diagnostic figures (cuperiod.pdot.plots).
     "matplotlib>=3.6",
 ]
@@ -222,10 +237,12 @@ module = ["numba", "numba.*"]
 follow_imports = "skip"
 ignore_missing_imports = true
 
-# pyarrow ships py.typed but leaves read_table/write_table untyped; skip it.
+# pyarrow: up to 24 it ships py.typed but leaves read_table/write_table untyped, and
+# 26 dropped py.typed altogether; skip it and accept it stub-less either way.
 [[tool.mypy.overrides]]
 module = ["pyarrow", "pyarrow.*"]
 follow_imports = "skip"
+ignore_missing_imports = true
 
 # pyqtgraph ships no type stubs.
 [[tool.mypy.overrides]]

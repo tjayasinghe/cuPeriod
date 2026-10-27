@@ -458,7 +458,8 @@ def test_kaufman_gradient_matches_finite_differences() -> None:
         down[i] -= h
         numeric[i] = (0.5 * np.sum(problem.fun(up) ** 2)
                       - 0.5 * np.sum(problem.fun(down) ** 2)) / (2 * h)
-    assert np.max(np.abs(gradient - numeric) / np.abs(numeric)) < 1e-6
+    # 1.6e-6 at the scipy 1.10 floor (finite-difference noise), ~1e-7 on current scipy.
+    assert np.max(np.abs(gradient - numeric) / np.abs(numeric)) < 5e-6
 
 
 def _problem_for(built: Built) -> tuple[Any, np.ndarray]:

@@ -21,10 +21,12 @@ from typing import Any
 
 from cuperiod.core.columns import ColumnMap, Domain
 from cuperiod.core.errors import _user_stacklevel
-from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve
+from cuperiod.core.lightcurve import LightCurve, MultiBandLightCurve, _scan_suffix
 from cuperiod.core.result import Periodogram
 
-#: File extensions treated as light-curve tables when scanning a directory.
+#: File extensions treated as light-curve tables when scanning a directory: what
+#: :meth:`~cuperiod.LightCurve.from_file` reads, also behind a ``.gz``/``.bz2``/``.xz``
+#: compression suffix (``star.fits.gz``, ``star.csv.bz2``).
 LIGHTCURVE_SUFFIXES = (
     ".parquet",
     ".pq",
@@ -32,10 +34,21 @@ LIGHTCURVE_SUFFIXES = (
     ".ecsv",
     ".fits",
     ".fit",
+    ".fts",
+    ".fz",
     ".dat",
     ".txt",
     ".tsv",
+    ".tab",
 )
+
+
+def _is_lightcurve_file(path: Path) -> bool:
+    """Whether a directory scan takes ``path``: its format suffix, looked through a
+    compression suffix as the reader does, is one of :data:`LIGHTCURVE_SUFFIXES`
+    (a compressed Parquet file, which the reader cannot open, is not)."""
+    return _scan_suffix(path) in LIGHTCURVE_SUFFIXES
+
 
 #: Methods whose secondary peaks are chosen alias-diverse (harmonics and aliases of a
 #: chosen peak skipped). A box/transit search puts strong peaks at every harmonic and
@@ -222,9 +235,7 @@ def _resolve_path_like(inputs: str | os.PathLike[str]) -> list[Path]:
     text = os.fspath(inputs)
     path = Path(text)
     if path.is_dir():
-        return sorted(
-            p for p in path.iterdir() if p.suffix.lower() in LIGHTCURVE_SUFFIXES
-        )
+        return sorted(p for p in path.iterdir() if _is_lightcurve_file(p))
     if path.is_file():
         return [path]
     if _glob.has_magic(text):

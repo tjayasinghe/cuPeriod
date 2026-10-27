@@ -12,6 +12,7 @@ propagate.
 from __future__ import annotations
 
 import importlib
+import operator
 import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -22,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 from pydantic import ValidationError
+from pydantic_core import PydanticSerializationError
 
 from cuperiod.core.columns import ColumnMap, Domain
 from cuperiod.core.config import PreWhitenSettings, SessionSettings
@@ -71,6 +73,7 @@ _REFUSABLE: tuple[type[BaseException], ...] = (
     SessionError,
     ConstraintError,
     ValueError,
+    OverflowError,  # an integer argument too large for the arrays it indexes
     np.linalg.LinAlgError,
 )
 
@@ -714,7 +717,7 @@ class PreWhitenSession:
         return self.do("polish")
 
     def prune(self) -> StepReport:
-        """The v1.3 S/N re-check; renumbers when it removed something."""
+        """The automatic loop's S/N re-check; renumbers when it removed something."""
         return self.do("prune")
 
     def renumber(self) -> StepReport:
@@ -861,7 +864,9 @@ class PreWhitenSession:
             if isinstance(indices, (list, tuple)) and indices and all(
                 isinstance(r, (list, tuple)) and len(r) == 2 for r in indices
             ):
-                return [(int(a), int(b)) for a, b in indices]
+                # operator.index, not int(): a fractional bound is refused, as a float
+                # index array is, rather than silently truncated.
+                return [(operator.index(a), operator.index(b)) for a, b in indices]
             n = self._kernel.data.n
             return PointMask.none(n).without(np.asarray(indices)).runs()
         except (TypeError, ValueError, OverflowError) as exc:
@@ -936,14 +941,25 @@ class PreWhitenSession:
     def configure(
         self, settings: PreWhitenSettings | None = None, **updates: Any
     ) -> StepReport:
-        """Replace the requested settings (``settings`` and/or field ``updates``)."""
+        """Replace the requested settings (``settings`` and/or field ``updates``).
+
+        An unknown (or misspelt) setting name, or a value the settings refuse, comes
+        back as a ``"refused"`` report and changes nothing.
+        """
         base = settings if settings is not None else self._head.settings
+        unknown = sorted(set(updates) - set(PreWhitenSettings.model_fields))
+        if unknown:
+            return StepReport(
+                kind="refused", message=f"configure: unknown settings {unknown}"
+            )
         try:
-            merged = base.model_copy(update=updates) if updates else base
-            PreWhitenSettings.model_validate(merged.model_dump())
-        except (ValidationError, ValueError) as exc:
+            # Validated, then dumped from the validated model: numpy scalars, lists
+            # for tuples and numeric strings become the plain values a log stores.
+            merged = PreWhitenSettings.model_validate({**base.model_dump(), **updates})
+            plain = merged.model_dump(mode="json")
+        except (ValidationError, ValueError, PydanticSerializationError) as exc:
             return StepReport(kind="refused", message=str(exc))
-        return self.do("configure", settings=merged.model_dump(mode="json"))
+        return self.do("configure", settings=plain)
 
     # -- history / persistence ---------------------------------------------------------
     def undo(self) -> bool:
@@ -973,14 +989,9 @@ class PreWhitenSession:
         with self._guard():
             if self._history is None:
                 return StepReport(kind="refused", message="this session keeps no log")
-            if self._history.reachable(seq) is False:
-                return StepReport(
-                    kind="refused",
-                    message=(
-                        "not in memory: this project was opened from a file; use "
-                        "Verify project to replay its log"
-                    ),
-                )
+            why = self._history.unreachable(seq)
+            if why is not None:
+                return StepReport(kind="refused", message=why)
             state = self._history.goto(seq)
             assert state is not None
             self._head = state

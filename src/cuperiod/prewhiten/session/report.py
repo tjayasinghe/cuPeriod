@@ -1,13 +1,14 @@
 """From a session state to a :class:`~cuperiod.PreWhitenResult` and to table rows.
 
-:func:`build_result` is the tail of v1.3 :func:`cuperiod.prewhiten` — uncertainties,
-final signal-to-noise, combination identification, the spectrum's own amplitude
-reading and the blend flags — applied to whatever state the session is in. Before any
-of that runs, amplitudes are made canonical: a component whose fit returned a negative
-amplitude (only possible under a fixed phase) is reported as ``|A|`` with its phase
-plus pi, so every magnitude consumer (S/N, blend checks, combinations, spacing) reads
-a non-negative amplitude. A component that varies per subset is judged by its RMS
-amplitude rather than its coherent (phasor-mean) headline.
+:func:`build_result` is the tail of the automatic :func:`cuperiod.prewhiten` loop —
+uncertainties, final signal-to-noise, combination identification, the spectrum's own
+amplitude reading and the blend flags — applied to whatever state the session is in.
+Before any of that runs, amplitudes are made canonical: a component whose fit
+returned a negative amplitude (only possible under a fixed phase) is reported as
+``|A|`` with its phase plus pi, so every magnitude consumer (S/N, blend checks,
+combinations, spacing) reads a non-negative amplitude. A component that varies per
+subset is judged by its RMS amplitude rather than its coherent (phasor-mean)
+headline.
 """
 
 from __future__ import annotations
@@ -99,7 +100,7 @@ def _errors(
     light: bool,
     should_stop: Callable[[], bool] | None,
 ) -> Uncertainties:
-    """The component uncertainties exactly as v1.3 asked for them."""
+    """The component uncertainties exactly as the automatic loop asks for them."""
     cfg = state.settings
     used = kernel.used(state)
     if light:

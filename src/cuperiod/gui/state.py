@@ -108,8 +108,11 @@ PROJECT_PREFIX: Final = "project:"
 #: The project file suffix (spec 2.10) and the file-dialog filters.
 PROJECT_SUFFIX: Final = ".cupw.json"
 PROJECT_FILTER: Final = "cuPeriod projects (*.cupw.json);;All files (*)"
+#: Every format the loader reads; a compressed file (``star.fits.gz``) is listed by
+#: its compression suffix, which the reader looks through.
 LIGHT_CURVE_FILTER: Final = (
-    "Light curves (*.csv *.ecsv *.txt *.dat *.fits *.fit *.parquet);;All files (*)"
+    "Light curves (*.csv *.ecsv *.fits *.fit *.fts *.fz *.parquet *.pq *.tsv *.tab "
+    "*.dat *.txt *.gz *.bz2 *.xz);;All files (*)"
 )
 
 #: How long the lazy pre-whitening preview waits after the last trigger (D22).
@@ -273,6 +276,8 @@ class AppController(QObject):
     # Additive (not in the 4.2 listing).
     status_message = Signal(str)  # one-line notices for the status bar
     preview_failed = Signal(str)  # "Spectrum unavailable: <reason>" placeholder text
+    # "Could not open/verify <project>: <reason>": a project, not a run, failed.
+    project_failed = Signal(str)
     settings_restored = Signal(object)  # PreWhitenSettings of an opened project
     entry_script_ready = Signal(int, str)  # History "Copy as Python": (seq, text)
     close_approved = Signal()  # the user resolved the unsaved sessions; close again
@@ -1914,24 +1919,27 @@ class AppController(QObject):
             )
 
     def _project_failed(self, key: SessionKey, path: str, text: str) -> None:
+        """A project that would not open (or verify): ``project_failed``, not
+        ``compute_failed`` -- nothing was computed, so no run is marked failed."""
         self._bridge.discard(key)
         name = Path(path).name
         provider = self._dialogs
         verify = key in self._verifying
         self._verifying.discard(key)
+        failure = f"Could not {'verify' if verify else 'open'} {name}: {text}"
         if "not found" in text and provider is not None:
 
             def located(data_path: str | None) -> None:
                 if data_path:
                     self._load_project(key, path, data_path, verify=verify)
                 else:
-                    self.compute_failed.emit(f"Could not open {name}: {text}")
+                    self.project_failed.emit(failure)
 
             provider.open_file(
                 f"Locate the light curve of {name}", LIGHT_CURVE_FILTER, located
             )
             return
-        self.compute_failed.emit(f"Could not open {name}: {text}")
+        self.project_failed.emit(failure)
 
     def save_project(
         self, path: str | Path | None = None, *, ask: bool = False

@@ -85,6 +85,13 @@ _TOOL_KEYS: dict[Qt.Key, SelectMode] = {
 #: the second value).
 _CURSOR_STEP = (0.01, 0.1)
 
+#: The keys the focused light curve acts on itself in pre-whitening, as ``(what,
+#: keys)`` for the F1 sheet (V / X / G, Del, U and Esc are commands, listed there).
+LIGHT_CURVE_KEYS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Move the time cursor (pre-whitening)", ("Left", "Right")),
+    ("Move it ten times further", ("Shift+Left", "Shift+Right")),
+)
+
 #: The session plot's mouse and keyboard gestures (status tip and What's This).
 _GESTURES_SESSION = (
     "Click: put the time cursor there (Subsets ▸ Split at cuts there) · Left/Right: "
@@ -1010,4 +1017,4 @@ class RawLightCurveView(QtWidgets.QWidget):
         self._refresh()
 
 
-__all__ = ["Y_MODES", "RawLightCurveView", "outliers_beyond"]
+__all__ = ["LIGHT_CURVE_KEYS", "Y_MODES", "RawLightCurveView", "outliers_beyond"]

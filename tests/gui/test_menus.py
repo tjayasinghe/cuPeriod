@@ -16,7 +16,7 @@ from pytestqt.qtbot import QtBot
 
 from cuperiod.core.columns import ColumnMap, Domain
 from cuperiod.core.lightcurve import LightCurve
-from cuperiod.gui.commands import COMMANDS
+from cuperiod.gui.commands import COMMAND_IDS, COMMANDS
 from cuperiod.gui.dialogs import FakeDialogProvider
 from cuperiod.gui.loaders import ImportChoice, ReadOptions
 from cuperiod.gui.main_window import (
@@ -182,6 +182,49 @@ def test_help_menu_offers_the_sheet_whats_this_docs_and_about(qtbot: QtBot) -> N
     kind, (title, html) = provider.calls[-1]
     assert kind == "show_html" and "cuPeriod" in title and DOCS_URL in html
     assert DOCS_URL in window._docs_action.statusTip()
+
+
+def test_the_f1_sheet_lists_every_shortcut_of_the_window(qtbot: QtBot) -> None:
+    """F1 listed only the registry's commands: Open folder, Quit, the theme, zoom,
+    What's This?, the raw light curve, Compute periodogram and the plots' own keys
+    were missing from a sheet that says it lists every shortcut."""
+    import html as html_module
+
+    from cuperiod.gui.widgets.rawlc_view import LIGHT_CURVE_KEYS
+    from cuperiod.gui.widgets.spectrum_view import SPECTRUM_KEYS
+
+    provider = FakeDialogProvider()
+    window = _window(qtbot, provider)
+    window.commands.action("view.shortcuts").trigger()
+    kind, (_title, sheet) = provider.calls[-1]
+    assert kind == "show_html"
+    native = QtGui.QKeySequence.SequenceFormat.NativeText
+
+    def listed(text: str, keys: str) -> bool:
+        cells = f"<td>{html_module.escape(text)}</td><td><b>{html_module.escape(keys)}"
+        return cells in sheet
+
+    registry = {id(window.commands.action(c)) for c in COMMAND_IDS}
+    own = [
+        a
+        for a in window.findChildren(QtGui.QAction)
+        if a.shortcuts() and id(a) not in registry
+    ]
+    assert len(own) >= 9
+    for action in own:
+        text = action.text().replace("&", "")
+        keys = ", ".join(s.toString(native) for s in action.shortcuts())
+        assert listed(text, keys), (text, keys)
+    for key in ("Ctrl+Q", "Ctrl+T", "Ctrl+Shift+F", "Shift+F1", "Ctrl+0", "Ctrl+R"):
+        assert QtGui.QKeySequence(key).toString(native) in sheet, key
+    # Every key a pane binds itself (the context letters, a table's copy) is there.
+    for shortcut in window.findChildren(QtGui.QShortcut):
+        assert html_module.escape(shortcut.key().toString(native)) in sheet
+    # And the keys a focused plot handles on its own, in sections of their own.
+    assert "Spectrum (focused)" in sheet and "Light curve (focused)" in sheet
+    for what, _keys in (*SPECTRUM_KEYS, *LIGHT_CURVE_KEYS):
+        assert html_module.escape(what) in sheet
+    window.controller.shutdown()
 
 
 # -- command states ------------------------------------------------------------------

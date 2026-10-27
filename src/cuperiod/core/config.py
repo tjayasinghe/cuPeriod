@@ -11,6 +11,7 @@ throughout, matching :meth:`cuperiod.Periodogram.best_periods`.
 
 from __future__ import annotations
 
+import os
 import sys
 import warnings
 from typing import Any, ClassVar, Literal, Self
@@ -896,8 +897,36 @@ class PreWhitenSettings(_DeviceSettings):
         description="Keep the full initial and residual spectra in the result.",
     )
     # downsample_points was accepted but never read: pre-whitening stores the full
-    # spectra (store_spectra) and has no downsampled product. Retired.
+    # spectra (store_spectra) and has no downsampled product. Retired: passing it, or
+    # setting CUPERIOD_PREWHITEN_DOWNSAMPLE_POINTS, warns and is ignored; reading it
+    # warns and gives the 1.2 default (it is no model field, so no dump, project file
+    # or comparison sees it).
     _retired_fields: ClassVar[tuple[str, ...]] = ("downsample_points",)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _retired_environment(cls, data: Any) -> Any:
+        name = "CUPERIOD_PREWHITEN_DOWNSAMPLE_POINTS"
+        if any(key.upper() == name for key in os.environ):
+            warnings.warn(
+                f"{name} is set, but PreWhitenSettings.downsample_points had no effect "
+                "and is deprecated; the variable is ignored, and the setting will be "
+                "removed in a future release.",
+                DeprecationWarning,
+                stacklevel=_caller_stacklevel(),
+            )
+        return data
+
+    @property
+    def downsample_points(self) -> int:
+        """Deprecated: never had an effect. Reads 2000, its 1.2 default."""
+        warnings.warn(
+            "PreWhitenSettings.downsample_points had no effect and is deprecated; it "
+            "reads 2000 (its 1.2 default) and will be removed in a future release.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return 2000
 
 
 class SessionSettings(BaseSettings):

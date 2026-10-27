@@ -1,6 +1,6 @@
 """The automatic path of a session: one legacy loop iteration per ``step``.
 
-:func:`step` is exactly one iteration of the v1.3 extraction loop — the same
+:func:`step` is exactly one iteration of the automatic extraction loop — the same
 pre-checks, the same peak search, trial fit, collision guard, false-alarm
 probability, trial spectrum, signal-to-noise and acceptance test, calling the same
 helpers from :mod:`cuperiod.prewhiten.engine` — so a session stepped to its stopping
@@ -280,7 +280,7 @@ def attempt(
 def step(
     kernel: SessionKernel, state: SessionState, derived: Derived, args: SeedArgs
 ) -> Outcome:
-    """One iteration of the v1.3 extraction loop (its pre-checks, then an attempt)."""
+    """One iteration of the automatic extraction loop (pre-checks, then an attempt)."""
     cfg = state.settings
     if state.status == "stopped":
         return state, None, StepReport(kind="noop", message="the search has stopped")
@@ -443,7 +443,7 @@ def renumber(
 def prune(
     kernel: SessionKernel, state: SessionState, derived: Derived, args: NoArgs
 ) -> Outcome:
-    """The v1.3 significance re-check of the final solution.
+    """The automatic loop's significance re-check of the final solution.
 
     The joint polish redistributes power between close components, so a frequency
     that cleared the threshold when it was extracted can end up insignificant in the

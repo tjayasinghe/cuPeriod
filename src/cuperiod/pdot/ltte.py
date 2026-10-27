@@ -65,7 +65,7 @@ from cuperiod.core._typing import FloatArray
 from cuperiod.core.config import PdotSettings
 from cuperiod.core.errors import InsufficientDataError
 from cuperiod.pdot.physics import AU_LIGHT_SECONDS, DAYS_PER_YEAR
-from cuperiod.pdot.result import SECONDS_PER_YEAR
+from cuperiod.pdot.result import DAYS_PER_MYR, SECONDS_PER_YEAR
 from cuperiod.pdot.track import (
     EphemerisFit,
     PhaseTrackResult,
@@ -523,9 +523,29 @@ class LTTEFit:
         return self.pdot * SECONDS_PER_YEAR
 
     @property
+    def pdot_ms_per_yr(self) -> float:
+        """Secular dP/dt in milliseconds per year (the transit-timing unit)."""
+        return self.pdot * SECONDS_PER_YEAR * 1e3
+
+    @property
+    def pdot_d_per_myr(self) -> float:
+        """Secular dP/dt in days per megayear (the classical-pulsator unit)."""
+        return self.pdot * DAYS_PER_MYR
+
+    @property
     def pdot_d_per_yr(self) -> float:
         """Secular dP/dt in days per year."""
         return self.pdot * DAYS_PER_YEAR
+
+    @property
+    def pdot_over_p(self) -> float:
+        """Secular fractional rate (dP/dt)/P in 1/day, at :attr:`period_ref`."""
+        return self.pdot / self.period_ref
+
+    @property
+    def dlnp_dt_per_yr(self) -> float:
+        """Secular fractional rate d(ln P)/dt per year (the Mira / delta Sct unit)."""
+        return self.pdot_over_p * DAYS_PER_YEAR
 
     def minimum_third_mass(self, inner_mass: float) -> float:
         """The third-body mass (solar masses) for ``sin i = 1``.
@@ -619,7 +639,11 @@ class LTTEFit:
             "pdot_err": self.pdot_err,
             "pdot_err_scaled": self.pdot_err_scaled,
             "pdot_s_per_yr": self.pdot_s_per_yr,
+            "pdot_ms_per_yr": self.pdot_ms_per_yr,
+            "pdot_d_per_myr": self.pdot_d_per_myr,
             "pdot_d_per_yr": self.pdot_d_per_yr,
+            "pdot_over_p": self.pdot_over_p,
+            "dlnp_dt_per_yr": self.dlnp_dt_per_yr,
             "a_sini_au": self.a_sini_au,
             "mass_function": self.mass_function,
             "chi2": self.chi2,

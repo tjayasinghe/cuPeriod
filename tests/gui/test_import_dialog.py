@@ -126,6 +126,33 @@ def test_a_headerless_csv_keeps_its_first_row(tmp_path: Path) -> None:
     assert lc.n == 2 and lc.time[0] == 2458000.1
 
 
+@pytest.mark.parametrize(
+    ("name", "header", "sep"),
+    [
+        ("excel.csv", "time,mag,mag_err", ","),
+        ("excel.tsv", "time\tmag\tmag_err", "\t"),
+        ("excel.dat", "time mag mag_err", " "),
+        ("nohdr.csv", None, ","),
+        ("nohdr.dat", None, " "),
+    ],
+)
+def test_a_file_with_a_byte_order_mark_loads_as_previewed(
+    qtbot: QtBot, tmp_path: Path, name: str, header: str | None, sep: str
+) -> None:
+    """Excel's "CSV UTF-8" starts with a byte-order mark: the dialog's columns must
+    be the ones the load finds (it detected ``time`` and then could not find it)."""
+    rows = [sep.join((repr(t), f"12.{i}", "0.01")) for i, t in enumerate(JD)]
+    lines = rows if header is None else [header, *rows]
+    path = tmp_path / name
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
+    dialog = _dialog(qtbot, path)
+    assert dialog.can_load(), dialog._problem.text()
+    assert dialog.column_map().time == ("time" if header else "col1")
+    lc = dialog.choice().load(path)
+    assert isinstance(lc, LightCurve) and lc.n == len(JD)
+    assert lc.time[0] == JD[0]
+
+
 def test_lines_the_options_cannot_split_come_back_unloadable(tmp_path: Path) -> None:
     path = tmp_path / "ragged.txt"
     path.write_text("a b c\n1 2\n3 4 5 6\n", encoding="utf-8")
@@ -297,6 +324,85 @@ def test_the_value_column_suggests_the_domain_until_the_user_says(
     _pick(dialog._combos["value"], "flux")
     _pick(dialog._combos["value"], "mag")
     assert dialog.domain() is Domain.FLUX
+
+
+def test_a_remembered_domain_yields_to_the_columns_name(
+    qtbot: QtBot, tmp_path: Path
+) -> None:
+    """The last file's domain is no choice made in this dialog: a ``flux`` column
+    reads as flux, and picking a ``mag`` column still switches to magnitudes."""
+    path = tmp_path / "both.csv"
+    path.write_text("time,flux,mag,x\n1,100,12.3,5\n2,110,12.4,6\n", encoding="utf-8")
+    dialog = _dialog(qtbot, path, domain=Domain.MAGNITUDE)
+    assert dialog.column_map().value == "flux"
+    assert dialog.domain() is Domain.FLUX
+    assert dialog.choice().domain is Domain.FLUX
+    _pick(dialog._combos["value"], "mag")
+    assert dialog.domain() is Domain.MAGNITUDE
+    # A column whose name says nothing keeps the domain shown.
+    _pick(dialog._combos["value"], "x")
+    assert dialog.domain() is Domain.MAGNITUDE
+    # With no name to go by, the remembered domain is the starting point.
+    flux_dialog = _dialog(qtbot, _dat(tmp_path / "star.dat"), domain=Domain.FLUX)
+    assert flux_dialog.column_map().value == "col2"
+    assert flux_dialog.domain() is Domain.FLUX
+
+
+def test_remembered_read_options_yield_to_the_files_own_look(
+    qtbot: QtBot, tmp_path: Path
+) -> None:
+    """Options remembered from the last file apply only where this file's own
+    detection leaves one column; a file with a header keeps it."""
+    header = tmp_path / "kepler.csv"
+    header.write_text(
+        "time,flux,flux_err\n1.5,100.0,0.1\n2.5,101.0,0.1\n3.5,99.0,0.1\n",
+        encoding="utf-8",
+    )
+    dialog = _dialog(qtbot, header, read=ReadOptions(header=False))
+    assert dialog._header.isChecked() and dialog.choice().read is None
+    assert dialog._preview.columns == ["time", "flux", "flux_err"]
+    assert dialog.can_load()
+    dialog = _dialog(qtbot, header, read=ReadOptions(delimiter=";"))
+    assert dialog._delimiter.currentData() is None and dialog.can_load()
+    # Spaces in a .csv: detection finds no delimiter, so the remembered one helps.
+    spaced = tmp_path / "spaced.csv"
+    spaced.write_text(
+        "time mag mag_err\n1.5 12.0 0.1\n2.5 12.1 0.1\n3.5 12.2 0.1\n",
+        encoding="utf-8",
+    )
+    dialog = _dialog(qtbot, spaced, read=ReadOptions(delimiter=" "))
+    assert dialog._delimiter.currentData() == " "
+    assert dialog._preview.columns == ["time", "mag", "mag_err"]
+    assert dialog.can_load()
+
+
+def test_a_header_row_read_as_data_disables_load(
+    qtbot: QtBot, tmp_path: Path
+) -> None:
+    path = tmp_path / "kepler.csv"
+    path.write_text(
+        "time,flux,flux_err\n1.5,100.0,0.1\n2.5,101.0,0.1\n3.5,99.0,0.1\n",
+        encoding="utf-8",
+    )
+    dialog = _dialog(qtbot, path)
+    assert dialog.can_load()
+    dialog._header.setChecked(False)  # the user unticks it by mistake
+    assert dialog._preview.columns == ["col1", "col2", "col3"]
+    _pick(dialog._combos["time"], "col1")  # as a remembered col1/col2 choice does
+    _pick(dialog._combos["value"], "col2")
+    assert not dialog.can_load()
+    problem = dialog._problem.text()
+    assert "'time'" in problem and "First row holds the column names" in problem
+    dialog._header.setChecked(True)
+    assert dialog.can_load()
+    # A headerless file whose band column is text throughout is not flagged.
+    bands = tmp_path / "bands.dat"
+    bands.write_text(
+        "".join(f"{t} 12.{i} 0.01 {'gr'[i % 2]}\n" for i, t in enumerate(JD)),
+        encoding="utf-8",
+    )
+    dialog = _dialog(qtbot, bands)
+    assert not dialog._header.isChecked() and dialog.can_load()
 
 
 def test_a_detected_band_stays_unpinned(qtbot: QtBot, tmp_path: Path) -> None:

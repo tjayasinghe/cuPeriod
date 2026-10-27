@@ -110,7 +110,8 @@ def test_default_independent_stack_is_unchanged(backend: str) -> None:
     np.testing.assert_array_equal(pg.extras["depth"], depth[order])
     np.testing.assert_array_equal(pg.extras["t0"], t0[order])
     np.testing.assert_array_equal(pg.extras["band_index"], band[order])
-    assert "mb_ephemeris" not in pg.meta
+    # The statistic is recorded for the default too, not only for "shared".
+    assert pg.meta["mb_ephemeris"] == "independent"
     assert list(pg.extras) == ["depth", "depth_snr", "duration", "t0", "sde",
                                "band_index"]
 
@@ -274,4 +275,4 @@ def test_settings_select_the_shared_ephemeris() -> None:
     pg = cup.periodogram(mblc, "BLS", settings=settings, backend="numpy")
     assert pg.meta["mb_ephemeris"] == "shared"
     default = cup.periodogram(mblc, "BLS", settings=SETTINGS, backend="numpy")
-    assert "mb_ephemeris" not in default.meta
+    assert default.meta["mb_ephemeris"] == "independent"

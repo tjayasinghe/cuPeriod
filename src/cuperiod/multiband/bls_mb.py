@@ -25,8 +25,8 @@ Bands of the same star share one trial *period*. Two statistics are available
     and is refused.
 
 Either way the power is ``sum_k max(SNR_k, 0)^2``, ``extras["band_index"]`` names the
-band with the largest SNR (an index into ``meta["bands"]``), and the reported depth is
-that band's, in its own flux units.
+band with the largest SNR (an index into ``meta["bands"]``), the reported depth is
+that band's, in its own flux units, and ``meta["mb_ephemeris"]`` names the statistic.
 
 The stack is only an SNR stack when every band's depth-SNR is dimensionless, so a
 band's errors are used only when *every* contributing band has them (the same rule
@@ -155,7 +155,7 @@ def bls_multiband_power(
     Periodogram
         The per-period sum of the bands' squared depth-SNRs, with the box geometry
         of the strongest band (``"independent"``) or of the shared box
-        (``"shared"``; ``meta["mb_ephemeris"]`` records it).
+        (``"shared"``); ``meta["mb_ephemeris"]`` records which.
         ``extras["band_index"]`` indexes ``meta["bands"]``, the contributing bands.
 
     Raises
@@ -201,12 +201,15 @@ def bls_multiband_power(
     if not segments:
         raise InsufficientDataError("BLS multiband: empty trial grid")
     errors = _band_errors(bands)
+    # The statistic is recorded either way, so ``meta["mb_ephemeris"]`` always says
+    # which one the result holds.
     meta: dict[str, Any] = {
-        **dict(finite.meta), "bands": tuple(name for name, _ in used),
+        **dict(finite.meta),
+        "bands": tuple(name for name, _ in used),
+        "mb_ephemeris": mode,
     }
     if mode == "shared":
         period, power, extras = _shared(bands, errors, segments, settings, backend)
-        meta["mb_ephemeris"] = "shared"
     else:
         period, power, extras = _independent(
             bands, errors, segments, settings, backend, _segments_power

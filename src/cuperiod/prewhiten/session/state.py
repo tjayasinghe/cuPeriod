@@ -665,7 +665,7 @@ class SessionState:
         )
 
     def is_plain(self) -> bool:
-        """Neither constraints nor data edits: the v1.3 code path applies."""
+        """Neither constraints nor data edits: the automatic loop's code applies."""
         return not (self.has_model_constraints() or self.has_data_edits())
 
     # -- content -------------------------------------------------------------------

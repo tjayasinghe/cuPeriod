@@ -147,6 +147,15 @@ def _default_delimiter(path: Path) -> str | None:
     return None
 
 
+def _starts_with_bom(path: Path) -> bool:
+    """Whether a file begins with a UTF-8 byte-order mark (Excel's "CSV UTF-8")."""
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(3) == b"\xef\xbb\xbf"
+    except OSError:
+        return False
+
+
 def _read_text_table(source: Any, path: Path, read: ReadOptions) -> Any:
     """An astropy table of ``source`` (a path or a list of lines) split per ``read``."""
     from astropy.table import Table
@@ -159,7 +168,10 @@ def _read_text_table(source: Any, path: Path, read: ReadOptions) -> Any:
     }
     if delimiter is not None:
         kwargs["delimiter"] = delimiter
-    return Table.read(source, **kwargs)
+    if isinstance(source, Path) and _starts_with_bom(source):
+        # The mark is not part of the first cell, a name or (headerless) a number.
+        kwargs["encoding"] = "utf-8-sig"
+    return _lightcurve._without_bom(Table.read(source, **kwargs))
 
 
 def _read_table(path: Path, read: ReadOptions | None) -> Any:
@@ -509,7 +521,8 @@ def _head_lines(path: Path, data_rows: int) -> list[str]:
     """The top of a text file: non-blank lines up to ``data_rows`` non-comment ones."""
     lines: list[str] = []
     data = 0
-    with open(path, encoding="utf-8", errors="replace") as fh:
+    # utf-8-sig: a leading byte-order mark is not part of the first column's name.
+    with open(path, encoding="utf-8-sig", errors="replace") as fh:
         for line in fh:
             text = line.rstrip("\r\n")
             if not text.strip():

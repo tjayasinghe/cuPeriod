@@ -6,9 +6,12 @@ The golden (``tests/data/prewhiten_golden.json``, written by
 reason and counters, the fit statistics, samples of the residuals and summaries of the
 stored spectra. Counts, labels, strings and flags must match exactly; numbers match
 at ``1e-12`` relative when the numerical environment's fingerprint equals the one the
-golden was written in, ``1e-9`` otherwise (a different BLAS or CPU moves the last bits).
-The ``finufft`` cases are held to ``prewhiten_corpus.RTOL_FINUFFT`` at best, the
-reproducibility that backend actually has.
+golden was written in, ``1e-6`` otherwise (another numpy, scipy, BLAS or OS moves the
+last bits, and the bootstrap errors amplify that to ~5e-7). Two cases are
+ill-conditioned by construction (``Case.chaotic``): outside the recording environment
+only their outline -- stop reason and counts -- is compared. The ``finufft`` cases are
+held to ``prewhiten_corpus.RTOL_FINUFFT`` at best, the reproducibility that backend
+actually has.
 
 A golden is never regenerated to make this pass: a failure here means the results of
 ``cup.prewhiten`` moved.
@@ -35,10 +38,8 @@ def golden() -> dict[str, Any]:
 
 
 @pytest.fixture(scope="module")
-def base_rtol(golden: dict[str, Any]) -> float:
-    if golden["fingerprint"] == corpus.fingerprint():
-        return corpus.RTOL_SAME_ENVIRONMENT
-    return corpus.RTOL_OTHER_ENVIRONMENT
+def same_environment(golden: dict[str, Any]) -> bool:
+    return bool(golden["fingerprint"] == corpus.fingerprint())
 
 
 def test_every_case_is_recorded(golden: dict[str, Any]) -> None:
@@ -119,12 +120,19 @@ def _compare(
 
 @pytest.mark.parametrize("case", corpus.CASES, ids=lambda c: c.name)
 def test_prewhiten_matches_the_golden(
-    case: corpus.Case, golden: dict[str, Any], base_rtol: float
+    case: corpus.Case, golden: dict[str, Any], same_environment: bool
 ) -> None:
     recorded = golden["cases"][case.name]
     assert recorded["case"] == corpus.describe(case), "corpus definition changed"
     expected = recorded["summary"]
     actual = json.loads(json.dumps(corpus.summarize(corpus.run(case))))
+    if same_environment:
+        base_rtol = corpus.RTOL_SAME_ENVIRONMENT
+    elif case.chaotic:
+        assert corpus.outline(actual) == corpus.outline(expected)
+        return
+    else:
+        base_rtol = case.other_environment_rtol or corpus.RTOL_OTHER_ENVIRONMENT
     rtol = max(base_rtol, case.rtol_floor)
     problems: list[str] = []
     # Integers, strings and flags (counts, labels, stop reason, combinations, blend

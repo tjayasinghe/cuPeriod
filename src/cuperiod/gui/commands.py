@@ -244,19 +244,31 @@ def shortcut_sheet(
     )
 
 
-def shortcut_sheet_html(commands: Iterable[Command] = COMMANDS) -> str:
-    """The keyboard-shortcut sheet (F1), generated from the registry."""
+def shortcut_sheet_html(
+    commands: Iterable[Command] = COMMANDS,
+    extra: Iterable[tuple[str, str, str]] = (),
+) -> str:
+    """The keyboard-shortcut sheet (F1), generated from the registry.
+
+    ``extra`` adds ``(section, command, keys)`` rows the registry does not hold: the
+    window's own actions under their menu, and sections of their own (the keys a
+    focused plot handles) after the menus.
+    """
+    sections: dict[str, list[tuple[str, str]]] = {}
+    for section, text, keys in (*shortcut_sheet(commands), *extra):
+        sections.setdefault(section, []).append((text, keys))
+    order = [m for m in MENUS if m in sections]
+    order += [s for s in sections if s not in MENUS]
     rows = []
-    menu = ""
-    for section, text, keys in shortcut_sheet(commands):
-        if section != menu:
-            menu = section
-            rows.append(
-                f'<tr><th colspan="2" align="left">{html.escape(section)}</th></tr>'
-            )
+    for section in order:
         rows.append(
-            f"<tr><td>{html.escape(text)}</td><td><b>{html.escape(keys)}</b></td></tr>"
+            f'<tr><th colspan="2" align="left">{html.escape(section)}</th></tr>'
         )
+        for text, keys in sections[section]:
+            rows.append(
+                f"<tr><td>{html.escape(text)}</td>"
+                f"<td><b>{html.escape(keys)}</b></td></tr>"
+            )
     return (
         "<table cellspacing='4'><tr><th align='left'>Command</th>"
         "<th align='left'>Keys</th></tr>" + "".join(rows) + "</table>"
@@ -502,9 +514,10 @@ class CommandRegistry(QObject):
                 )
         return tuple(problems)
 
-    def sheet_html(self) -> str:
-        """The F1 sheet for this registry's commands."""
-        return shortcut_sheet_html(self._commands.values())
+    def sheet_html(self, extra: Iterable[tuple[str, str, str]] = ()) -> str:
+        """The F1 sheet for this registry's commands (plus ``extra`` rows, see
+        :func:`shortcut_sheet_html`)."""
+        return shortcut_sheet_html(self._commands.values(), extra)
 
 
 __all__ = [

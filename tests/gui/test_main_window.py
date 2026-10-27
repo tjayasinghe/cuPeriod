@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
@@ -224,6 +225,48 @@ def test_is_acceptable_drop_accepts_directory_and_known_extensions(
     mime_bad = QtCore.QMimeData()
     mime_bad.setUrls([QtCore.QUrl.fromLocalFile(str(bogus))])
     assert not window._is_acceptable_drop(mime_bad)
+
+
+def test_compressed_and_tab_files_are_taken_by_drop_and_open_folder(
+    qtbot: QtBot, tmp_path: Path
+) -> None:
+    """A dropped star.csv.gz or star.fits.gz was refused, and Open folder skipped
+    them (and .tab / .fts files), though the single-file loader reads them all."""
+    import gzip
+
+    window = _window(qtbot)
+    plain = tmp_path / "plain.csv"
+    _write_csv(plain)
+    folder = tmp_path / "survey"
+    folder.mkdir()
+    gz = folder / "b.csv.gz"
+    gz.write_bytes(gzip.compress(plain.read_bytes()))
+    tab = folder / "c.tab"
+    tab.write_text(plain.read_text(encoding="utf-8").replace(",", "\t"), "utf-8")
+    for path in (gz, tab, folder / "d.fits.gz", folder / "e.fts"):
+        mime = QtCore.QMimeData()
+        mime.setUrls([QtCore.QUrl.fromLocalFile(str(path))])
+        assert window._is_acceptable_drop(mime), path.name
+    archive = tmp_path / "archive.gz"
+    archive.write_bytes(gzip.compress(b"x"))
+    mime = QtCore.QMimeData()
+    mime.setUrls([QtCore.QUrl.fromLocalFile(str(archive))])
+    assert not window._is_acceptable_drop(mime)
+    # A dropped compressed file loads (it has no preview, so no import dialog).
+    with qtbot.waitSignal(window._controller.lc_loaded, timeout=10000):
+        window._handle_dropped_paths([gz])
+    lc = window._controller.state.current_lc
+    assert isinstance(lc, LightCurve) and lc.n == 100
+    # A folder holding only these is a batch of both, not "no light curves".
+    window._handle_dropped_paths([folder])
+    sources = window._controller.state.sources
+    assert sources is not None
+    assert sorted(Path(s.key).name for s in sources) == ["b.csv.gz", "c.tab"]
+    # And the Open dialog's filter shows compressed files without "All files".
+    from cuperiod.gui.main_window import _FILE_FILTER
+
+    patterns = _FILE_FILTER.split(";;")[0]
+    assert all(p in patterns for p in ("*.gz", "*.bz2", "*.xz", "*.tab", "*.fts"))
 
 
 # -- last-used directory / file filter -----------------------------------------------
@@ -640,6 +683,11 @@ def test_drop_of_a_folder_and_a_file_takes_both(
 # -- GUI-B-15: the demo menu is filled when it opens, not at start-up -----------------
 
 
+def _plain(text: str) -> str:
+    """A menu text without its mnemonic ampersand."""
+    return re.sub(r"&(.)", r"\1", text)
+
+
 def test_demo_menu_is_built_on_first_open(
     qtbot: QtBot, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -649,7 +697,7 @@ def test_demo_menu_is_built_on_first_open(
     monkeypatch.setattr("cuperiod.gui.main_window.demo_sources", boom)
     window = _window(qtbot)  # must not touch the demo files
     menu = window._demo_menu
-    assert [a.text() for a in menu.actions() if not a.isSeparator()] == [
+    assert [_plain(a.text()) for a in menu.actions() if not a.isSeparator()] == [
         "Batch: browse all demo sources"
     ]
     demo = SourceItem("d", "Demo star", _light_curve)
@@ -657,7 +705,9 @@ def test_demo_menu_is_built_on_first_open(
     menu.aboutToShow.emit()
     menu.aboutToShow.emit()  # a second opening adds nothing
     texts = [a.text() for a in menu.actions() if not a.isSeparator()]
-    assert texts == ["Demo star", "Batch: browse all demo sources"]
+    assert [_plain(t) for t in texts] == ["Demo star", "Batch: browse all demo sources"]
+    # Each entry has an Alt mnemonic, as on every other menu.
+    assert texts == ["&Demo star", "&Batch: browse all demo sources"]
 
 
 def test_unreadable_demo_files_leave_a_working_menu(

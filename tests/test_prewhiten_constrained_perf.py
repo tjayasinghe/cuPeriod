@@ -64,7 +64,8 @@ def assert_same_fit(
     """
     d, p = dense.detail, projected.detail
     assert d is not None and p is not None
-    tol = 1e-4 if iterative else 1e-7
+    # Non-iterative: ~3e-7 sigma at the numpy 1.24 floor, far less on numpy 2.
+    tol = 1e-4 if iterative else 1e-6
     if iterative:
         # In units of the reduced chi-square: 1e-4 is a parameter shift of ~1e-2
         # sigma at most (a single cyclic sweep stops short of the optimum, so where

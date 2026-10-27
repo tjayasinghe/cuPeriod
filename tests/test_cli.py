@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 from pathlib import Path
 
@@ -361,3 +362,81 @@ def test_save_periodogram_reports_the_file_it_wrote(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     written = tmp_path / "spec.dat.npz"
     assert written.exists() and f"Wrote {written}" in result.stdout
+
+
+def test_console_script_keeps_a_quoted_glob_whole(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # CliRunner bypasses click's Windows argument expansion; main() does not. With
+    # it on, a quoted glob matching two files reached `batch` as two arguments.
+    from cuperiod.cli.app import main
+
+    for i in range(2):
+        _write_csv(tmp_path / f"s{i}.csv")
+    out = tmp_path / "results.parquet"
+    monkeypatch.setattr(
+        "sys.argv",
+        ["cuperiod", "batch", str(tmp_path / "*.csv"), "-m", "GLS", "--out", str(out)],
+    )
+    with pytest.raises(SystemExit) as exit_info:
+        main()
+    assert exit_info.value.code in (0, None)
+    assert out.exists()
+
+
+def test_prewhiten_options_defer_to_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An option the user did not give must not pin its field: the CLI's own defaults
+    # hid CUPERIOD_PREWHITEN_*, which cup.prewhiten honours.
+    # The module, not cuperiod.cli.app (the package re-exports the Typer app there).
+    cli = importlib.import_module("cuperiod.cli.app")
+
+    monkeypatch.setenv("CUPERIOD_PREWHITEN_SNR_THRESHOLD", "7.5")
+    monkeypatch.setenv("CUPERIOD_PREWHITEN_MAX_FREQUENCIES", "5")
+    monkeypatch.setenv("CUPERIOD_PREWHITEN_COMBINATIONS", "false")
+    unset = dict.fromkeys(
+        ("max_frequencies", "snr", "stop", "minimum_frequency", "maximum_frequency",
+         "uncertainty", "combinations", "backend")
+    )
+    settings = cli._prewhiten_settings(**unset)
+    assert settings.snr_threshold == 7.5
+    assert settings.max_frequencies == 5
+    assert settings.combinations is False
+    given = cli._prewhiten_settings(**{**unset, "snr": 5.0, "combinations": True})
+    assert given.snr_threshold == 5.0 and given.combinations is True
+
+
+@pytest.mark.parametrize("flag", [None, "--combinations", "--no-combinations"])
+def test_prewhiten_combinations_flag_is_three_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flag: str | None
+) -> None:
+    # The module, not cuperiod.cli.app (the package re-exports the Typer app there).
+    cli = importlib.import_module("cuperiod.cli.app")
+
+    seen: dict[str, object] = {}
+    real = cli._prewhiten_settings
+
+    def spy(**kwargs: object) -> object:
+        seen.update(kwargs)
+        return real(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(cli, "_prewhiten_settings", spy)
+    csv = _write_pulsator_csv(tmp_path / "p0.csv")
+    args = ["prewhiten", str(csv), "-n", "1"] + ([flag] if flag else [])
+    result = runner.invoke(app, args)
+    assert result.exit_code == 0, result.output
+    expected = {None: None, "--combinations": True, "--no-combinations": False}[flag]
+    assert seen["combinations"] is expected
+
+
+def test_an_unparsable_settings_variable_is_a_usage_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # pydantic-settings reads list fields from the environment as JSON; "snr,bic"
+    # raised SettingsError, which reached the user as a traceback.
+    monkeypatch.setenv("CUPERIOD_PREWHITEN_STOP_CRITERIA", "snr,bic")
+    csv = _write_pulsator_csv(tmp_path / "p0.csv")
+    result = runner.invoke(app, ["prewhiten", str(csv), "-n", "1"])
+    assert result.exit_code == 2
+    assert "stop_criteria" in result.output and "Traceback" not in result.output

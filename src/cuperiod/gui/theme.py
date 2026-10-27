@@ -376,7 +376,7 @@ def apply_plot_theme(plot: Any, pal: ThemePalette) -> None:
         # x1000 tick scale behind with no "(x0.001)" in the label. An empty set of
         # enable-ranges pins that computation to 1 first; setLabel() later resets the
         # ranges but, with the prefix disabled, never recomputes the scale. pyqtgraph
-        # before 0.13.4 has no enable-ranges hook (the pin allows 0.13), so the scale
+        # before 0.14 has no enable-ranges hook (the pin allows 0.13.7), so the scale
         # it computed is also reset by hand; on newer versions that is a no-op.
         if hasattr(axis, "setSIPrefixEnableRanges"):
             axis.setSIPrefixEnableRanges(())

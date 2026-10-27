@@ -277,7 +277,18 @@ class ConfigureArgs(OpArgs):
         for key, item in value.items():
             if isinstance(item, float) and not math.isfinite(item):
                 raise ValueError(f"setting {key!r} must be finite")
-        return value
+        # The given fields as the settings model reads them, in plain JSON: a numpy
+        # scalar (or a list for a tuple) would otherwise reach the log unconverted.
+        try:
+            plain = PreWhitenSettings.model_validate(value).model_dump(mode="json")
+        except ValidationError as exc:
+            raise ValueError(
+                "; ".join(
+                    f"{'.'.join(str(p) for p in e['loc']) or 'value'}: {e['msg']}"
+                    for e in exc.errors()[:5]
+                )
+            ) from None
+        return {key: plain[key] for key in value}
 
 
 #: Argument model of every operation (the 25 of the log schema).

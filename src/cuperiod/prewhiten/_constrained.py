@@ -2,8 +2,8 @@
 
 :func:`~cuperiod.prewhiten.fit.fit_multisine` dispatches here whenever it receives a
 non-trivial :class:`~cuperiod.prewhiten.constraints.FitConstraints`; an unconstrained
-call never reaches this module, so the v1.3 kernel and every result it produces are
-untouched.
+call never reaches this module, so the unconstrained kernel and every result it
+produces are untouched.
 
 The model, for samples ``i`` with ``tau_i = t_i - t_ref`` and weights
 ``w_i = omega_i / sigma_i^2``,
@@ -20,7 +20,7 @@ non-linear vector is ``alpha = [theta; psi]`` — the free *independent* frequen
 makes non-linear (a fixed amplitude, or an amplitude shared across subsets whose phase
 is per subset, or vice versa). Variable projection with Kaufman's Jacobian optimises
 ``alpha`` while every linear parameter is solved exactly at each step, exactly as the
-v1.3 kernel does for the free case (where ``M = I`` and ``psi`` is empty).
+unconstrained kernel does for the free case (where ``M = I`` and ``psi`` is empty).
 
 Each component falls into one of three classes (spec table 1.3): a **pair** (free
 amplitude and phase: ``cos``/``sin`` columns, per subset when both vary), a **signed**
@@ -596,7 +596,7 @@ def _polish(
     the original fit and the rebuild finish on the exact stationary point: Kaufman's
     gradient is exact, so the Gauss-Newton fixed point is the true optimum. Only fits
     with non-linear phases are polished; the unconstrained-equivalent path stays
-    step-for-step that of the v1.3 kernel.
+    step-for-step that of the unconstrained kernel.
     """
     cost = float(np.sum(problem.fun(x) ** 2))
     for _ in range(_POLISH_STEPS):

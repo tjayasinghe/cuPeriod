@@ -29,7 +29,41 @@ def main() -> None:
             "    pip install 'cuperiod[gui]'\n"
             f"(could not import: {exc.name})"
         ) from exc
+    problem = _known_broken_qt()
+    if problem:
+        raise SystemExit(problem)
     raise SystemExit(run_app(exit_when_closed=True))
+
+
+def _known_broken_qt() -> str:
+    """Why the installed PySide6 cannot run the GUI here, or ``""``.
+
+    PySide6 6.12 drops a reference to ``None`` whenever a Qt call returns a null
+    pointer. ``None`` is immortal from Python 3.12, but on 3.11 its count reaches zero
+    within seconds of normal use and the interpreter aborts ("deallocating None"),
+    taking unsaved work with it. The ``[gui]`` extra keeps 3.11 below 6.12; this
+    catches an environment that already had it.
+    """
+    import sys
+
+    python = sys.version_info[:2]
+    if python >= (3, 12):
+        return ""
+    import PySide6
+
+    try:
+        major, minor = (int(part) for part in PySide6.__version__.split(".")[:2])
+    except ValueError:
+        return ""
+    if (major, minor) < (6, 12):
+        return ""
+    return (
+        f"PySide6 {PySide6.__version__} crashes on Python "
+        f"{python[0]}.{python[1]} (a reference-counting "
+        "bug that aborts the process). Install an earlier release:\n"
+        "    pip install 'PySide6<6.12'\n"
+        "or run cuperiod-gui on Python 3.12 or newer."
+    )
 
 
 __all__ = ["main"]

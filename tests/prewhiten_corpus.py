@@ -44,9 +44,12 @@ GOLDEN_FORMAT = 1
 #: Where the golden file lives.
 GOLDEN_PATH = Path(__file__).parent / "data" / "prewhiten_golden.json"
 
-#: Relative tolerances of the comparison (see tests/test_prewhiten_golden.py).
+#: Relative tolerances of the comparison (see tests/test_prewhiten_golden.py). Another
+#: numpy / scipy / BLAS build or OS moves the well-conditioned cases by up to ~5e-7
+#: (the seeded bootstrap errors; measured across numpy 2.4.6 / 2.5.4, scipy 1.17.1 /
+#: 1.18, OpenBLAS 0.3.31 / 0.3.34 on Windows and Linux), so 1e-6 is the bound there.
 RTOL_SAME_ENVIRONMENT = 1e-12
-RTOL_OTHER_ENVIRONMENT = 1e-9
+RTOL_OTHER_ENVIRONMENT = 1e-6
 
 #: The finufft backend is not run-to-run reproducible (its spectrum moves at ~1e-15,
 #: which shifts each peak seed and so the optimiser's stopping point by ~1e-11); the
@@ -196,6 +199,14 @@ class Case:
     dataset: str
     settings: Mapping[str, Any] = field(default_factory=dict)
     grid: tuple[float, float, float] | None = None
+    #: Tolerance in another numerical environment, when RTOL_OTHER_ENVIRONMENT is too
+    #: tight for this case.
+    other_environment_rtol: float | None = None
+    #: Ill-conditioned by construction: a separation guard below the refinement box
+    #: lets two components converge on one frequency with large cancelling
+    #: amplitudes, which only rounding fixes. Its numbers are pinned in the recording
+    #: environment; elsewhere only the run's :func:`outline` must match.
+    chaotic: bool = False
 
     def resolved_settings(self) -> cup.PreWhitenSettings:
         return cup.PreWhitenSettings(**{**BASE_SETTINGS, **self.settings})
@@ -270,13 +281,16 @@ CASES: tuple[Case, ...] = (
          grid=(12.0, 12.7, 5.0)),
     Case("modulated-prune", "modulated",
          {"min_separation_rayleigh": 0.2, "refine_bound_rayleigh": 5.0,
-          "snr_threshold": 2.0, "max_frequencies": 6}),
+          "snr_threshold": 2.0, "max_frequencies": 6}, chaotic=True),
     Case("drift-blocked", "drift",
          {"min_separation_rayleigh": 0.3, "refine_bound_rayleigh": 3.0,
-          "snr_threshold": 2.0, "max_frequencies": 6, "refine": "simultaneous"}),
+          "snr_threshold": 2.0, "max_frequencies": 6, "refine": "simultaneous"},
+         chaotic=True),
+    # Moves ~5e-6 between environments (measured): near-degenerate, not chaotic.
     Case("drift-budget", "drift",
          {"min_separation_rayleigh": 0.05, "refine_bound_rayleigh": 8.0,
-          "snr_threshold": 0.5, "max_frequencies": 10, "refine": "simultaneous"}),
+          "snr_threshold": 0.5, "max_frequencies": 10, "refine": "simultaneous"},
+         other_environment_rtol=1e-4),
     # -- finufft, compared at RTOL_FINUFFT --------------------------------------------
     Case("finufft-triple", "triple", {"backend": "finufft"}),
     Case("finufft-pair", "close_pair", {"backend": "finufft"}),
@@ -443,6 +457,19 @@ def case_by_name(name: str) -> Case:
         if case.name == name:
             return case
     raise KeyError(name)
+
+
+def outline(summary: Mapping[str, Any]) -> dict[str, Any]:
+    """The parts of a summary that hold even for a :attr:`Case.chaotic` case."""
+    return {
+        "stop_reason": summary["stop_reason"],
+        "n_iterations": summary["n_iterations"],
+        "n_pruned": summary["n_pruned"],
+        "n_samples": summary["n_samples"],
+        "n_components": len(summary["components"]),
+        "uncertainty_method": summary["uncertainty_method"],
+        "backend": summary["backend"],
+    }
 
 
 def describe(case: Case) -> dict[str, Any]:

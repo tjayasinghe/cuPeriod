@@ -1162,9 +1162,10 @@ def test_axes_never_rescale_by_an_si_prefix(qtbot: QtBot) -> None:
 def test_si_prefix_is_reset_without_the_enable_ranges_hook(
     qtbot: QtBot, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """pyqtgraph < 0.13.4 (allowed by the >=0.13 pin) has no enable-ranges hook to pin
+    """pyqtgraph < 0.14 (allowed by the >=0.13.7 pin) has no enable-ranges hook to pin
     the scale with, so a scale computed earlier must still be dropped by hand. The hook
-    is stubbed out here (pyqtgraph 0.14 calls it itself, so it cannot be deleted)."""
+    is stubbed out here (pyqtgraph 0.14 calls it itself, so it cannot be deleted); on
+    an older pyqtgraph, which lacks it, the stub is added for the test and removed."""
     from pyqtgraph.graphicsItems.AxisItem import AxisItem
 
     pal = th.palette("dark")
@@ -1175,7 +1176,9 @@ def test_si_prefix_is_reset_without_the_enable_ranges_hook(
     QtWidgets.QApplication.processEvents()
     axis = plot.getPlotItem().getAxis("left")
     assert axis.autoSIPrefixScale != 1.0  # pyqtgraph's default: a x1000 scale
-    monkeypatch.setattr(AxisItem, "setSIPrefixEnableRanges", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        AxisItem, "setSIPrefixEnableRanges", lambda *_a, **_k: None, raising=False
+    )
     th.apply_plot_theme(plot, pal)
     assert axis.autoSIPrefixScale == 1.0
     assert "(x" not in axis.labelString()

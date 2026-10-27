@@ -724,6 +724,38 @@ def _format_suffix(path: Path) -> str:
     return suffixes[-1] if suffixes else ""
 
 
+def _scan_suffix(path: Path) -> str:
+    """:func:`_format_suffix` for a file a folder scan or a drop may take, else ``""``.
+
+    Text and FITS tables are read through ``.gz`` / ``.bz2`` / ``.xz``; Parquet is not
+    (pyarrow cannot read a compressed file), so ``star.parquet.gz`` is left out.
+    """
+    suffix = _format_suffix(path)
+    compressed = path.suffix.lower() in _COMPRESSION_SUFFIXES
+    return "" if compressed and suffix in (".parquet", ".pq") else suffix
+
+
+#: A UTF-8 byte-order mark as astropy's ASCII readers decode it: as one character
+#: under a UTF-8 locale, byte by byte under a cp1252/latin-1 one (Windows).
+_BOM_PREFIXES = ("\ufeff", "\xef\xbb\xbf")
+
+
+def _without_bom(table: Any) -> Any:
+    """``table`` with a UTF-8 byte-order mark dropped from its first column name.
+
+    Excel's "CSV UTF-8" starts the file with one, and astropy's ASCII readers keep it
+    in the first header cell (``'\\ufefftime'``), so the time column was not found.
+    """
+    names = list(table.colnames)
+    for bom in _BOM_PREFIXES:
+        if names and names[0].startswith(bom):
+            bare = names[0][len(bom) :]
+            if bare and bare not in names:
+                table.rename_column(names[0], bare)
+            break
+    return table
+
+
 def _read_table_object(path: Path) -> Any:
     """Read a tabular file into a table object (pyarrow or astropy) by extension."""
     suffix = _format_suffix(path)
@@ -739,13 +771,13 @@ def _read_table_object(path: Path) -> Any:
         # alone sent star.fits.gz to the ASCII reader.
         return Table.read(path, format="fits")
     if suffix in {".csv"}:
-        return Table.read(path, format="ascii.csv")
+        return _without_bom(Table.read(path, format="ascii.csv"))
     if suffix in {".ecsv"}:
         return Table.read(path, format="ascii.ecsv")
     if suffix in {".tsv", ".tab"}:
-        return Table.read(path, format="ascii.tab")
+        return _without_bom(Table.read(path, format="ascii.tab"))
     # .dat/.txt and unknowns: let astropy guess the ASCII flavor.
-    return Table.read(path, format="ascii")
+    return _without_bom(Table.read(path, format="ascii"))
 
 
 def _read_table_file(path: Path) -> tuple[list[str], Callable[[str], Any]]:

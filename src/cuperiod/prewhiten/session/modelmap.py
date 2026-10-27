@@ -39,7 +39,8 @@ class ModelMap:
     Attributes
     ----------
     constraints : FitConstraints or None
-        ``None`` when the mapped constraints are trivial (the v1.3 fit applies).
+        ``None`` when the mapped constraints are trivial (the automatic loop's plain
+        fit applies).
     ids : tuple of int
         Component id at each fit position (the active components, table order).
     frequencies : numpy.ndarray

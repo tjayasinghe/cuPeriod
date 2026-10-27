@@ -143,8 +143,8 @@ def predicted_frequency(state: SessionState, component_id: int) -> float:
 
 
 def band(kernel: SessionKernel, state: SessionState) -> tuple[float, float]:
-    """The frequencies a refinement may reach: the box :meth:`SessionKernel.bounds`
-    clips to (half the grid's first frequency up to its last)."""
+    """The frequencies a refinement may reach: the band :meth:`SessionKernel.bounds`
+    clips a component inside it to (half the grid's first frequency up to its last)."""
     engine = kernel.engine(state)
     f_min, f_max = float(engine.frequency[0]), float(engine.frequency[-1])
     return max(0.5 * f_min, 1e-12), f_max

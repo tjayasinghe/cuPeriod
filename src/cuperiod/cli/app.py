@@ -63,6 +63,7 @@ if TYPE_CHECKING:  # annotations only — the pdot modules load inside the comma
         PhaseTrackResult,
     )
     from cuperiod.pdot.detrend import TrendMethod
+    from cuperiod.prewhiten.session import PreWhitenSession
 
 #: Seconds per Julian year, for reporting a dP/dt error in the eclipse-timing unit
 #: (the canonical definition lives in :mod:`cuperiod.pdot.result`).
@@ -375,35 +376,51 @@ def batch(
 
 def _prewhiten_settings(
     *,
-    max_frequencies: int,
-    snr: float,
-    stop: str,
+    max_frequencies: int | None,
+    snr: float | None,
+    stop: str | None,
     minimum_frequency: float | None,
     maximum_frequency: float | None,
-    uncertainty: str,
-    combinations: bool,
+    uncertainty: str | None,
+    combinations: bool | None,
     backend: str | None,
     store_spectra: bool = True,
 ) -> PreWhitenSettings:
-    """Build a :class:`PreWhitenSettings` from CLI options (validated by pydantic)."""
-    criteria = tuple(c.strip().lower() for c in stop.split(",") if c.strip())
-    # Pass --backend only when given: an explicit backend="auto" would pin the field
-    # and hide CUPERIOD_PREWHITEN_BACKEND, which the library API honours.
-    pinned: dict[str, Any] = {} if backend is None else {"backend": backend}
+    """Build a :class:`PreWhitenSettings` from CLI options (validated by pydantic).
+
+    Only the options the user gave are passed: an explicit default would pin the
+    field and hide its ``CUPERIOD_PREWHITEN_*`` variable, which the library honours.
+    """
+    given: dict[str, Any] = {
+        "max_frequencies": max_frequencies,
+        "snr_threshold": snr,
+        "minimum_frequency": minimum_frequency,
+        "maximum_frequency": maximum_frequency,
+        "uncertainty": uncertainty,
+        "combinations": combinations,
+        "backend": backend,
+    }
+    if stop is not None:
+        given["stop_criteria"] = tuple(
+            c.strip().lower() for c in stop.split(",") if c.strip()
+        )
     try:
         return PreWhitenSettings(
-            max_frequencies=max_frequencies,
-            snr_threshold=snr,
-            stop_criteria=criteria,  # type: ignore[arg-type]
-            minimum_frequency=minimum_frequency,
-            maximum_frequency=maximum_frequency,
-            uncertainty=uncertainty,  # type: ignore[arg-type]
-            combinations=combinations,
             store_spectra=store_spectra,
-            **pinned,
+            **{key: value for key, value in given.items() if value is not None},
         )
-    except ValidationError as exc:
+    # ValueError, not only ValidationError: a CUPERIOD_PREWHITEN_* variable the
+    # settings cannot parse (a list that is not JSON) raises SettingsError.
+    except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
+
+
+def _prewhiten_help(text: str, field: str) -> str:
+    """An option's help, naming its effective default: the environment, else ours."""
+    default = PreWhitenSettings.model_fields[field].default
+    if isinstance(default, tuple):
+        default = ",".join(default)
+    return f"{text} (default: CUPERIOD_PREWHITEN_{field.upper()}, else {default})."
 
 
 @app.command()
@@ -420,12 +437,23 @@ def prewhiten(
         help="auto | cpu | gpu | concrete backend (default: the settings' backend,"
         " CUPERIOD_PREWHITEN_BACKEND, else auto).",
     ),
-    max_frequencies: int = typer.Option(
-        30, "--max-frequencies", "-n", help="Cap on extracted components."
+    max_frequencies: int | None = typer.Option(
+        None,
+        "--max-frequencies",
+        "-n",
+        help=_prewhiten_help("Cap on extracted components", "max_frequencies"),
     ),
-    snr: float = typer.Option(4.0, "--snr", help="Breger signal-to-noise threshold."),
-    stop: str = typer.Option(
-        "snr", "--stop", help="Stopping criteria (comma-sep): snr,fap,bic,amplitude."
+    snr: float | None = typer.Option(
+        None,
+        "--snr",
+        help=_prewhiten_help("Breger signal-to-noise threshold", "snr_threshold"),
+    ),
+    stop: str | None = typer.Option(
+        None,
+        "--stop",
+        help=_prewhiten_help(
+            "Stopping criteria (comma-sep): snr,fap,bic,amplitude", "stop_criteria"
+        ),
     ),
     minimum_frequency: float | None = typer.Option(
         None, "--fmin", help="Lowest trial frequency (cycles/day)."
@@ -433,13 +461,14 @@ def prewhiten(
     maximum_frequency: float | None = typer.Option(
         None, "--fmax", help="Highest trial frequency (cycles/day)."
     ),
-    uncertainty: str = typer.Option(
-        "covariance", help="covariance | analytic | bootstrap."
+    uncertainty: str | None = typer.Option(
+        None,
+        help=_prewhiten_help("covariance | analytic | bootstrap", "uncertainty"),
     ),
-    combinations: bool = typer.Option(
-        True,
+    combinations: bool | None = typer.Option(
+        None,
         "--combinations/--no-combinations",
-        help="Identify combination frequencies.",
+        help=_prewhiten_help("Identify combination frequencies", "combinations"),
     ),
     spacing: bool = typer.Option(
         False, "--spacing", help="Also search for a g-mode period-spacing pattern."
@@ -531,12 +560,44 @@ def prewhiten(
         if result.window is not None:
             arrays["window_amplitude"] = result.window.amplitude
         _save_npz(save_spectrum, arrays)
+    # The script does not depend on the project file: a failed save must not cost it.
+    failure: CuPeriodError | None = None
     if session is not None and save_project is not None:
-        session.save(save_project, title=path.stem)
-        typer.echo(f"Wrote {save_project}")
+        try:
+            _save_project(session, save_project, title=path.stem)
+        except CuPeriodError as exc:
+            failure = exc
+        else:
+            typer.echo(f"Wrote {save_project}")
     if session is not None and export_script is not None:
         written = session.export_script(export_script, title=path.stem)
         typer.echo(f"Wrote {written}")
+    if failure is not None:
+        raise failure
+
+
+def _save_project(session: PreWhitenSession, path: Path, *, title: str) -> None:
+    """Save ``session``, embedding a large light curve rather than refusing it.
+
+    ``embed_data="auto"`` references the data file when it sits in the project's
+    folder and otherwise embeds the data, but refuses to embed more than
+    ``embed_data_max_points`` (``CUPERIOD_SESSION_EMBED_DATA_MAX_POINTS``) without
+    being asked. Asking for ``--save-project`` is that request, made after the run
+    it saves: it is embedded anyway, with a note (``max_project_bytes`` still caps
+    the file).
+    """
+    try:
+        session.save(path, title=title)
+    except CuPeriodError:
+        n = session.kernel.data.n
+        if n <= session.session_settings.embed_data_max_points:
+            raise
+        session.save(path, title=title, embed_data="always")
+        typer.echo(
+            f"note: embedded all {n} data points in {path.name} (more than "
+            "embed_data_max_points, but the data file cannot be referenced from the "
+            "project's folder)"
+        )
 
 
 def _write_component_csv(result: PreWhitenResult, path: Path) -> None:
@@ -569,22 +630,36 @@ def batch_prewhiten_cmd(
         min=1,
         help="Light curves per chunk/task (None = the batch_prewhiten default).",
     ),
-    max_frequencies: int = typer.Option(
-        30, "--max-frequencies", "-n", help="Cap on extracted components."
+    max_frequencies: int | None = typer.Option(
+        None,
+        "--max-frequencies",
+        "-n",
+        help=_prewhiten_help("Cap on extracted components", "max_frequencies"),
     ),
-    snr: float = typer.Option(4.0, "--snr", help="Breger signal-to-noise threshold."),
-    stop: str = typer.Option("snr", "--stop", help="Stopping criteria (comma-sep)."),
+    snr: float | None = typer.Option(
+        None,
+        "--snr",
+        help=_prewhiten_help("Breger signal-to-noise threshold", "snr_threshold"),
+    ),
+    stop: str | None = typer.Option(
+        None,
+        "--stop",
+        help=_prewhiten_help("Stopping criteria (comma-sep)", "stop_criteria"),
+    ),
     minimum_frequency: float | None = typer.Option(
         None, "--fmin", help="Lowest trial frequency (cycles/day)."
     ),
     maximum_frequency: float | None = typer.Option(
         None, "--fmax", help="Highest trial frequency (cycles/day)."
     ),
-    uncertainty: str = typer.Option(
-        "covariance", help="covariance | analytic | bootstrap."
+    uncertainty: str | None = typer.Option(
+        None,
+        help=_prewhiten_help("covariance | analytic | bootstrap", "uncertainty"),
     ),
-    combinations: bool = typer.Option(
-        True, "--combinations/--no-combinations", help="Identify combinations."
+    combinations: bool | None = typer.Option(
+        None,
+        "--combinations/--no-combinations",
+        help=_prewhiten_help("Identify combinations", "combinations"),
     ),
     time: str | None = typer.Option(None, help="Time column name override."),
     value: str | None = typer.Option(None, help="Value column name override."),
@@ -658,28 +733,58 @@ def _pdot_range(value: str | None) -> tuple[float, float] | None:
 
 def _pdot_settings(
     *,
-    max_cycle_drift: float,
-    samples_per_drift: int,
-    samples_per_peak: int,
-    window_rayleigh: float,
+    max_cycle_drift: float | None,
+    samples_per_drift: int | None,
+    samples_per_peak: int | None,
+    window_rayleigh: float | None,
     pdot_range: str | None,
     harmonics: int | None,
     segments: int | None,
     harmonic_scale: float | None,
 ) -> PdotSettings:
-    """Build a :class:`PdotSettings` from CLI options (validated by pydantic)."""
+    """Build a :class:`PdotSettings` from CLI options (validated by pydantic).
+
+    Only the options given are passed: in pydantic-settings an explicit argument
+    beats the environment, so passing the CLI's own defaults (or ``None``) would
+    hide every ``CUPERIOD_PDOT_*`` override the library API honours.
+    """
+    options: dict[str, Any] = {
+        "max_cycle_drift": max_cycle_drift,
+        "samples_per_drift": samples_per_drift,
+        "samples_per_peak": samples_per_peak,
+        "window_rayleigh": window_rayleigh,
+        "pdot_over_p_range": _pdot_range(pdot_range),
+        "harmonics": harmonics,
+        "n_segments": segments,
+        "harmonic_scale": harmonic_scale,
+    }
     try:
-        return PdotSettings(
-            max_cycle_drift=max_cycle_drift,
-            samples_per_drift=samples_per_drift,
-            samples_per_peak=samples_per_peak,
-            window_rayleigh=window_rayleigh,
-            pdot_over_p_range=_pdot_range(pdot_range),
-            harmonics=harmonics,
-            n_segments=segments,
-            harmonic_scale=harmonic_scale,
-        )
-    except ValidationError as exc:
+        return PdotSettings(**{k: v for k, v in options.items() if v is not None})
+    except ValueError as exc:  # ValidationError, or an unparsable CUPERIOD_PDOT_*
+        raise typer.BadParameter(str(exc)) from exc
+
+
+def _pdot_help(text: str, field: str, fallback: str | None = None) -> str:
+    """An option's help, naming its effective default: the environment, else ours."""
+    if fallback is None:
+        fallback = f"{PdotSettings.model_fields[field].default:g}"
+    return f"{text} (default: CUPERIOD_PDOT_{field.upper()}, else {fallback})."
+
+
+@contextlib.contextmanager
+def _option_errors() -> Iterator[None]:
+    """Report a plain ``ValueError`` from the library as a usage error (status 2).
+
+    A search the options cannot set up (``-m BLS``, a ``--pdot-range`` outside the
+    period law's domain, too large a grid) raises ``ValueError``. cuPeriod's own
+    errors pass through to :func:`_clean_errors`: ``InsufficientDataError`` is a
+    ``ValueError`` too, but too few points is not a bad option.
+    """
+    try:
+        yield
+    except CuPeriodError:
+        raise
+    except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
 
 
@@ -785,32 +890,58 @@ def pdot(
         None, "--model", help="Period law: constant-pdot (default) | exponential."
     ),
     backend: str = typer.Option("auto", help="auto | cpu | gpu | concrete backend."),
-    max_cycle_drift: float = typer.Option(
-        10.0, "--max-cycle-drift", help="dP/dt half-range, in accumulated cycles."
+    max_cycle_drift: float | None = typer.Option(
+        None,
+        "--max-cycle-drift",
+        help=_pdot_help("dP/dt half-range, in accumulated cycles", "max_cycle_drift"),
     ),
-    samples_per_drift: int = typer.Option(
-        5, "--samples-per-drift", help="Oversampling of the (dP/dt)/P axis."
+    samples_per_drift: int | None = typer.Option(
+        None,
+        "--samples-per-drift",
+        help=_pdot_help("Oversampling of the (dP/dt)/P axis", "samples_per_drift"),
     ),
-    samples_per_peak: int = typer.Option(
-        10, "--samples-per-peak", help="Frequency oversampling inside the window."
+    samples_per_peak: int | None = typer.Option(
+        None,
+        "--samples-per-peak",
+        help=_pdot_help(
+            "Frequency oversampling inside the window", "samples_per_peak"
+        ),
     ),
-    window_rayleigh: float = typer.Option(
-        30.0, "--window-rayleigh", help="Frequency half-window in Rayleigh widths."
+    window_rayleigh: float | None = typer.Option(
+        None,
+        "--window-rayleigh",
+        help=_pdot_help(
+            "Frequency half-window in Rayleigh widths", "window_rayleigh"
+        ),
     ),
     pdot_range: str | None = typer.Option(
-        None, "--pdot-range", help="Explicit (dP/dt)/P bounds 'lo,hi' in 1/day."
+        None,
+        "--pdot-range",
+        help=_pdot_help(
+            "Explicit (dP/dt)/P bounds 'lo,hi' in 1/day",
+            "pdot_over_p_range",
+            "from --max-cycle-drift",
+        ),
     ),
     harmonics: int | None = typer.Option(
-        None, "--harmonics", help="Tracking template order (None = BIC-selected)."
+        None,
+        "--harmonics",
+        help=_pdot_help("Tracking template order", "harmonics", "BIC-selected"),
     ),
     segments: int | None = typer.Option(
         None,
         "--segments",
         min=4,
-        help="Target tracking segment count (at least 4; None = auto).",
+        help=_pdot_help(
+            "Target tracking segment count, at least 4", "n_segments", "auto"
+        ),
     ),
     harmonic_scale: float | None = typer.Option(
-        None, "--harmonic-scale", help="Extra (dP/dt)/P refinement (None = per method)."
+        None,
+        "--harmonic-scale",
+        help=_pdot_help(
+            "Extra (dP/dt)/P refinement", "harmonic_scale", "per method"
+        ),
     ),
     detrend_width: float | None = typer.Option(
         None, "--detrend-width", help="Running-median window (days) removed first."
@@ -867,26 +998,29 @@ def pdot(
         segments=segments,
         harmonic_scale=harmonic_scale,
     )
-    result = pdot_search(
-        lc,
-        period=_positive_period(period),
-        method=method,
-        model=model_name,
-        settings=settings,
-        backend=backend,
-    )
+    seed_period = _positive_period(period)
+    with _option_errors():
+        result = pdot_search(
+            lc,
+            period=seed_period,
+            method=method,
+            model=model_name,
+            settings=settings,
+            backend=backend,
+        )
     _print_pdot_search(result)
 
     tracked: PhaseTrackResult | None = None
     if track:
         try:
-            tracked = phase_track(
-                lc,
-                period=result.best.period,
-                pdot=result.best.pdot,
-                model=model_name,
-                settings=settings,
-            )
+            with _option_errors():
+                tracked = phase_track(
+                    lc,
+                    period=result.best.period,
+                    pdot=result.best.pdot,
+                    model=model_name,
+                    settings=settings,
+                )
         except InsufficientDataError as exc:
             typer.echo(f"\nphase tracking skipped: {exc}")
         else:
@@ -983,15 +1117,23 @@ def _print_phase_track(res: PhaseTrackResult) -> None:
 
 
 def _print_ltte(res: LTTESearchResult) -> None:
-    """The cyclic O-C block: the light-time orbit found in the tracked delays."""
+    """The cyclic O-C block: the light-time orbit found in the tracked delays.
+
+    Every error in it is the formal one times ``best.error_inflation``
+    (``sqrt(chi2_reduced)``, floored at 1), the convention of
+    :attr:`~cuperiod.LTTEFit.pdot_err_scaled`; the block says so.
+    """
     best = res.best
+    scale = best.error_inflation
     typer.echo(f"\nlight-time orbit search over the O-C  ({res.n_used} points)")
     typer.echo(
         f"  {'outer period':<15} {best.outer_period_yr:.3f} +- "
-        f"{best.outer_period_err_yr:.3f} yr   ({res.n_cycles:.2f} cycles covered)"
+        f"{best.outer_period_err_yr * scale:.3f} yr   "
+        f"({res.n_cycles:.2f} cycles covered)"
     )
     typer.echo(
-        f"  {'amplitude':<15} {best.amplitude_s:.1f} +- {best.amplitude_err_s:.1f} s"
+        f"  {'amplitude':<15} {best.amplitude_s:.1f} +- "
+        f"{best.amplitude_err_s * scale:.1f} s"
         f"   (a sin i = {best.a_sini_au:.3f} au, f(m) = {best.mass_function:.4f} Msun)"
     )
     typer.echo(
@@ -1002,6 +1144,10 @@ def _print_ltte(res: LTTESearchResult) -> None:
         f"  {'secular dP/dt':<15} {best.pdot_s_per_yr:+.4g} +- "
         f"{best.pdot_err_scaled * _SECONDS_PER_YEAR:.2g} s/yr   "
         f"(parabola alone: {res.null.pdot_s_per_yr:+.4g})"
+    )
+    typer.echo(
+        f"  {'errors':<15} formal x {scale:.3g}   (error_inflation = "
+        "sqrt(chi2_reduced), floored at 1)"
     )
     if best.at_grid_edge:
         typer.echo(
@@ -1084,32 +1230,58 @@ def pdot_batch_cmd(
     chunk_size: int = typer.Option(
         32, "--chunk-size", help="Light curves per chunk/task."
     ),
-    max_cycle_drift: float = typer.Option(
-        10.0, "--max-cycle-drift", help="dP/dt half-range, in accumulated cycles."
+    max_cycle_drift: float | None = typer.Option(
+        None,
+        "--max-cycle-drift",
+        help=_pdot_help("dP/dt half-range, in accumulated cycles", "max_cycle_drift"),
     ),
-    samples_per_drift: int = typer.Option(
-        5, "--samples-per-drift", help="Oversampling of the (dP/dt)/P axis."
+    samples_per_drift: int | None = typer.Option(
+        None,
+        "--samples-per-drift",
+        help=_pdot_help("Oversampling of the (dP/dt)/P axis", "samples_per_drift"),
     ),
-    samples_per_peak: int = typer.Option(
-        10, "--samples-per-peak", help="Frequency oversampling inside the window."
+    samples_per_peak: int | None = typer.Option(
+        None,
+        "--samples-per-peak",
+        help=_pdot_help(
+            "Frequency oversampling inside the window", "samples_per_peak"
+        ),
     ),
-    window_rayleigh: float = typer.Option(
-        30.0, "--window-rayleigh", help="Frequency half-window in Rayleigh widths."
+    window_rayleigh: float | None = typer.Option(
+        None,
+        "--window-rayleigh",
+        help=_pdot_help(
+            "Frequency half-window in Rayleigh widths", "window_rayleigh"
+        ),
     ),
     pdot_range: str | None = typer.Option(
-        None, "--pdot-range", help="Explicit (dP/dt)/P bounds 'lo,hi' in 1/day."
+        None,
+        "--pdot-range",
+        help=_pdot_help(
+            "Explicit (dP/dt)/P bounds 'lo,hi' in 1/day",
+            "pdot_over_p_range",
+            "from --max-cycle-drift",
+        ),
     ),
     harmonics: int | None = typer.Option(
-        None, "--harmonics", help="Tracking template order (None = BIC-selected)."
+        None,
+        "--harmonics",
+        help=_pdot_help("Tracking template order", "harmonics", "BIC-selected"),
     ),
     segments: int | None = typer.Option(
         None,
         "--segments",
         min=4,
-        help="Target tracking segment count (at least 4; None = auto).",
+        help=_pdot_help(
+            "Target tracking segment count, at least 4", "n_segments", "auto"
+        ),
     ),
     harmonic_scale: float | None = typer.Option(
-        None, "--harmonic-scale", help="Extra (dP/dt)/P refinement (None = per method)."
+        None,
+        "--harmonic-scale",
+        help=_pdot_help(
+            "Extra (dP/dt)/P refinement", "harmonic_scale", "per method"
+        ),
     ),
     detrend_width: float | None = typer.Option(
         None, "--detrend-width", help="Running-median window (days) removed first."
@@ -1141,7 +1313,10 @@ def pdot_batch_cmd(
         None, "--profile-sink", help="Per-interval P(t) table (its own file or dir)."
     ),
     plots: Path | None = typer.Option(
-        None, "--plots", help="Directory for per-star figures (needs the [plot] extra)."
+        None,
+        "--plots",
+        # Rich markup reads a bare "[plot]" as a style tag and drops it.
+        help="Directory for per-star figures (needs: pip install 'cuperiod\\[plot]').",
     ),
     plot_keys: str | None = typer.Option(
         None, "--plot-keys", help="Restrict figures to these keys (comma-sep)."
@@ -1242,16 +1417,44 @@ _DATA_OPTION = typer.Option(
     "--data",
     exists=True,
     dir_okay=False,
-    help="Light-curve file to use instead of the project's own data (it must hold "
-    "the same points: the content hash is checked).",
+    help="Light-curve file to use instead of the project's own data, read with the "
+    "project's recorded columns and domain (it must hold the same points: the "
+    "content hash is checked).",
 )
 _SESSION_BACKEND_OPTION = typer.Option(
     None, help="Spectrum backend (default: the recorded one when available, else CPU)."
 )
 
 
-def _project_data(data: Path | None) -> LightCurve | None:
-    return None if data is None else LightCurve.from_file(data)
+def _project_data(project: Path, data: Path | None) -> LightCurve | None:
+    """``--data``: read the moved data file the way the project's own file was read.
+
+    Every project records its data's domain, and a project that references its
+    file records the column mapping it was read with (``prewhiten --time ...``, or
+    a GUI mapping), so the same file under another name needs neither repeated. A
+    project that cannot be read here is left for ``PreWhitenSession.load`` to
+    report.
+    """
+    if data is None:
+        return None
+    from cuperiod.prewhiten.session import ProjectError
+    from cuperiod.prewhiten.session.project import ProjectModel, read_document
+
+    try:
+        stored = ProjectModel.model_validate(read_document(project)).data
+    except (ProjectError, ValidationError):
+        return LightCurve.from_file(data)
+    columns = (
+        None
+        if stored.columns is None
+        else ColumnMap(
+            time=stored.columns.time,
+            value=stored.columns.value,
+            error=stored.columns.error,
+            band=stored.columns.band,
+        )
+    )
+    return LightCurve.from_file(data, columns=columns, domain=stored.domain)
 
 
 @contextlib.contextmanager
@@ -1259,18 +1462,22 @@ def _session_warnings() -> Iterator[None]:
     """Print a session's warnings as ``warning: ...`` lines, not Python tracebacks."""
     from cuperiod.prewhiten.session import SessionWarning
 
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always", SessionWarning)
-        try:
+    caught: list[warnings.WarningMessage] = []
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", SessionWarning)
             yield
-        finally:
-            for item in caught:
-                if issubclass(item.category, SessionWarning):
-                    typer.echo(f"warning: {item.message}", err=True)
-                else:
-                    warnings.warn_explicit(
-                        item.message, item.category, item.filename, item.lineno
-                    )
+    finally:
+        # Re-emitted only after the recording context has closed: inside it, each
+        # re-emitted warning was recorded again onto the list being walked, and
+        # the loop never ended (any non-session warning hung the command).
+        for item in caught:
+            if issubclass(item.category, SessionWarning):
+                typer.echo(f"warning: {item.message}", err=True)
+            else:
+                warnings.warn_explicit(
+                    item.message, item.category, item.filename, item.lineno
+                )
 
 
 @session_app.command("verify")
@@ -1285,7 +1492,7 @@ def session_verify_cmd(
 
     with _session_warnings():
         session = PreWhitenSession.load(
-            project, data=_project_data(data), verify=True, backend=backend
+            project, data=_project_data(project, data), verify=True, backend=backend
         )
     typer.echo(
         f"Verified {project}: its {len(session.history)} logged action(s) reproduce "
@@ -1308,7 +1515,7 @@ def session_script_cmd(
 
     with _session_warnings():
         session = PreWhitenSession.load(
-            project, data=_project_data(data), backend="cpu"
+            project, data=_project_data(project, data), backend="cpu"
         )
     written = session.export_script(out, title=project.name.split(".")[0])
     typer.echo(f"Wrote {written}")
@@ -1323,7 +1530,7 @@ def session_replay_cmd(
         "--out",
         "-o",
         dir_okay=False,
-        help="Save the replayed session (with its full undo history) as a project.",
+        help="Save the replayed session (its log and solution) as a new project.",
     ),
     data: Path | None = _DATA_OPTION,
     backend: str | None = _SESSION_BACKEND_OPTION,
@@ -1334,7 +1541,7 @@ def session_replay_cmd(
 
     with _session_warnings():
         stored = PreWhitenSession.load(
-            project, data=_project_data(data), backend=backend
+            project, data=_project_data(project, data), backend=backend
         )
         replayed = rerun(stored, backend=backend)
     typer.echo(replayed.result().summary())
@@ -1357,11 +1564,14 @@ def session_replay_cmd(
 @app.command()
 def methods() -> None:
     """List registered periodogram methods and their backends."""
-    typer.echo(f"  {'method':>6}  {'objective':>9}  {'multiband':>9}  backends")
-    for info in list_methods():
+    infos = list_methods()
+    # As wide as the longest name (STRINGLENGTH, SUPERSMOOTHER), so columns line up.
+    width = max([len("method"), *(len(info.name) for info in infos)])
+    typer.echo(f"  {'method':<{width}}  {'objective':>9}  {'multiband':>9}  backends")
+    for info in infos:
         mb = "yes" if info.supports_multiband else "no"
         typer.echo(
-            f"  {info.name:>6}  {info.objective_sense:>9}  {mb:>9}  "
+            f"  {info.name:<{width}}  {info.objective_sense:>9}  {mb:>9}  "
             f"{', '.join(info.all_backends)}"
         )
 
@@ -1429,27 +1639,35 @@ def doctor() -> None:
         else "  no CUDA device (needs the [gpu] extra and an NVIDIA GPU)"
     )
 
+    auto: dict[str, str] = {}
+    for m in list_methods():
+        try:
+            auto[m.name] = get_method(m.name).resolve_backend("auto")
+        except Exception as exc:  # pragma: no cover - defensive
+            auto[m.name] = f"error: {exc}"
+
     typer.echo("\nportable torch backend (AMD/Intel/Mac/CPU):")
     if not torch_available():
         typer.echo("  torch not installed — `pip install 'cuperiod[torch]'`")
     else:
         devices = torch_devices()
         best = best_torch_device()
+        # backend='auto' prefers the CUDA fast paths and the CPU kernels; it reaches
+        # torch only for a non-CPU torch device, so say so only when it does.
+        users = "backend='torch'"
+        if any(r == "torch" or r == f"torch:{best}" for r in auto.values()):
+            users += " and 'auto'"
         for d in ("cuda", "xpu", "mps", "cpu"):
             if d in devices:
-                tag = "   <- best (used by backend='auto')" if d == best else ""
+                tag = f"   <- best (used by {users})" if d == best else ""
                 prec = resolve_precision("auto", d)
                 typer.echo(f"  OK  torch:{d:4s} precision auto -> {prec}{tag}")
             else:
                 typer.echo(f"  --  torch:{d}")
 
     typer.echo("\nbackend='auto' resolves to:")
-    for m in list_methods():
-        try:
-            resolved = get_method(m.name).resolve_backend("auto")
-        except Exception as exc:  # pragma: no cover - defensive
-            resolved = f"error: {exc}"
-        typer.echo(f"  {m.name:14s} {resolved}")
+    for name, resolved in auto.items():
+        typer.echo(f"  {name:14s} {resolved}")
 
 
 @app.command(name="grid-info")
@@ -1479,8 +1697,13 @@ def grid_info_cmd(
 
 
 def main() -> None:
-    """Console-script entry point."""
-    app()
+    """Console-script entry point.
+
+    ``windows_expand_args=False``: on Windows, click would otherwise expand a quoted
+    glob (``"lcs/*.csv"``) into one argument per match, which the single-``INPUTS``
+    batch commands reject. They resolve globs themselves, as on POSIX shells.
+    """
+    app(windows_expand_args=False)
 
 
 __all__ = ["app", "main"]

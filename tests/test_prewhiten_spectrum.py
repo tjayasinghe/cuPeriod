@@ -496,6 +496,7 @@ def test_ill_conditioned_zone_reports_the_power_equivalent_amplitude() -> None:
 def test_numpy_direct_sums_match_a_brute_force_sum() -> None:
     # PERF-PREWHITEN-09: the numpy direct path is a mat-vec now; it must still be the
     # transparent reference and must not depend on the frequency chunking.
+    from cuperiod.core._arrayapi import array_namespace
     from cuperiod.prewhiten.spectrum import _direct_trig_sums
 
     rng = np.random.default_rng(4)
@@ -505,8 +506,10 @@ def test_numpy_direct_sums_match_a_brute_force_sum() -> None:
     expected = np.exp(
         2j * np.pi * (f0 + df * np.arange(nf))[:, None] * tau[None, :]
     ) @ strengths
-    cos_a, sin_a = _direct_trig_sums(np, tau, strengths, f0, df, nf, 4096)
-    cos_b, sin_b = _direct_trig_sums(np, tau, strengths, f0, df, nf, 37)
+    # The array-API namespace, as production passes: raw numpy < 2 has no device=.
+    xp = array_namespace(tau)
+    cos_a, sin_a = _direct_trig_sums(xp, tau, strengths, f0, df, nf, 4096)
+    cos_b, sin_b = _direct_trig_sums(xp, tau, strengths, f0, df, nf, 37)
     assert np.max(np.abs(cos_a - expected.real)) < 1e-12
     assert np.max(np.abs(sin_a - expected.imag)) < 1e-12
     scale = float(np.abs(strengths).sum())

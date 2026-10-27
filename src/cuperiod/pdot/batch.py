@@ -94,7 +94,7 @@ from cuperiod.pdot.laws import (
     available_laws,
     compare_period_laws,
 )
-from cuperiod.pdot.ltte import LTTESearchResult, ltte_search
+from cuperiod.pdot.ltte import LTTEFit, LTTESearchResult, ltte_search
 from cuperiod.pdot.models import get_model
 from cuperiod.pdot.profile import PeriodProfile, period_profile
 from cuperiod.pdot.result import PdotSearchResult
@@ -132,6 +132,11 @@ _WRITE_ORDER: tuple[str, ...] = ("oc", "profile", "summary")
 #: directory sink pins their layout): enough that one slow star does not leave the
 #: other workers idle at the end, few enough that per-task overhead stays small.
 _TASKS_PER_WORKER = 4
+
+#: Smallest ΔBIC (cycle over the polynomial alone) at which a figure draws the
+#: light-time orbit: the "conventionally strong" level of :class:`~cuperiod.LTTEFit`
+#: and the detection threshold of the LTTE recovery benchmark.
+_FIGURE_LTTE_MIN_DELTA_BIC = 10.0
 
 
 @dataclass(frozen=True)
@@ -623,13 +628,46 @@ def _write_figure(
             track=track,
             profile=profile,
             law=laws[0] if laws else None,
-            ltte=cyclic.best if cyclic is not None else None,
+            ltte=_figure_orbit(cyclic),
             title=key,
             path=path,
         )
         return str(path)
-    except Exception:  # noqa: BLE001 - a missing matplotlib must not fail a run
+    except Exception:  # noqa: BLE001 - one unplottable star must not fail a run
         return ""
+
+
+def _figure_orbit(cyclic: LTTESearchResult | None) -> LTTEFit | None:
+    """The light-time orbit a figure draws: only one the O-C supports.
+
+    The cyclic search always returns its best trial, detected or not; drawn on the
+    O-C panel and labelled with its period and amplitude, a non-detection reads as
+    a fitted orbit. It is drawn when ΔBIC > :data:`_FIGURE_LTTE_MIN_DELTA_BIC` and
+    the best outer period is not at the edge of the scanned range.
+    """
+    if cyclic is None:
+        return None
+    best = cyclic.best
+    if not (best.delta_bic > _FIGURE_LTTE_MIN_DELTA_BIC) or best.at_grid_edge:
+        return None
+    return best
+
+
+def _require_matplotlib() -> None:
+    """Refuse ``plots=`` up front when matplotlib is missing.
+
+    Per-star plotting failures are swallowed by design, so a missing matplotlib
+    would otherwise fail every star the same silent way: a finished run with an
+    empty ``figure`` column and no word of the ``[plot]`` extra.
+    """
+    try:
+        import matplotlib  # noqa: F401  (importability probe only)
+    except ImportError as exc:
+        raise ImportError(
+            "batch_pdot(plots=...) needs matplotlib, which is an optional "
+            "dependency. Install it with:\n"
+            "    pip install 'cuperiod[plot]'"
+        ) from exc
 
 
 #: Longest figure stem, digest included; well inside every file system's limit.
@@ -1067,9 +1105,12 @@ def batch_pdot(
         Directory for per-star diagnostic figures (one PNG per light curve,
         named after the key; a key that is not a plain file name, or that differs
         from another only in letter case, gets a short digest appended so no
-        figure overwrites another). Needs matplotlib; a plotting failure is
-        recorded as an empty ``figure`` cell and never fails the analysis.
-        Generating thousands of figures is slow — pair it with ``plot_keys``.
+        figure overwrites another). Needs matplotlib (the ``[plot]`` extra),
+        checked before any input is read; a plotting failure is recorded as an
+        empty ``figure`` cell and never fails the analysis. The O-C panel draws the
+        light-time orbit only when ``ltte`` found one the O-C supports (ΔBIC > 10
+        and the outer period not at the edge of the scan). Generating thousands of
+        figures is slow — pair it with ``plot_keys``.
     plot_keys : str or sequence, optional
         Restrict figures to these keys (matched as strings; a bare string is
         one key).
@@ -1108,6 +1149,9 @@ def batch_pdot(
         ``detrend_width``, or directory sinks sharing one directory.
     TypeError
         If ``period`` is neither a number nor a mapping.
+    ImportError
+        If ``plots`` is given and matplotlib is not installed (the ``[plot]``
+        extra), before any light curve is touched.
 
     Warns
     -----
@@ -1127,6 +1171,8 @@ def batch_pdot(
     """
     if device not in {"cpu", "gpu"}:
         raise ValueError("device must be 'cpu' or 'gpu'")
+    if plots is not None:
+        _require_matplotlib()
     _warn_dead_batch_env()
     if detrend_width is not None and not (
         np.isfinite(detrend_width) and detrend_width > 0.0

@@ -17,10 +17,11 @@ Each interval's period comes from minimizing the chi-squared of a fixed-order
 harmonic model over frequency — multi-harmonic AOV, the same statistic
 Schwarzenberg-Czerny (1996) built for non-sinusoidal light curves — with the
 uncertainty read off the curvature of that chi-squared at its minimum. The
-harmonic order is chosen once, on a single central interval and by a criterion
-that does not trust the quoted photometric errors, then held fixed — so every
-point on the track is measured the same way and the intervals are comparable to
-each other, which is what a subsequent law fit needs.
+harmonic order is chosen once — by a scale-free BIC, a criterion that does not
+trust the quoted photometric errors, as the median of the orders picked on up to
+five intervals spread across the baseline — then held fixed, so every point on
+the track is measured the same way and the intervals are comparable to each
+other, which is what a subsequent law fit needs.
 
 Interval periods are searched only inside a narrow window around the reference
 period (``period_window``, a fractional half-width). That is a deliberate
@@ -529,8 +530,10 @@ def period_profile(
         Fractional half-width of the per-interval search window (default 0.05,
         i.e. +-5% in period). Must contain the true total period change.
     harmonics : int, optional
-        Harmonic order of the shared template. ``None`` selects it by BIC on the
-        whole light curve and then holds it fixed across intervals.
+        Harmonic order of the shared template. ``None`` chooses it once, by a
+        scale-free BIC (``n*ln(chi2/n) + k*ln(n)``, blind to the overall error
+        scale), as the median of the orders picked on up to five intervals spread
+        across the baseline, and then holds it fixed across every interval.
     measure_pdot : bool, default False
         Also run a small joint (P, dP/dt) search inside each interval. Rarely
         worth it — an interval short enough to have a constant period is usually
