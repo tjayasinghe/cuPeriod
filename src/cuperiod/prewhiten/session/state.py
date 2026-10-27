@@ -164,7 +164,10 @@ class Component:
         ``renumber``.
     frequency, amplitude, phase : float
         The values (phase in radians at the session's ``t_ref``). The amplitude is
-        signed: negative only under a fixed phase.
+        signed: negative only under a fixed phase. Under phase variation it is the
+        coherent headline ``A |mean exp(i phi_s)|`` the fit reports, except for a
+        fixed amplitude: that stays the held amplitude ``A`` of every subset, and
+        only the fit's result reports the (smaller) headline.
     active : bool
         Inactive rows keep their values but leave the model and the peak search.
     fix_frequency, fix_amplitude, fix_phase : bool

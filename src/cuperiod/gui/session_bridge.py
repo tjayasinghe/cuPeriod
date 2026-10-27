@@ -35,6 +35,7 @@ Session jobs never read :attr:`ComputeManager.generation` (see
 
 from __future__ import annotations
 
+import threading
 import time
 import warnings
 from collections import OrderedDict, deque
@@ -120,6 +121,68 @@ class _Outcome:
     warnings: tuple[str, ...] = ()
 
 
+#: Per thread: the list a running :func:`_making` records session warnings into
+#: (``caught``); unset, or None, everywhere else.
+_capture = threading.local()
+
+_HOOK_LOCK = threading.Lock()
+
+
+class _CaptureHook:
+    """:mod:`warnings`' output hook, wrapped: a session warning raised on a thread
+    whose :func:`_making` is recording goes to that thread's list; everything else
+    goes on to the hook it wraps, unchanged."""
+
+    def __init__(self, inner: Callable[[warnings.WarningMessage], None]) -> None:
+        self._inner = inner
+
+    def __call__(self, message: warnings.WarningMessage) -> None:
+        caught: list[warnings.WarningMessage] | None = getattr(
+            _capture, "caught", None
+        )
+        if caught is not None:
+            from cuperiod.prewhiten.session.state import SessionWarning
+
+            if issubclass(message.category, SessionWarning):
+                caught.append(message)
+                return
+        self._inner(message)
+
+
+def _install_hook() -> None:
+    """Wrap :mod:`warnings`' output hook in a :class:`_CaptureHook`, once.
+
+    ``warnings._showwarnmsg`` is the hook every shown warning goes through (the
+    module says to replace it at will); ``catch_warnings`` never swaps it, so a
+    block on another thread neither bypasses nor removes the wrapper. A Python
+    without that hook keeps its warnings as they were (shown, not recorded).
+    """
+    with _HOOK_LOCK:
+        current = getattr(warnings, "_showwarnmsg", None)
+        if callable(current) and not isinstance(current, _CaptureHook):
+            warnings._showwarnmsg = _CaptureHook(current)  # type: ignore[attr-defined]
+
+
+def _install_warning_capture() -> None:
+    """Let :func:`_making` record session warnings; call on the GUI thread.
+
+    ``warnings.catch_warnings`` swaps the process-wide filters and output hook and
+    is not thread-safe: on the worker it raced with the GUI thread's own (the file
+    loader records the reader's warnings that way), and the exits could interleave
+    so that every later warning of the process went to a list nobody read. Instead
+    the output hook is wrapped once (:class:`_CaptureHook`), and a filter shows
+    every :class:`~cuperiod.prewhiten.session.state.SessionWarning`, not just the
+    first from each place (opening the same project twice warns twice). Nothing
+    else about warnings changes. Called by every :class:`SessionBridge`; repeating
+    it does nothing.
+    """
+    from cuperiod.prewhiten.session.state import SessionWarning
+
+    _install_hook()
+    if ("always", None, SessionWarning, None, 0) not in warnings.filters:
+        warnings.filterwarnings("always", category=SessionWarning)
+
+
 def _making(
     make: Callable[[], PreWhitenSession],
 ) -> tuple[PreWhitenSession, tuple[str, ...]]:
@@ -127,23 +190,30 @@ def _making(
 
     A :class:`~cuperiod.prewhiten.session.state.SessionWarning` (opening a project
     saved on a GPU machine here, replaying a log whose stored values differ) is
-    meant for the user, and from the worker it reached only stderr. Any other
-    warning is issued again unchanged.
+    meant for the user, and from the worker it reached only stderr. Those raised on
+    this thread while ``make()`` runs are recorded without touching the process-wide
+    warning state (see :func:`_install_warning_capture`); any other warning is
+    shown as it is raised, unchanged. When ``make()`` fails, the recorded texts are
+    added to the exception's notes, which the failure message lists.
     """
-    from cuperiod.prewhiten.session.state import SessionWarning
-
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always", SessionWarning)
+    _install_hook()  # a no-op once the bridge installed it on the GUI thread
+    outer = getattr(_capture, "caught", None)
+    caught: list[warnings.WarningMessage] = []
+    _capture.caught = caught
+    try:
         session = make()
-    texts: list[str] = []
-    for item in caught:
-        if issubclass(item.category, SessionWarning):
-            texts.append(str(item.message))
-        else:
-            warnings.warn_explicit(
-                item.message, item.category, item.filename, item.lineno
-            )
-    return session, tuple(dict.fromkeys(texts))
+    except Exception as exc:
+        for text in _texts(caught):
+            exc.add_note(f"Warning: {text}")
+        raise
+    finally:
+        _capture.caught = outer
+    return session, _texts(caught)
+
+
+def _texts(caught: Sequence[warnings.WarningMessage]) -> tuple[str, ...]:
+    """The distinct texts of recorded warnings, in order."""
+    return tuple(dict.fromkeys(str(item.message) for item in caught))
 
 
 def _sentence(text: str) -> str:
@@ -319,6 +389,7 @@ class SessionBridge(QObject):
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
+        _install_warning_capture()  # on the GUI thread, before any job runs
         self._compute = compute
         self._max_clean = max(0, int(max_clean))
         self._progress_interval = max(0.0, float(progress_interval))

@@ -212,13 +212,15 @@ time; the `gui` extra is not needed for that.
 
 1. Cut the version's metadata and merge. Every file that names the version changes
    together:
-   - `version` in `pyproject.toml`, and the source-tree fallback `__version__` in
-     `src/cuperiod/__init__.py`;
+   - `version` in `pyproject.toml`, and the source-tree fallbacks: `__version__` in
+     `src/cuperiod/__init__.py` and `release` in `docs/conf.py`;
    - `uv.lock`, refreshed with `uv lock` so its `cuperiod` entry carries the new version;
    - `version` and `date-released` in `CITATION.cff`;
    - `CHANGELOG.md`: retitle `[Unreleased]` to `[<version>] - <date>` and add its
      compare link (`[<version>]: …/compare/v<previous>...v<version>`) at the bottom;
-   - the README's citation note, which says what each release added.
+   - the README's citation note, which says what each release added;
+   - `benchmarks/REPORT.md` names the version it was measured with
+     (`benchmarks/make_report.py` writes it from `cuperiod.__version__`).
 2. Push the tag `v<version>`. The release workflow builds the package and refuses to
    publish when the tag does not equal the built version (tagging `v1.3.0` while
    `pyproject.toml` still says `1.3.0.dev0`, for example).

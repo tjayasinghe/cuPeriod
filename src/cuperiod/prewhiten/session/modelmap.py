@@ -251,12 +251,32 @@ def _expand(
     return tuple(float(v) for v in out)
 
 
+def _held_amplitude(mm: ModelMap, position: int) -> float | None:
+    """The amplitude the fit held at ``position`` when it reports another, else None.
+
+    A fixed amplitude on a component whose phase varies per subset is the amplitude
+    ``A`` of every subset, while the fit's headline is their coherent mean
+    ``A |mean exp(i phi_s)|``, smaller whenever the subset phases differ. Writing the
+    headline back would fix a smaller amplitude at the next fit, and again at every
+    fit after it, so the component keeps ``A`` (bit for bit) and the fit's result
+    reports the headline.
+    """
+    if mm.constraints is None or position >= len(mm.constraints.components):
+        return None
+    constraint = mm.constraints.components[position]
+    if constraint.amplitude is None or not constraint.varies_phase:
+        return None
+    return float(constraint.amplitude)
+
+
 def apply(state: SessionState, fit: MultiSineFit, mm: ModelMap) -> StateUpdate:
     """Write ``fit`` (built from ``mm``) back onto the components of ``state``.
 
     Frequencies, signed amplitudes and phases go to the ids of ``mm``; per-subset
     amplitudes and phases are expanded onto the full variation partition (NaN for a
-    subset with no point in use); components outside the fit are unchanged.
+    subset with no point in use); components outside the fit are unchanged. A fixed
+    amplitude under phase variation keeps the value the fit held, not the fit's
+    smaller coherent headline (see :func:`_held_amplitude`).
     """
     detail = fit.detail
     position = {cid: i for i, cid in enumerate(mm.ids)}
@@ -274,11 +294,12 @@ def apply(state: SessionState, fit: MultiSineFit, mm: ModelMap) -> StateUpdate:
                 subset_amplitude = _expand(amplitudes[i], subsets, total)
             if c.variation in ("phase", "both") and phases is not None:
                 subset_phase = _expand(phases[i], subsets, total)
+        held = _held_amplitude(mm, i)
         components.append(
             replace(
                 c,
                 frequency=float(fit.frequency[i]),
-                amplitude=float(fit.amplitude[i]),
+                amplitude=float(fit.amplitude[i]) if held is None else held,
                 phase=float(fit.phase[i]),
                 subset_amplitude=subset_amplitude,
                 subset_phase=subset_phase,

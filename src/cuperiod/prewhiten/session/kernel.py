@@ -724,14 +724,21 @@ def _partition_key(state: SessionState, name: str | None) -> tuple[Any, ...] | N
 
 
 def _drift(state: SessionState, fit: MultiSineFit) -> float:
-    """Largest relative difference between stored and rebuilt component values."""
+    """Largest relative difference between stored and rebuilt component values.
+
+    A fixed amplitude under phase variation is held, and the fit reports the smaller
+    coherent headline instead (``modelmap.apply`` keeps the held value), so it is not
+    compared.
+    """
     worst = 0.0
     for i, c in enumerate(state.active):
         if i >= fit.n_components:
             break
+        held = c.fix_amplitude and c.variation == "phase"
+        amplitude = c.amplitude if held else float(fit.amplitude[i])
         pairs = (
             (c.frequency, float(fit.frequency[i]), abs(c.frequency)),
-            (c.amplitude, float(fit.amplitude[i]), abs(c.amplitude)),
+            (c.amplitude, amplitude, abs(c.amplitude)),
         )
         for stored, rebuilt, scale in pairs:
             if scale > 0.0 and np.isfinite(stored) and np.isfinite(rebuilt):

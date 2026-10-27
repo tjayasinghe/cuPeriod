@@ -36,7 +36,7 @@ independent implementations.
   independent reference implementation (PyAstronomy, the `supersmoother` package and
   gatspy, or a direct implementation of the published algorithm) on identical grids.
   Across the seven benchmark-suite methods, CPU, CUDA, and the portable PyTorch backend
-  agree to within 3e-6 relative (round-off for BLS, PDM, CE and String-Length; GLS, whose
+  agree to about 3e-6 relative (round-off for BLS, PDM, CE and String-Length; GLS, whose
   sums are NUFFTs, is the loosest) and pick the identical best period on 126 real ASAS-SN
   light curves across six variability classes (the 28 eclipsing binaries among them for
   TLS), with 88–96% harmonic-aware period recovery on this deliberately heterogeneous

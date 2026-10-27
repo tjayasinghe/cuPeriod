@@ -9,6 +9,7 @@ light curve and written as Parquet (default) or CSV.
 
 from __future__ import annotations
 
+import fnmatch
 import glob as _glob
 import numbers
 import os
@@ -250,6 +251,67 @@ def _resolve_path_like(inputs: str | os.PathLike[str]) -> list[Path]:
             raise FileNotFoundError(f"glob pattern {text!r} matched no files")
         return sorted(Path(p) for p in matches)
     raise FileNotFoundError(f"no such file, directory, or glob match: {text!r}")
+
+
+#: Suffixes that make a sink a single file; any other sink is a directory.
+_FILE_SINK_SUFFIXES = frozenset({".parquet", ".pq", ".csv"})
+
+#: What a directory sink writes inside itself: its part files, its manifest and the
+#: CLI's errors list, each also as a dot-prefixed temporary or ``.corrupt-*`` copy.
+_DIR_SINK_FILES = ("part-*", "_manifest.json*", "_errors.csv*")
+
+
+def _resolve_input_files(
+    inputs: str | os.PathLike[str],
+    *,
+    outputs: Iterable[str | os.PathLike[str]] = (),
+) -> list[Path]:
+    """The files a path-like batch input names, less the batch's own ``outputs``.
+
+    A batch whose sink sits inside its own input (``"*.csv"`` with ``--out
+    results.csv``) otherwise reads its previous results, and the errors list beside
+    them, as light curves when it is run again. A file output excludes itself and,
+    beside it, the ``.corrupt-*`` copies a resume sets aside and the dot-prefixed
+    temporary files of its write-then-rename. A directory output (no file suffix)
+    excludes what it writes inside itself (:data:`_DIR_SINK_FILES`), not the rest of
+    its contents: a directory sink may be the input folder itself. Folders are
+    compared resolved, each one once.
+
+    Raises
+    ------
+    FileNotFoundError
+        As :func:`_resolve_path_like`.
+    """
+    paths = _resolve_path_like(inputs)
+    files: list[Path] = []
+    dirs: list[Path] = []
+    for output in outputs:
+        out = Path(output)
+        kind = files if out.suffix.lower() in _FILE_SINK_SUFFIXES else dirs
+        kind.append(out.resolve())
+    if not files and not dirs:
+        return paths
+    folders: dict[Path, tuple[tuple[str, ...], bool]] = {}
+
+    def owned(path: Path) -> bool:
+        info = folders.get(path.parent)
+        if info is None:
+            folder = path.parent.resolve()
+            names = tuple(os.path.normcase(f.name) for f in files if f.parent == folder)
+            info = folders[path.parent] = (names, folder in dirs)
+        names, in_dir_sink = info
+        name = os.path.normcase(path.name)
+        if in_dir_sink and any(
+            fnmatch.fnmatch(name.removeprefix("."), pattern)
+            for pattern in _DIR_SINK_FILES
+        ):
+            return True
+        return any(
+            name == own or name.startswith((f"{own}.corrupt-", f".{own}."))
+            for own in names
+        )
+
+    return [path for path in paths if not owned(path)]
 
 
 def _escape_existing_prefix(text: str) -> str | None:

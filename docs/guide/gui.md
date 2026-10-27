@@ -147,19 +147,24 @@ lets you choose:
   *none*), pre-filled with what cuPeriod auto-detects — the same
   {class}`~cuperiod.ColumnMap` resolution described under {doc}`light-curves`;
 - whether the values are **Magnitudes** or **Fluxes**. Until you choose, the brightness
-  column's name decides (`flux`, `uJy`, `mag_g`, …); the previous file's choice is used
-  only for a column whose name says neither (`V`, `col2`), and magnitudes otherwise;
+  column's name decides (`flux`, `uJy`, `mag_g`, …); a choice you made yourself for an
+  earlier file is used only for a column whose name says neither (`V`, `col2`), and
+  magnitudes otherwise. Only what you chose carries over to the next file: a column
+  you picked applies where that file has it, and a *none* for error or band never hides
+  a column the next file has;
 - for text tables, the **delimiter** and whether the **first row holds the column
   names** — semicolon-separated and headerless files (OGLE, Period04 `JD mag err`) are
-  recognised on opening. The file's own look comes first: the previous file's read
-  options are tried only when it does not split into columns by itself.
+  recognised on opening, also when the first row has a missing value (`nan`, an empty
+  cell). The file's own look comes first: the previous file's read options are tried
+  only when it does not split into columns by itself.
 
 The *File* tab labels each column's role and the *As loaded* tab shows the first rows
 exactly as they will be read, at full precision. A note names the time scale the numbers
 look like (BJD, HJD, MJD, BTJD, …) and warns when they look like seconds or decimal
 years. **Load** is unavailable, with the reason shown, while the chosen columns cannot
-work (unset, clashing, not numeric) or while a header row would be read as data (text
-names above numbers with *First row holds the column names* unticked). The dialog
+work (unset, clashing, not numeric) or while a header row would be read as data (the
+time column's first cell is text above numbers with *First row holds the column names*
+unticked). The dialog
 offers the last file's columns again where the new file has them, remembers that
 choice across launches, and never blocks the window.
 

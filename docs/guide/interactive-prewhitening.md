@@ -554,7 +554,10 @@ subset is barely determined. A varying component's headline amplitude and phase 
 **coherent** (phasor-mean) values — what the spectrum sees — while its significance
 (S/N, `A/Asp`, the `!` mark) uses its **RMS amplitude** `amplitude_rms`, since the
 coherent mean shrinks when the phases wander; varying components are never pruned.
-Per-subset values are in `result.subsets.amplitude` / `.phase`.
+Per-subset values are in `result.subsets.amplitude` / `.phase`. A fixed amplitude on a
+component whose phase varies is the amplitude of every subset and is held exactly:
+`session.components` and the table show it, while the result reports the smaller
+coherent amplitude.
 
 ### Undo, redo and the history
 
@@ -642,8 +645,9 @@ copy = cup.PreWhitenSession.replay((time, mag, err), session.history, settings=s
   project at its stored state (no replay). `verify=True` first replays the log on a fresh
   session and raises {class}`~cuperiod.ProjectError` unless the stored state follows
   from it (frequencies to 1e-9 relative, amplitudes and phases to 1e-6). `data=` supplies
-  the light curve when the referenced file has moved; it is still checked against the
-  stored content hash, unless `allow_modified_data=True`, which re-fits the stored
+  the light curve when the referenced file has moved — a light curve, arrays, a table, or
+  a file path, read with the project's recorded columns and domain (detected columns
+  when the file lacks them); it is still checked against the stored content hash, unless `allow_modified_data=True`, which re-fits the stored
   solution to the new data. `backend=None` uses the recorded backend when this machine
   has it, else the best CPU backend (with a {class}`~cuperiod.SessionWarning`).
 - `replay(data, log, **create)` creates a new session and applies a log entry by entry;
@@ -694,12 +698,12 @@ is safe to open:
   overflow a float and duplicate keys are refused;
 - its size is checked before it is read (`SessionSettings.max_project_bytes`, 64 MiB),
   the log length is capped (`max_actions`, 100 000) and so are the number of points and
-  the grid size: a project's grid may hold at most max(2 × 10⁷, 64 per data point)
-  frequencies, and never more than 10⁸, so a small file cannot name a grid that keeps
-  `load` busy for hours;
+  the grid size (at most 10⁸ frequencies);
 - a project recorded on the direct `numpy` backend whose spectrum would cost more than
   2 × 10⁹ evaluations (points × grid frequencies) opens on the NUFFT CPU backend
-  instead, with a {class}`~cuperiod.SessionWarning`, unless you pass `backend=`;
+  instead, with a {class}`~cuperiod.SessionWarning`, unless you pass `backend=`, so a
+  small file cannot name a grid that keeps `load` busy for hours (on NUFFT the cost
+  hardly grows with the number of points: 2 × 10⁷ frequencies open in seconds);
 - every object is validated by a strict model (unknown fields refused, no type
   coercion), and every cross reference — component ids, ties, partitions, roles, the
   point mask — is checked against the data before the session exists;
@@ -707,8 +711,8 @@ is safe to open:
 - the source file an embedded project names in its data's metadata (`data.meta.source`)
   is kept only as a record, under `meta["recorded_source"]`: a later `save` or
   `export_script` never re-reads it. Only a source set in this process (by
-  `LightCurve.from_file`) is re-read, and a URL, a network (UNC) path or a
-  drive-relative path is refused before any file-system call;
+  `LightCurve.from_file`, or the GUI's loader) is re-read, from wherever it was read
+  (a network share included); a URL is refused before any file-system call;
 - the data must match the stored content hash;
 - tie expressions are parsed, never evaluated, and exported scripts carry free text only
   as sanitised comments;

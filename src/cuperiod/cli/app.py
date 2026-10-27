@@ -23,8 +23,13 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import glob
 import json
 import math
+import ntpath
+import os
+import re
+import sys
 import warnings
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import replace
@@ -33,10 +38,12 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import numpy as np
 import typer
+import typer.core
+import typer.main
 from pydantic import ValidationError
 
 from cuperiod.api import periodogram
-from cuperiod.batch.io import alias_diverse_for, write_rows
+from cuperiod.batch.io import _resolve_input_files, alias_diverse_for, write_rows
 from cuperiod.batch.runner import BatchSummary, batch_periodograms
 from cuperiod.core.columns import ColumnMap, Domain, coerce_domain
 from cuperiod.core.config import PdotSettings, PreWhitenSettings
@@ -180,6 +187,22 @@ def _errors_file(sink: Path) -> Path:
     if sink.suffix.lower() in {".parquet", ".pq", ".csv"}:
         return sink.with_name(f"{sink.stem}.errors.csv")
     return sink / "_errors.csv"
+
+
+def _batch_inputs(inputs: str, outputs: Sequence[Path | None]) -> str | list[Path]:
+    """``INPUTS`` as the files it names, less the command's own ``outputs``.
+
+    A rerun of a batch whose sink matches its own glob read the previous results
+    and the errors list as light curves, which failed and made the rerun exit 1.
+    An ``INPUTS`` that names nothing is passed on as given: the driver reports it,
+    after checking its other options.
+    """
+    try:
+        return _resolve_input_files(
+            inputs, outputs=[out for out in outputs if out is not None]
+        )
+    except FileNotFoundError:
+        return inputs
 
 
 def _report_batch(
@@ -344,9 +367,10 @@ def batch(
     """
     columns = _column_map(time, value, error, None)
     sink = _sink_path(out)
+    errors_file = _errors_file(sink)
     try:
         summary = batch_periodograms(
-            inputs,
+            _batch_inputs(inputs, [sink, errors_file]),
             _parse_methods(method),
             backend=backend,
             device=_device(device),
@@ -371,7 +395,7 @@ def batch(
         f"({summary.n_skipped} skipped, {summary.n_failed} failed{workers_note}) "
         f"-> {summary.sink}"
     )
-    _report_batch(summary, errors_file=_errors_file(sink))
+    _report_batch(summary, errors_file=errors_file)
 
 
 def _prewhiten_settings(
@@ -561,12 +585,14 @@ def prewhiten(
             arrays["window_amplitude"] = result.window.amplitude
         _save_npz(save_spectrum, arrays)
     # The script does not depend on the project file: a failed save must not cost it.
-    failure: CuPeriodError | None = None
+    failure: Exception | None = None
     if session is not None and save_project is not None:
         try:
             _save_project(session, save_project, title=path.stem)
         except CuPeriodError as exc:
             failure = exc
+        except OSError as exc:  # a missing or unwritable folder
+            failure = _unwritable(save_project, "--save-project", exc)
         else:
             typer.echo(f"Wrote {save_project}")
     if session is not None and export_script is not None:
@@ -574,6 +600,16 @@ def prewhiten(
         typer.echo(f"Wrote {written}")
     if failure is not None:
         raise failure
+
+
+def _unwritable(path: Path, option: str, exc: OSError) -> typer.BadParameter:
+    """A usage error naming the file asked for, not the temporary file it failed on."""
+    reason = (
+        f"its folder {path.parent} does not exist"
+        if not path.parent.is_dir()
+        else exc.strerror or str(exc)
+    )
+    return typer.BadParameter(f"cannot write {path}: {reason}", param_hint=option)
 
 
 def _save_project(session: PreWhitenSession, path: Path, *, title: str) -> None:
@@ -584,15 +620,28 @@ def _save_project(session: PreWhitenSession, path: Path, *, title: str) -> None:
     ``embed_data_max_points`` (``CUPERIOD_SESSION_EMBED_DATA_MAX_POINTS``) without
     being asked. Asking for ``--save-project`` is that request, made after the run
     it saves: it is embedded anyway, with a note (``max_project_bytes`` still caps
-    the file).
+    the file). When that fails too, the error keeps the first refusal's remedy:
+    referencing the data file instead.
     """
     try:
         session.save(path, title=title)
-    except CuPeriodError:
+    except CuPeriodError as refused:
         n = session.kernel.data.n
-        if n <= session.session_settings.embed_data_max_points:
+        # Only the refusal to embed is retried: any other (a referenced project
+        # that is too large, say) would only grow or fail the same way.
+        if (
+            n <= session.session_settings.embed_data_max_points
+            or "embed_data_max_points" not in str(refused)
+        ):
             raise
-        session.save(path, title=title, embed_data="always")
+        try:
+            session.save(path, title=title, embed_data="always")
+        except CuPeriodError as exc:
+            from cuperiod.prewhiten.session import ProjectError
+
+            raise ProjectError(
+                f"{exc}, with all {n} data points embedded. They had to be: {refused}"
+            ) from exc
         typer.echo(
             f"note: embedded all {n} data points in {path.name} (more than "
             "embed_data_max_points, but the data file cannot be referenced from the "
@@ -691,10 +740,11 @@ def batch_prewhiten_cmd(
         store_spectra=False,
     )
     sink = _sink_path(out)
+    errors_file = _errors_file(sink)
     extra: dict[str, Any] = {} if chunk_size is None else {"chunk_size": chunk_size}
     try:
         summary = _batch_prewhiten(
-            inputs,
+            _batch_inputs(inputs, [sink, errors_file]),
             settings=settings,
             backend=backend,
             device=_device(device),
@@ -711,7 +761,7 @@ def batch_prewhiten_cmd(
         f"Wrote {summary.n_done} component rows from {summary.n_inputs} inputs "
         f"({summary.n_skipped} skipped, {summary.n_failed} failed) -> {summary.sink}"
     )
-    _report_batch(summary, errors_file=_errors_file(sink))
+    _report_batch(summary, errors_file=errors_file)
 
 
 def _pdot_range(value: str | None) -> tuple[float, float] | None:
@@ -1359,7 +1409,7 @@ def pdot_batch_cmd(
     )
     try:
         summary = _batch_pdot(
-            inputs,
+            _batch_inputs(inputs, [sink, oc_sink, profile_sink]),
             period=seed_period,
             method=method,
             model=_period_model(model),
@@ -1432,8 +1482,10 @@ def _project_data(project: Path, data: Path | None) -> LightCurve | None:
     Every project records its data's domain, and a project that references its
     file records the column mapping it was read with (``prewhiten --time ...``, or
     a GUI mapping), so the same file under another name needs neither repeated. A
-    project that cannot be read here is left for ``PreWhitenSession.load`` to
-    report.
+    file without the recorded columns (the same points re-exported under another
+    header) is read with detected ones instead: the content hash, checked on
+    loading, still guards that the points are the same. A project that cannot be
+    read here is left for ``PreWhitenSession.load`` to report.
     """
     if data is None:
         return None
@@ -1454,7 +1506,20 @@ def _project_data(project: Path, data: Path | None) -> LightCurve | None:
             band=stored.columns.band,
         )
     )
-    return LightCurve.from_file(data, columns=columns, domain=stored.domain)
+    try:
+        return LightCurve.from_file(data, columns=columns, domain=stored.domain)
+    except ColumnResolutionError as recorded:
+        if columns is None:
+            raise
+        try:
+            lc = LightCurve.from_file(data, domain=stored.domain)
+        except ColumnResolutionError:
+            raise recorded from None
+        typer.echo(
+            f"note: {data.name} lacks the project's recorded columns ({recorded}); "
+            "it was read with detected columns instead"
+        )
+        return lc
 
 
 @contextlib.contextmanager
@@ -1598,9 +1663,7 @@ def doctor() -> None:
     backends, the NVIDIA CUDA fast paths, the portable torch backend and its devices
     (CUDA/ROCm/MPS/XPU/CPU), and what ``backend="auto"`` resolves to per method.
     """
-    import os
     import platform
-    import sys
     from importlib.metadata import PackageNotFoundError
     from importlib.metadata import version as _pkg_version
 
@@ -1696,14 +1759,103 @@ def grid_info_cmd(
     )
 
 
+#: Commands whose single ``INPUTS`` argument is a glob they resolve themselves.
+_BATCH_COMMANDS = frozenset({"batch", "batch-prewhiten", "pdot-batch"})
+
+
+def _on_windows() -> bool:
+    """Whether the console script expands its arguments itself (no shell does)."""
+    return os.name == "nt"
+
+
+def _option_arity(command: str) -> dict[str, int]:
+    """How many following words each of ``command``'s options takes (flags: 0)."""
+    group = typer.main.get_command(app)
+    if not isinstance(group, typer.core.TyperGroup):  # pragma: no cover - defensive
+        return {}
+    arity: dict[str, int] = {}
+    for param in group.commands[command].params:
+        if isinstance(param, typer.core.TyperOption):
+            takes = 0 if param.is_flag or param.count else param.nargs
+            for name in (*param.opts, *param.secondary_opts):
+                arity[name] = takes
+    return arity
+
+
+def _batch_inputs_index(argv: Sequence[str]) -> int | None:
+    """Where a batch command's ``INPUTS`` sits in ``argv``, or ``None``.
+
+    The top-level group takes no option but ``--help``, so the command is the first
+    word that is not an option; its ``INPUTS`` is the first word after it that is
+    neither an option nor the value of one.
+    """
+    start = next((i for i, word in enumerate(argv) if not word.startswith("-")), None)
+    if start is None or argv[start] not in _BATCH_COMMANDS:
+        return None
+    arity = _option_arity(argv[start])
+    i = start + 1
+    while i < len(argv):
+        word = argv[i]
+        if word == "--":  # everything after it is an argument
+            return i + 1 if i + 1 < len(argv) else None
+        if word.startswith("--"):
+            name, eq, _ = word.partition("=")
+            i += 1 + (0 if eq else arity.get(name, 0))
+        elif word.startswith("-") and len(word) > 1:
+            # "-m GLS" takes the next word; "-mGLS" carries its value along.
+            i += 1 + (arity.get(word[:2], 0) if len(word) == 2 else 0)
+        else:
+            return i
+    return None
+
+
+def _expand_windows_args(
+    argv: Sequence[str], *, keep_whole: int | None = None
+) -> list[str]:
+    """Expand ``argv`` as click does on Windows, but leave one argument unglobbed.
+
+    No Windows shell expands ``~``, ``%VAR%`` or a wildcard for a native program, so
+    click does it for every argument: ``~`` and variables, then a glob whose matches
+    replace the argument (an argument matching nothing stays as typed). The value of
+    ``--opt=~/x`` gets its ``~`` too. The argument at ``keep_whole`` (a batch
+    command's ``INPUTS``) is expanded but not globbed, so ``"lcs/*.csv"`` reaches the
+    command as one pattern to resolve itself. ``ntpath`` is what ``os.path`` is on
+    Windows; naming it keeps the expansion testable anywhere.
+    """
+    out: list[str] = []
+    for index, word in enumerate(argv):
+        name, eq, value = word.partition("=")
+        if word.startswith("--") and eq:
+            word = f"{name}={ntpath.expanduser(value)}"
+        word = ntpath.expandvars(ntpath.expanduser(word))
+        if index == keep_whole:
+            out.append(word)
+            continue
+        try:
+            matches = glob.glob(word, recursive=True)
+        except re.error:  # pragma: no cover - a pattern glob cannot compile
+            matches = []
+        out.extend(matches or [word])
+    return out
+
+
 def main() -> None:
     """Console-script entry point.
 
-    ``windows_expand_args=False``: on Windows, click would otherwise expand a quoted
-    glob (``"lcs/*.csv"``) into one argument per match, which the single-``INPUTS``
-    batch commands reject. They resolve globs themselves, as on POSIX shells.
+    On Windows the arguments are expanded here, as click would (``~``, ``%VAR%``
+    and wildcards), except a batch command's ``INPUTS``: click would expand a
+    quoted glob (``"lcs/*.csv"``) into one argument per match, which the
+    single-``INPUTS`` batch commands reject. They resolve globs themselves, as on
+    POSIX shells, where the shell does the rest and nothing is expanded here.
     """
-    app(windows_expand_args=False)
+    if not _on_windows():
+        app()
+        return
+    argv = sys.argv[1:]
+    app(
+        args=_expand_windows_args(argv, keep_whole=_batch_inputs_index(argv)),
+        windows_expand_args=False,
+    )
 
 
 __all__ = ["app", "main"]

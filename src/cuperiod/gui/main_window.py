@@ -354,7 +354,13 @@ def _string_list(value: object) -> list[str]:
 
 
 def import_choice_to_json(choice: ImportChoice) -> str:
-    """An :class:`ImportChoice` as JSON for QSettings (the next import's presets)."""
+    """An :class:`ImportChoice` as JSON for QSettings: the next import's presets.
+
+    What is written is :meth:`ImportChoice.remembered`: of a choice made in the
+    import dialog, only what the user chose there (a column or domain detection
+    found is the next file's to detect again).
+    """
+    choice = choice.remembered()
     columns = dataclasses.asdict(choice.columns)
     read = None if choice.read is None else dataclasses.asdict(choice.read)
     domain = None if choice.domain is None else choice.domain.value
@@ -2110,10 +2116,19 @@ class MainWindow(QtWidgets.QMainWindow):
             text = re.sub(r"&(.)", r"\1", action.text())  # without its mnemonic
             return (menu, text, native(action.shortcuts()))
 
+        # F5 / Ctrl+Return also run the registry's Auto, listed under Pre-whitening:
+        # the analysis shown decides which, so the sheet says so.
+        compute = row("View", self._compute_action)
+        compute = (
+            compute[0],
+            f"{compute[1]} (Periodogram analysis; in Pre-whitening the same keys "
+            "run Auto)",
+            compute[2],
+        )
         rows = [
             row("File", self._folder_action),
             row("File", self._quit_action),
-            row("View", self._compute_action),
+            compute,
             row("View", self._raw_action),
             row("View", self._theme_action),
             *(row("View", action) for action in self._zoom_actions),
@@ -2638,7 +2653,9 @@ class MainWindow(QtWidgets.QMainWindow):
     @staticmethod
     def _project_data_name(lc: object, source: str) -> str:
         meta = getattr(lc, "meta", {}) or {}
-        for key in ("name", "source", "path", "file"):
+        # recorded_source: an embedded project keeps the file it named only as a
+        # record (never re-read), which still names the data in the title.
+        for key in ("name", "source", "recorded_source", "path", "file"):
             value = meta.get(key) if isinstance(meta, Mapping) else None
             if isinstance(value, str) and value:
                 return Path(value).name

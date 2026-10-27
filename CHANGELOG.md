@@ -58,19 +58,21 @@ and data that worked with 1.2.0.
   log, with the light curve embedded or referenced next to the project and pinned by a
   SHA-256. A project stores the log, not the undo states: after `load` only the stored
   state is in memory, and the earlier ones are re-created by replaying the log.
+  `load(data=...)` takes the moved data as a light curve, arrays, a table or a file
+  path (read with the project's recorded columns and domain).
   `snapshot()` / `restore()` keep and re-attach a session in memory, undo states
   included, without a re-run.
 - **Projects are read as untrusted input.** A `*.cupw.json` file is read as JSON only
   (no pickle, no `eval`), size-checked before it is read (64 MiB by default), with
   `NaN` / `Infinity`, overflowing numbers and duplicate keys refused, every object
   validated by a strict model (`extra="forbid"`, no coercion), every cross reference
-  checked, the log length, point count and frequency grid capped (64 grid frequencies
-  per data point, but never fewer than 20 million or more than 100 million), and data
-  references confined to the project's folder; anything wrong raises `ProjectError`,
-  and `save()` refuses a session that `load` would refuse. The source path an embedded
-  project records is kept as `meta["recorded_source"]`, a record that is never re-read;
-  a URL, a network (UNC) path or a drive-relative path is refused before any filesystem
-  call. A project recorded on the direct `numpy` backend whose spectrum would cost more
+  checked, the log length, point count and frequency grid capped (at most 100 million
+  grid frequencies), and data references confined to the project's folder; anything
+  wrong raises `ProjectError`, and `save()` refuses a session that `load` would refuse.
+  The source path an embedded project records is kept as `meta["recorded_source"]`, a
+  record that is never re-read: only a source this process read itself is re-read (a
+  network share included), and a URL is refused before any filesystem call. A project
+  recorded on the direct `numpy` backend whose spectrum would cost more
   than 2e9 point-frequency evaluations opens on the NUFFT CPU backend, with a
   `SessionWarning`, unless `backend=` is given. Tie expressions are parsed, never
   evaluated, and exported scripts carry every value as a Python literal and free text
@@ -83,7 +85,9 @@ and data that worked with 1.2.0.
 - **Amplitude/phase variation tests**: `PreWhitenSession.variations()` fits per-subset
   amplitudes and/or phases of selected components and returns Wald constancy tests (χ²
   with S−1 degrees of freedom), p-values and the BIC change (`VariationResult`), with
-  the frequencies held; `set_variation` puts the variation into the model.
+  the frequencies held; `set_variation` puts the variation into the model. A fixed
+  amplitude on a component whose phase varies is held exactly (the result reports the
+  smaller coherent amplitude).
 - **Constrained multi-sine fits** (`fit_multisine(constraints=...)`, `FitConstraints`,
   `ComponentConstraint`, `FrequencyTie`, `FitStart`, `ConstraintError`): fixed
   frequencies, amplitudes and phases; integer frequency ties (`"F3 = F1 + F2"`, `"2F1"`,
@@ -114,7 +118,8 @@ and data that worked with 1.2.0.
   partition, via `cuperiod.core.lightcurve.stack_bands()`.
 - **Refusal hints.** A refused `StepReport` whose message names a remedy in keyword
   arguments also carries it as a code in `StepReport.hint` (`"allow_close"`,
-  `"cascade"`, `"exact"` for `refine="none"`, `"fit_mean"`; `REFUSAL_HINTS`,
+  `"cascade"`, `"exact"` for `refine="none"`, `"fit_mean"`;
+  `cuperiod.prewhiten.session.state.REFUSAL_HINTS`,
   `SessionError(..., hint=...)`), so a front end can phrase its own advice without
   parsing the message, which is unchanged.
 - **CLI**: `cuperiod prewhiten --save-project FILE --export-script FILE`, and a
@@ -194,9 +199,12 @@ and data that worked with 1.2.0.
   Load disabled with the reason while the choice cannot work (a header row read as data
   included). The file's own detection comes first: the read options and the
   magnitude/flux choice of the previous import are only fallbacks, and a column named
-  as flux or magnitude always decides the domain. Headerless JD/mag/err tables (OGLE,
-  Period04), semicolon-separated files and unrecognised headers such as `HJD, V, e_V`
-  now load.
+  as flux or magnitude always decides the domain. Only choices you make carry over to
+  the next file: columns you picked apply where it has them, a *none* for error or band
+  never hides a column it has, and a magnitude/flux choice is remembered only when you
+  set it yourself (never one read off a column name). Headerless JD/mag/err tables
+  (OGLE, Period04), including ones whose first row has a missing value,
+  semicolon-separated files and unrecognised headers such as `HJD, V, e_V` now load.
 - **GUI: keyboard-operable spectrum.** A click folds at the nearest peak within 12 px
   (Alt: exactly there), also with the markers hidden; Left / Right move between local
   maxima (Ctrl: marked peaks, Shift: one sample), Home, Enter, + / − / 0 and the Menu
@@ -482,9 +490,10 @@ and data that worked with 1.2.0.
   the fitted law, and the decay timescale — plus the panel helpers to compose your own.
   Built on `Figure` + `FigureCanvasAgg` rather than pyplot, so it is safe to call from
   batch workers, and matplotlib is imported lazily so everything else works without it.
-  Flux light curves are drawn the right way up, and the O−C panel draws a light-time
-  orbit only when the O−C supports it (ΔBIC > 10, outer period not at the edge of the
-  scan). `batch_pdot(plots=...)` raises `ImportError` naming
+  Flux light curves are drawn the right way up. In `batch_pdot(plots=...)` figures the
+  O−C panel draws a light-time orbit only when the O−C supports it (ΔBIC > 10, outer
+  period not at the edge of the scan); `pdot_figure` and `plot_oc` draw whatever fit
+  they are given. `batch_pdot(plots=...)` raises `ImportError` naming
   `pip install 'cuperiod[plot]'` before any work when matplotlib is missing; figures of
   keys that sanitise to the same file name, or differ only in letter case, get distinct
   names.
@@ -511,6 +520,11 @@ and data that worked with 1.2.0.
   a period longer than the sliding window, an unknown law name or mismatched lengths.
   `PdotSettings` validates its fields (`n_segments >= 4`, finite positive bounds), and a
   constant light curve given to `period_profile` raises `InsufficientDataError`.
+- **Also public.** `cuperiod.weighted_epoch`, `available_models`, `PdotSearchResult`,
+  `PhaseTemplate`, `SegmentShift`, `EddingtonPlakidisResult` and `SessionSnapshot`;
+  in `cuperiod.pdot`, `fit_template`, `get_model`, `PeriodModel`, `ltte_delay`,
+  `pdot_units`, `AUTO_LAWS`, `DAYS_PER_MYR` and `SECONDS_PER_YEAR`; in `cuperiod.core`,
+  `log_period_grid` and `uniform_frequency_grid`.
 
 ### Changed
 
@@ -668,11 +682,11 @@ Other changes:
   the exact remedy (`columns=ColumnMap(band='filtercode')`, or `band_column=` for the
   batch functions) and is attributed to the caller's line, not a library one.
 - **CLI.** User errors (missing file, unknown method / backend / device, bad sink suffix,
-  non-positive `--period`, empty `-m`, `--n-best` < 1, a GPU-only backend with
-  `--device cpu`) are usage errors (exit 2) without a traceback; `batch` and
-  `batch-prewhiten` exit 1 when every light curve that ran failed, list every failure in
-  `<stem>.errors.csv` beside a file sink (`_errors.csv` inside a directory sink) and
-  print the worker count. The `--resume/--no-resume` help of `batch-prewhiten` says what
+  non-positive `--period`, empty `-m`, `--n-best` < 1 (< 0 for `batch`), a GPU-only
+  backend with `--device cpu`) are usage errors (exit 2) without a traceback; `batch` and
+  `batch-prewhiten` exit 1 when every light curve that ran failed and list every failure
+  in `<stem>.errors.csv` beside a file sink (`_errors.csv` inside a directory sink), and
+  `batch` prints the worker count. The `--resume/--no-resume` help of `batch-prewhiten` says what
   resume does now: skip the light curves already in the sink and retry failures,
   matched by key.
 - **LINCC interop.** `nested=None` is the new default (the preset's nest, else `"lc"`);
@@ -730,7 +744,13 @@ Other changes:
 - **Quoted globs on Windows.** `cuperiod batch "lcs/*.csv"` (and `batch-prewhiten`)
   stopped with an "unexpected extra argument" usage error: click expanded the quoted
   pattern into one argument per match. The commands now receive the pattern and resolve
-  it themselves, as on POSIX shells.
+  it themselves, as on POSIX shells. Every other argument is still expanded on Windows
+  as before: `~` (also in `--opt=~/x`), `%VAR%`, and a wildcard that matches files, so
+  `cuperiod run ~/lc.csv` and `--out ~/results.parquet` keep working.
+- **A batch rerun into a sink inside its own inputs** read the previous results (and
+  its errors list) as light curves. `batch`, `batch-prewhiten` and `pdot-batch` now
+  leave their own sink, `<stem>.errors.csv`, `.corrupt-*` copies and temporary files
+  out of the inputs (for a directory sink: its part files, manifest and errors list).
 - **`cuperiod prewhiten` and `batch-prewhiten` ignored `CUPERIOD_PREWHITEN_*`.** Their
   `--max-frequencies`, `--snr`, `--stop`, `--uncertainty`, `--combinations` and
   `--backend` options always passed the CLI's own defaults, which hid the environment.

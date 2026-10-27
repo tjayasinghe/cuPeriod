@@ -122,7 +122,11 @@ worker count used. The errors file is rewritten after each batch that had inputs
 removed when that batch had no failures; a batch with no inputs leaves the sink and its
 errors file alone. It is the command that writes it: the Python
 {func}`~cuperiod.batch_periodograms` returns its failures in the summary's `errors` and
-writes no such file. See {doc}`batch`.
+writes no such file. A rerun is safe when the sink sits inside the inputs' folder or
+matches their glob: the batch commands never read their own sink, its errors file,
+`.corrupt-*` copies or temporary files as light curves (nor, for a directory sink, its
+part files and manifest; for `pdot-batch`, its `--sink`, `--oc-sink` and
+`--profile-sink`). See {doc}`batch`.
 
 ## `prewhiten` — a pulsator's frequency solution
 
@@ -183,7 +187,9 @@ rule as the library. An option you give always wins.
     the library refuses to embed unasked, so the command embeds anyway and prints a
     `note: embedded all N data points …` line. A project larger than
     `max_project_bytes` (64 MiB; `CUPERIOD_SESSION_MAX_PROJECT_BYTES`) is not written:
-    the command ends with `Error: …` and exit status 1, after printing the solution.
+    the command ends with `Error: …` and exit status 1, after printing the solution, and
+    repeats why the data could not be referenced. A project path whose folder does not
+    exist or cannot be written is a usage error (exit 2) naming that path.
 * - `--export-script`
   - Also write a Python script that reproduces the run with the library. It is written
     even when saving the project fails.
@@ -221,8 +227,10 @@ the GUI ({doc}`interactive-prewhitening`).
   - (all three) A light-curve file to use instead of the project's own data — the data
     file moved or renamed, say. It is read with the project's recorded domain and, for a
     project that references its data file, the recorded column mapping, so a project made
-    with `prewhiten --time/--value/--error` needs no column options here. It must hold
-    the same points (the content hash is checked).
+    with `prewhiten --time/--value/--error` needs no column options here. When the file
+    lacks the recorded columns (the same points under other names), its columns are
+    detected instead and a `note:` says so. It must hold the same points (the content
+    hash is checked).
 * - `--backend`
   - (`verify`, `replay`) The spectrum backend; default: the recorded one when this
     machine has it, else the best CPU backend. Steps replay their logged peak seeds, so

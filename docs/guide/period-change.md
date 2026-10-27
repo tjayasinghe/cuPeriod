@@ -740,7 +740,8 @@ device gets a `-<8 hex>` digest suffix, so distinct keys never overwrite each ot
 figures. Figures follow the brightness domain (flux light curves are labelled `flux`,
 not drawn inverted), and the drift-corrected fold uses the track's fitted ephemeris.
 The same figure is available directly as {func}`cuperiod.pdot.plots.pdot_figure`, and
-its panel helpers can be composed into your own layout.
+its panel helpers can be composed into your own layout; those draw whatever light-time
+fit they are given, so pass `ltte=` only for a cycle you consider detected.
 
 ## Settings
 

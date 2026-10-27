@@ -1,19 +1,28 @@
 """Pre-release fixes of the interactive pre-whitening session (1.3.0 gate).
 
 - A component the grid was configured past keeps its own refinement box.
-- A project's ``meta.source`` is never trusted: saving or exporting an opened
-  project touches no path the file chose (and never a network path).
+- An opened project's own ``meta.source`` is kept as a record only: saving or
+  exporting it touches no path the file chose. A source this process read itself (a
+  network share, a drive-relative or a colon-containing name) is still checked and
+  referenced; only a URL or a NUL byte is refused before any filesystem call.
 - ``configure()`` takes numpy scalars, and refuses unknown setting names.
-- A constrained project re-opens without a "stored values differ" warning.
-- Huge run codes, oversized project grids, fractional point runs and unknown
-  ``goto`` targets are refused with a message that says why.
+- A constrained project re-opens without a "stored values differ" warning, and a
+  fixed amplitude under phase variation is held bit for bit rather than re-fixed to
+  the fit's smaller coherent headline at every fit.
+- Huge run codes, fractional point runs and unknown ``goto`` targets are refused
+  with a message that says why.
+- A project's grid is limited only by ``MAX_GRID_POINTS``: a grid the library builds
+  for multi-year space photometry (more than 2e7 frequencies) saves and re-opens,
+  while a costly project recorded on the direct ``numpy`` backend opens on NUFFT.
 - Exported scripts need nothing beyond ``import cuperiod``.
 - ``PreWhitenSettings.downsample_points`` still reads, with a DeprecationWarning.
 """
 
 from __future__ import annotations
 
+import gc
 import json
+import os
 import warnings
 from pathlib import Path
 from typing import Any
@@ -211,27 +220,93 @@ def test_a_project_cannot_name_the_file_a_save_rereads(
     assert "script.data.csv" in data_line  # written beside the script, not re-read
 
 
-def test_a_network_source_is_refused_before_any_filesystem_call(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def _session_from(source: str) -> PreWhitenSession:
+    """A session whose data name ``source`` (as user code or a loader sets it)."""
     rng = np.random.default_rng(3)
     t = np.sort(rng.uniform(0.0, 30.0, 300))
     y = 0.05 * np.sin(2 * np.pi * 3.1 * t) + rng.normal(0.0, 0.004, t.size)
-    lc = LightCurve.from_arrays(t, y, np.full(t.size, 0.004), meta={"source": UNC})
-    session = PreWhitenSession(lc, settings=_numpy())
+    lc = LightCurve.from_arrays(t, y, np.full(t.size, 0.004), meta={"source": source})
+    return PreWhitenSession(lc, settings=_numpy())
+
+
+def test_a_url_source_is_refused_before_any_filesystem_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _session_from("https://attacker.invalid/x.csv")
     touched = _watch(monkeypatch, "attacker.invalid")
     path, why = project.source_file(session)
-    assert path is None and "UNC" in why
+    assert path is None
+    assert why == "the source 'https://attacker.invalid/x.csv' is a URL, not a file"
     assert touched == []
+
+
+@pytest.mark.parametrize("source", [UNC, "//attacker.invalid/share/x.csv"])
+def test_a_network_source_set_in_this_process_is_checked(
+    source: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Only this process sets meta["source"] (an opened project's claim is renamed),
+    # so a share is a file the user opened: checked like any other, never refused
+    # on its name (the test's guard stands in for the network).
+    session = _session_from(source)
+    touched = _watch(monkeypatch, "attacker.invalid")
+    path, why = project.source_file(session)
+    assert path is None and why == "the source file cannot be read: blocked by the test"
+    assert touched and touched[0][0] == "resolve"
+
+
+def _unc(path: Path) -> str:
+    """``path`` through the administrative share of its drive (Windows only)."""
+    if os.name != "nt" or not path.drive.endswith(":"):
+        pytest.skip("needs a Windows drive and its administrative share")
+    unc = f"\\\\localhost\\{path.drive[0]}$" + str(path)[len(path.drive) :]
+    try:
+        reachable = Path(unc).is_file()
+    except OSError:
+        reachable = False
+    if not reachable:
+        pytest.skip("the administrative share \\\\localhost\\C$ is not reachable")
+    return unc
+
+
+@pytest.mark.parametrize("slashes", ["\\", "/"])
+def test_data_opened_from_a_network_share_is_referenced(
+    slashes: str, tmp_path: Path
+) -> None:
+    csv = tmp_path / "star.csv"
+    _write_csv(csv, _sine_session())
+    share = _unc(csv).replace("\\", slashes)
+    session = PreWhitenSession(LightCurve.from_file(share), settings=_numpy())
+    session.run()
+    path, why = project.source_file(session)
+    assert path is not None, why
+    target = Path(share).parent / "p.cupw.json"  # next to the data, on the share
+    session.save(target, embed_data="never")
+    doc = json.loads(target.read_text(encoding="utf-8"))
+    assert doc["data"]["mode"] == "reference" and doc["data"]["path"] == "star.csv"
+    loaded = PreWhitenSession.load(target)
+    assert loaded.components == session.components
+    loaded.save(target)  # re-opened from the share: still referenced
+    doc = json.loads(target.read_text(encoding="utf-8"))
+    assert doc["data"]["mode"] == "reference"
 
 
 @pytest.mark.parametrize(
     ("text", "reason"),
     [
-        ("//host/share/x.csv", "UNC"),
-        ("https://example.org/x.csv", "URL"),
-        ("C:data.csv", "relative to a drive"),
-        ("\\data.csv", "relative to a drive"),
+        ("https://example.org/x.csv", "source 'https://example.org/x.csv' is a URL"),
+        ("s3://bucket/x.csv", "is a URL"),
+        ("file:///C:/data/x.csv", "is a URL"),
+        ("x\x00.csv", "malformed"),
+        # A path this process read is checked on the filesystem, whatever its form.
+        ("//host/share/x.csv", ""),
+        ("\\\\host\\share\\x.csv", ""),
+        ("\\\\?\\C:\\long\\x.csv", ""),
+        ("C:data.csv", ""),
+        ("\\data.csv", ""),
+        ("TIC123:s14.csv", ""),
+        ("obs:2024/x.csv", ""),
+        ("C://data/x.csv", ""),
+        ("//home/x.csv", ""),
         ("data.csv", ""),
         ("C:\\data\\x.csv", ""),
         ("/data/x.csv", ""),
@@ -369,6 +444,76 @@ def test_a_tampered_constrained_project_is_still_refitted(tmp_path: Path) -> Non
     )
 
 
+# --- a fixed amplitude under phase variation (sessions-fixed-amplitude-decays) -------
+
+
+def _phase_varying(*, fixed_at: float | None = None) -> PreWhitenSession:
+    """F2 with one phase per night and its amplitude fixed (at ``fixed_at``)."""
+    data, night = _nightly()
+    session = PreWhitenSession(
+        data,
+        settings=_numpy(max_frequencies=4, maximum_frequency=25.0),
+        labels={"night": night},
+        partitions=["night"],
+    )
+    session.run(max_steps=4)
+    assert session.use_variation("night").kind == "edited"
+    assert session.set_variation([2], "phase").kind == "edited"
+    assert session.fix([2], amplitude=True).kind == "edited"
+    if fixed_at is not None:
+        assert session.set_values(2, amplitude=fixed_at).kind == "edited"
+    return session
+
+
+def _held(session: PreWhitenSession) -> float:
+    return session.state.component(2).amplitude
+
+
+def test_a_fixed_amplitude_under_phase_variation_is_held() -> None:
+    session = _phase_varying()
+    held = _held(session)
+    assert session.polish().kind == "edited"
+    assert _held(session) == held
+    rss = session.state.stats.rss
+    for act in (session.polish, session.calculate, session.improve):
+        assert act().kind == "edited"
+        # 1.3.0-dev wrote the fit's coherent headline back as the fixed value, so
+        # each fit fixed a smaller amplitude (x 0.9984 here) and the RSS rose.
+        assert _held(session) == held
+        assert session.state.stats.rss == pytest.approx(rss, rel=1e-9)
+    # The fit (and the result) report the coherent mean A |mean exp(i phi_s)|.
+    position = [c.id for c in session.state.active].index(2)
+    headline = float(session.kernel.derive(session.state).fit.amplitude[position])
+    assert 0.99 * held < headline < held
+    assert float(session.finalize().amplitude[position]) == pytest.approx(headline)
+
+
+def test_a_value_set_on_a_fixed_phase_varying_amplitude_is_kept() -> None:
+    session = _phase_varying(fixed_at=0.02)
+    assert _held(session) == 0.02
+    for _ in range(2):
+        assert session.polish().kind == "edited"
+        assert _held(session) == 0.02
+
+
+def test_a_project_with_a_fixed_phase_varying_amplitude_reopens_cleanly(
+    tmp_path: Path,
+) -> None:
+    session = _phase_varying()
+    session.polish()
+    first, second = tmp_path / "a.cupw.json", tmp_path / "b.cupw.json"
+    session.save(first)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", SessionWarning)
+        loaded = PreWhitenSession.load(first)
+        assert loaded.components == session.components
+        assert not loaded.is_dirty
+        loaded.save(second)
+        again = PreWhitenSession.load(second)
+    assert again.components == session.components
+    assert again.state.stats.rss == pytest.approx(session.state.stats.rss, rel=1e-9)
+
+
 # --- run codes beyond int32 (bug_sessions-5) -----------------------------------------
 
 
@@ -401,35 +546,48 @@ def test_replay_of_a_huge_run_code_raises_project_error() -> None:
 # --- the grid of an untrusted project (bug_sessions-6) -------------------------------
 
 
-def test_grid_limit() -> None:
-    assert project.grid_limit(300) == project.GRID_POINTS_FLOOR
-    assert project.grid_limit(1_000_000) == 64_000_000
-    assert project.grid_limit(10**8) == project.MAX_GRID_POINTS
-
-
 @pytest.mark.parametrize("section", ["creation", "state"])
-def test_an_oversized_project_grid_is_refused(section: str, tmp_path: Path) -> None:
+def test_a_grid_above_max_grid_points_is_refused(section: str, tmp_path: Path) -> None:
     session = _sine_session()
     path = tmp_path / "p.cupw.json"
     session.save(path)
     doc = json.loads(path.read_text(encoding="utf-8"))
-    doc[section]["grid"]["nf"] = project.GRID_POINTS_FLOOR + 1
+    doc[section]["grid"]["nf"] = project.MAX_GRID_POINTS + 1
     path.write_text(json.dumps(doc), encoding="utf-8")
+    limit = project.MAX_GRID_POINTS
     with pytest.raises(
-        ProjectError, match=rf"{section}\.grid\.nf: .* exceed the limit of 20000000"
+        ProjectError, match=rf"{section}\.grid\.nf: .*less than or equal to {limit}"
     ):
         PreWhitenSession.load(path)
 
 
-def test_a_session_whose_grid_a_load_would_refuse_is_not_saved(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_a_grid_larger_than_the_retired_per_point_cap_saves_and_reopens(
+    tmp_path: Path,
 ) -> None:
-    session = _sine_session()
-    monkeypatch.setattr(project, "GRID_POINTS_FLOOR", 10)
-    monkeypatch.setattr(project, "GRID_POINTS_PER_POINT", 0)
-    with pytest.raises(ProjectError, match="cannot be saved: creation.grid.nf"):
-        session.save(tmp_path / "p.cupw.json")
-    assert not (tmp_path / "p.cupw.json").exists()
+    # Multi-year 2-min TESS data get a default grid of ~18000 x baseline frequencies
+    # (3e7 over five years); 1.3.0-dev refused to save or open any grid above
+    # max(2e7, 64 per point). 300 points on 2.1e7 frequencies stand in for them
+    # (about 2 s and 2 GB per engine; the "dft" spectrum skips the cached Gram terms,
+    # which would double both).
+    nf = 21_000_000
+    rng = np.random.default_rng(3)
+    t = np.sort(rng.uniform(0.0, 30.0, 300))
+    y = 0.05 * np.sin(2 * np.pi * 3.1 * t) + rng.normal(0.0, 0.004, t.size)
+    session = PreWhitenSession(
+        (t, y, np.full(t.size, 0.004)),
+        settings=cup.PreWhitenSettings(backend="finufft", normalization="dft"),
+        grid=(0.01, 50.0 / nf, nf),
+    )
+    assert session.kernel.creation.grid[2] == nf and session.state.grid[2] == nf
+    path = tmp_path / "big.cupw.json"
+    session.save(path)  # 1.3.0-dev: "the session cannot be saved: creation.grid.nf"
+    del session
+    gc.collect()  # one engine of that size in memory at a time
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", SessionWarning)
+        opened = PreWhitenSession.load(path)  # 1.3.0-dev: "... exceed the limit"
+    assert opened.backend == "finufft"
+    assert opened.kernel.creation.grid[2] == nf and opened.state.grid[2] == nf
 
 
 def test_a_costly_direct_numpy_project_opens_on_nufft(
@@ -558,3 +716,48 @@ def test_the_retired_environment_variable_warns(
     with pytest.warns(DeprecationWarning, match="CUPERIOD_PREWHITEN_DOWNSAMPLE_POINTS"):
         settings = cup.PreWhitenSettings()
     assert settings == cup.PreWhitenSettings.model_construct()
+
+
+# --- the GUI's "Locate the light curve" hands load() a path ---------------------------
+
+
+def test_load_reads_a_moved_data_file_given_as_a_path(tmp_path: Path) -> None:
+    # The GUI passes the file the user picked as data=; load() took only light
+    # curves, arrays or tables, so locating a moved data file could never succeed.
+    session = _session_from("unused")
+    session.run(max_steps=2)
+    frequencies = [c.frequency for c in session.components]
+    embedded = tmp_path / "embedded.cupw.json"
+    session.save(embedded, embed_data="always")
+    moved = tmp_path / "elsewhere" / "star.csv"
+    moved.parent.mkdir()
+    _write_csv(moved, session)
+    for given in (str(moved), moved):
+        reopened = PreWhitenSession.load(embedded, data=given)
+        assert [c.frequency for c in reopened.components] == frequencies
+
+    # A referenced project records its column mapping: a moved copy under the same
+    # unusual names is read with it, and one under detectable names by detection.
+    custom = tmp_path / "custom.csv"
+    custom.write_text(
+        moved.read_text(encoding="utf-8").replace("time,mag,mag_err", "t_obs,b,b_e", 1),
+        encoding="utf-8",
+    )
+    columns = cup.ColumnMap(time="t_obs", value="b", error="b_e")
+    lc = LightCurve.from_file(custom, columns=columns, domain="magnitude")
+    referenced = PreWhitenSession(lc, settings=_numpy(), columns=columns)
+    referenced.run(max_steps=2)
+    target = tmp_path / "referenced.cupw.json"
+    referenced.save(target)
+    assert json.loads(target.read_text(encoding="utf-8"))["data"]["mode"] == "reference"
+    copy = tmp_path / "elsewhere" / "custom_copy.csv"
+    copy.write_bytes(custom.read_bytes())
+    assert PreWhitenSession.load(target, data=copy).data.n == lc.n
+    assert PreWhitenSession.load(target, data=moved).data.n == lc.n
+
+    other = tmp_path / "other.csv"  # different points: still refused by the hash
+    other.write_text(
+        "time,mag,mag_err\n1.0,12.0,0.1\n2.0,12.1,0.1\n3.0,12.0,0.1\n", encoding="utf-8"
+    )
+    with pytest.raises(ProjectError, match="content hash"):
+        PreWhitenSession.load(embedded, data=other)

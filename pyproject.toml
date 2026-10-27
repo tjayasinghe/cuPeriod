@@ -140,6 +140,8 @@ dev = [
     "torch>=2.2",
     # Drive the Qt GUI headlessly (QT_QPA_PLATFORM=offscreen) in tests; the same
     # bounds as the [gui] extra. pytest-qt 4.2 is the first that loads under pytest 8.
+    # At exactly PySide6 6.7.0 the GUI tests pass but one file's interpreter can crash
+    # at shutdown (Windows); CI resolves the current release.
     "PySide6>=6.7,<6.12; python_version < '3.12'",
     "PySide6>=6.7; python_version >= '3.12'",
     "pyqtgraph>=0.13.7",
@@ -159,9 +161,10 @@ Repository = "https://github.com/tjayasinghe/cuPeriod"
 Issues = "https://github.com/tjayasinghe/cuPeriod/issues"
 Changelog = "https://github.com/tjayasinghe/cuPeriod/blob/main/CHANGELOG.md"
 
-# The [lsdb] extra transitively pins nested-pandas <0.7 (the pandas-2 world),
-# while [dev] tests against current nested-pandas (pandas 3). Declaring them
-# conflicting lets uv fork the lock instead of downgrading pandas for everyone.
+# lsdb releases before 0.11 pin nested-pandas <0.7 (the pandas-2 world), while [dev]
+# tests against current nested-pandas (pandas 3). Declaring them conflicting lets uv
+# fork the lock instead of downgrading pandas for everyone; with lsdb 0.11 the lock
+# currently resolves both to the same nested-pandas 0.7 line.
 [tool.uv]
 conflicts = [[{ extra = "lsdb" }, { extra = "dev" }]]
 

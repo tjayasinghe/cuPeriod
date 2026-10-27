@@ -433,6 +433,8 @@ def plot_oc(
         Overlaid as the joint polynomial + light-time curve, with the outer
         period in the label — a cycle shorter than the baseline is what makes
         the O-C non-monotonic, and the parabola alone then averages over it.
+        Drawn as given: pass it only for a detected cycle (``batch_pdot`` uses
+        ``delta_bic > 10`` and not ``at_grid_edge``).
     t_offset : float, default 2450000.0
         Subtracted from the epochs before plotting.
     degree_overlays : sequence of int, default ``(2,)``
@@ -810,7 +812,8 @@ def pdot_figure(
         From :func:`cuperiod.fit_period_law`. Overlaid on the profile panel, and
         the source of the decay-timescale panel.
     ltte : LTTEFit, optional
-        The best fit of :func:`cuperiod.ltte_search`, overlaid on the O-C panel.
+        The best fit of :func:`cuperiod.ltte_search`, overlaid on the O-C panel as
+        given (pass it only for a detected cycle; see :func:`plot_oc`).
     title : str, default ""
         Figure suptitle (typically the star's name).
     path : str or pathlib.Path, optional

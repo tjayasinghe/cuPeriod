@@ -294,3 +294,106 @@ def test_session_commands_pass_other_warnings_through_once(
     with pytest.warns(UserWarning, match="a column read"), _session_warnings():
         warnings.warn("a column read", UserWarning, stacklevel=1)
     assert len(calls) == 1
+
+
+# --- release gate (1.3.0), round 2 -------------------------------------------------
+
+
+def test_export_script_survives_a_project_folder_that_does_not_exist(
+    tmp_path: Path,
+) -> None:
+    # An OSError from --save-project (here: no such folder) escaped before the
+    # script was written, and the error named the temporary file, not the project.
+    star = _write_star(tmp_path / "star.csv")
+    project = tmp_path / "no_such_dir" / "star.cupw.json"
+    script = tmp_path / "star.py"
+    result = runner.invoke(
+        app,
+        ["prewhiten", str(star), *OPTIONS, "--save-project", str(project),
+         "--export-script", str(script)],
+    )
+    assert result.exit_code == 2, result.output
+    assert script.exists() and f"Wrote {script}" in result.stdout
+    assert "--save-project" in result.output and "does not exist" in result.output
+    assert "star.cupw.json" in result.output and ".tmp" not in result.output
+    assert "Traceback" not in result.output
+
+
+def test_a_failed_embed_fallback_keeps_the_first_refusals_remedy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Room for a project that references its data file, not for one embedding it.
+    monkeypatch.setenv("CUPERIOD_SESSION_EMBED_DATA_MAX_POINTS", "10")
+    monkeypatch.setenv("CUPERIOD_SESSION_MAX_PROJECT_BYTES", "15000")
+    (tmp_path / "data").mkdir()
+    (tmp_path / "project").mkdir()
+    star = _write_star(tmp_path / "data" / "star.csv")
+    project = tmp_path / "project" / "star.cupw.json"
+    result = runner.invoke(
+        app, ["prewhiten", str(star), *OPTIONS, "--save-project", str(project)]
+    )
+    assert result.exit_code == 1, result.output
+    assert "max_project_bytes (15000)" in result.output
+    assert "exceed embed_data_max_points (10)" in result.output
+    assert "keep the data file next to the project" in result.output
+    # The remedy works: saved beside the data, the file is referenced.
+    beside = tmp_path / "data" / "star.cupw.json"
+    result = runner.invoke(
+        app, ["prewhiten", str(star), *OPTIONS, "--save-project", str(beside)]
+    )
+    assert result.exit_code == 0, result.output
+    assert "note: embedded" not in result.output
+    # A referenced project that is too large is not retried as an embedded one.
+    monkeypatch.setenv("CUPERIOD_SESSION_MAX_PROJECT_BYTES", "2000")
+    result = runner.invoke(
+        app, ["prewhiten", str(star), *OPTIONS, "--save-project", str(beside)]
+    )
+    assert result.exit_code == 1, result.output
+    assert "max_project_bytes (2000)" in result.output
+    assert "embedded" not in result.output
+
+
+def test_session_data_under_another_header_falls_back_to_detected_columns(
+    tmp_path: Path,
+) -> None:
+    # A project made with explicit columns records them; the same points exported
+    # under another (detectable) header were refused, with no way to override.
+    star = _write_star(tmp_path / "star.csv")
+    project = tmp_path / "star.cupw.json"
+    created = runner.invoke(
+        app,
+        ["prewhiten", str(star), *OPTIONS, "--time", "time", "--value", "mag",
+         "--error", "mag_err", "--save-project", str(project)],
+    )
+    assert created.exit_code == 0, created.output
+    assert json.loads(project.read_text(encoding="utf-8"))["data"]["columns"]
+    text = star.read_text(encoding="utf-8")
+    moved = tmp_path / "moved" / "star_hjd.csv"
+    moved.parent.mkdir()
+    moved.write_text(text.replace("time,mag,mag_err", "hjd,vmag,e_vmag", 1),
+                     encoding="utf-8")
+    result = runner.invoke(
+        app, ["session", "verify", str(project), "--data", str(moved)]
+    )
+    assert result.exit_code == 0, result.output
+    assert "note: star_hjd.csv lacks the project's recorded columns" in result.output
+    # The content hash still guards the points: other values are refused.
+    lines = text.splitlines()
+    first = lines[1].split(",")
+    first[1] = repr(float(first[1]) + 0.5)
+    lines[1] = ",".join(first)
+    changed = tmp_path / "moved" / "changed.csv"
+    changed.write_text(
+        "\n".join(["hjd,vmag,e_vmag", *lines[1:]]) + "\n", encoding="utf-8"
+    )
+    result = runner.invoke(
+        app, ["session", "verify", str(project), "--data", str(changed)]
+    )
+    assert result.exit_code == 1, result.output
+    assert "Error:" in result.output
+    # Neither the recorded nor any detectable columns: the recorded ones are named.
+    odd = tmp_path / "moved" / "odd.csv"
+    odd.write_text("a,b\n1,2\n3,4\n", encoding="utf-8")
+    result = runner.invoke(app, ["session", "verify", str(project), "--data", str(odd)])
+    assert result.exit_code == 2, result.output
+    assert "'time'" in result.output

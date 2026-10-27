@@ -240,7 +240,10 @@ class SessionJob(QtCore.QRunnable):
             outcome = self.work(self)
         except Exception as exc:  # noqa: BLE001 - surfaced to the UI as a failure
             self._end(start)
-            signals.failed.emit(self, f"{type(exc).__name__}: {exc}")
+            # Notes too: what opening a session warned about before it failed.
+            notes = [str(note) for note in getattr(exc, "__notes__", ())]
+            text = "\n".join([f"{type(exc).__name__}: {exc}", *notes])
+            signals.failed.emit(self, text)
             return
         self._end(start)
         signals.done.emit(self, outcome)

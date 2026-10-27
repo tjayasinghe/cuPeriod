@@ -22,7 +22,7 @@ those characters, not be rendered (or fetched) as markup.
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from cuperiod.core.columns import ColumnMap, Domain, infer_domain
@@ -34,6 +34,7 @@ from cuperiod.gui.loaders import (
     ReadOptions,
     describe_time,
     guess_columns,
+    is_text_cell,
     is_text_table,
     numeric_cells,
     preview_file,
@@ -107,38 +108,65 @@ def _number_text(cell: str) -> str:
 def _headerless_looking(preview: FilePreview) -> bool:
     """Whether the file has no header row: its "column names" are numbers (a data
     row read as the header), or the reader's own col1, col2, ... (it found none,
-    e.g. under a commented header, and the box must not claim otherwise)."""
-    names = preview.columns
+    e.g. under a commented header, and the box must not claim otherwise).
+
+    A data row may lack a value, so ``nan``, ``inf`` and the reader's name for an
+    empty cell (``Unnamed: 2``, ``col2``) pass as numbers, and so does a number the
+    reader renamed for repeating one before it (``0.02_1``); at least one name must
+    be a finite number.
+    """
+    names = [str(name) for name in preview.columns]
     if not names:
         return False
-    if all(re.fullmatch(r"col\d+", str(name)) for name in names):
+    if all(re.fullmatch(r"col\d+", name) for name in names):
         return True
-    return len(numeric_cells(names)) == len(names)
+    finite = False
+    for j, name in enumerate(names):
+        if re.fullmatch(r"col\d+|Unnamed: \d+", name):
+            continue  # an empty cell
+        repeated = re.fullmatch(r"(.+)[._]\d+", name)
+        if repeated is not None and repeated.group(1) in names[:j]:
+            name = repeated.group(1)
+        if is_text_cell(name):
+            return False
+        finite = finite or bool(numeric_cells([name]))
+    return finite
 
 
-def _text_over_numbers(preview: FilePreview, columns: Sequence[str]) -> list[str]:
-    """The first-row cells of ``columns`` that are text over numbers below them.
+def _text_over_numbers(preview: FilePreview, column: str) -> str | None:
+    """The first cell of ``column`` when it is text over numbers below it, else None.
+
+    A missing value (an empty cell, ``nan``) is no text, and a column of text
+    throughout (a band) has no numbers below.
+    """
+    if column not in preview.columns:
+        return None
+    j = preview.columns.index(column)
+    cells = [row[j] for row in preview.rows if j < len(row)]
+    if len(cells) >= 2 and is_text_cell(cells[0]) and numeric_cells(cells[1:]):
+        return cells[0]
+    return None
+
+
+def _names_read_as_data(
+    preview: FilePreview, time: str, columns: Sequence[str]
+) -> list[str]:
+    """The first-row cells of ``columns`` that look like column names read as data.
 
     Read without a header row, a file that has one starts with its column names
-    (``time``, ``flux`` ...) above the data; those cells are returned. A column of
-    text throughout (a band) is not one of them.
+    (``time``, ``flux`` ...) above the data. Such a row names every column, the time
+    column too, so it is taken for one only when the first cell of ``time`` is text
+    over numbers; a data row with a value missing (``nan``, an empty cell) or a
+    stray word in another column is not. Returns the text-over-numbers cells of
+    ``time`` and ``columns``, or nothing.
     """
-    rows = preview.rows
-    if len(rows) < 2:
+    if _text_over_numbers(preview, time) is None:
         return []
     found: list[str] = []
-    for column in columns:
-        if column not in preview.columns:
-            continue
-        j = preview.columns.index(column)
-        cells = [row[j] for row in rows if j < len(row)]
-        if (
-            cells
-            and cells[0].strip()
-            and not numeric_cells(cells[:1])
-            and numeric_cells(cells[1:])
-        ):
-            found.append(cells[0])
+    for column in dict.fromkeys([time, *columns]):
+        cell = _text_over_numbers(preview, column)
+        if cell is not None:
+            found.append(cell)
     return found
 
 
@@ -163,11 +191,19 @@ class PreviewDialog(QtWidgets.QDialog):
         sniffs a delimiter or a missing header row when the first read clearly
         missed one.
     columns, domain, read : optional
-        A previous choice to start from (e.g. the last mapping used); names the file
-        does not have are ignored. What the file shows of itself comes first: the
-        ``domain`` applies only to a brightness column whose name says neither
-        magnitude nor flux (``col2``, ``V``), and ``read`` only to a text file that
-        its own detection leaves in a single column.
+        What the user chose for an earlier file (:meth:`ImportChoice.remembered
+        <cuperiod.gui.loaders.ImportChoice.remembered>` of the last choice). What
+        the file shows of itself comes first: a column applies only where the file
+        has it, and a "none" (:data:`~cuperiod.gui.loaders.NO_COLUMN`) only where
+        detection found no error or band column; the ``domain`` applies only to a
+        brightness column whose name says neither magnitude nor flux (``col2``,
+        ``V``); ``read`` only to a text file that its own detection leaves in a
+        single column.
+
+    :meth:`choice` carries, besides what loads this file, what the next import
+    starts from: what the user picked here, and for what they left alone, the
+    earlier choice passed in. What detection found or a column's name implied is
+    the next file's to find again.
     """
 
     #: The user pressed Load: carries the :class:`~cuperiod.gui.loaders.ImportChoice`.
@@ -196,9 +232,19 @@ class PreviewDialog(QtWidgets.QDialog):
         #: The user set the domain in this dialog (then the value column no longer
         #: infers it). A remembered domain is not such a choice: see below.
         self._domain_touched = False
-        #: The previous file's domain, for a brightness column whose name does not
-        #: say (a flux file opened after a magnitude one must still read as flux).
+        #: The domain the user chose for an earlier file, for a brightness column
+        #: whose name does not say (a flux file opened after a magnitude one must
+        #: still read as flux).
         self._fallback_domain = domain
+        #: The columns the user chose for an earlier file, by role (unset roles
+        #: left out): each applies where this file allows, see :meth:`_wanted`.
+        self._presets: dict[str, str] = {
+            role: str(getattr(columns, role))
+            for role in _ROLES
+            if columns is not None and getattr(columns, role) is not None
+        }
+        #: The columns the user picked in this dialog, by role.
+        self._mine: dict[str, str] = {}
         self._filling = False
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -263,7 +309,7 @@ class PreviewDialog(QtWidgets.QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-        self._start(preview, columns, read)
+        self._start(preview, read)
 
     # -- construction ------------------------------------------------------------
     def _make_table(self, name: str) -> QtWidgets.QTableWidget:
@@ -384,12 +430,7 @@ class PreviewDialog(QtWidgets.QDialog):
         return box
 
     # -- state -------------------------------------------------------------------
-    def _start(
-        self,
-        preview: FilePreview,
-        columns: ColumnMap | None,
-        read: ReadOptions | None,
-    ) -> None:
+    def _start(self, preview: FilePreview, read: ReadOptions | None) -> None:
         """Show ``preview``; with the file at hand, fix an obviously wrong first read.
 
         A text file read into a single column (a semicolon or tab file) is re-read
@@ -404,14 +445,17 @@ class PreviewDialog(QtWidgets.QDialog):
             options, detected = self._detect_read(self._path, preview)
             if read is not None and read != options and not _splits(detected):
                 remembered = preview_file(self._path, read=read)
-                # header=False on a file that has one reads its names as data.
-                names_as_data = (
-                    remembered is not None
-                    and not read.header
-                    and bool(_text_over_numbers(remembered, remembered.columns))
-                )
-                if _splits(remembered) and not names_as_data:
-                    options, detected = read, remembered
+                if remembered is not None and _splits(remembered):
+                    # header=False on a file that has one reads its names as data.
+                    time = remembered.columns[0]
+                    preset_time = self._presets.get("time")
+                    if preset_time is not None and preset_time in remembered.columns:
+                        time = preset_time
+                    names_as_data = not read.header and bool(
+                        _names_read_as_data(remembered, time, remembered.columns)
+                    )
+                    if not names_as_data:
+                        options, detected = read, remembered
             if detected is not None:
                 preview = detected
             self._filling = True
@@ -421,7 +465,7 @@ class PreviewDialog(QtWidgets.QDialog):
                 self._header.setChecked(options.header)
             finally:
                 self._filling = False
-        self._show_preview(preview, columns)
+        self._show_preview(preview)
 
     @staticmethod
     def _detect_read(
@@ -445,26 +489,12 @@ class PreviewDialog(QtWidgets.QDialog):
             current = preview_file(path, read=options)
         return options, current
 
-    def _show_preview(
-        self, preview: FilePreview, columns: ColumnMap | None = None
-    ) -> None:
+    def _show_preview(self, preview: FilePreview) -> None:
         """Fill everything from ``preview``, keeping the choices that still apply."""
-        previous = self._chosen()
         self._preview = preview
         guess = guess_columns(preview)
         guessed = not preview.mapping and bool(guess)
-        wanted: dict[str, str | None] = {}
-        for role in _ROLES:
-            preset = getattr(columns, role) if columns is not None else None
-            usable = preset == NO_COLUMN or preset in preview.columns
-            if preset is not None and usable:
-                wanted[role] = preset
-            elif previous.get(role) is not None and (
-                previous[role] == NO_COLUMN or previous[role] in preview.columns
-            ):
-                wanted[role] = previous[role]
-            else:
-                wanted[role] = guess.get(role)
+        wanted = {role: self._wanted(role, preview, guess) for role in _ROLES}
         self._filling = True
         try:
             for role in _ROLES:
@@ -488,6 +518,31 @@ class PreviewDialog(QtWidgets.QDialog):
         self._note.setVisible(bool(preview.note))
         self._fill_file_table()
         self._refresh()
+
+    def _wanted(
+        self, role: str, preview: FilePreview, guess: Mapping[str, str]
+    ) -> str | None:
+        """The column ``role`` shows for ``preview``.
+
+        The user's pick in this dialog comes first while the file (re-read) still
+        has it; then the earlier file's choice: a column the file has, or "none"
+        where detection found no column for the role (the last file's lack of an
+        error or band column must not drop this one's); then detection, or the
+        guess when there was none.
+        """
+        mine = self._mine.get(role)
+        if mine is not None and (mine == NO_COLUMN or mine in preview.columns):
+            return mine
+        preset = self._presets.get(role)
+        if preset is not None and preset in preview.columns:
+            return preset
+        if (
+            preset == NO_COLUMN
+            and role in ("error", "band")
+            and role not in preview.mapping
+        ):
+            return preset
+        return guess.get(role)
 
     def _fill_combo(self, role: str, wanted: str | None) -> None:
         combo = self._combos[role]
@@ -557,6 +612,11 @@ class PreviewDialog(QtWidgets.QDialog):
         if self._filling:
             return
         self._touched = True
+        picked = self._chosen().get(role)
+        if picked is None:
+            self._mine.pop(role, None)
+        else:
+            self._mine[role] = picked
         if role == "value" and not self._domain_touched:
             value = self._chosen().get("value")
             inferred = infer_domain(value) if value else None
@@ -621,8 +681,8 @@ class PreviewDialog(QtWidgets.QDialog):
                     f"cannot be the {role}."
                 )
         if self._text and not self._header.isChecked():
-            numeric = [c for c in (time, value, error) if c not in (None, NO_COLUMN)]
-            above = _text_over_numbers(preview, [str(c) for c in numeric])
+            numeric = [c for c in (value, error) if c not in (None, NO_COLUMN)]
+            above = _names_read_as_data(preview, time, [str(c) for c in numeric])
             if above:
                 listed = ", ".join(repr(cell) for cell in above)
                 return (
@@ -740,9 +800,36 @@ class PreviewDialog(QtWidgets.QDialog):
         )
 
     def choice(self) -> ImportChoice:
-        """Everything :func:`~cuperiod.gui.loaders.load_path` needs."""
+        """Everything :func:`~cuperiod.gui.loaders.load_path` needs, and what the next
+        import starts from (:meth:`~cuperiod.gui.loaders.ImportChoice.remembered`)."""
         return ImportChoice(
-            columns=self.column_map(), domain=self.domain(), read=self.read_options()
+            columns=self.column_map(),
+            domain=self.domain(),
+            read=self.read_options(),
+            remember=self._carried_over(),
+        )
+
+    def _carried_over(self) -> ImportChoice:
+        """What the next import starts from: the user's choices, never detection's.
+
+        A column the user picked here (and still shown) replaces the earlier file's
+        choice for its role; a role they left alone keeps that earlier choice, used
+        here or not. A column detection found, or a guess, is not carried: the next
+        file's own detection finds its own (a "none" carried from a file without an
+        error column dropped the next file's errors). Likewise the domain: one set
+        here, else the earlier choice, never one inferred from a column's name (a
+        flux CSV made the next OGLE table load as fluxes). The read options are kept
+        as used: they apply only where the next file's own look leaves one column.
+        """
+        chosen = self._chosen()
+        columns: dict[str, str | None] = {}
+        for role in _ROLES:
+            mine = self._mine.get(role)
+            shown = mine is not None and chosen.get(role) == mine
+            columns[role] = mine if shown else self._presets.get(role)
+        domain = self.domain() if self._domain_touched else self._fallback_domain
+        return ImportChoice(
+            columns=ColumnMap(**columns), domain=domain, read=self.read_options()
         )
 
     def can_load(self) -> bool:

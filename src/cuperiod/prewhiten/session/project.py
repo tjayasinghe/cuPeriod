@@ -10,12 +10,14 @@ by feeding the logged, resolved arguments to the reducers again.
 Opening a file never executes anything from it. It is read as JSON only (no pickle,
 no ``eval``), its size is checked before reading, ``NaN``/``Infinity`` tokens are
 refused, every object is validated by a strict pydantic model with
-``extra="forbid"``, every cross reference by :func:`validate_state`, the frequency
-grid is limited relative to the data (:func:`grid_limit`), and a data reference must
-stay inside the project's directory. A source file the document names in its metadata
-is kept as a record only (:data:`RECORDED_SOURCE`), never re-read by a later save or
-script export. Whatever goes wrong while reading surfaces as
-:class:`~cuperiod.ProjectError` and nothing else.
+``extra="forbid"``, every cross reference by :func:`validate_state`, and a data
+reference must stay inside the project's directory. A frequency grid may name at most
+:data:`MAX_GRID_POINTS` frequencies, and a project recorded on the direct ``numpy``
+backend whose spectrum would cost more than :data:`DIRECT_WORK_LIMIT` opens on the
+NUFFT CPU backend, so a small file cannot keep :func:`load` busy for hours. A source
+file the document names in its metadata is kept as a record only
+(:data:`RECORDED_SOURCE`), never re-read by a later save or script export. Whatever
+goes wrong while reading surfaces as :class:`~cuperiod.ProjectError` and nothing else.
 """
 
 from __future__ import annotations
@@ -90,15 +92,13 @@ _MIGRATIONS: dict[int, Callable[[dict[str, Any]], dict[str, Any]]] = {}
 
 #: Largest frequency grid a project may name (8e8 bytes of float64 frequencies).
 MAX_GRID_POINTS: Final = 100_000_000
-#: Opening a project computes its head's residual spectrum, so a small file naming
-#: a huge grid could keep :func:`load` busy for hours. Below :data:`MAX_GRID_POINTS`
-#: a project's grid is limited to :data:`GRID_POINTS_PER_POINT` per data point, but
-#: never below :data:`GRID_POINTS_FLOOR` (see :func:`grid_limit`).
-GRID_POINTS_FLOOR: Final = 20_000_000
-GRID_POINTS_PER_POINT: Final = 64
-#: Points times grid frequencies above which a project recorded on the direct
-#: ``numpy`` backend opens on the NUFFT CPU backend instead (about two minutes of
-#: direct summation per spectrum), unless ``backend=`` asks for it.
+#: Opening a project computes its head's residual spectrum. On the NUFFT backends that
+#: costs about frequencies x log(frequencies), whatever the number of points (a
+#: 2e7-frequency project opens in a few seconds), but the direct ``numpy`` sum costs
+#: points x frequencies, so a small file naming a huge grid could keep :func:`load`
+#: busy for hours. Above this many evaluations (about two minutes of direct summation
+#: per spectrum) a project recorded on ``numpy`` opens on the NUFFT CPU backend
+#: instead, unless ``backend=`` asks for it.
 DIRECT_WORK_LIMIT: Final = 2_000_000_000
 #: Most points a project may hold.
 MAX_POINTS: Final = 50_000_000
@@ -415,27 +415,6 @@ def _brief(exc: ValidationError) -> str:
     )
 
 
-def grid_limit(n: int) -> int:
-    """The most grid frequencies a project on ``n`` data points may name.
-
-    :data:`GRID_POINTS_PER_POINT` per point, at least :data:`GRID_POINTS_FLOOR` and at
-    most :data:`MAX_GRID_POINTS`: every default grid of real data fits (a century of
-    sparse photometry to 50 c/d, or years of 20-s space photometry, which bring
-    their own millions of points), while a small file cannot name an hours-long one.
-    """
-    return min(MAX_GRID_POINTS, max(GRID_POINTS_FLOOR, GRID_POINTS_PER_POINT * n))
-
-
-def _check_grid(grid: tuple[float, float, int], n: int, where: str) -> None:
-    limit = grid_limit(n)
-    if int(grid[2]) > limit:
-        raise ProjectError(
-            f"{where}.nf: {int(grid[2])} frequencies exceed the limit of {limit} for "
-            f"{n} data points (max({GRID_POINTS_FLOOR}, {GRID_POINTS_PER_POINT} per "
-            "point))"
-        )
-
-
 def created_with() -> dict[str, str]:
     """Versions of what wrote a project (informative only)."""
     from cuperiod import __version__
@@ -603,9 +582,11 @@ def source_file(session: PreWhitenSession) -> tuple[Path, str] | tuple[None, str
 
     The file is ``meta["source"]``; it qualifies when the session has no label columns
     and :meth:`LightCurve.from_file` of it (same columns and domain) reproduces the
-    session's ``content_sha256`` exactly. A URL, a network (UNC) path or a path
-    relative to a drive (``C:data.csv``, or one with a single leading backslash)
-    never qualifies, and is refused before any filesystem call.
+    session's ``content_sha256`` exactly. Only this process sets that key (the file
+    constructors and the GUI loader name the path they read; an opened project's own
+    claim is kept as :data:`RECORDED_SOURCE`), so any path it holds may be checked:
+    a network share, a drive-relative or a relative name. A URL, or a name holding a
+    NUL byte, never qualifies, and is refused before any filesystem call.
     """
     data = session.kernel.data
     source = data.meta.get("source")
@@ -620,11 +601,11 @@ def source_file(session: PreWhitenSession) -> tuple[Path, str] | tuple[None, str
     try:
         path = Path(source).resolve()
         if not path.is_file():
-            return None, f"the source file {source!r} does not exist"
+            return None, f"the source file '{source}' does not exist"
         if not _data_suffix_ok(path.name):
             return (
                 None,
-                f"the source file {path.name!r} is not a known light-curve type",
+                f"the source file '{path.name}' is not a known light-curve type",
             )
         stat = path.stat()
         key = (
@@ -657,17 +638,17 @@ _SOURCE_DIGESTS: dict[tuple[Any, ...], str] = {}
 def _unusable_source(text: str) -> str:
     """Why ``text`` may not name a re-readable data file (``""`` when it may).
 
-    Decided on the text alone: resolving a UNC path already opens a connection to
-    its host, and a drive-relative path depends on that drive's working directory.
+    Decided on the text alone. ``meta["source"]`` only ever holds a path this process
+    read (see :func:`source_file`), so a network share (``\\\\host\\share``,
+    ``//host/share``), a long or device path (``\\\\?\\C:\\...``), a drive-relative
+    path (``C:data.csv``) and a relative name with a colon (``TIC123:s14.csv``) are
+    all files to check. Only a URL (a scheme of two or more characters followed by
+    ``://``, so ``C://data/x.csv`` stays a path) and a NUL byte are refused.
     """
     if "\x00" in text:
         return "the source file name is malformed"
-    if text.startswith(("\\\\", "//")):
-        return f"the source file {text!r} is a network (UNC) or device path"
-    if re.match(r"^[A-Za-z][A-Za-z0-9+.\-]+:", text):
-        return f"the source {text!r} is a URL, not a file"
-    if text.startswith("\\") or re.match(r"^[A-Za-z]:(?![\\/])", text):
-        return f"the source file {text!r} is relative to a drive, not a full path"
+    if re.match(r"^[A-Za-z][A-Za-z0-9+.\-]+://", text):
+        return f"the source '{text}' is a URL, not a file"
     return ""
 
 
@@ -790,21 +771,16 @@ def save(
     Raises
     ------
     ProjectError
-        When the data can be neither referenced nor embedded as asked, the file
-        would exceed ``max_project_bytes``, or the grid exceeds :func:`grid_limit`
-        (a file :func:`load` would refuse is never written).
+        When the data can be neither referenced nor embedded as asked, or the file
+        would exceed ``max_project_bytes``.
     """
     target = Path(path)
     if embed_data not in ("auto", "always", "never"):
         raise ProjectError("embed_data must be 'auto', 'always' or 'never'")
     data = session.kernel.data
     limits = session.session_settings
-    try:
-        _check_grid(session.kernel.creation.grid, data.n, "creation.grid")
-        _check_grid(session.state.grid, data.n, "state.grid")
-    except ProjectError as exc:
-        raise ProjectError(f"the session cannot be saved: {exc}") from None
     reference: str | None = None
+    why = ""
     if embed_data != "always":
         reference, why = _reference(session, target.parent)
         if reference is None and embed_data == "never":
@@ -816,8 +792,9 @@ def save(
     ):
         raise ProjectError(
             f"{data.n} points exceed embed_data_max_points "
-            f"({limits.embed_data_max_points}); save with embed_data='always', or "
-            "keep the data file next to the project so it can be referenced"
+            f"({limits.embed_data_max_points}) and the data cannot be referenced "
+            f"({why}); save with embed_data='always', or keep the data file next to "
+            "the project so it can be referenced"
         )
     doc = document(session, reference=reference, title=title, ui=ui)
     try:
@@ -1361,6 +1338,26 @@ def _coerce(data: Any) -> LightCurve:
     return _as_light_curve(data, None, None).finite()
 
 
+def _supplied(data: Any, columns: ColumnMap | None, domain: str) -> LightCurve:
+    """The caller's replacement for the project's data.
+
+    A path is read with the project's recorded column mapping and domain, falling back
+    to detected columns when the recorded names are not in the file (the content hash
+    still checks the points): what *Locate the light curve* and ``--data`` hand over.
+    """
+    if not isinstance(data, (str, os.PathLike)):
+        return _coerce(data)
+    from cuperiod.core.errors import ColumnResolutionError
+
+    file = Path(data)
+    try:
+        return LightCurve.from_file(file, columns=columns, domain=domain).finite()
+    except ColumnResolutionError:
+        if columns is None:
+            raise
+        return LightCurve.from_file(file, domain=domain).finite()
+
+
 def _open(
     project: ProjectModel,
     file: Path,
@@ -1375,7 +1372,7 @@ def _open(
     stored = project.data
     columns = _columns(stored.columns) if stored.mode == "reference" else None
     if data is not None:
-        lc = _coerce(data)
+        lc = _supplied(data, _columns(stored.columns), stored.domain)
     elif stored.mode == "embedded":
         lc = _embedded(stored)
     else:
@@ -1430,9 +1427,7 @@ def _open(
         label_names=tuple(labels),
         content_sha256=actual,
     )
-    _check_grid(creation.grid, n, "creation.grid")
     head = build_state(project.state, n=n)
-    _check_grid(head.grid, n, "state.grid")
     validate_state(head, _session_data(lc, labels))
     log = _log(project.log)
     if len(log) > creation.session_settings.max_actions:
@@ -1543,7 +1538,9 @@ def load(
     path : str or Path
     data : optional
         The light curve, replacing the embedded or referenced data (still checked by
-        content hash).
+        content hash): a light curve, arrays or a table, or a file path, read with the
+        project's recorded columns and domain (detected columns when those are not in
+        the file).
     verify : bool, default False
         Replay the logged actions on a fresh session and compare its head with the
         stored one (frequencies to 1e-9 relative, amplitudes to 1e-6, phases to 1e-6

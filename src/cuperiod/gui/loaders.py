@@ -19,10 +19,11 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 import warnings
 from collections import Counter
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Final
@@ -114,15 +115,25 @@ class ImportChoice:
 
     ``columns`` may carry :data:`NO_COLUMN` for the error and band roles. Pass the
     three to :func:`load_path`, or call :meth:`load`.
+
+    ``remember`` is what the next import should start from when that is not this
+    choice itself (see :meth:`remembered`): the dialog carries over only what the
+    user chose, never what detection found in this file. It takes no part in
+    comparisons: two choices that load alike are equal.
     """
 
     columns: ColumnMap
     domain: Domain | None = None
     read: ReadOptions | None = None
+    remember: ImportChoice | None = field(default=None, compare=False, repr=False)
 
     def load(self, path: str | Path) -> LoadedCurve:
         """Load ``path`` with this choice (:func:`load_path`)."""
         return load_path(path, columns=self.columns, domain=self.domain, read=self.read)
+
+    def remembered(self) -> ImportChoice:
+        """The choice the next import starts from: :attr:`remember`, else this one."""
+        return self if self.remember is None else self.remember
 
 
 def is_text_table(path: str | Path) -> bool:
@@ -241,6 +252,36 @@ def _pyarrow_table_from_batch(batch: Any) -> Any:
     import pyarrow as pa
 
     return pa.Table.from_batches([batch])
+
+
+def _loader_names(path: Path, names: list[str]) -> list[str]:
+    """The names the load gives the columns pandas previewed of a CSV / TSV.
+
+    The two readers name an empty or a repeated header cell differently (pandas
+    ``Unnamed: 2`` and ``mag.1``, the loader's astropy ``col2`` and ``mag_1``), so a
+    column picked under the preview's name was not found at load. When pandas
+    renamed one, the loader's reader reads the top lines, and its names are used if
+    they line up with pandas' columns.
+    """
+    renamed = any(
+        re.fullmatch(r"Unnamed: \d+", name)
+        or ((dup := re.fullmatch(r"(.+)\.\d+", name)) and dup.group(1) in names[:j])
+        for j, name in enumerate(names)
+    )
+    if not renamed:
+        return names
+    from astropy.table import Table
+
+    try:
+        lines = _head_lines(path, 2)
+        table = Table.read(
+            lines, format="ascii.csv" if path.suffix.lower() == ".csv" else "ascii.tab"
+        )
+    except Exception:  # noqa: BLE001 - pandas' names are still a preview
+        _logger.debug("could not read the header of %s as the loader", path)
+        return names
+    loaded = [str(c) for c in table.colnames]
+    return loaded if len(loaded) == len(names) else names
 
 
 def _count_rows(path: Path) -> int | None:
@@ -650,6 +691,7 @@ def preview_file(
         frame = _read_dataframe(p, nrows=max_rows)
         if frame is None:
             return None
+        frame.columns = _loader_names(p, [str(c) for c in frame.columns])
     elif is_text_table(p):
         frame, n_rows, problem = _text_head(p, read, max_rows)
         if frame is None:
@@ -734,6 +776,35 @@ def numeric_cells(cells: Iterable[str]) -> list[float]:
     return out
 
 
+#: How a preview shows a value the row lacks, besides an empty cell and ``nan``:
+#: pandas' missing value (a masked integer cell). Placeholders the loader does not
+#: read as missing (``--``, ``INDEF``) are text: a column holding them cannot load.
+_MISSING_CELLS: Final = frozenset({"<NA>"})
+
+
+def is_text_cell(cell: str) -> bool:
+    """Whether a preview cell is text rather than a number.
+
+    ``float()`` decides, so ``nan`` and ``inf`` are numbers (missing ones), and an
+    empty cell, or the reader's rendering of one, is no text either: a value the row
+    lacks says nothing about a header row or a column of labels.
+    """
+    text = str(cell).strip()
+    if not text or text in _MISSING_CELLS:
+        return False
+    try:
+        float(text)
+    except ValueError:
+        return True
+    return False
+
+
+def _numeric_column(cells: Sequence[str]) -> bool:
+    """Whether preview cells read as a column of numbers: no text among them (a
+    missing value may be), and at least one finite number."""
+    return not any(is_text_cell(c) for c in cells) and bool(numeric_cells(cells))
+
+
 def _column_cells(preview: FilePreview, column: str) -> list[str]:
     try:
         j = preview.columns.index(column)
@@ -748,16 +819,12 @@ def guess_columns(preview: FilePreview) -> dict[str, str]:
     Each role is taken by name where a column matches the detection lists; time and
     value otherwise fall to the first unused all-numeric columns, and the error to
     the third numeric column of a three-column numeric table (``JD mag err``, the
-    OGLE / Period04 layout). A role nothing suits is left out.
+    OGLE / Period04 layout). A role nothing suits is left out. A missing value (an
+    empty cell, ``nan``) does not stop a column from counting as numeric.
     """
     if preview.mapping:
         return dict(preview.mapping)
-    numeric = [
-        c
-        for c in preview.columns
-        if (cells := _column_cells(preview, c))
-        and len(numeric_cells(cells)) == len(cells)
-    ]
+    numeric = [c for c in preview.columns if _numeric_column(_column_cells(preview, c))]
     lower = {c.lower(): c for c in reversed(preview.columns)}
     out: dict[str, str] = {}
 
@@ -1070,6 +1137,7 @@ __all__ = [
     "enumerate_sources",
     "example_data_dir",
     "guess_columns",
+    "is_text_cell",
     "is_text_table",
     "load_path",
     "make_demo_multiband",

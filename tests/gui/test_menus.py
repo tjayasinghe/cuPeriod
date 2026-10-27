@@ -201,8 +201,13 @@ def test_the_f1_sheet_lists_every_shortcut_of_the_window(qtbot: QtBot) -> None:
     native = QtGui.QKeySequence.SequenceFormat.NativeText
 
     def listed(text: str, keys: str) -> bool:
-        cells = f"<td>{html_module.escape(text)}</td><td><b>{html_module.escape(keys)}"
-        return cells in sheet
+        # The command's text, perhaps with a note in parentheses (which analysis).
+        cells = (
+            re.escape(f"<td>{html_module.escape(text)}")
+            + r"(?: \([^<]*\))?"
+            + re.escape(f"</td><td><b>{html_module.escape(keys)}")
+        )
+        return re.search(cells, sheet) is not None
 
     registry = {id(window.commands.action(c)) for c in COMMAND_IDS}
     own = [
@@ -224,6 +229,28 @@ def test_the_f1_sheet_lists_every_shortcut_of_the_window(qtbot: QtBot) -> None:
     assert "Spectrum (focused)" in sheet and "Light curve (focused)" in sheet
     for what, _keys in (*SPECTRUM_KEYS, *LIGHT_CURVE_KEYS):
         assert html_module.escape(what) in sheet
+    window.controller.shutdown()
+
+
+def test_the_f1_sheet_says_which_analysis_the_shared_keys_run(qtbot: QtBot) -> None:
+    """F5 / Ctrl+Return / Ctrl+Enter are listed under View (Compute periodogram) and
+    Pre-whitening (Auto); the sheet did not say that the analysis decides."""
+    import html as html_module
+
+    provider = FakeDialogProvider()
+    window = _window(qtbot, provider)
+    window.commands.action("view.shortcuts").trigger()
+    _kind, (_title, sheet) = provider.calls[-1]
+    f5 = QtGui.QKeySequence("F5").toString(QtGui.QKeySequence.SequenceFormat.NativeText)
+    rows = [
+        html_module.unescape(text)
+        for text, keys in re.findall(r"<tr><td>(.*?)</td><td><b>(.*?)</b>", sheet)
+        if f5 in html_module.unescape(keys).split(", ")
+    ]
+    assert len(rows) == 2, rows
+    compute = next(text for text in rows if text.startswith("Compute periodogram"))
+    assert "Periodogram analysis" in compute
+    assert "Pre-whitening" in compute and "Auto" in compute
     window.controller.shutdown()
 
 
