@@ -311,6 +311,7 @@ def test_export_script_survives_a_project_folder_that_does_not_exist(
         app,
         ["prewhiten", str(star), *OPTIONS, "--save-project", str(project),
          "--export-script", str(script)],
+        env={"COLUMNS": "1000"},  # rich wraps a long temp path inside its error panel
     )
     assert result.exit_code == 2, result.output
     assert script.exists() and f"Wrote {script}" in result.stdout
