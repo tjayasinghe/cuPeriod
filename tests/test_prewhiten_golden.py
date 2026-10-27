@@ -95,6 +95,12 @@ def _compare(
                 # Residuals scatter about zero: their mean and the samples that happen
                 # to sit near zero are held to the residual scatter, not to themselves.
                 inner = max(scale, float(expected[key]["std"]))
+            elif key == "residual" and "predicted" in expected:
+                # A combination's residual is observed minus predicted frequency, a
+                # difference of nearly equal numbers: held to the frequency scale, as
+                # the frequencies themselves are (Linux CI moved one by 8e-10 c/d,
+                # 1.3e-6 of its own size).
+                inner = max(scale, abs(float(expected["predicted"])))
             _compare(actual[key], expected[key], rtol, f"{path}.{key}", inner, problems)
         return
     if isinstance(expected, list):
