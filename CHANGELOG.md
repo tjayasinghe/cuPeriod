@@ -6,6 +6,8 @@ All notable changes to cuPeriod are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-10-27
+
 Everything below is measured against 1.2.0. Interactive pre-whitening (sessions,
 projects, constrained fits, partitions), the period-change tools (`cuperiod.pdot`), the
 GUI's import dialog, menu bar and session panes, and the `cuperiod pdot`, `pdot-batch`
@@ -1593,6 +1595,7 @@ First public release.
   parity, on 72 real ASAS-SN light curves across six variability classes and on confirmed
   Kepler transits.
 
+[1.3.0]: https://github.com/tjayasinghe/cuPeriod/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/tjayasinghe/cuPeriod/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/tjayasinghe/cuPeriod/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/tjayasinghe/cuPeriod/releases/tag/v1.0.0

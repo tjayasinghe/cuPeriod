@@ -1,6 +1,6 @@
 # cuPeriod — Validation & Benchmark Report
 
-**Summary.** cuPeriod 1.3.0.dev0's 7 single-band-benchmarked period-search methods were validated on 126 real ASAS-SN light curves with literature periods, plus 12 confirmed Kepler KOIs for the transit methods. CPU and GPU backends agree to round-off (worst-case relative difference 3e-06, in GLS where the power is near zero; its absolute difference stays ≤ 5e-09) and select the identical best period on 100% of targets; every method with an established external reference implementation reproduces it on an identical grid. Harmonic-aware period recovery is ≥88% for all of them. Peak measured throughput is 728 light curves/s (GLS) on one GPU. Every multi-band method was additionally validated on 100 real SDSS Stripe 82 RR Lyrae with literature periods (best joint model: 93% strict top-period recovery; §4). Practical guidance on backend selection is given in §8; limitations in §9.
+**Summary.** cuPeriod 1.3.0's 7 single-band-benchmarked period-search methods were validated on 126 real ASAS-SN light curves with literature periods, plus 12 confirmed Kepler KOIs for the transit methods. CPU and GPU backends agree to round-off (worst-case relative difference 3e-06, in GLS where the power is near zero; its absolute difference stays ≤ 5e-09) and select the identical best period on 100% of targets; every method with an established external reference implementation reproduces it on an identical grid. Harmonic-aware period recovery is ≥88% for all of them. Peak measured throughput is 728 light curves/s (GLS) on one GPU. Every multi-band method was additionally validated on 100 real SDSS Stripe 82 RR Lyrae with literature periods (best joint model: 93% strict top-period recovery; §4). Practical guidance on backend selection is given in §8; limitations in §9.
 
 ## 1 — Test environment and methodology
 
@@ -11,7 +11,7 @@
 | GPU | NVIDIA GeForce RTX 5070 Ti, 16 GB (compute capability 12.0, sm_120) |
 | CPU | AMD Ryzen 9 9950X3D, 16 cores / 32 threads |
 | Memory | 32 GB |
-| Software | cuPeriod 1.3.0.dev0, Python 3.12, CuPy (CUDA 12), PyTorch cu128 (torch:cuda), numba, finufft |
+| Software | cuPeriod 1.3.0, Python 3.12, CuPy (CUDA 12), PyTorch cu128 (torch:cuda), numba, finufft |
 | torch device (validated) | torch:cuda |
 | Reference tools | astropy (`LombScargle`, `BoxLeastSquares`), PyAstronomy (`pyPDM`), `transitleastsquares`; CE/String-Length/MHAOV vs direct NumPy implementations of the published algorithms |
 | Validation data | 126 ASAS-SN g-band light curves (6 variability classes: Eclipsing 28, Rr Lyrae 22, Cepheid 16, Delta Scuti 16, Long Period 22, Rotational 22) with VSX literature periods, bundled in `dataset/light_curves.parquet` (core sample plus an extension selected/downloaded via `dataset/download_extension.py` from ASAS-SN Sky Patrol — clean single VSX types, n_det≥300, baseline≥1000 d); 12 confirmed Kepler KOIs (Mendeley *Dataset_Machine_Learning_Exoplanets_2024*; flux via MAST/lightkurve); 100 SDSS Stripe 82 RR Lyrae with ugriz photometry and literature periods (Sesar et al. 2010, `dataset/s82_rrlyrae.parquet`) for the multi-band methods |
