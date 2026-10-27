@@ -21,7 +21,7 @@ pictures per star (raw → periodogram → phased).
 ### Run it
 
 ```bash
-pip install cuperiod matplotlib pandas pyarrow   # add "cuperiod[gpu]" to use a GPU
+pip install cuperiod matplotlib pandas jupyterlab   # add "cuperiod[gpu]" to use a GPU
 jupyter lab cuperiod_tour.ipynb
 ```
 
@@ -52,9 +52,9 @@ cuperiod-gui                    # or:  python -m cuperiod.gui
 
 ### A two-minute smoke test
 
-1. **Load demo → *Kepler KIC 7532973*.** Pick method **BLS**, press **Compute**. The
-   spectrum draws (peak-preserving, smooth to zoom); the phased panel shows the transit as
-   a **dip** at the best period.
+1. **Load demo → *Kepler KIC 7532973*.** Pick method **BLS**, press **Compute
+   periodogram** (F5). The spectrum draws (peak-preserving, smooth to zoom); the phased
+   panel shows the transit as a **dip** at the best period.
 2. **Slide the teal line** across the spectrum (or click a row in the **Peaks** dock) and
    watch the phased curve re-fold live. Toggle the spectrum's **x-axis** (frequency ↔
    period) and **log** scales, and the **2 cycles** checkbox on the phased panel.

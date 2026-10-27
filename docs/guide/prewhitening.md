@@ -110,6 +110,21 @@ insignificant. Those are dropped and the solution re-fitted (`prune`, on by defa
 re-check is the S/N test, so it runs only when `"snr"` is among `stop_criteria`), and the
 count appears in `n_pruned` and in `stop_reason`.
 
+:::{admonition} Known limitation: keep the separation guard above the refine box
+:class: warning
+`min_separation_rayleigh` is checked when a component is extracted. The final polish
+then lets every frequency move by up to `refine_bound_rayleigh` Rayleigh widths and does
+not check the separation again. With a tight guard, two components can converge on one
+frequency with amplitudes orders of magnitude above the real signal that cancel each
+other, and an S/N to match. Keep `min_separation_rayleigh` above
+`refine_bound_rayleigh`, as the defaults (1.5 and 1.0) are. A guard of 1 Rayleigh width
+or less can collapse even when the refine box is no wider than the guard: on 40
+synthetic stars with drifting, modulated or close frequencies, the default guard and box
+gave no such solution, while a guard of 1.0 with the default box gave three. If you do
+tighten the guard, check the result for components closer than the guard; the collapsed
+pairs are flagged `blended` (counted in `n_blended`).
+:::
+
 ## Uncertainties
 
 Reported errors are 1-sigma and come from one of three estimators, set by `uncertainty`:
@@ -315,9 +330,13 @@ cuperiod prewhiten star.csv --snr 4.6 -n 30 --spacing --csv modes.csv
 cuperiod batch-prewhiten "lightcurves/*.csv" --out modes.parquet --workers 8
 ```
 
-`--save-project star.cupw.json` keeps the run as a project to open, edit or verify
-later, and `--export-script star.py` writes a script that reproduces it
-({doc}`interactive-prewhitening`). See {doc}`cli` for the full option list, and
+An option you do not give falls back to `CUPERIOD_PREWHITEN_<FIELD>`, as in the library
+(the help text names the variable). `--save-project star.cupw.json` keeps the run as a
+project to open, edit or verify later, and `--export-script star.py` writes a script that
+reproduces it ({doc}`interactive-prewhitening`). A data file outside the project's folder
+is embedded in the project; above `embed_data_max_points` (200 000 points) the library's
+`save` would refuse, so the CLI embeds it anyway and prints a note. See {doc}`cli` for the
+full option list, and
 {doc}`gui` for the desktop app, which runs the same analysis with the amplitude
 spectrum, the residual overlay, an editable frequency table and a period-spacing
 explorer side by side.
@@ -332,7 +351,7 @@ Every field of {class}`~cuperiod.PreWhitenSettings` is documented in the
 | --- | --- | --- |
 | `max_frequencies` | 30 | Hard cap on extracted components. |
 | `snr_threshold` | 4.0 | The Breger criterion (see the note above). |
-| `min_separation_rayleigh` | 1.5 | Resolution guard between components. |
+| `min_separation_rayleigh` | 1.5 | Resolution guard between components; keep it above `refine_bound_rayleigh` (1.0), see the known limitation under [Stopping criteria](#stopping-criteria). |
 | `samples_per_peak` | 10 | Frequency oversampling of the search grid. |
 | `maximum_frequency` | regular cadence: 0.5/cadence; otherwise max(5 × pseudo-Nyquist, 50 /d) | Top of the search band (see [below](#the-automatic-search-band)). |
 | `uncertainty` | `"covariance"` | Error estimator. |
@@ -341,8 +360,11 @@ Every field of {class}`~cuperiod.PreWhitenSettings` is documented in the
 | `combination_max_order` | 2 | Largest `Σ|nᵢ|` in the combination search; 1 switches it off. |
 | `backend` | `"auto"` | GPU when available (see {doc}`backends`). |
 
-`downsample_points` had no effect and is deprecated: setting it warns
-(`DeprecationWarning`), and it will be removed.
+`downsample_points` never had an effect and is deprecated, to be removed in a future
+release. It is no longer a settings field (it is not in `model_fields` or
+`model_dump()`): passing it, or setting `CUPERIOD_PREWHITEN_DOWNSAMPLE_POINTS`, warns
+(`DeprecationWarning`) and is ignored, and reading `settings.downsample_points` warns and
+returns 2000, its 1.2 default.
 
 ### The automatic search band
 

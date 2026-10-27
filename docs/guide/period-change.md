@@ -86,8 +86,9 @@ Both axes are sampled to equal phase smear: the dP/dt step keeps the residual
 drift under {math}`1/(2 s)` cycles across the baseline, exactly as the
 frequency step does. Methods that resolve structure sharper than a sinusoid
 smear proportionally sooner, so the step automatically refines by a per-method
-harmonic scale (MHAOV's harmonic count; half the phase-bin count for PDM and
-conditional entropy; SuperSmoother's smallest span). The default extent is set
+harmonic scale: MHAOV's harmonic count (3 at its defaults); half the phase-bin count
+for PDM and conditional entropy (5); a fixed 4 for String-Length; half the inverse of
+SuperSmoother's smallest span (10); and 1 for every other method. The default extent is set
 in accumulated drift *cycles* (`max_cycle_drift`), which keeps the row count
 baseline-independent while reaching every drift big enough to defocus a
 constant-period search — and means the physical dP/dt coverage adapts to your
@@ -155,9 +156,12 @@ ambiguous, the classical O−C failure (a one-cycle error anywhere invalidates
 the diagram). Timings may come in any order, each keeping its own error, and a
 non-finite time is dropped together with its error. With `errors=None` the common
 timing error is estimated from the scatter about the fitted quadratic (so the
-quadratic's `chi2_reduced` is 1 by construction); the errors of a cubic and higher
-ladder steps are inflated by `sqrt(chi2_reduced)` when that exceeds 1
-(`pdot_err_scaled`, `pddot_err_scaled`).
+quadratic's `chi2_reduced` is 1 by construction). {func}`~cuperiod.fit_ephemeris`
+always fits the quadratic; for a cubic see
+[When one rate is not enough](#when-one-rate-is-not-enough). On any
+{class}`~cuperiod.EphemerisFit`, `pdot_err_scaled` (and, on a cubic,
+`pddot_err_scaled`) inflates the formal error by `sqrt(chi2_reduced)` when that
+exceeds 1.
 
 Timing lists exist for thousands of eclipsing binaries. The AAVSO hosts the
 late Bob Nelson's database of over 5800 O−C files — one spreadsheet of minima
@@ -185,13 +189,22 @@ timings show.
 Three conventions for "the period derivative" coexist in the literature, and
 mixing them up has reached refereed journals (a published hot-Jupiter decay
 rate was once wrong by the period squared — the conversion was multiplied
-instead of divided). cuPeriod reports all of them:
+instead of divided). cuPeriod reports all of them, with the same accessors on every
+result that carries a rate — the search's {class}`~cuperiod.PdotBest`, a
+{class}`~cuperiod.PhaseTrackResult`, an {class}`~cuperiod.EphemerisFit` and an
+{class}`~cuperiod.LTTEFit` (whose values are the *secular* rate, with the cycle
+removed):
 
 | Convention | Definition | Where you meet it | Accessor |
 | --- | --- | --- | --- |
-| dP/dt | per unit time, dimensionless | most of this page | `pdot` (+ `pdot_s_per_yr`, `pdot_ms_per_yr`, `pdot_d_per_myr`) |
+| dP/dt | per unit time, dimensionless | most of this page | `pdot` (+ `pdot_s_per_yr`, `pdot_ms_per_yr`, `pdot_d_per_yr`, `pdot_d_per_myr`) |
 | dP/dE | per cycle: {math}`P \dot P` | eclipse-timing ephemerides, `T_0 + PE + QE^2` with {math}`Q = \tfrac{1}{2} P \dot P` | `2 * quadratic term` — tested as {math}`\dot P = 2Q/P` |
-| {math}`\dot P / P` | fractional rate, 1/time | theory; the search's own axis | `pdot_over_p`, `dlnp_dt_per_yr` |
+| {math}`\dot P / P` | fractional rate, 1/time | theory; the search's own axis | `pdot_over_p` (1/day), `dlnp_dt_per_yr` |
+
+`pdot_over_p` divides by `period` on a {class}`~cuperiod.PdotBest` and a
+{class}`~cuperiod.PhaseTrackResult`, and by `period_ref` on an
+{class}`~cuperiod.EphemerisFit` and an {class}`~cuperiod.LTTEFit`.
+{func}`~cuperiod.convert_pdot` converts a bare number between the units.
 
 ## A third body: the cyclic O−C
 
@@ -212,9 +225,9 @@ two regimes you are in is decided by the baseline:
 - **{math}`P_2 \gg` baseline.** Less than one cycle is sampled and the
   sinusoid is indistinguishable from a parabola. This is how WASP-4b's
   "orbital decay" became a companion (see below); only curvature beyond a
-  parabola — the cubic in the ephemeris ladder,
-  {attr}`~cuperiod.EphemerisFit.pddot` — or an independent radial-velocity
-  jerk can break it.
+  parabola — a cubic ephemeris's {attr}`~cuperiod.EphemerisFit.pddot`, see
+  [When one rate is not enough](#when-one-rate-is-not-enough) — or an
+  independent radial-velocity jerk can break it.
 - **{math}`P_2 \lesssim` baseline.** The O−C is *not monotonic*, and the rate
   a parabola reports is a baseline-weighted average of a wobble: its value
   and its sign depend on which part of the cycle the data happen to cover.
@@ -253,6 +266,15 @@ OGLE-BLG-ECL-289126: 14.3 yr of OGLE-III+IV photometry, 40 segments
   secular dP/dt   : +1.5e-7 +- 0.5e-7 d/yr                  chi2_r = 1.3
   f(m) = 0.056 Msun  ->  m3 >= 0.63 Msun for a 1.5 Msun binary
 ```
+
+Every error in this block is the formal one times `sqrt(chi2_reduced)` of its own
+fit, floored at 1. For the orbit that factor is
+{attr}`LTTEFit.error_inflation <cuperiod.LTTEFit.error_inflation>` (1.16 here); the
+attributes `best.outer_period_err_yr` and `best.amplitude_err_s` return the formal
+errors (0.08 yr and 15 s here), so multiply them by `best.error_inflation` to quote
+the block's 0.09 yr and 17 s. The two dP/dt errors are `pdot_err_scaled`, which
+already carries the factor. `cuperiod pdot` prints the orbit's errors and the secular
+rate's the same way, and says so in its `errors  formal x ...` line.
 
 The second number pair is the point. `res.null` is the polynomial-only fit —
 the quadratic ephemeris {func}`~cuperiod.phase_track` already reported — and
@@ -312,6 +334,9 @@ will happily confirm the drift is real; it is that the O−C keeps shedding
 residual when the ephemeris is allowed to curve further:
 
 ```python
+import numpy as np
+
+dt = track.t_mid - track.t_ref
 ladder = {d: np.polyfit(dt, track.delay, d, w=1/track.delay_err) for d in (2, 3, 4)}
 ```
 
@@ -319,7 +344,23 @@ A quadratic *is* constant dP/dt, so a cubic that removes most of what remains
 means the rate is changing. {attr}`~cuperiod.EphemerisFit.pddot` measures that
 directly from a degree-3 fit, and {attr}`~cuperiod.EphemerisFit.implied_model`
 reports which law it favours (`pddot = 0` is constant dP/dt;
-`pddot = pdot²/P` is exponential).
+`pddot = pdot²/P` is exponential); both are `NaN` / `"unknown"` below degree 3.
+{func}`~cuperiod.fit_ephemeris` and {func}`~cuperiod.phase_track` fit only the
+linear and quadratic ephemerides. Two public paths give the cubic:
+
+- {func}`~cuperiod.ltte_search` with `degree=3` (or
+  `PdotSettings(ltte_degree=3)`): its `null` is the cubic
+  {class}`~cuperiod.EphemerisFit` alone, fitted to the same O−C as the light-time
+  orbit. It takes a track or a timing list, and raises
+  {exc}`~cuperiod.InsufficientDataError` below `ltte_min_points` (8) O−C points or
+  on a baseline too short for its cycle scan.
+- {func}`~cuperiod.batch_pdot`: its summary table reports the cubic as the
+  `ladder_*` columns and `implied_model` (see [Whole catalogues](#whole-catalogues)).
+
+```python
+cubic = cup.ltte_search(track, degree=3).null      # an EphemerisFit, degree 3
+print(cubic.pddot, cubic.pddot_err_scaled, cubic.implied_model)
+```
 
 The model-free answer is to stop assuming a shape. {func}`~cuperiod.period_profile`
 chops the light curve into intervals short enough that the period is constant
@@ -434,7 +475,8 @@ long-period-variable community's standard, whose Gaussian window adapts to
 each trial frequency instead of being fixed in days. Both trade frequency
 resolution for time localization — a window of length {math}`W` cannot
 resolve fractional period changes below {math}`\sim P/W` — and both expose a
-`period_trend()` that turns the ridge into a rough dP/dt. Treat these as
+`period_trend()` that turns the ridge into a rough *fractional* rate: it returns
+the pair `((dP/dt)/P, error)` in 1/day, so multiply by the period for dP/dt. Treat these as
 diagnostics: the coherent tools above are an order of magnitude more
 sensitive to a genuinely secular trend, but they will happily average over a
 reversal that a map shows at a glance.
@@ -442,7 +484,7 @@ reversal that a map shows at a glance.
 ```python
 res = cup.wwz((time, mag), frequency=freqs)     # or cup.sliding_periodogram(...)
 res.peak_period                                 # the ridge: an array, one per tau
-res.period_trend()                              # a rough dP/dt from the ridge
+rate, rate_err = res.period_trend()             # (dP/dt)/P in 1/day; times P for dP/dt
 res.to_dict(include_map=True)                   # same spelling on both maps
 ```
 
@@ -460,9 +502,13 @@ res.to_dict(include_map=True)                   # same spelling on both maps
 - `SlidingPeriodogram.window_periodogram(i)` reports that window's own `baseline` and
   point count (`n_window_points`), so `best_periods()` separates peaks at the window's
   resolution; the run's values are in `meta["run_baseline"]` / `meta["run_n_samples"]`.
-  {func}`~cuperiod.sliding_periodogram` honours the method's settings backend, never
-  drops the last observation, and raises `ValueError` for a non-finite window, step or
-  period, or a period longer than the window.
+  {func}`~cuperiod.sliding_periodogram` honours the method's settings backend, no
+  longer loses the last observation to rounding, and raises `ValueError` for a
+  non-finite window, step or period, or a period longer than the window. The default
+  window and step tile the baseline exactly. A custom pair that does not gets one
+  extra window ending at the last epoch when more than half a step of the tail is
+  left over; otherwise up to half a step of the tail stays outside the map (with
+  `window=30, step=20` on a 100-day run, the windows end at day 90).
 
 ## How small a rate can you measure?
 
@@ -683,8 +729,11 @@ Useful cuts on the summary table:
 
 `plots=` writes a six-panel diagnostic per star (light curve, drift-corrected
 fold, search map, O−C, P(t) track with the fitted law, and the decay
-timescale). It needs matplotlib — `pip install "cuperiod[plot]"` — and is slow
-enough at catalogue scale that it is worth pairing with `plot_keys`. The summary row's
+timescale). It needs matplotlib — `pip install "cuperiod[plot]"`; without it
+`plots=` raises `ImportError` naming that command before any light curve is read — and
+is slow enough at catalogue scale that it is worth pairing with `plot_keys`. The O−C
+panel draws the light-time orbit only when the O−C supports it (ΔBIC > 10 and the
+outer period not at the edge of the scan); otherwise it shows the O−C alone. The summary row's
 `figure` column gives each file's path. A key that is not plain `[A-Za-z0-9_.-]` (a
 path-qualified `fieldA/lc_0000`), is longer than 120 characters or names a Windows
 device gets a `-<8 hex>` digest suffix, so distinct keys never overwrite each other's

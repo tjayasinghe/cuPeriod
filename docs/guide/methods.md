@@ -91,7 +91,7 @@ Key settings ({class}`~cuperiod.GLSSettings`): `samples_per_peak`, `nyquist_fact
 - The data are centred in float64 before the transform, so precision no longer drops
   with (mean/scatter)²; power is clipped to [0, 1] and an exactly constant light curve
   has zero power on every backend.
-- `PeriodogramMethod.make_engine("finufft")` returns a plan-reusing
+- `PeriodogramMethod.make_engine("finufft", settings)` returns a plan-reusing
   {class}`~cuperiod.methods.gls.FinufftGLS` engine (one per thread or process), used by
   {func}`~cuperiod.pdot_search`, {func}`~cuperiod.sliding_periodogram` and batch runs.
 
@@ -140,8 +140,8 @@ The out-of-transit level is fitted jointly with the depth, so depths are unbiase
 box-free fit used to underestimate them by about the duty cycle). Each peak's `t0` is an
 absolute epoch on your time axis, like BLS's. The default period grid step is tied to
 `2 × duration_min_frac`, so it resolves the shortest transit searched, and a constant
-flux gives an all-zero spectrum. Float32 backends (torch, Apple MPS, `precision="float32"`
-on CUDA) rescale the flux internally, so physical flux units work too.
+flux gives an all-zero spectrum. Float32 runs (Apple MPS, or `precision="float32"` on
+torch or CUDA) rescale the flux internally, so physical flux units work too.
 
 ```python
 pg = cup.periodogram(lc, "TLS")
@@ -158,9 +158,10 @@ under-fits. Supports {doc}`multi-band <multiband>`. Key setting
 pg = cup.periodogram(lc, "MHAOV", settings=cup.MHAOVSettings(n_harmonics=4))
 ```
 
-Every backend fits mean-centred values (float32 — torch, Apple MPS — used to return an
-all-zero spectrum for magnitudes). On uniform frequency grids the `numpy` backend, and
-`numba` for curves above 64 points per numba thread, evaluate the harmonic sums with
+Every backend fits mean-centred values (float32 runs — Apple MPS, or
+`precision="float32"` — used to return an all-zero spectrum for magnitudes). On uniform
+frequency grids the `numpy` backend, and `numba` for curves above 64 points per numba
+thread, evaluate the harmonic sums with
 type-1 NUFFTs (finufft, all cores for large transforms, like GLS); the values agree with
 the direct sums to ~1e-11. `min_detections` and the harmonic-order limit are reported
 separately when a light curve is too short.
@@ -201,8 +202,11 @@ eccentric systems. Settings: {class}`~cuperiod.StringLengthSettings`. Supports
 pg = cup.periodogram(lc, "String-Length")     # or "StringLength"
 ```
 
-(`String-Length` is the canonical name; lookup is case-insensitive and tolerant of the
-hyphen.)
+Results and batch rows name it `STRINGLENGTH` (and SuperSmoother `SUPERSMOOTHER`), as do
+{func}`~cuperiod.list_methods` and `cuperiod methods`. Lookup ignores case, hyphens and
+underscores, so `"String-Length"`, `"string_length"` and `"StringLength"` all select it,
+and {class}`~cuperiod.MultiResult` keys match the same way — but compare `pg.method`, or
+filter a batch table, with `"STRINGLENGTH"`.
 
 The low-level kernels of the fold statistics (`pdm_theta`, `conditional_entropy`,
 `string_length`, `aov_power`) return `NaN` at trial values that cannot be folded (a period

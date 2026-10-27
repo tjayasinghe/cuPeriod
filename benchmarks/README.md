@@ -16,7 +16,7 @@ and is exercised on real data in the multi-band validation below.
 | | Methods | Reference | Question |
 |---|---|---|---|
 | CPU↔GPU parity | all 7 | — | do the two backends agree to round-off? |
-| 1-to-1 vs reference | GLS, BLS | astropy `LombScargle` / `BoxLeastSquares` | bit-for-bit match a standard? |
+| 1-to-1 vs reference | GLS, BLS | astropy `LombScargle` / `BoxLeastSquares` | match a standard to round-off (GLS to its 1e-9 NUFFT tolerance)? |
 | | PDM | PyAstronomy `pyPDM` | match an established package? |
 | | CE, String-Length, MHAOV | independent textbook impl. | match the original paper? |
 | | TLS | `transitleastsquares` | recover known Kepler periods? |

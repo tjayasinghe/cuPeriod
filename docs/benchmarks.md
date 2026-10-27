@@ -11,9 +11,12 @@ each with an established VSX literature period. The set combines an original 72-
 curated core with a 54-star extension (`benchmarks/dataset/download_extension.py`) added to
 broaden coverage of harder classes. TLS is validated on 12 confirmed Kepler KOIs. The
 curves and their literature periods ship with the suite, so §1–2 and §4 are fully
-reproducible offline. The download scripts that fetch the real-data sets verify a pinned
-SHA-256 for every file (on download and for cached copies) and fetch the OGLE archive over
-HTTPS.
+reproducible offline. The S82 and OGLE download scripts fetch over HTTPS and verify a
+pinned SHA-256 for every file (on download and for cached copies). The ASAS-SN Sky Patrol
+extension and the Kepler/MAST fetch cannot be pinned, because those services publish no
+checksums: the extension's output is reviewed before it is merged into the committed
+dataset, whose integrity is then git's, and the Kepler step commits only its derived
+results table.
 
 §1, §2, §4 and §5 below cover the seven methods that go through the single-band validation
 suite. SuperSmoother, added in v1.2, is pinned in the unit tests against the reference
@@ -80,15 +83,21 @@ agree to round-off) and cuPeriod↔**reference** (must match an established impl
   - —
 ```
 
-*parity* is the worst-case relative difference between the CPU and GPU statistic over all
-stars. Every GPU path computes in double precision. GLS's CPU and GPU sums are NUFFTs
-with a 1e-9 relative tolerance (`nufft_eps`), so their absolute power differences stay
-at that level (≤ 5e-9) and the relative figure, ~1e-6, comes from near-zero powers;
-MHAOV agrees to ~1e-10 now that every backend fits mean-centred values, and
-String-Length via a stable phase sort on every backend. † String-Length's
-*reference* agreement shows one isolated outlier: a heavily phase-tied star where the
-textbook reference breaks ties with an unstable sort. Its correlation stays ≈ 1 (median
-\|Δ\| ≈ 6e-12) and **the recovered period is unaffected** (*same P* = 100%).
+*parity* is the worst case over all stars of the per-frequency relative difference
+between the CPU and GPU statistic, max_f \|S_CPU(f) − S_GPU(f)\| / \|S_CPU(f)\|, so it is
+largest where the statistic is near zero. Every GPU path computes in double precision.
+GLS's CPU and GPU sums are NUFFTs with a 1e-9 relative tolerance (`nufft_eps`), so their
+absolute power differences stay at that level (≤ 5e-9) and the relative figure, ~1e-6,
+comes from near-zero powers; MHAOV agrees to ~1e-10 now that every backend fits
+mean-centred values, and String-Length via a stable phase sort on every backend.
+† String-Length's *reference* difference comes from the 15 of 126 stars with repeated
+timestamps. Points taken at the same time share every phase, so the string length
+depends on the order in which tied points are joined: cuPeriod orders them with a stable
+sort on every backend, the textbook reference with NumPy's default (unstable) sort. On
+those 15 stars the two differ at almost every trial frequency, by up to 3.7% (correlation
+≥ 0.61, below 0.99 on 6 stars), and the best period on the shared grid differs on 2 of
+them; the reference rerun with a stable sort matches cuPeriod to ≤ 3e-11. On the other
+111 stars the worst difference is 5e-11.
 
 **Torch backend.** The portable `backend="torch"` path was validated against cuPeriod's
 own CPU backend on the same grid, on an NVIDIA device (`torch:cuda`):
@@ -341,7 +350,7 @@ tested SNR is String-Length on the narrow eclipse model (~78%) — a method–si
 not a bug: its rank-based statistic is comparatively insensitive to narrow, low duty-cycle
 dips, and a box-fitting method (BLS) is the appropriate tool for narrow eclipses/transits.
 Full per-SNR grid and figure in the
-[full report](https://github.com/tjayasinghe/cuPeriod/blob/main/benchmarks/REPORT.md#5--injection–recovery-sensitivity).
+[full report](https://github.com/tjayasinghe/cuPeriod/blob/main/benchmarks/REPORT.md#5--injectionrecovery-sensitivity).
 
 ## 5. Batch throughput & transits
 

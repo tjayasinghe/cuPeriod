@@ -155,7 +155,7 @@ large grids and big catalogs. On a non-NVIDIA GPU (AMD, Intel, or Apple), instal
 A multiperiodic star needs the whole frequency solution, not one best period:
 
 ```python
-solution = cup.prewhiten((t, mag, err))
+solution = cup.prewhiten((time, mag, err))
 print(solution.summary())
 print(solution.frequency, solution.frequency_error)
 ```

@@ -24,9 +24,9 @@ if __name__ == "__main__":
 :::{important}
 Worker pools start fresh Python processes on every operating system, and each one
 imports your script. Put a pooled batch call under `if __name__ == "__main__":` (as
-above), or run with `workers=1`. An unguarded script now stops with a message saying
-exactly that, instead of pages of child tracebacks and a bare `BrokenProcessPool`. In a
-notebook or the REPL nothing needs guarding.
+above), or run with `workers=1`. An unguarded script now fails with a message saying
+exactly that: it ends each worker's traceback and the final `BrokenProcessPool`, which
+used to be bare. In a notebook or the REPL nothing needs guarding.
 :::
 
 ## Inputs
@@ -48,6 +48,11 @@ ideal when an entire survey lives in a single Parquet file. Column handling
 single-curve API; `ColumnMap(band=...)` makes each group a
 {class}`~cuperiod.MultiBandLightCurve`, as it does for file inputs.
 
+- A directory is scanned for every format {meth}`LightCurve.from_file
+  <cuperiod.LightCurve.from_file>` reads — `.csv`, `.ecsv`, `.fits`/`.fit`/`.fts`/`.fz`,
+  `.parquet`/`.pq`, `.tsv`/`.tab`, `.dat`, `.txt` — with the text and FITS formats also
+  taken compressed (`star.csv.gz`, `star.fits.bz2`, `.xz`); other files are ignored. A
+  glob takes whatever it matches.
 - An existing path is always taken literally (even one containing `[`), and a glob that
   matches nothing raises `FileNotFoundError` instead of succeeding with no work.
 - Keys are file stems; stems that collide (`a.csv` beside `a.parquet`, or the same name
@@ -117,10 +122,12 @@ summary = cup.batch_periodograms(
 - **A directory** — one part file per task (`part-00000.parquet`, …), all with the same
   schema. This is the choice for large runs.
 
-Every failure is also listed in `<sink>.errors.csv` (inside a directory sink:
-`_errors.csv`). Sinks are written through a uniquely named temporary file and renamed
-into place; an unreadable existing sink (or part) is moved aside to
-`<name>.corrupt-<timestamp>` rather than overwritten, and an impossible sink (a `.csv`
+Failures are returned in `summary.errors` (below); `batch_periodograms` writes no
+errors file. The `cuperiod batch` command ({doc}`cli`) also writes them to
+`<stem>.errors.csv` beside a file sink (`out.parquet` → `out.errors.csv`), or to
+`_errors.csv` inside a directory sink. Sinks are written through a uniquely named
+temporary file and renamed into place; an unreadable existing sink (or part) is moved
+aside to `<name>.corrupt-<timestamp>` rather than overwritten, and an impossible sink (a `.csv`
 path that is a directory, an uncreatable location) is refused before anything is
 computed. CSV sinks escape text cells a spreadsheet would run as a formula (`=`, `+`,
 `-`, `@`, tab, CR; plain numbers untouched); Parquet stores values verbatim.
@@ -164,7 +171,7 @@ the GUI. Set `store_raw=True` to also store the peak-preserving downsampled spec
 summary.n_inputs     # total inputs discovered
 summary.n_done       # results produced
 summary.n_failed     # light curves that errored (one bad curve never kills the batch)
-summary.n_skipped    # (light curve, method) pairs already in the sink
+summary.n_skipped    # light curves whose every method was already in the sink
 summary.methods      # methods run
 summary.n_workers    # the worker count actually used
 summary.errors       # list of (key, message) for failures
@@ -191,9 +198,12 @@ light curves on 4 workers went from 13.9 s to 2.2 s for `batch_pdot`.
 ## Throughput
 
 On one GPU, batch GLS peaks at **~728 light curves/second** for short survey curves
-(>2.6 million/hour), and PDM at ~534/second. With the `[fast]` extra's multicore `numba`
-CPU tier, a CPU process pool on a 32-thread machine stays within 1.0–1.8× of the GPU at
-the batch sizes where both were measured (256 and 1024 curves): GLS 1.2× and 1.0×, PDM
+(>2.6 million/hour), and PDM at ~534/second. These are single-shot rates that include the
+worker pool's start-up (process spawn and a CUDA context per worker); the worker sweep
+above, which leaves start-up out, reached ~1150 GLS curves/second. With the `[fast]`
+extra's multicore `numba` CPU tier, a CPU process pool on a 32-thread machine stays
+within 1.0–1.8× of the GPU at the batch sizes where both were measured (256 and 1024
+curves): GLS 1.2× and 1.0×, PDM
 1.8× and 1.3× — see {doc}`../benchmarks` for the current breakdown before assuming the
 GPU wins by default.
 

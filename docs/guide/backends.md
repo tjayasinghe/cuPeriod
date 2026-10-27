@@ -1,8 +1,10 @@
 # Backends & performance
 
 Every method has more than one *backend* — a concrete implementation of the same math.
-You select among them with the `backend=` argument; the result is identical to
-floating-point round-off regardless of which one runs.
+You select among them with the `backend=` argument; the results agree to floating-point
+round-off whichever one runs — GLS to its NUFFT tolerance (`nufft_eps`, 1e-9 relative;
+≤ 5e-9 absolute on the validation set) — and the CPU, CUDA and torch backends picked the
+same best period on every validation star ({doc}`../benchmarks`).
 
 ## Selecting a backend
 
@@ -93,8 +95,8 @@ runs the same array-API code on any torch device — see below.
 `backend="torch"` runs a method through the [array API](https://data-apis.org/array-api/)
 on whichever torch device you have — CUDA, AMD **ROCm**, Apple **MPS**, Intel **XPU**, or
 **CPU** — so the accelerated code is no longer NVIDIA-only and works even with no GPU at
-all. The NVIDIA fast paths (cufinufft for GLS, the cupy kernels for BLS/PDM/CE/TLS) are
-untouched and remain what `"auto"`/`"gpu"` pick on CUDA; torch is the cross-vendor path
+all. The NVIDIA fast paths (cufinufft for GLS, the cupy kernels for the other methods)
+are untouched and remain what `"auto"`/`"gpu"` pick on CUDA; torch is the cross-vendor path
 for everything else.
 
 ```python
@@ -113,10 +115,12 @@ Two orthogonal settings tune it (both environment-overridable, e.g. `CUPERIOD_GL
   are always returned as float64 numpy arrays regardless of the device precision.
 
 :::{note}
-The portable path is correct everywhere (it matches the CPU reference to round-off — float
-methods bit-for-bit, MHAOV to ~1e-10 from its linear solve) but it is **not** the speed
-champion on CPU, where finufft (GLS) and the numba box search (BLS) are faster. Its value
-is reaching GPUs the CUDA fast paths can't — AMD, Intel, and Apple. On those devices its
+The portable path is correct everywhere: it matches the CPU reference to round-off (GLS
+to its NUFFT tolerance, MHAOV to ~1e-10 from its linear solve; the {doc}`../benchmarks`
+list each method) and picked the CPU's best period on every validation star. It is
+**not** the speed champion on CPU, where finufft (GLS) and the numba box search (BLS)
+are faster. Its value is reaching GPUs the CUDA fast paths can't — AMD, Intel, and
+Apple. On those devices its
 massively-parallel evaluation is the win. Run `cuperiod doctor` to see what you have.
 :::
 
@@ -247,8 +251,9 @@ off a busy GPU.
 
 `backend="auto"` silently falls back to the CPU, so portable code "just works."
 `backend="gpu"` is explicit and raises {exc}`~cuperiod.BackendUnavailableError` when no
-CUDA device or the `[gpu]` extra is missing — use it when you *want* to fail loudly rather
-than run on the CPU by accident.
+GPU path is usable — neither a CUDA device with the `[gpu]` extra nor a GPU that the
+`[torch]` extra sees (AMD, Intel, Apple, or an NVIDIA card without `[gpu]`) — use it when
+you *want* to fail loudly rather than run on the CPU by accident.
 
 ```python
 try:

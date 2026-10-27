@@ -46,7 +46,8 @@ commands stay off until the Options or the data change; **Run pre-whitening** an
 
 Above the table, the **session bar** repeats these buttons together with Delete, Undo,
 Redo and Stop, and a chip shows what Step would try next, for example
-`12.34012 c/d · P 0.081037 d · A 3.9 mmag · S/N ≈ 8.2 · near F1 + F2`. <kbd>N</kbd> in
+`Next: 12.34012 c/d · P 0.081037 d · A 0.0039 · S/N ≈ 8.2 · near F1 + F2` (the
+amplitude is in the data's own units). <kbd>N</kbd> in
 the spectrum moves the pick cursor to that candidate. In a narrow pane the bar's buttons
 wrap onto more rows rather than hiding.
 
@@ -378,7 +379,7 @@ compact them (rewriting every tie).
 ```python
 report = session.add(24.6912)          # snapped to the residual peak within one Rayleigh width
 print(report.message)
-# F4 added at 24.7170104 c/d
+# F4 added at 24.7168984 c/d
 session.undo()                         # F4 is gone again
 session.redo()                         # ... and back
 session.remove("F4")
@@ -471,7 +472,8 @@ with session.group():
 
 session.improve()
 sub = session.result().subsets
-print(sub.offsets_by, sub.offset_labels[:3], sub.offset[:3], sub.offset_error[:3])
+print(sub.offsets_by, sub.offset_labels[:3], sub.offset[:3].round(4),
+      sub.offset_error[:3].round(5))
 # night ('N1', 'N2', 'N3') [11.9993 12.0001 12.0003] [0.00019 0.00022 0.00019]
 
 session.exclude_subsets("night", ["N7"])         # leave a whole night out
@@ -486,7 +488,9 @@ session.exclude_subsets("night", ["N7"])         # leave a whole night out
   length=)`, `from_labels(values, name=)` (a label column such as a site or a band),
   `from_ranges(time, edges)` and `a.crossed(b)`; hand edits (`merged`, `split_at`,
   `renamed`, `with_weights`) are recorded run by run.
-  {func}`cuperiod.prewhiten.suggest_partition` proposes the obvious split of a sampling.
+  {func}`~cuperiod.prewhiten.suggest_partition` proposes the obvious split of a sampling.
+  It lives in the `cuperiod.prewhiten` module — `cup.prewhiten` is the function — so
+  import it as `from cuperiod.prewhiten import suggest_partition`.
   Per-point label columns can be given to the constructor (`labels={"site": ...}`,
   aligned with the input rows): `partitions=["site"]` turns one into a partition at
   creation, and `Partition.from_labels(session.data.labels["site"], name="site")`
@@ -501,13 +505,17 @@ session.exclude_subsets("night", ["N7"])         # leave a whole night out
   `set_subset_weights`, and get 1/rms² values from `subset_rms_weights`) and
   `use_variation(name)` (see below). `None` switches a role off. A partition in use by a
   role, or with excluded subsets, cannot be redefined or dropped.
-- Zero points come back in `result.subsets` (a {class}`~cuperiod.prewhiten.SubsetSolution`:
-  `offset`, `offset_error` and labels per subset) and the number of deleted points in
+- Zero points come back in `result.subsets` (a {class}`~cuperiod.prewhiten.SubsetSolution`,
+  imported the same way, `from cuperiod.prewhiten import SubsetSolution`: `offset`,
+  `offset_error` and labels per subset) and the number of deleted points in
   `result.n_deleted`.
 - `configure(settings=None, **updates)` replaces the requested settings (a manual
   edit). Changing the grid settings (`minimum_frequency`, `maximum_frequency`,
   `nyquist_factor`, `samples_per_peak`) recomputes the grid from the points in use;
-  `backend` and `device` cannot change.
+  `backend` and `device` cannot change. An unknown or misspelt name
+  (`configure(snr_treshold=5)` gives *configure: unknown settings ['snr_treshold']*)
+  or a value the settings refuse comes back as a `refused` report and changes nothing;
+  NumPy scalars and lists are accepted and stored as plain values.
 
 A change of the points in use or their weights rebuilds the spectrum engine for the new
 sampling (two are kept, so an undo finds the previous one again). Zero points per subset
@@ -555,9 +563,9 @@ session.undo()                 # one action, or one group
 session.redo()
 for entry in session.history[-3:]:
     print(entry.seq, entry.op, "|", entry.report.message)
-# 18 improve | improved all 3 frequencies
-# 19 exclude_subsets | excluded N7 of 'night'
-# 20 define_partition | defined partition 'season' (2 subsets)
+# 22 define_partition | defined partition 'season' (2 subsets)
+# 23 use_variation | variation per 'season'
+# 24 set_variation | F2: variation 'amplitude' per 'season'
 
 session.goto(3)                                  # the state after log entry 3 (0 = start)
 session.goto(session.log_entries[-1].seq)        # and back to the newest
@@ -569,6 +577,15 @@ actions inside one undo step (as `run()` and `finalize()` do). The undo depth is
 `SessionSettings.undo_depth` (200 states); `reachable(seq)` says whether a state is still
 in memory — after loading a project only the stored state is, and the rest of the log is
 re-created by replaying it. Doing anything after an undo discards the redo tail.
+
+`goto(seq)` to a state it cannot reach is a `refused` report that says why:
+
+- *no log entry 999* — no entry has that number;
+- *the state after entry 1 is no longer in memory: only the newest 2 states are kept
+  (SessionSettings.undo_depth)* — the state was evicted;
+- *the state after entry 3 is not in memory: this project was opened from a file; use
+  Verify project to replay its log* — the session was loaded from a project, which
+  stores only its current state.
 
 ### Finishing
 
@@ -588,8 +605,9 @@ Pre-whitening: 3 components from 3391 points over 39.28 d  (backend=numpy)
   F3          30.1556454    9.56e-05    0.00299675    4.79e-05   6.0755   55.04    0.95  F3 = F1 + F2
 ```
 
-With one zero point per night the reduced χ² drops from 4.9 to 0.96, the residuals are
-white again (`D` from 2.1 to 1.0) and the uncertainties shrink threefold.
+Deleting the two outliers and fitting one zero point per night take the reduced χ² from
+4.9 (after `run()`) to 0.96, the residuals are white again (`D` from 2.1 to 1.0) and the
+uncertainties shrink threefold.
 
 The result is the usual {class}`~cuperiod.PreWhitenResult`. Each
 {class}`~cuperiod.Sinusoid` also carries `fixed` (which quantities were held), `tied`,
@@ -597,7 +615,8 @@ The result is the usual {class}`~cuperiod.PreWhitenResult`. Each
 `negative_amplitude`, `degenerate`, `at_bound`, `out_of_band`, `unresolved`,
 `low_frequency`, `weak_frequency`, `short_subset`. A parameter that cannot be determined
 reports `NaN`. `to_table(constraints=None)` adds the constraint columns only when a
-component carries a constraint, so an automatic solution keeps the v1.3 table layout.
+component carries a constraint, so an automatic solution keeps the table layout it had
+in cuPeriod 1.2.
 
 ### Saving, verifying and exporting
 
@@ -611,8 +630,14 @@ copy = cup.PreWhitenSession.replay((time, mag, err), session.history, settings=s
 
 - `save(path, embed_data="auto")` writes the project atomically. With `"auto"` the data
   file is *referenced* when it sits in the project's folder and still holds exactly
-  these data (and the session has no label columns), otherwise the data are *embedded*;
-  `"always"` / `"never"` force either.
+  these data (and the session has no label columns), otherwise the data are *embedded*
+  — up to `SessionSettings.embed_data_max_points` points (200 000;
+  `CUPERIOD_SESSION_EMBED_DATA_MAX_POINTS`). Above that, `save` raises
+  {class}`~cuperiod.ProjectError`: pass `embed_data="always"`, or keep the data file
+  next to the project so it can be referenced. `"always"` / `"never"` force either.
+  `save` also refuses a session that `load` would refuse (a file over
+  `max_project_bytes`, or a grid over the limit below), so it never writes a project
+  that cannot be opened.
 - `load(path, verify=False, data=None, backend=None, allow_modified_data=False)` opens a
   project at its stored state (no replay). `verify=True` first replays the log on a fresh
   session and raises {class}`~cuperiod.ProjectError` unless the stored state follows
@@ -626,8 +651,13 @@ copy = cup.PreWhitenSession.replay((time, mag, err), session.history, settings=s
   naming it. Steps reuse their logged peak seeds, so a replay is **bitwise identical on
   any spectrum backend** — a session run on `finufft` verifies on `numpy`.
 - `to_script()` returns, and `export_script(path)` writes, a Python script that uses only
-  the public API: it loads the data (from the source file, or a `*.data.csv` written
-  next to the script when the data have no re-readable source), checks their SHA-256,
+  the public API. The script re-reads the data from their source file when that file
+  still holds exactly these data (and the session has no label columns). Otherwise
+  `export_script` writes the data to a `*.data.csv` next to the script, while
+  `to_script` writes no file: it raises {class}`~cuperiod.SessionError` unless you pass
+  `data_expr=`, a one-line Python expression for the data that it inserts as code (for
+  the in-memory example above, `session.to_script(data_expr="(time, mag, err)")`).
+  The script checks the data's SHA-256,
   repeats every action — consecutive steps fold into one `session.run(seeds=[...])` —
   prints the solution and says whether it reproduced the session. Every value in the
   script is a Python literal and every free text (notes, titles, labels) is sanitised
@@ -664,11 +694,21 @@ is safe to open:
   overflow a float and duplicate keys are refused;
 - its size is checked before it is read (`SessionSettings.max_project_bytes`, 64 MiB),
   the log length is capped (`max_actions`, 100 000) and so are the number of points and
-  the grid size;
+  the grid size: a project's grid may hold at most max(2 × 10⁷, 64 per data point)
+  frequencies, and never more than 10⁸, so a small file cannot name a grid that keeps
+  `load` busy for hours;
+- a project recorded on the direct `numpy` backend whose spectrum would cost more than
+  2 × 10⁹ evaluations (points × grid frequencies) opens on the NUFFT CPU backend
+  instead, with a {class}`~cuperiod.SessionWarning`, unless you pass `backend=`;
 - every object is validated by a strict model (unknown fields refused, no type
   coercion), and every cross reference — component ids, ties, partitions, roles, the
   point mask — is checked against the data before the session exists;
 - a data reference must stay inside the project's folder;
+- the source file an embedded project names in its data's metadata (`data.meta.source`)
+  is kept only as a record, under `meta["recorded_source"]`: a later `save` or
+  `export_script` never re-reads it. Only a source set in this process (by
+  `LightCurve.from_file`) is re-read, and a URL, a network (UNC) path or a
+  drive-relative path is refused before any file-system call;
 - the data must match the stored content hash;
 - tie expressions are parsed, never evaluated, and exported scripts carry free text only
   as sanitised comments;
@@ -692,13 +732,20 @@ settings field writes that version's default, never a value from the environment
 cuperiod prewhiten star.csv --fmax 50 --save-project star.cupw.json --export-script star_session.py
 ```
 
-and the `cuperiod session` group works on saved projects — written by the CLI, the
+The project is saved like `save(embed_data="auto")`, with one difference: when the data
+file lies outside the project's folder and holds more than `embed_data_max_points`
+points, the CLI embeds the data anyway and prints a line starting
+`note: embedded all N data points in ...` (`max_project_bytes` still caps the file).
+`--export-script` is written even when the project cannot be saved; the command then
+ends with the save's error and exit status 1.
+
+The `cuperiod session` group works on saved projects — written by the CLI, the
 library or the GUI:
 
 ```bash
 cuperiod session verify star.cupw.json
 # Verified star.cupw.json: its 5 logged action(s) reproduce the stored solution
-# (3 active component(s), backend numpy).
+# (3 active component(s), backend finufft).
 
 cuperiod session replay star.cupw.json -o replayed.cupw.json   # re-create it, print the solution
 cuperiod session script star.cupw.json -o star_session.py      # export a reproducing script
@@ -706,8 +753,9 @@ cuperiod session script star.cupw.json -o star_session.py      # export a reprod
 
 `verify` and `replay` exit with status 1 and a one-line error when the project cannot
 be read or its log does not reproduce the stored solution. Each
-command takes `--data FILE` to use a light-curve file in place of the project's own data
-(the content hash is still checked), and `verify` / `replay` take `--backend`. See
+command takes `--data FILE` to use a light-curve file in place of the project's own data,
+read with the project's recorded column mapping and brightness domain (the content hash
+is still checked), and `verify` / `replay` take `--backend`. See
 {doc}`cli` for every option.
 
 ## Settings of a session
@@ -724,7 +772,7 @@ session reacts to edits and what it keeps — never a number of an automatic run
 | `collision_rayleigh` | 0.25 | A manual frequency closer than this (Rayleigh widths) to another is refused. |
 | `snap_rayleigh` | 1.0 | Search radius of a snapped manual frequency. |
 | `min_subset_points` | 10 | Fewest points a variation subset may have. |
-| `embed_data_max_points` | 200 000 | Largest light curve a project embeds automatically. |
+| `embed_data_max_points` | 200 000 | Largest light curve `save(embed_data="auto")` embeds; above it `save` refuses unless asked for `"always"` (the CLI's `--save-project` embeds anyway, with a note). |
 | `max_actions`, `max_project_bytes` | 100 000, 64 MiB | Limits of what a project may hold. |
 
 Pass them as `PreWhitenSession(..., session_settings=cup.SessionSettings(...))`.

@@ -76,10 +76,13 @@ lc = LightCurve.from_file("star.csv")
 lc = LightCurve.from_fits("lightcurve.fits", hdu=1)
 ```
 
-The originating path is recorded in `lc.meta["source"]`. Compressed FITS
-(`.fits.gz`, `.fits.bz2`, `.fits.xz`) and `.fts` files are recognised. Parquet
-categorical columns with nulls read correctly, and a column that cannot be converted is
-named in the error (`time column 'date' could not be converted to float64: ...`).
+The originating path is recorded in `lc.meta["source"]`. Tab-separated (`.tsv`/`.tab`)
+and other text tables (`.dat`/`.txt`, flavour guessed) read too, as do `.fts` and `.fz`
+FITS files; the text and FITS formats may also be compressed (`star.fits.gz`,
+`star.csv.bz2`, `.xz`). UTF-8 files that start with a byte-order mark — Excel's
+*CSV UTF-8* — load with their first column name intact. Parquet categorical columns with
+nulls read correctly, and a column that cannot be converted is named in the error
+(`time column 'date' could not be converted to float64: ...`).
 
 ## Column auto-detection with `ColumnMap`
 

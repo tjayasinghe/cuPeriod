@@ -556,9 +556,9 @@ def main():
              "sustained rates over many chunks are higher.\n")
     L.append("### 1.3 Metric definitions\n")
     L.append("- **parity** — worst case over all validation stars of "
-             "max_f |S_CPU(f) − S_GPU(f)| / max_f |S_CPU(f)|, the relative difference of the "
-             "periodogram statistic between cuPeriod's CPU and GPU backends on an identical "
-             "frequency grid.\n"
+             "max_f |S_CPU(f) − S_GPU(f)| / |S_CPU(f)|, the per-frequency relative difference "
+             "of the periodogram statistic between cuPeriod's CPU and GPU backends on an "
+             "identical frequency grid (largest where the statistic is near zero).\n"
              "- **identical peak** — fraction of stars where CPU and GPU backends select "
              "exactly the same best period.\n"
              "- **reference agreement** — worst-case max_f |S_cuPeriod(f) − S_reference(f)| "
@@ -599,11 +599,16 @@ def main():
                  "a stable phase sort on every backend). GLS's CPU and GPU sums are NUFFTs "
                  "with a relative tolerance of 1e-9 (`nufft_eps`), so their absolute power "
                  "differences stay at that level and the relative figure above is largest "
-                 "where the power is near zero. String-Length's "
-                 "worst-case reference difference is an isolated outlier on 1–2 heavily "
-                 "phase-tied stars, where the textbook reference breaks ties with an "
-                 "unstable sort (correlation ≈1, median \\|Δ\\| ≈ 6e-12, recovered period "
-                 "unaffected).\n")
+                 "where the power is near zero. String-Length's worst-case reference "
+                 "difference comes from the 15 stars with repeated timestamps: points taken "
+                 "at the same time share every phase, so the string length depends on the "
+                 "order in which tied points are joined, and cuPeriod orders them with a "
+                 "stable sort on every backend while the textbook reference uses NumPy's "
+                 "default (unstable) sort. On those stars the two differ at almost every "
+                 "trial frequency, by up to 3.7% (correlation ≥ 0.61, below 0.99 on 6 "
+                 "stars), and the best period on the shared grid differs on 2 of them; the "
+                 "reference rerun with a stable sort matches cuPeriod to ≤ 3e-11, and on the "
+                 "other 111 stars the worst difference is 5e-11.\n")
         L.append("![parity](figures/fig1_parity_reference.png)\n")
         L.append("**Figure 1.** Per-star distribution of (a) CPU↔GPU parity and "
                  "(b) cuPeriod-vs-reference agreement, per method.\n")
@@ -1235,9 +1240,10 @@ def main():
                  "~8 significant digits across machines (e.g. FAP tail comparisons), pin one "
                  "backend, and for GLS its `nufft_eps`.\n"
                  "6. **Minimal installations (no numba).** `backend=\"cpu\"` falls back to "
-                 "numpy — numerically identical but much slower for the box methods (the "
-                 f"pure-numpy BLS parity reference takes {numba_txt}). "
-                 "Install the `[fast]` extra, or use `backend=\"astropy\"` for BLS.\n")
+                 "astropy's `BoxLeastSquares` for BLS and to numpy for the other methods "
+                 "numba accelerates — the same results, much more slowly for the box "
+                 f"methods (the pure-numpy BLS parity reference takes {numba_txt}). "
+                 "Install the `[fast]` extra.\n")
 
     L.append("## 9 — Limitations\n")
     L.append("- All timings are from a single machine (Table in §1.1); CPU↔GPU ratios "

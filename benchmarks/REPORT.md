@@ -22,7 +22,7 @@ Wall-clock times use `time.perf_counter()`. Every timed configuration is run onc
 
 ### 1.3 Metric definitions
 
-- **parity** — worst case over all validation stars of max_f |S_CPU(f) − S_GPU(f)| / max_f |S_CPU(f)|, the relative difference of the periodogram statistic between cuPeriod's CPU and GPU backends on an identical frequency grid.
+- **parity** — worst case over all validation stars of max_f |S_CPU(f) − S_GPU(f)| / |S_CPU(f)|, the per-frequency relative difference of the periodogram statistic between cuPeriod's CPU and GPU backends on an identical frequency grid (largest where the statistic is near zero).
 - **identical peak** — fraction of stars where CPU and GPU backends select exactly the same best period.
 - **reference agreement** — worst-case max_f |S_cuPeriod(f) − S_reference(f)| against the external implementation on an identical grid (Pearson *r* for PDM, whose PyAstronomy reference uses a different θ normalisation).
 - **harmonic recovery** — recovered period matches the VSX literature period or a method-appropriate harmonic (P/2, 2P, P/3, 3P) within 2%; **exact recovery** requires the literature period itself within 2%.
@@ -41,7 +41,7 @@ Every method runs on an identical grid through cuPeriod's CPU and GPU backends a
 | MHAOV | 126 | 1.2e-10 | 100% | Sch.-Czerny | 1.1e-07 |
 | TLS | 28 | 9.0e-09 | 100% | — | — |
 
-**Table 1.** Numerical validation per method (metrics defined in §1.3). Every GPU path computes in double precision (String-Length included, via a stable phase sort on every backend). GLS's CPU and GPU sums are NUFFTs with a relative tolerance of 1e-9 (`nufft_eps`), so their absolute power differences stay at that level and the relative figure above is largest where the power is near zero. String-Length's worst-case reference difference is an isolated outlier on 1–2 heavily phase-tied stars, where the textbook reference breaks ties with an unstable sort (correlation ≈1, median \|Δ\| ≈ 6e-12, recovered period unaffected).
+**Table 1.** Numerical validation per method (metrics defined in §1.3). Every GPU path computes in double precision (String-Length included, via a stable phase sort on every backend). GLS's CPU and GPU sums are NUFFTs with a relative tolerance of 1e-9 (`nufft_eps`), so their absolute power differences stay at that level and the relative figure above is largest where the power is near zero. String-Length's worst-case reference difference comes from the 15 stars with repeated timestamps: points taken at the same time share every phase, so the string length depends on the order in which tied points are joined, and cuPeriod orders them with a stable sort on every backend while the textbook reference uses NumPy's default (unstable) sort. On those stars the two differ at almost every trial frequency, by up to 3.7% (correlation ≥ 0.61, below 0.99 on 6 stars), and the best period on the shared grid differs on 2 of them; the reference rerun with a stable sort matches cuPeriod to ≤ 3e-11, and on the other 111 stars the worst difference is 5e-11.
 
 ![parity](figures/fig1_parity_reference.png)
 
@@ -246,7 +246,7 @@ Guidance by use case, from the measurements above:
 3. **Catalogue-scale processing (10³–10⁶ curves).** Use `batch_periodograms(..., device="gpu")` on NVIDIA hardware — peak measured throughput 728 curves/s (>2.6 million curves/hour) on one GPU. On this 32-thread CPU the process pool keeps pace for the numba-tier methods, so on wide CPU nodes `device="cpu"` is a legitimate alternative; expect the GPU margin to widen on narrower CPUs and larger batches.
 4. **AMD, Intel or Apple GPUs.** Use `backend="torch"` — the portable path validated to the same parity standard. On NVIDIA hardware the native CUDA backend is usually at least as fast (Table 6), so treat torch as the portability path, not the speed path.
 5. **Bit-level reproducibility.** Every CUDA and CPU path computes in double precision; the one float32 path is torch on Apple MPS, which cannot do float64. GLS's CPU and GPU NUFFTs agree to their 1e-9 tolerance rather than to round-off (Table 1). The selected best period was unaffected on all 126 validation stars; if statistic values must match beyond ~8 significant digits across machines (e.g. FAP tail comparisons), pin one backend, and for GLS its `nufft_eps`.
-6. **Minimal installations (no numba).** `backend="cpu"` falls back to numpy — numerically identical but much slower for the box methods (the pure-numpy BLS parity reference takes ~18 s vs 0.04 s with numba). Install the `[fast]` extra, or use `backend="astropy"` for BLS.
+6. **Minimal installations (no numba).** `backend="cpu"` falls back to astropy's `BoxLeastSquares` for BLS and to numpy for the other methods numba accelerates — the same results, much more slowly for the box methods (the pure-numpy BLS parity reference takes ~18 s vs 0.04 s with numba). Install the `[fast]` extra.
 
 ## 9 — Limitations
 

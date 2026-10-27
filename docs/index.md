@@ -24,8 +24,10 @@ and bootstrap false-alarm probabilities — and the LINCC adapters run the whole
 nested-pandas / lsdb survey catalogs. Add frictionless column handling, alias diagnostics,
 raw-spectrum output, and an N-best-periods utility.
 
-Every implementation is validated against an established reference (astropy's
-`LombScargle` / `BoxLeastSquares`, and others) to floating-point round-off.
+Every implementation is validated against an established reference on identical grids:
+BLS matches astropy's `BoxLeastSquares` to floating-point round-off, GLS matches astropy's
+`LombScargle` to its NUFFT tolerance (~1e-9), and the other methods are checked against
+independent implementations (see {doc}`benchmarks`).
 
 ```python
 import cuperiod as cup
@@ -75,7 +77,8 @@ survey data.
 :::{grid-item-card} 🖥️ Explore interactively
 The {doc}`desktop GUI <guide/gui>` runs any method, folds the light curve live as
 you move across peaks, and pre-whitens interactively — keyboard-operable, with a menu
-bar and shortcuts for everything. `pip install "cuperiod[gui]"`, then `cuperiod-gui`.
+bar for everything and shortcuts for the common actions. `pip install "cuperiod[gui]"`,
+then `cuperiod-gui`.
 :::
 
 ::::
@@ -118,8 +121,9 @@ orbit of a third body when the O−C turns out to be cyclic rather than secular.
 pip install cuperiod            # CPU (numpy, scipy, astropy, finufft)
 pip install "cuperiod[gpu]"     # + CUDA 12 GPU backends (cupy, cufinufft)
 pip install "cuperiod[torch]"   # + portable PyTorch backend (AMD/Intel/Apple GPUs + CPU)
-pip install "cuperiod[fast]"    # + numba multicore CPU kernels (all but GLS, 20-300×)
+pip install "cuperiod[fast]"    # + numba multicore CPU kernels (every method but GLS)
 pip install "cuperiod[gui]"     # + interactive desktop GUI (cuperiod-gui)
+pip install "cuperiod[plot]"    # + matplotlib figures for the period-change tools
 ```
 
 See {doc}`installation` for the full matrix and GPU requirements.

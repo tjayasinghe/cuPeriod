@@ -10,10 +10,10 @@ pip install cuperiod
 ```
 
 This pulls in the core dependencies — `numpy`, `scipy`, `astropy`, `finufft`,
-`array-api-compat`, `pydantic`, `typer`, and `pyarrow` (at least 14.0.1: earlier releases
-unpickle extension-type metadata while reading Parquet, CVE-2023-47248, and cuPeriod opens
-user-supplied `.parquet` files) — and gives you every method on the CPU, the command line,
-and batch processing over a process pool.
+`array-api-compat`, `pydantic`, `pydantic-settings`, `typer`, and `pyarrow` (at least
+14.0.1: earlier releases unpickle extension-type metadata while reading Parquet,
+CVE-2023-47248, and cuPeriod opens user-supplied `.parquet` files) — and gives you every
+method on the CPU, the command line, and batch processing over a process pool.
 
 ## Optional extras
 
@@ -21,19 +21,30 @@ and batch processing over a process pool.
 | --- | --- | --- |
 | **gpu** | `pip install "cuperiod[gpu]"` | CUDA-12 GPU backends (`cupy-cuda12x`, `cufinufft`, the NVIDIA runtime wheels) |
 | **torch** | `pip install "cuperiod[torch]"` | the portable **PyTorch** backend — runs every method on AMD (ROCm), Intel (XPU), Apple (MPS), and a CPU path |
-| **fast** | `pip install "cuperiod[fast]"` | multicore `numba` CPU kernels for BLS, PDM, CE, String-Length, MHAOV, TLS, and SuperSmoother — the CPU default when installed, one to two orders of magnitude faster than the fallback CPU paths |
-| **gui** | `pip install "cuperiod[gui]"` | the interactive desktop GUI, `cuperiod-gui` (PySide6 + pyqtgraph) — see {doc}`guide/gui` |
+| **fast** | `pip install "cuperiod[fast]"` | multicore `numba` CPU kernels for BLS, PDM, CE, String-Length, MHAOV, TLS, and SuperSmoother — the CPU default when installed, and much faster than the fallback CPU paths for all of them but MHAOV |
+| **gui** | `pip install "cuperiod[gui]"` | the interactive desktop GUI, `cuperiod-gui` (PySide6 + pyqtgraph) — see {doc}`guide/gui`. On Python 3.11 it keeps PySide6 below 6.12 (see the note below) |
+| **plot** | `pip install "cuperiod[plot]"` | matplotlib, for the period-change diagnostic figures: {func}`cuperiod.pdot.plots.pdot_figure` and the rest of `cuperiod.pdot.plots`, the `plots=` option of {func}`~cuperiod.batch_pdot`, and `cuperiod pdot-batch --plots` — see {doc}`guide/period-change` |
 | **pandas** | `pip install "cuperiod[pandas]"` | pandas `DataFrame` ingestion |
 | **nested** | `pip install "cuperiod[nested]"` | nested-pandas `NestedFrame` light curves, one row per object — see {doc}`guide/interop` |
 | **lsdb** | `pip install "cuperiod[lsdb]"` | the same adapter over lazy, dask-partitioned lsdb HATS catalogs |
 
 Extras combine, e.g. `pip install "cuperiod[gpu,fast]"` or `"cuperiod[gui,torch]"`.
 
+:::{note}
+**The GUI on Python 3.11.** PySide6 6.12 drops a reference to `None` whenever a Qt call
+returns a null pointer. From Python 3.12 `None` is immortal and nothing happens; on 3.11
+its reference count reaches zero within seconds of normal use and the interpreter aborts
+("deallocating None"). The `[gui]` extra therefore installs `PySide6<6.12` on Python 3.11
+(any PySide6 from 6.7 on 3.12+), and `cuperiod-gui` on 3.11 refuses to start under a newer
+PySide6 already in the environment, naming the fix: `pip install 'PySide6<6.12'`, or run
+it on Python 3.12 or newer.
+:::
+
 :::{tip}
 The `[fast]` extra is worth installing even without a GPU: it gives BLS, PDM, CE,
-String-Length, MHAOV, TLS, and SuperSmoother multicore JIT kernels that are one to two
-orders of magnitude faster than the fallback CPU paths while matching them to floating
-point. When present they become the default CPU backends automatically.
+String-Length, MHAOV, TLS, and SuperSmoother multicore JIT kernels that return the
+fallback CPU paths' results, much sooner for the box and fold methods. When present they
+become the default CPU backends automatically.
 :::
 
 ### What the `[fast]` extra changes
@@ -41,13 +52,29 @@ point. When present they become the default CPU backends automatically.
 Installing `numba` flips `backend="cpu"` (and the CPU fallback of `"auto"`) from the
 fallback implementations — astropy's `BoxLeastSquares` for BLS, the vectorized numpy
 kernels for PDM, CE, String-Length, MHAOV, TLS, and SuperSmoother — to in-house multicore
-JIT kernels. Nothing else about your code changes: the results match the fallbacks to
-round-off (BLS still matches astropy), they just arrive much sooner (~89× for BLS over
-astropy; ~25–300× for the others over their numpy paths). (Note that `numba` currently caps
-`numpy < 2.5`, so installing it may downgrade numpy slightly.) The kernels are compiled
-once per install and cached on disk; files named `supersmoother._numba_ss_kernel…` left in
-`cuperiod/methods/__pycache__` by earlier versions, which recompiled in every process,
-can be deleted.
+JIT kernels. Nothing else about your code changes: the results match the fallbacks (to
+round-off, and within ~1e-10 for MHAOV; BLS still matches astropy), they just arrive
+sooner. How much sooner depends on the method. On the {doc}`benchmarks` page the numba
+BLS runs 89× faster than astropy's `BoxLeastSquares`; PDM, CE, String-Length, TLS and
+SuperSmoother gain the most over their vectorized numpy paths, while MHAOV's numpy path
+already sums its harmonics with a NUFFT on the automatic (uniform) grids and runs at
+about the numba kernel's speed. (Note that `numba` currently caps `numpy < 2.5`, so installing it may
+downgrade numpy slightly; the extra also asks for `scipy >= 1.13`, because the OpenBLAS
+bundled with older scipy can crash the process at exit on many-core machines once numba's
+thread pool is running.) The kernels are compiled once per install and cached on disk;
+files named `supersmoother._numba_ss_kernel…` left in `cuperiod/methods/__pycache__` by
+earlier versions, which recompiled in every process, can be deleted.
+
+:::{note}
+**numba's cache on a long Windows path.** numba writes its cache next to the installed
+package (`cuperiod\methods\__pycache__`), and cuPeriod's kernel names are long. Installed
+under a deep folder (a long project or OneDrive path) with Windows long paths disabled,
+those file names pass the 260-character limit, and the first call of each numba kernel
+in a process fails with `FileNotFoundError` naming a `*.nbi.tmp` or `*.nbc.tmp` file — in
+a batch, every worker hits it. Set `NUMBA_CACHE_DIR` to a short
+folder (for example `C:\numba-cache`), install into a shorter path, or enable Windows long
+paths (the `LongPathsEnabled` registry value, or the *Enable Win32 long paths* policy).
+:::
 
 Backends are probed once per process. If you install a GPU or torch extra into a running
 session (a notebook, say), call `cuperiod.core.backend.refresh_backends()` to probe again.
@@ -138,7 +165,10 @@ cuperiod doctor
 ```
 
 If no CUDA device is present, `gpu-info` says so and exits cleanly — the CPU paths still
-work. From Python:
+work. A backend asked for by name that cannot run here says which extra provides it:
+`backend="numba"` without numba names `pip install 'cuperiod[fast]'`, and `"cupy"` or
+`"cufinufft"` without a CUDA device or the GPU packages name `pip install 'cuperiod[gpu]'`.
+From Python:
 
 ```python
 import cuperiod as cup
@@ -180,7 +210,15 @@ time; the `gui` extra is not needed for that.
 
 ### Releasing
 
-1. Bump `version` in `pyproject.toml` and merge.
+1. Cut the version's metadata and merge. Every file that names the version changes
+   together:
+   - `version` in `pyproject.toml`, and the source-tree fallback `__version__` in
+     `src/cuperiod/__init__.py`;
+   - `uv.lock`, refreshed with `uv lock` so its `cuperiod` entry carries the new version;
+   - `version` and `date-released` in `CITATION.cff`;
+   - `CHANGELOG.md`: retitle `[Unreleased]` to `[<version>] - <date>` and add its
+     compare link (`[<version>]: …/compare/v<previous>...v<version>`) at the bottom;
+   - the README's citation note, which says what each release added.
 2. Push the tag `v<version>`. The release workflow builds the package and refuses to
    publish when the tag does not equal the built version (tagging `v1.3.0` while
    `pyproject.toml` still says `1.3.0.dev0`, for example).

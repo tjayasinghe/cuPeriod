@@ -24,22 +24,27 @@ and the complete API reference, including
 [the GUI](https://cuperiod.readthedocs.io/en/latest/guide/gui.html), and
 [benchmarks](https://cuperiod.readthedocs.io/en/latest/benchmarks.html) pages.
 
-Every implementation is validated against the standard reference (astropy
-`LombScargle` / `BoxLeastSquares`) to floating-point round-off.
+Every implementation is validated against an established reference on identical grids:
+BLS matches astropy's `BoxLeastSquares` to floating-point round-off, GLS matches astropy's
+`LombScargle` to its NUFFT tolerance (~1e-9), and the other methods are checked against
+independent implementations.
 
 ## Why cuPeriod
 
-- **Validated, not just fast.** GLS and BLS match astropy to floating-point round-off,
-  and every other method is checked against an independent reference implementation
-  (PyAstronomy, the `supersmoother` package and gatspy, or a direct implementation of the
-  published algorithm) on identical grids. Across the seven benchmark-suite methods, CPU,
-  CUDA, and the portable PyTorch backend agree to round-off and pick the
-  identical best period on 126 real ASAS-SN light curves
-  across six variability classes plus 12 confirmed *Kepler* transits — 88–96%
-  harmonic-aware period recovery on this deliberately heterogeneous sample (a synthetic
-  injection–recovery sweep further characterizes sensitivity vs. signal-to-noise) — see the
-  [full benchmark report](benchmarks/REPORT.md) and the
-  [benchmarks docs page](https://cuperiod.readthedocs.io/en/latest/benchmarks.html). The
+- **Validated, not just fast.** BLS matches astropy to floating-point round-off and GLS
+  matches it to its NUFFT tolerance (~1e-9). Every other method is checked against an
+  independent reference implementation (PyAstronomy, the `supersmoother` package and
+  gatspy, or a direct implementation of the published algorithm) on identical grids.
+  Across the seven benchmark-suite methods, CPU, CUDA, and the portable PyTorch backend
+  agree to within 3e-6 relative (round-off for BLS, PDM, CE and String-Length; GLS, whose
+  sums are NUFFTs, is the loosest) and pick the identical best period on 126 real ASAS-SN
+  light curves across six variability classes (the 28 eclipsing binaries among them for
+  TLS), with 88–96% harmonic-aware period recovery on this deliberately heterogeneous
+  sample. TLS also recovers 10 of 12 confirmed *Kepler* transits in a blind search, and a
+  synthetic injection–recovery sweep characterizes sensitivity vs. signal-to-noise — see
+  the
+  [full benchmark report](https://github.com/tjayasinghe/cuPeriod/blob/main/benchmarks/REPORT.md)
+  and the [benchmarks docs page](https://cuperiod.readthedocs.io/en/latest/benchmarks.html). The
   multi-band methods are further validated blind on 100 real SDSS Stripe 82 RR Lyrae with
   literature periods — the pooled fold statistics recover up to 93% of periods strictly
   (97% harmonic-aware) on real five-band data.
@@ -79,8 +84,9 @@ Every implementation is validated against the standard reference (astropy
   delete outliers, fit nightly zero points and weights, test amplitude/phase variations,
   undo anything — then save a `*.cupw.json` project that verifies by replay, or export a
   script that reproduces it.
-- **Period *changes*, not just periods.** `pdot_search` turns any of the methods into a
-  joint (P, dP/dt) search by evaluating it on exactly time-warped data — a drift that
+- **Period *changes*, not just periods.** `pdot_search` turns GLS, MHAOV, PDM, CE,
+  String-Length or SuperSmoother (not the transit searches BLS and TLS) into a joint
+  (P, dP/dt) search by evaluating it on exactly time-warped data — a drift that
   buries a signal in an ordinary periodogram (GLS power 0.19) stands out at the correct
   cell (0.95) — and `phase_track` measures the derivative with an automated O−C analysis:
   template timing per segment, quadratic ephemeris fits with honest uncertainties, an
@@ -117,8 +123,9 @@ All eight methods have CPU and GPU backends, plus the full single/batch/CLI mach
 pip install cuperiod            # CPU (numpy, scipy, astropy, finufft)
 pip install "cuperiod[gpu]"     # + CUDA 12 GPU backends (cupy, cufinufft)
 pip install "cuperiod[torch]"   # + portable PyTorch backend (AMD/Intel/Apple GPUs + CPU)
-pip install "cuperiod[fast]"    # + numba multicore CPU kernels (7 methods, no GLS, 20-300x)
+pip install "cuperiod[fast]"    # + numba multicore CPU kernels (every method but GLS)
 pip install "cuperiod[gui]"     # + interactive desktop GUI (cuperiod-gui)
+pip install "cuperiod[plot]"    # + matplotlib figures for the period-change tools
 pip install "cuperiod[pandas]"  # + pandas DataFrame ingestion
 pip install "cuperiod[nested]"  # + nested-pandas light curves (cuperiod.interop)
 pip install "cuperiod[lsdb]"    # + lsdb HATS catalogs (lazy, dask-partitioned)
@@ -131,8 +138,11 @@ everywhere — so the accelerated code runs beyond NVIDIA (install the wheel mat
 accelerator from [pytorch.org](https://pytorch.org/get-started/locally/); the default is
 CPU-only). The `[fast]` extra adds multicore `numba` CPU kernels that become the default
 `"cpu"`/`"auto"` backend for **every method but GLS** — BLS, PDM, CE, String-Length,
-MHAOV, TLS, and SuperSmoother — one to two orders of magnitude faster than the fallback
-CPU paths and matching them to floating point.
+MHAOV, TLS, and SuperSmoother. They return the fallback CPU paths' results (within ~1e-10
+for MHAOV, to round-off for the rest), much sooner for the box and fold methods: the numba
+BLS is 89× faster than astropy's `BoxLeastSquares`, its fallback, in the benchmark report.
+On the automatic (uniform) grids MHAOV's numpy fallback already sums its harmonics with a
+NUFFT and runs at about the same speed.
 
 Not sure what will run where? `cuperiod doctor` reports every installed backend, the torch
 devices it sees and the precision each uses, and what `backend="auto"` resolves to.
@@ -164,7 +174,7 @@ frequency, power = pg.frequency, pg.power
 
 Method names are case-insensitive (`"gls"` == `"GLS"`).
 
-> 📓 **New here?** The [`examples/cuperiod_tour.ipynb`](examples/cuperiod_tour.ipynb)
+> 📓 **New here?** The [`examples/cuperiod_tour.ipynb`](https://github.com/tjayasinghe/cuPeriod/blob/main/examples/cuperiod_tour.ipynb)
 > notebook works through real light curves — a Cepheid, an RR Lyrae, an eclipsing binary,
 > a Mira, and a *Kepler* exoplanet — showing each periodogram and phase-folded result.
 
@@ -305,7 +315,7 @@ cuperiod batch "lcs/*.csv" --method GLS --device gpu --out results/
 cuperiod prewhiten star.csv --snr 4.6 -n 30 --spacing --save-project star.cupw.json
 cuperiod session verify star.cupw.json   # replay a project's log against its solution
 cuperiod batch-prewhiten "lcs/*.csv" --out modes.parquet
-cuperiod pdot star.csv --period 0.5168   # joint (P, dP/dt) search + O-C measurement
+cuperiod pdot star.csv --period 0.5168   # (P, dP/dt) search + O-C + light-time orbit
 cuperiod methods                 # list methods and backends
 cuperiod gpu-info                # device + suggested worker counts
 cuperiod doctor                  # backends, torch devices, precision, auto-resolution
@@ -331,9 +341,9 @@ nightly zero points and weights, amplitude/phase variation tests, a History pane
 undo to any state, `*.cupw.json` projects and script export.
 
 Everything is reachable from the **keyboard** — a menu bar with mnemonics, shortcuts for
-every pre-whitening action (F1 lists them), a keyboard-operable spectrum — with visible
-focus, WCAG AA contrast in both themes, screen-reader names and descriptions, nothing
-conveyed by colour alone, and an interface zoom (Ctrl++ / Ctrl+-).
+the common pre-whitening actions (F1 lists every shortcut), a keyboard-operable
+spectrum — with visible focus, WCAG AA contrast in both themes, screen-reader names and
+descriptions, nothing conveyed by colour alone, and an interface zoom (Ctrl++ / Ctrl+-).
 
 ```bash
 pip install "cuperiod[gui]"      # add [gpu] or [torch] for accelerated backends
@@ -356,7 +366,7 @@ methods (BLS, TLS) work in flux — magnitudes are converted automatically.
 If you use cuPeriod in your research, please cite the Research Note
 ([ADS](https://ui.adsabs.harvard.edu/abs/2026RNAAS..10..244J),
 [doi:10.3847/2515-5172/ae9b06](https://doi.org/10.3847/2515-5172/ae9b06)). It is also the
-`preferred-citation` in [`CITATION.cff`](CITATION.cff), so GitHub's "Cite this repository"
+`preferred-citation` in [`CITATION.cff`](https://github.com/tjayasinghe/cuPeriod/blob/main/CITATION.cff), so GitHub's "Cite this repository"
 button and `cffconvert` both hand it back.
 
 ```bibtex
@@ -378,7 +388,8 @@ button and `cffconvert` both hand it back.
 ```
 
 The Note describes the v1.1 release (the seven methods of its title); multi-band, SuperSmoother
-and pre-whitening arrived in v1.2. Cite the version you ran alongside it if that matters for
+and pre-whitening arrived in v1.2, and the period-change tools and interactive pre-whitening
+sessions in v1.3. Cite the version you ran alongside it if that matters for
 reproducibility — `cuperiod.__version__` reports it.
 
 ## License

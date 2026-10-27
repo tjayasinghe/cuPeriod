@@ -51,8 +51,9 @@ suggested method (BLS for the transit).
 3. **Load demo → *Synthetic multiband*.** With **GLS** the phased panel overlays all three
    bands, each with its own colour *and* marker shape; the **Band** selector chooses
    *combined* or a single band.
-4. **Load demo → a folder in batch mode.** Scroll the **Sources** pane (arrow keys or
-   Prev/Next); each source computes on demand and revisits are instant (cached).
+4. **Load demo → *Batch: browse all demo sources*** (or File ▸ *Open folder…* for your
+   own). Scroll the **Sources** pane (arrow keys or Prev/Next); each source computes on
+   demand and revisits are instant (cached).
 5. **Switch Analysis to *Pre-whitening*.** The data's amplitude spectrum appears on its
    own. Press **Run pre-whitening** (Auto, <kbd>F5</kbd>): the residual spectrum is
    overlaid, every extracted component is marked, and the **Frequencies** pane lists them
@@ -114,9 +115,10 @@ the menus always show what can be done now.
 The form is built automatically from each method's settings model ({doc}`tuning`), so
 every knob is exposed with the right type and defaults, grouped into sections: **Search
 range** first, then the method's model (or *Extraction* and *Stopping* for
-pre-whitening), **Peaks**, **Multiband** (only when a joint multiband fit will run — with
-*combined (all bands)* chosen), and *Uncertainties*, *Combinations* and *Advanced*
-collapsed. Labels carry units; **Reset to defaults** puts everything back.
+pre-whitening) and **Peaks**, open; then *Multiband* (only when a joint multiband fit
+will run — with *combined (all bands)* chosen), *Uncertainties*, *Combinations* and
+*Advanced*, which start collapsed. Labels carry units; **Reset to defaults** puts
+everything back.
 
 - A line under the form shows the description of the focused option; every field also
   has a status tip and What's This? help (<kbd>Shift+F1</kbd>, then click it).
@@ -144,21 +146,28 @@ lets you choose:
 - the **Time**, **Brightness**, **Error** and **Band** columns (error and band can be
   *none*), pre-filled with what cuPeriod auto-detects — the same
   {class}`~cuperiod.ColumnMap` resolution described under {doc}`light-curves`;
-- whether the values are **Magnitudes** or **Fluxes** (inferred from the column until
-  you choose);
+- whether the values are **Magnitudes** or **Fluxes**. Until you choose, the brightness
+  column's name decides (`flux`, `uJy`, `mag_g`, …); the previous file's choice is used
+  only for a column whose name says neither (`V`, `col2`), and magnitudes otherwise;
 - for text tables, the **delimiter** and whether the **first row holds the column
   names** — semicolon-separated and headerless files (OGLE, Period04 `JD mag err`) are
-  recognised on opening.
+  recognised on opening. The file's own look comes first: the previous file's read
+  options are tried only when it does not split into columns by itself.
 
 The *File* tab labels each column's role and the *As loaded* tab shows the first rows
 exactly as they will be read, at full precision. A note names the time scale the numbers
 look like (BJD, HJD, MJD, BTJD, …) and warns when they look like seconds or decimal
 years. **Load** is unavailable, with the reason shown, while the chosen columns cannot
-work (unset, clashing, not numeric). The dialog remembers the last choice and never
-blocks the window.
+work (unset, clashing, not numeric) or while a header row would be read as data (text
+names above numbers with *First row holds the column names* unticked). The dialog
+offers the last file's columns again where the new file has them, remembers that
+choice across launches, and never blocks the window.
 
-Supported formats: `*.csv`, `*.ecsv`, `*.fits`/`*.fit`/`*.fz` (also compressed),
-`*.parquet`/`*.pq`, `*.tsv`/`*.tab`, `*.dat`, `*.txt`. A band/filter column gives a
+Supported formats: `*.csv`, `*.ecsv`, `*.fits`/`*.fit`/`*.fts`/`*.fz`,
+`*.parquet`/`*.pq`, `*.tsv`/`*.tab`, `*.dat`, `*.txt`; the text and FITS formats may
+also be compressed (`.gz`, `.bz2`, `.xz`, as in `star.fits.gz` or `star.csv.gz`). Open,
+a drop and Open folder all take the same list, and Open's *Light curves* filter shows
+the compressed files too. A band/filter column gives a
 {class}`~cuperiod.MultiBandLightCurve` in every format; rows without a band label are
 dropped and reported, and an auto-detected band column with more than 32 labels is
 treated as an identifier (the file loads as one band). Wide one-row-per-object tables
@@ -173,8 +182,9 @@ Sources are read lazily and each computed source is cached. A source that cannot
 is greyed out with the reason in its tooltip, skipped by Prev/Next and the arrow keys,
 and counted (*N unreadable*); when its columns could not be resolved, the error banner
 offers *Choose columns…*, which opens the import dialog for it. A drop may mix files and
-folders (a dropped `*.cupw.json` opens as a project); anything unrecognised is skipped
-and named in the status bar. Loading a new batch clears the source filter.
+folders; a `*.cupw.json` dropped on its own opens as a project. Anything unrecognised,
+a project file in a mixed drop included, is skipped and named in the status bar.
+Loading a new batch clears the source filter.
 
 ## Computing, stopping and errors
 
@@ -210,7 +220,7 @@ leaves the table (the arrow keys move between cells). The Peaks CSV has a `frequ
 {meth}`Sinusoid.to_dict <cuperiod.Sinusoid.to_dict>` columns (plus the session columns
 in a session); a pre-whitening spectrum CSV names its column `amplitude`. PNG exports
 render at the screen's scale and append `.png` when the name has no image suffix. Every
-*Export…* — the spectrum's and the fold's CSV / PNG, the tables' Export CSV — asks for
+*Export…* — the spectrum's CSV / PNG, the fold's PNG, the tables' Export CSV — asks for
 the file in the window's usual Save dialog, like *Save project*.
 
 ## Pre-whitening interactively
@@ -247,8 +257,8 @@ ring on every control, and nothing is conveyed by colour alone.
   skipped. When the fold and the raw light curve share their pane, its tabs come right
   after the spectrum, and <kbd>Left</kbd> / <kbd>Right</kbd> switch them; a point tool
   from the Data menu or <kbd>Ctrl+3</kbd> brings the light curve to the front.
-  <kbd>Ctrl+1</kbd> … <kbd>Ctrl+5</kbd> jump to the spectrum, the frequency table, the
-  light curve, the subsets and the history.
+  <kbd>Ctrl+1</kbd> … <kbd>Ctrl+5</kbd> jump to the spectrum, the frequency table (the
+  Peaks table in periodogram mode), the light curve, the subsets and the history.
 - **The spectrum** is keyboard-operable: <kbd>Left</kbd> / <kbd>Right</kbd> move a cursor
   between local maxima (<kbd>Ctrl</kbd>: marked peaks; <kbd>Shift</kbd>: one grid
   sample), <kbd>Home</kbd> goes to the tallest, <kbd>Enter</kbd> folds there,
@@ -273,14 +283,16 @@ ring on every control, and nothing is conveyed by colour alone.
   <kbd>Ctrl+0</kbd> zoom text and plot labels together and are remembered; a larger
   system or application font also enlarges the interface. Check boxes, spin buttons,
   splitters, scroll bars and pane buttons are large pointer targets.
-- **Help.** <kbd>F1</kbd> lists every shortcut; <kbd>Shift+F1</kbd> then a click explains
-  any control.
+- **Help.** <kbd>F1</kbd> lists every shortcut — the menu commands, the window's own keys
+  below, and the keys of a focused spectrum, light curve or table; <kbd>Shift+F1</kbd>
+  then a click explains any control.
 
-Window keys that are not in the command list below:
+Window keys that are not in the command list below (the F1 sheet lists them under
+their menus):
 
 | Key | Does |
 | --- | --- |
-| <kbd>F5</kbd>, <kbd>Ctrl+Return</kbd> | Compute the periodogram (in pre-whitening the same keys run Auto) |
+| <kbd>F5</kbd>, <kbd>Ctrl+Return</kbd> (or <kbd>Ctrl</kbd>+keypad <kbd>Enter</kbd>) | Compute the periodogram (in pre-whitening the same keys run Auto) |
 | <kbd>Ctrl+Shift+F</kbd> | Open a folder of light curves |
 | <kbd>Ctrl+R</kbd> | Show or hide the raw light curve |
 | <kbd>Ctrl+T</kbd> | Toggle the dark / light theme |

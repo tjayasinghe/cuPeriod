@@ -102,11 +102,12 @@ in band).
 **Errors and weights.** A multi-band method uses the error bars only when every
 contributing band has them; a set mixing bands with and without errors runs every band
 unweighted (BLS then uses each band's own robust flux scatter, 1.4826 × MAD, as its
-error). `meta["bands"]` lists only the bands that contributed, matching `n_samples`, and
-an exactly constant band contributes zero power (it is left out of MHAOV and
-SuperSmoother). `min_detections` applies to every multi-band method, counted over the
-bands that pass the method's per-band floor, and raises
-{exc}`~cuperiod.InsufficientDataError` as the single-band methods do.
+error). `meta["bands"]` lists the bands that passed the method's per-band point floor,
+matching `n_samples`. An exactly constant band among them adds zero power (MHAOV and
+SuperSmoother skip it in the statistic, but it stays listed and counted).
+`min_detections` applies to every multi-band method, counted over the bands that pass
+the method's per-band floor, and raises {exc}`~cuperiod.InsufficientDataError` as the
+single-band methods do.
 
 ## The three GLS models
 
@@ -296,7 +297,8 @@ at unrelated phases in different bands no longer add up. On 40 simulated six-ban
 light curves with a 1.5% transit in 0.5% noise it recovers 39 periods where the
 independent stack recovers 24, at about three times the numba cost. It runs on the
 numba, numpy, torch and cupy backends (they agree bit for bit, cupy to 1e-15); astropy
-is refused. `meta["mb_ephemeris"]` records the mode, and the default is unchanged:
+is refused. Every multi-band BLS result records the mode in `meta["mb_ephemeris"]`
+(`"independent"` or `"shared"`), and the default is unchanged:
 
 ```python
 pg = cup.periodogram(mb, "BLS", settings=cup.BLSSettings(mb_ephemeris="shared"))
