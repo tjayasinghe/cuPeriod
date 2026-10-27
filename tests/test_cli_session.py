@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -315,9 +316,12 @@ def test_export_script_survives_a_project_folder_that_does_not_exist(
     )
     assert result.exit_code == 2, result.output
     assert script.exists() and f"Wrote {script}" in result.stdout
-    assert "--save-project" in result.output and "does not exist" in result.output
-    assert "star.cupw.json" in result.output and ".tmp" not in result.output
-    assert "Traceback" not in result.output
+    # On GitHub Actions typer forces rich's terminal mode, and its highlighter styles
+    # "--save" and "-project" apart: compare the text without the ANSI codes.
+    output = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+    assert "--save-project" in output and "does not exist" in output
+    assert "star.cupw.json" in output and ".tmp" not in output
+    assert "Traceback" not in output
 
 
 def test_a_failed_embed_fallback_keeps_the_first_refusals_remedy(
